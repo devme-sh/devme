@@ -1,0 +1,21 @@
+[package]
+name = "devstack-shared-supervisor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "devstack-shared-supervisor"
+path = "src/main.rs"
+
+[dependencies]
+devstack-core = { workspace = true }
+devstack-config = { workspace = true }
+tokio = { workspace = true }
+portable-pty = { workspace = true }
+process_alive = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

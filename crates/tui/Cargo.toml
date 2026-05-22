@@ -1,0 +1,19 @@
+[package]
+name = "devstack-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "devstack-tui"
+path = "src/main.rs"
+
+[dependencies]
+devstack-core = { workspace = true }
+devstack-client = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/config",
+    "crates/supervisor",
+    "crates/shared-supervisor",
+    "crates/client",
+    "crates/tui",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "TBD"
+repository = "TBD"
+
+[workspace.dependencies]
+# Internal crates
+devstack-core = { path = "crates/core" }
+devstack-config = { path = "crates/config" }
+devstack-client = { path = "crates/client" }
+
+# Async runtime + IPC
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# Config / serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# CLI + completions
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.29"
+
+# PTY
+portable-pty = "0.9"
+
+# Process / system
+process_alive = "0.1"
+
+# Logging / error handling
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
