@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "devstack_tui"
+path = "src/lib.rs"
+
 [[bin]]
 name = "devstack-tui"
 path = "src/main.rs"
