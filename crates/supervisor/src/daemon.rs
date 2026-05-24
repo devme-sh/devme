@@ -100,6 +100,12 @@ enum InternalEvent {
         step: String,
         passed: bool,
     },
+    /// A line of output from a step's check or provision subprocess.
+    /// Streamed as it arrives so the user can watch slow setup commands.
+    StepLine {
+        step: String,
+        line: String,
+    },
 }
 
 struct ChildRecord {
@@ -475,6 +481,21 @@ fn process_event(
                 },
             );
             enact_actions(state, actions, tx);
+        }
+        InternalEvent::StepLine { step, line } => {
+            let ts = now_ms();
+            let bytes = encode_line(&line);
+            let buf = state
+                .logs
+                .entry(step.clone())
+                .or_insert_with(|| RingBuffer::new(RING_CAPACITY));
+            buf.push(ts, line);
+            let msg = ServerMessage::LogChunk {
+                service: step.clone(),
+                bytes,
+                ts,
+            };
+            state.broadcast(Some(&step), msg);
         }
         InternalEvent::StepProvisionResult { step, passed } => {
             let actions = state.executor.handle(ExecEvent::StepProvisionCompleted {
@@ -1005,7 +1026,8 @@ fn enact_actions(
                 let check_tx = tx.clone();
                 let step_name = name.clone();
                 tokio::spawn(async move {
-                    let passed = run_shell_quiet(&cmd, &cwd).await;
+                    let passed =
+                        run_shell_streaming(&cmd, &cwd, &step_name, &check_tx).await;
                     let _ = check_tx.send(InternalEvent::StepCheckResult {
                         step: step_name,
                         passed,
@@ -1044,7 +1066,8 @@ fn enact_actions(
                 let provision_tx = tx.clone();
                 let step_name = name.clone();
                 tokio::spawn(async move {
-                    let passed = run_shell_quiet(&cmd, &cwd).await;
+                    let passed =
+                        run_shell_streaming(&cmd, &cwd, &step_name, &provision_tx).await;
                     let _ = provision_tx.send(InternalEvent::StepProvisionResult {
                         step: step_name,
                         passed,
@@ -1083,18 +1106,55 @@ fn interpolate_health(check: &HealthCheck, ctx: &InterpContext) -> HealthCheck {
     }
 }
 
-/// Run `cmd` under `sh -c`, discarding output. Returns true on exit code 0.
-async fn run_shell_quiet(cmd: &str, cwd: &Path) -> bool {
-    match tokio::process::Command::new("sh")
+/// Run `cmd` under `sh -c`, streaming both stdout and stderr back to the
+/// event loop as `StepLine`s tagged with `step_name`. Returns true on
+/// exit code 0.
+async fn run_shell_streaming(
+    cmd: &str,
+    cwd: &Path,
+    step_name: &str,
+    tx: &mpsc::UnboundedSender<InternalEvent>,
+) -> bool {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let mut child = match tokio::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
     {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    async fn pump<R>(reader: R, tx: mpsc::UnboundedSender<InternalEvent>, name: String)
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    {
+        let mut lines = BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if tx
+                .send(InternalEvent::StepLine {
+                    step: name.clone(),
+                    line,
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+    if let Some(out) = child.stdout.take() {
+        tokio::spawn(pump(out, tx.clone(), step_name.to_string()));
+    }
+    if let Some(err) = child.stderr.take() {
+        tokio::spawn(pump(err, tx.clone(), step_name.to_string()));
+    }
+
+    match child.wait().await {
         Ok(status) => status.success(),
         Err(_) => false,
     }
@@ -1513,6 +1573,62 @@ depends_on = ["tools"]
         }
         assert!(saw_step_passed, "step never reported Passed");
         assert!(saw_app_running, "service blocked on step never reached Running");
+
+        send_msg(&mut conn, ClientMessage::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn step_output_is_streamed_to_subscribers_as_log_chunks() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("d.sock");
+        let server = DaemonServer::bind_with_stack(
+            &sock,
+            make_stack(
+                r#"
+schema_version = 1
+
+[step.greeting]
+check = "echo hello from check; echo line two"
+"#,
+            ),
+        )
+        .unwrap();
+        let task = tokio::spawn(server.serve());
+
+        let mut conn = connect(&sock).await;
+        send_msg(&mut conn, ClientMessage::Subscribe { services: vec![] }).await;
+        let _ = recv_msg(&mut conn).await;
+        send_msg(
+            &mut conn,
+            ClientMessage::Start {
+                service: String::new(),
+                skip_deps: false,
+            },
+        )
+        .await;
+
+        let mut got: Vec<String> = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline
+            && !got.iter().any(|l| l.contains("hello from check"))
+        {
+            match tokio::time::timeout(Duration::from_millis(500), recv_msg(&mut conn)).await {
+                Ok(ServerMessage::LogChunk {
+                    service, bytes, ..
+                }) if service == "greeting" => {
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(bytes.as_bytes())
+                        .unwrap();
+                    got.push(String::from_utf8(decoded).unwrap());
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            got.iter().any(|l| l.contains("hello from check")),
+            "step output missing 'hello from check', got: {got:?}"
+        );
 
         send_msg(&mut conn, ClientMessage::Shutdown).await;
         let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
