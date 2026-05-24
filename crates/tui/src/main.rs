@@ -57,6 +57,16 @@ async fn real_main() -> anyhow::Result<()> {
     client
         .send(ClientMessage::Subscribe { services: vec![] })
         .await?;
+    // Opening the TUI implies "bring this stack up." Start is idempotent —
+    // services already running stay running; only newly-eligible ones spawn.
+    // Services the user has explicitly stopped this session stay stopped
+    // because the executor still has them tracked as Stopped.
+    client
+        .send(ClientMessage::Start {
+            service: String::new(),
+            skip_deps: false,
+        })
+        .await?;
 
     let mut state = TuiState::default();
     if let Some(name) = cwd.file_name().and_then(|s| s.to_str()) {
