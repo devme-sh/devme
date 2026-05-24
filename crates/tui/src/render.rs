@@ -5,18 +5,23 @@
 //! Layout (lazygit-inspired, see ADR-0010):
 //!
 //! ```text
-//! ╭─ instance ──╮╭─ header: stack name • [tab1 │ tab2 │ tab3] • selected meta ─╮
+//! ╭─ stacks ────╮╭─ header: stack name • [tab1 │ tab2 │ tab3] • selected meta ─╮
 //! │ ▸ kpi-...   ││╭─ logs ──────────────────────────────────────────────────╮ │
-//! │             │││ 12:34:01 listening on :8080                              │ │
-//! │ steps:      │││ 12:34:02 GET /api/health 200                             │ │
-//! │  ✓ tools    │││ ...                                                       │ │
-//! │  · uv       │││                                                           │ │
-//! │             │││                                                           │ │
-//! │             │││                                                           │ │
+//! │   smoke     │││ 12:34:01 listening on :8080                              │ │
+//! │             │││ 12:34:02 GET /api/health 200                             │ │
+//! │             │││ ...                                                       │ │
+//! ├─ tools ─────┤││                                                           │ │
+//! │ ✓ gcloud    │││                                                           │ │
+//! │ · uv        │││                                                           │ │
 //! ╰─────────────╯│╰───────────────────────────────────────────────────────────╯ │
 //!                ╰── status: tick • running • pid 12345 • 0 restarts ───────────╯
-//!  q quit  ↑↓/jk navigate  s stop  r restart  S start  ? help
+//!  q quit  ↑↓/jk stack  ←→/hl service  s stop  r restart  S start  ? help
 //! ```
+//!
+//! Services live in the tabs row at the top of the main pane, not in the
+//! sidebar (which would duplicate them). The sidebar's top half is stacks,
+//! the bottom half is the dependency checks ("tools" — uv, gcloud, etc.)
+//! that gate startup.
 
 use ansi_to_tui::IntoText;
 use ratatui::Frame;
@@ -59,7 +64,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect) {
         Span::styled("←→/hl", key),
         Span::styled(" service  ", dim),
         Span::styled("↑↓/jk", key),
-        Span::styled(" instance  ", dim),
+        Span::styled(" stack  ", dim),
         Span::styled("b/space", key),
         Span::styled(" scroll  ", dim),
         Span::styled("g/G", key),
@@ -71,9 +76,41 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    // Sidebar is split into two boxes stacked vertically. The top box lists
+    // running stacks (multi-stack scaffolding — for now usually one entry).
+    // The bottom box shows the dependency checks declared as `[step.*]`,
+    // which are the tools/services we rely on (uv, gcloud, redis…).
+    //
+    // Services are deliberately NOT listed here — they live in the tabs row
+    // of the main pane. Putting them in both places would just waste real
+    // estate.
+    //
+    // The tools pane gets a fixed height proportional to the count, so a
+    // tall instance list doesn't crowd it out. We cap the stack pane at a
+    // sensible minimum height too.
+    let step_count = state.steps().len() as u16;
+    // Tools pane = header + steps + a little padding (rounded box borders).
+    let tools_height = if step_count == 0 { 0 } else { (step_count + 2).min(area.height / 2) };
+    let stacks_constraint = if tools_height == 0 {
+        [Constraint::Min(0), Constraint::Length(0)]
+    } else {
+        [Constraint::Min(3), Constraint::Length(tools_height)]
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(stacks_constraint)
+        .split(area);
+
+    render_stacks_pane(frame, chunks[0], state);
+    if tools_height > 0 {
+        render_tools_pane(frame, chunks[1], state);
+    }
+}
+
+fn render_stacks_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let block = Block::default()
         .title(Span::styled(
-            " instance ",
+            " stacks ",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -103,51 +140,33 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             ]));
         }
     }
-    if !state.instances().is_empty() {
-        lines.push(Line::default());
-    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
 
-    if !state.steps().is_empty() {
-        lines.push(Line::from(Span::styled(
-            "steps",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for s in state.steps() {
-            lines.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(
-                    step_glyph(s.state).to_string(),
-                    Style::default().fg(step_color(s.state)),
-                ),
-                Span::raw(" "),
-                Span::styled(s.name.as_str().to_string(), step_text_style(s.state)),
-            ]));
-        }
-        lines.push(Line::default());
-    }
+fn render_tools_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let block = Block::default()
+        .title(Span::styled(
+            " tools ",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    if !state.services().is_empty() {
-        lines.push(Line::from(Span::styled(
-            "services",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )));
-        for s in state.services() {
-            lines.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(
-                    service_dot(&s.state).to_string(),
-                    Style::default().fg(service_color(&s.state)),
-                ),
-                Span::raw(" "),
-                Span::styled(s.name.clone(), Style::default()),
-            ]));
-        }
+    let mut lines: Vec<Line> = Vec::new();
+    for s in state.steps() {
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                step_glyph(s.state).to_string(),
+                Style::default().fg(step_color(s.state)),
+            ),
+            Span::raw(" "),
+            Span::styled(s.name.as_str().to_string(), step_text_style(s.state)),
+        ]));
     }
-
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
@@ -554,8 +573,8 @@ mod tests {
         let last = text.lines().last().unwrap_or("");
         assert!(last.contains("quit"), "footer missing 'quit':\n{text}");
         assert!(
-            last.contains("instance"),
-            "footer missing instance nav hint:\n{text}"
+            last.contains("stack"),
+            "footer missing stack nav hint:\n{text}"
         );
         assert!(
             last.contains("service"),
