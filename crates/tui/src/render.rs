@@ -95,7 +95,9 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Span::styled(format!(" ●{running} "), Style::default().fg(Color::Green)),
         Span::styled(format!("◌{starting} "), Style::default().fg(Color::Yellow)),
         Span::styled(format!("○{stopped} "), Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("✗{failed} "), Style::default().fg(Color::Red)),
+        Span::styled(format!("✗{failed}"), Style::default().fg(Color::Red)),
+        // Right-edge margin so the glyphs don't kiss the terminal border.
+        Span::raw("  "),
     ];
     let right = Paragraph::new(Line::from(right_spans))
         .alignment(ratatui::layout::Alignment::Right);
@@ -487,9 +489,11 @@ fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 Style::default().fg(Color::Gray)
             })
             // Slim symbols — ratatui defaults to `█`/`║` which are visually
-            // heavy for a 1-column gutter. `▐` (right-half block) and `│`
-            // (light vertical) match lazygit's understated style.
-            .thumb_symbol("▐")
+            // heavy for a 1-column gutter. `┃` (heavy vertical) for the
+            // thumb pairs with `│` (light vertical) for the track: both
+            // characters sit in the cell's centre, so the thumb sliding
+            // past the track stays visually aligned column-to-column.
+            .thumb_symbol("┃")
             .track_symbol(Some("│"))
             .begin_symbol(None)
             .end_symbol(None);
