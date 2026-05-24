@@ -346,6 +346,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "devstack-executor"
+version = "0.1.0"
+dependencies = [
+ "devstack-config",
+ "devstack-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "devstack-shared-supervisor"
 version = "0.1.0"
 dependencies = [

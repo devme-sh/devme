@@ -12,12 +12,25 @@ use thiserror::Error;
 
 use crate::stack::Stack;
 
+/// Distinguishes the two kinds of nodes the supervisor handles differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NodeKind {
+    /// A Step: setup task with a `check` (and optional `provision`).
+    Step,
+    /// A Service: long-running process.
+    Service,
+}
+
 #[derive(Debug, Clone)]
 pub struct Graph {
     /// Forward edges: node -> its declared dependencies.
     edges: HashMap<String, Vec<Dependency>>,
     /// Insertion order matches declaration order — used for stable output.
     nodes: Vec<String>,
+    /// What kind of node each name refers to.
+    kinds: HashMap<String, NodeKind>,
+    /// Names of steps that declare a `provision` command.
+    has_provision: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -39,21 +52,37 @@ impl Graph {
     pub fn from_stack(stack: &Stack) -> Self {
         let mut edges = HashMap::new();
         let mut nodes = Vec::with_capacity(stack.step.len() + stack.service.len());
+        let mut kinds = HashMap::new();
+        let mut has_provision = std::collections::HashSet::new();
 
         for (name, step) in &stack.step {
             edges.insert(name.clone(), step.depends_on.clone());
+            kinds.insert(name.clone(), NodeKind::Step);
+            if step.provision.is_some() {
+                has_provision.insert(name.clone());
+            }
             nodes.push(name.clone());
         }
         for (name, service) in &stack.service {
             edges.insert(name.clone(), service.depends_on.clone());
+            kinds.insert(name.clone(), NodeKind::Service);
             nodes.push(name.clone());
         }
 
-        Self { edges, nodes }
+        Self { edges, nodes, kinds, has_provision }
+    }
+
+    /// True if `node` is a Step whose config declared a `provision`.
+    pub fn has_provision(&self, node: &str) -> bool {
+        self.has_provision.contains(node)
     }
 
     pub fn nodes(&self) -> &[String] {
         &self.nodes
+    }
+
+    pub fn kind(&self, node: &str) -> Option<NodeKind> {
+        self.kinds.get(node).copied()
     }
 
     pub fn dependencies(&self, node: &str) -> &[Dependency] {

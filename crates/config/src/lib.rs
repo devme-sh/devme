@@ -13,7 +13,7 @@ mod step;
 mod validate;
 
 pub use error::ConfigError;
-pub use graph::{DepStatus, Graph, GraphError, SatisfactionOutcome};
+pub use graph::{DepStatus, Graph, GraphError, NodeKind, SatisfactionOutcome};
 pub use interpolate::{InterpContext, InterpError, interpolate};
 pub use provision::Provision;
 pub use service::Service;

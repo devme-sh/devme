@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/config",
     "crates/slot-allocator",
+    "crates/executor",
     "crates/supervisor",
     "crates/shared-supervisor",
     "crates/client",
@@ -23,6 +24,7 @@ repository = "TBD"
 devstack-core = { path = "crates/core" }
 devstack-config = { path = "crates/config" }
 devstack-slot-allocator = { path = "crates/slot-allocator" }
+devstack-executor = { path = "crates/executor" }
 devstack-client = { path = "crates/client" }
 
 # Async runtime + IPC
