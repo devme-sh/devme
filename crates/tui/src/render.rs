@@ -55,15 +55,15 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect) {
         Span::styled(" q", key),
         Span::styled(" quit  ", dim),
         Span::styled("↑↓/jk", key),
-        Span::styled(" nav  ", dim),
+        Span::styled(" instance  ", dim),
+        Span::styled("←→/hl", key),
+        Span::styled(" service  ", dim),
         Span::styled("S", key),
         Span::styled(" start  ", dim),
         Span::styled("s", key),
         Span::styled(" stop  ", dim),
         Span::styled("r", key),
-        Span::styled(" restart  ", dim),
-        Span::styled("?", key),
-        Span::styled(" help", dim),
+        Span::styled(" restart", dim),
     ];
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -80,16 +80,28 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let label = state.instance_label();
     let mut lines: Vec<Line> = Vec::new();
-    if !label.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("▸ ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                label.to_string(),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ]));
+    let selected = state.selected_instance_index();
+    for (i, label) in state.instances().iter().enumerate() {
+        let is_selected = selected == Some(i);
+        if is_selected {
+            lines.push(Line::from(vec![
+                Span::styled("▸ ", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    label.clone(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(label.clone(), Style::default().fg(Color::Gray)),
+            ]));
+        }
+    }
+    if !state.instances().is_empty() {
         lines.push(Line::default());
     }
 
@@ -513,12 +525,16 @@ mod tests {
     #[test]
     fn footer_lists_basic_key_bindings() {
         let state = TuiState::default();
-        let text = render_to_text(&state, 80, 12);
+        let text = render_to_text(&state, 100, 12);
         let last = text.lines().last().unwrap_or("");
         assert!(last.contains("quit"), "footer missing 'quit':\n{text}");
         assert!(
-            last.contains("nav") || last.contains("navigate"),
-            "footer missing navigation hint:\n{text}"
+            last.contains("instance"),
+            "footer missing instance nav hint:\n{text}"
+        );
+        assert!(
+            last.contains("service"),
+            "footer missing service nav hint:\n{text}"
         );
     }
 

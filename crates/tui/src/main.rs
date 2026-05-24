@@ -32,13 +32,21 @@ fn main() {
             std::process::exit(1);
         }
     };
-    if let Err(e) = runtime.block_on(real_main()) {
-        // Ensure we leave the terminal in a sane state before printing.
-        let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
-        eprintln!("devme-tui: {e}");
-        std::process::exit(1);
-    }
+    let exit_code = match runtime.block_on(real_main()) {
+        Ok(()) => 0,
+        Err(e) => {
+            // Ensure we leave the terminal in a sane state before printing.
+            let _ = disable_raw_mode();
+            let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+            eprintln!("devme-tui: {e}");
+            1
+        }
+    };
+    // Force exit so the spawn_blocking thread reading from crossterm's
+    // (blocking) event stream doesn't keep the process alive — its blocking
+    // syscall ignores tokio runtime shutdown, so otherwise `q` would render
+    // cleanup but leave the user staring at a hung terminal until Ctrl-C.
+    std::process::exit(exit_code);
 }
 
 async fn real_main() -> anyhow::Result<()> {
@@ -98,12 +106,12 @@ async fn run(
                         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                             return Ok(());
                         }
-                        KeyCode::Down | KeyCode::Char('j') | KeyCode::Right | KeyCode::Char('l') => {
-                            state.select_next();
-                        }
-                        KeyCode::Up | KeyCode::Char('k') | KeyCode::Left | KeyCode::Char('h') => {
-                            state.select_prev();
-                        }
+                        // Vertical = instance list (sidebar).
+                        KeyCode::Down | KeyCode::Char('j') => state.select_next_instance(),
+                        KeyCode::Up | KeyCode::Char('k') => state.select_prev_instance(),
+                        // Horizontal = service tabs.
+                        KeyCode::Right | KeyCode::Char('l') => state.select_next_service(),
+                        KeyCode::Left | KeyCode::Char('h') => state.select_prev_service(),
                         KeyCode::Char('S') => {
                             if let Some(name) = state.selected_service().map(|s| s.name.clone()) {
                                 let _ = client

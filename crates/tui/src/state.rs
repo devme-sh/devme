@@ -28,7 +28,12 @@ pub struct TuiState {
     steps: Vec<StepSnapshot>,
     selected_service: Option<usize>,
     focus: Focus,
-    instance_label: String,
+    /// Workspaces/worktrees visible in the sidebar. v1 has just one (the
+    /// local instance), but the navigation model is set up for future
+    /// multi-instance support (e.g. shared-supervisor or a TUI attached to
+    /// multiple worktrees at once).
+    instances: Vec<String>,
+    selected_instance: Option<usize>,
     logs: HashMap<String, VecDeque<String>>,
 }
 
@@ -39,7 +44,8 @@ impl Default for TuiState {
             steps: Vec::new(),
             selected_service: None,
             focus: Focus::Tabs,
-            instance_label: String::new(),
+            instances: Vec::new(),
+            selected_instance: None,
             logs: HashMap::new(),
         }
     }
@@ -58,14 +64,38 @@ impl TuiState {
         self.focus
     }
 
-    /// Human-friendly label for this instance — e.g. the repo basename.
-    /// Surfaced in the sidebar.
+    /// Human-friendly label for the currently selected instance, or "" if
+    /// none. Surfaced in the sidebar header.
     pub fn instance_label(&self) -> &str {
-        &self.instance_label
+        self.selected_instance
+            .and_then(|i| self.instances.get(i))
+            .map(|s| s.as_str())
+            .unwrap_or("")
     }
 
+    /// All known instances, in the order they appear in the sidebar.
+    pub fn instances(&self) -> &[String] {
+        &self.instances
+    }
+
+    pub fn selected_instance_index(&self) -> Option<usize> {
+        self.selected_instance
+    }
+
+    /// Replace the instance list with a single label and select it. For v1
+    /// the TUI shows exactly one instance.
     pub fn set_instance_label(&mut self, label: impl Into<String>) {
-        self.instance_label = label.into();
+        self.instances = vec![label.into()];
+        self.selected_instance = Some(0);
+    }
+
+    /// Append a new instance to the sidebar list. The first call also
+    /// selects it. Reserved for multi-instance support.
+    pub fn add_instance(&mut self, label: impl Into<String>) {
+        self.instances.push(label.into());
+        if self.selected_instance.is_none() {
+            self.selected_instance = Some(0);
+        }
     }
 
     /// The currently-focused service, if any.
@@ -129,25 +159,51 @@ impl TuiState {
         }
     }
 
-    /// Move selection within the focused pane.
-    pub fn select_next(&mut self) {
-        if matches!(self.focus, Focus::Tabs) && !self.services.is_empty() {
-            let next = match self.selected_service {
-                Some(i) => (i + 1) % self.services.len(),
-                None => 0,
-            };
-            self.selected_service = Some(next);
+    /// Horizontal navigation across service tabs (`h`/`l` / `←`/`→`).
+    pub fn select_next_service(&mut self) {
+        if self.services.is_empty() {
+            return;
         }
+        let next = match self.selected_service {
+            Some(i) => (i + 1) % self.services.len(),
+            None => 0,
+        };
+        self.selected_service = Some(next);
     }
 
-    pub fn select_prev(&mut self) {
-        if matches!(self.focus, Focus::Tabs) && !self.services.is_empty() {
-            let prev = match self.selected_service {
-                Some(0) | None => self.services.len() - 1,
-                Some(i) => i - 1,
-            };
-            self.selected_service = Some(prev);
+    pub fn select_prev_service(&mut self) {
+        if self.services.is_empty() {
+            return;
         }
+        let prev = match self.selected_service {
+            Some(0) | None => self.services.len() - 1,
+            Some(i) => i - 1,
+        };
+        self.selected_service = Some(prev);
+    }
+
+    /// Vertical navigation through the sidebar's instance list
+    /// (`j`/`k` / `↑`/`↓`).
+    pub fn select_next_instance(&mut self) {
+        if self.instances.is_empty() {
+            return;
+        }
+        let next = match self.selected_instance {
+            Some(i) => (i + 1) % self.instances.len(),
+            None => 0,
+        };
+        self.selected_instance = Some(next);
+    }
+
+    pub fn select_prev_instance(&mut self) {
+        if self.instances.is_empty() {
+            return;
+        }
+        let prev = match self.selected_instance {
+            Some(0) | None => self.instances.len() - 1,
+            Some(i) => i - 1,
+        };
+        self.selected_instance = Some(prev);
     }
 }
 
@@ -253,22 +309,61 @@ mod tests {
     }
 
     #[test]
-    fn select_next_wraps_around_at_end() {
+    fn select_next_service_wraps_around_at_end() {
         let mut s = TuiState::default();
         s.apply(snapshot_msg(&["a", "b", "c"]));
-        s.select_next();
-        s.select_next();
+        s.select_next_service();
+        s.select_next_service();
         assert_eq!(s.selected_service().unwrap().name, "c");
-        s.select_next(); // wraps to "a"
+        s.select_next_service(); // wraps to "a"
         assert_eq!(s.selected_service().unwrap().name, "a");
     }
 
     #[test]
-    fn select_prev_wraps_around_at_start() {
+    fn select_prev_service_wraps_around_at_start() {
         let mut s = TuiState::default();
         s.apply(snapshot_msg(&["a", "b", "c"]));
-        s.select_prev();
+        s.select_prev_service();
         assert_eq!(s.selected_service().unwrap().name, "c");
+    }
+
+    #[test]
+    fn instance_navigation_wraps_through_added_instances() {
+        let mut s = TuiState::default();
+        s.add_instance("first");
+        s.add_instance("second");
+        s.add_instance("third");
+        assert_eq!(s.instance_label(), "first");
+        s.select_next_instance();
+        assert_eq!(s.instance_label(), "second");
+        s.select_next_instance();
+        s.select_next_instance(); // wraps back to first
+        assert_eq!(s.instance_label(), "first");
+        s.select_prev_instance(); // wraps to last
+        assert_eq!(s.instance_label(), "third");
+    }
+
+    #[test]
+    fn instance_navigation_is_a_noop_with_a_single_instance() {
+        let mut s = TuiState::default();
+        s.set_instance_label("only");
+        s.select_next_instance();
+        s.select_prev_instance();
+        assert_eq!(s.instance_label(), "only");
+    }
+
+    #[test]
+    fn service_and_instance_navigation_are_independent() {
+        let mut s = TuiState::default();
+        s.add_instance("repo-a");
+        s.add_instance("repo-b");
+        s.apply(snapshot_msg(&["api", "db"]));
+        s.select_next_service();
+        assert_eq!(s.selected_service().unwrap().name, "db");
+        assert_eq!(s.instance_label(), "repo-a");
+        s.select_next_instance();
+        assert_eq!(s.instance_label(), "repo-b");
+        assert_eq!(s.selected_service().unwrap().name, "db");
     }
 
     #[test]
@@ -320,16 +415,4 @@ mod tests {
         assert_eq!(buf.last().unwrap(), &format!("line {}", super::TUI_LOG_CAP + 4));
     }
 
-    #[test]
-    fn select_does_nothing_when_focus_isnt_tabs() {
-        let mut s = TuiState::default();
-        s.apply(snapshot_msg(&["a", "b"]));
-        // Manually shift focus; the next() call should be a no-op now.
-        s = TuiState {
-            focus: Focus::Sidebar,
-            ..s
-        };
-        s.select_next();
-        assert_eq!(s.selected_service().unwrap().name, "a");
-    }
 }

@@ -14,7 +14,9 @@ use ratatui::buffer::Buffer;
 
 fn main() {
     let mut state = TuiState::default();
-    state.set_instance_label("kpi-dashboard");
+    state.add_instance("kpi-dashboard");
+    state.add_instance("internal-portal");
+    state.add_instance("ingest-worker");
     state.apply(ServerMessage::Subscribed {
         services: vec![
             ServiceSnapshot {
@@ -83,7 +85,7 @@ fn main() {
         });
     }
     // Select the second tab so the preview shows the busier service.
-    state.select_next();
+    state.select_next_service();
 
     let (w, h) = (110, 30);
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
