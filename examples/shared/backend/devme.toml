@@ -1,0 +1,20 @@
+schema_version = 1
+
+# See examples/shared/frontend/devme.toml for the demo description.
+# The cache service here is declared identically (same name, same
+# scope = "repo") so the shared supervisor knows the two stacks
+# reference the same instance.
+
+[step.tools]
+check = "command -v sh"
+
+[service.cache]
+cmd = "echo shared redis on :{port}; while true; do echo shared cache tick; sleep 3; done"
+port = { base = 6379, slot_offset = 10 }
+scope = "repo"
+depends_on = ["tools"]
+
+[service.api]
+cmd = "echo api on :{port}; while true; do echo GET /things 200; sleep 2; done"
+port = { base = 8080, slot_offset = 10 }
+depends_on = ["cache"]

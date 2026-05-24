@@ -1,0 +1,19 @@
+schema_version = 1
+
+# Smallest possible stack — three services exercising the basic
+# happy-path / failure / restart-loop branches.
+
+[step.tools]
+check = "command -v sh"
+
+[service.tick]
+cmd = "while true; do echo tick $(date +%H:%M:%S); sleep 1; done"
+depends_on = ["tools"]
+
+[service.flaky]
+cmd = "echo flaky starting; sleep 1; echo crashing now; exit 1"
+restart = "on-failure"
+
+[service.boom]
+cmd = "echo about to fail; sleep 0.5; exit 7"
+restart = "never"

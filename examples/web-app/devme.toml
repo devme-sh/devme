@@ -1,0 +1,40 @@
+schema_version = 1
+
+# Realistic web-app stack: a faux db + cache + api + worker + web + step.
+# All services are fake (sh loops), but the dependency graph, port slot
+# interpolation, and health-check shapes mirror a real Node/Python/Go
+# dev environment.
+
+[step.tools]
+check = "command -v sh && command -v sleep"
+
+[step.migrations]
+# A one-shot step that "migrates the db". Runs after db is up, gates api.
+check = "test -f /tmp/devme-fake-migrations.done"
+provision = "sleep 1 && touch /tmp/devme-fake-migrations.done && echo migrations applied"
+
+[service.db]
+cmd = "echo postgres listening on :{port}; while true; do sleep 5; echo db heartbeat; done"
+port = { base = 5432, slot_offset = 10 }
+depends_on = ["tools"]
+
+[service.cache]
+cmd = "echo redis listening on :{port}; while true; do sleep 7; echo cache heartbeat; done"
+port = { base = 6379, slot_offset = 10 }
+depends_on = ["tools"]
+
+[service.api]
+cmd = "echo api booting on :{port}; sleep 1; echo api ready; while true; do echo GET /health 200; sleep 3; done"
+port = { base = 8080, slot_offset = 10 }
+depends_on = ["db", "cache", "migrations"]
+env = { DATABASE_URL = "postgres://localhost:5442/dev", REDIS_URL = "redis://localhost:6389" }
+
+[service.worker]
+# Job processor. Soft-depends on cache (the `?` suffix means optional).
+cmd = "echo worker started; while true; do echo processed job $RANDOM; sleep 2; done"
+depends_on = ["db", "cache?"]
+
+[service.web]
+cmd = "echo dev server on :{port}; while true; do echo hmr ping; sleep 4; done"
+port = { base = 3000, slot_offset = 10 }
+depends_on = ["api"]

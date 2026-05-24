@@ -1,0 +1,24 @@
+schema_version = 1
+
+# One half of a "shared repo service" demo. The `cache` service is
+# scope = "repo" — both stacks (frontend/, backend/) reference the
+# same name and devme starts exactly one copy across both worktrees.
+#
+# To exercise the shared path: open two terminals, run `devme` in
+# examples/shared/frontend and examples/shared/backend. The cache
+# service should appear in both TUIs but only one process should be
+# spawned.
+
+[step.tools]
+check = "command -v sh"
+
+[service.cache]
+cmd = "echo shared redis on :{port}; while true; do echo shared cache tick; sleep 3; done"
+port = { base = 6379, slot_offset = 10 }
+scope = "repo"
+depends_on = ["tools"]
+
+[service.web]
+cmd = "echo frontend dev server on :{port}; while true; do echo hmr ping; sleep 4; done"
+port = { base = 3000, slot_offset = 10 }
+depends_on = ["cache"]
