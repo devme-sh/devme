@@ -56,15 +56,71 @@ async fn down() -> anyhow::Result<()> {
     let sock = socket_path();
     let mut client = match devme_client::Client::connect(&sock).await {
         Ok(c) => c,
-        Err(_) => return Ok(()),
+        Err(_) => {
+            println!("devme: no daemon running");
+            return Ok(());
+        }
     };
-    let reply = client.request(ClientMessage::Shutdown).await?;
-    match reply {
-        ServerMessage::Goodbye { .. } => Ok(()),
-        other => Err(anyhow::anyhow!(
-            "daemon replied with unexpected message: {other:?}"
-        )),
+
+    // Snapshot first so we know what we're tearing down. The daemon emits
+    // StatusUpdate { state: Stopped } per service as it kills each one;
+    // we render those as checkmarks docker-compose-style.
+    client
+        .send(ClientMessage::Subscribe { services: vec![] })
+        .await?;
+    let services = match client.next_event().await? {
+        Some(ServerMessage::Subscribed { services, .. }) => services,
+        Some(other) => {
+            return Err(anyhow::anyhow!("unexpected initial reply: {other:?}"));
+        }
+        None => return Err(anyhow::anyhow!("daemon closed before snapshot")),
+    };
+
+    // Services that are actually live — Stopped/Failed/CrashLoop are already
+    // off the board, no need to checkmark them.
+    use devme_core::ServiceState as S;
+    let live: Vec<String> = services
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.state,
+                S::Starting
+                    | S::Running { .. }
+                    | S::Restarting { .. }
+                    | S::WaitingOnDependency { .. }
+            )
+        })
+        .map(|s| s.name.clone())
+        .collect();
+
+    let total = live.len();
+    println!("[+] Stopping {total}/{total}");
+
+    client.send(ClientMessage::Shutdown).await?;
+
+    let started = std::time::Instant::now();
+    let mut stopped: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        match client.next_event().await? {
+            Some(ServerMessage::StatusUpdate { service, state: S::Stopped, .. })
+                if live.contains(&service) && stopped.insert(service.clone()) =>
+            {
+                let elapsed = started.elapsed().as_secs_f32();
+                println!(" ✔ Service {service:<20}  Stopped   {elapsed:>5.1}s");
+            }
+            Some(ServerMessage::Goodbye { .. }) | None => break,
+            _ => {}
+        }
     }
+    // Any service that never reported Stopped (already-failed, etc.) still
+    // gets a line so the count matches what we promised in the header.
+    for name in &live {
+        if !stopped.contains(name) {
+            let elapsed = started.elapsed().as_secs_f32();
+            println!(" ✔ Service {name:<20}  Stopped   {elapsed:>5.1}s");
+        }
+    }
+    Ok(())
 }
 
 async fn status(as_json: bool) -> anyhow::Result<()> {
