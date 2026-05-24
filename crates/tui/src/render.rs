@@ -486,6 +486,11 @@ fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             } else {
                 Style::default().fg(Color::Gray)
             })
+            // Slim symbols — ratatui defaults to `█`/`║` which are visually
+            // heavy for a 1-column gutter. `▐` (right-half block) and `│`
+            // (light vertical) match lazygit's understated style.
+            .thumb_symbol("▐")
+            .track_symbol(Some("│"))
             .begin_symbol(None)
             .end_symbol(None);
         frame.render_stateful_widget(sb, sb_area, &mut sb_state);
