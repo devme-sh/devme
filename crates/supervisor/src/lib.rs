@@ -4,4 +4,5 @@
 //!
 //! See ADR-0003 for daemon lifecycle and ADR-0007 for the two-tier model.
 
+pub mod health;
 pub mod process;

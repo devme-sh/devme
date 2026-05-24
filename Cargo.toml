@@ -53,6 +53,9 @@ portable-pty = "0.9"
 process_alive = "0.1"
 tempfile = "3"
 
+# HTTP client (health probes)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+
 # Logging / error handling
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

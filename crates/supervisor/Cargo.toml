@@ -22,6 +22,7 @@ devstack-ipc = { workspace = true }
 devstack-slot-allocator = { workspace = true }
 tokio = { workspace = true }
 portable-pty = { workspace = true }
+reqwest = { workspace = true }
 process_alive = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
