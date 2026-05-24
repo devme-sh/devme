@@ -39,6 +39,8 @@ pub struct TuiState {
     /// 0 = pinned to the tail; a non-zero value freezes the viewport so new
     /// lines arrive into the buffer without disturbing what's on screen.
     log_scroll: HashMap<String, usize>,
+    /// Whether the `?` help overlay is showing. Pure UI state.
+    help_visible: bool,
 }
 
 impl Default for TuiState {
@@ -52,6 +54,7 @@ impl Default for TuiState {
             selected_instance: None,
             logs: HashMap::new(),
             log_scroll: HashMap::new(),
+            help_visible: false,
         }
     }
 }
@@ -67,6 +70,20 @@ impl TuiState {
 
     pub fn focus(&self) -> Focus {
         self.focus
+    }
+
+    /// Is the `?` help overlay currently shown?
+    pub fn help_visible(&self) -> bool {
+        self.help_visible
+    }
+
+    /// Toggle the help overlay. `?` shows or hides it; `Esc` also hides.
+    pub fn toggle_help(&mut self) {
+        self.help_visible = !self.help_visible;
+    }
+
+    pub fn hide_help(&mut self) {
+        self.help_visible = false;
     }
 
     /// Human-friendly label for the currently selected instance, or "" if

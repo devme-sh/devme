@@ -29,8 +29,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Tabs,
-    Wrap,
+    Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Tabs, Wrap,
 };
 
 use crate::state::TuiState;
@@ -51,31 +51,154 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
 
     render_sidebar(frame, outer[0], state);
     render_main(frame, outer[1], state);
-    render_footer(frame, vertical[1]);
+    render_footer(frame, vertical[1], state);
+
+    // Help overlay renders last so it sits on top of every other widget.
+    if state.help_visible() {
+        render_help_overlay(frame, area);
+    }
 }
 
 // ── footer / sidebar ────────────────────────────────────────────────────────
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect) {
+fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    // Three-region status bar:
+    //   left  — focus breadcrumb (stack > service)
+    //   centre — terse key hints (only the most-used)
+    //   right — aggregate health summary (counts of each state)
     let dim = Style::default().fg(Color::DarkGray);
     let key = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-    let spans = vec![
-        Span::styled(" q", key),
-        Span::styled(" quit  ", dim),
-        Span::styled("D", key),
-        Span::styled(" detach  ", dim),
-        Span::styled("←→/hl", key),
-        Span::styled(" service  ", dim),
-        Span::styled("↑↓/jk", key),
-        Span::styled(" stack  ", dim),
-        Span::styled("b/space", key),
-        Span::styled(" scroll  ", dim),
-        Span::styled("g/G", key),
-        Span::styled(" top/bot  ", dim),
-        Span::styled("S/s/r", key),
-        Span::styled(" start/stop/restart", dim),
+
+    let stack = state.instance_label();
+    let svc = state.selected_service().map(|s| s.name.as_str()).unwrap_or("—");
+    let breadcrumb = format!(" {stack} › {svc} ");
+    let left = Paragraph::new(Line::from(vec![
+        Span::styled(breadcrumb, Style::default().fg(Color::White)),
+    ]));
+
+    let centre = Paragraph::new(Line::from(vec![
+        Span::styled("? ", key),
+        Span::styled("help  ", dim),
+        Span::styled("hl ", key),
+        Span::styled("svc  ", dim),
+        Span::styled("jk ", key),
+        Span::styled("stack  ", dim),
+        Span::styled("S/s/r ", key),
+        Span::styled("start/stop/restart  ", dim),
+        Span::styled("q ", key),
+        Span::styled("quit", dim),
+    ]))
+    .alignment(ratatui::layout::Alignment::Center);
+
+    let (running, starting, stopped, failed) = aggregate_states(state);
+    let right_spans = vec![
+        Span::styled(format!(" ●{running} "), Style::default().fg(Color::Green)),
+        Span::styled(format!("◌{starting} "), Style::default().fg(Color::Yellow)),
+        Span::styled(format!("○{stopped} "), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("✗{failed} "), Style::default().fg(Color::Red)),
     ];
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    let right = Paragraph::new(Line::from(right_spans))
+        .alignment(ratatui::layout::Alignment::Right);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(24),
+            Constraint::Min(0),
+            Constraint::Length(22),
+        ])
+        .split(area);
+    frame.render_widget(left, cols[0]);
+    frame.render_widget(centre, cols[1]);
+    frame.render_widget(right, cols[2]);
+}
+
+fn aggregate_states(state: &TuiState) -> (usize, usize, usize, usize) {
+    let mut running = 0;
+    let mut starting = 0;
+    let mut stopped = 0;
+    let mut failed = 0;
+    for s in state.services() {
+        match &s.state {
+            ServiceState::Running { .. } | ServiceState::External { healthy: true } => {
+                running += 1
+            }
+            ServiceState::Starting
+            | ServiceState::Restarting { .. }
+            | ServiceState::WaitingOnDependency { .. } => starting += 1,
+            ServiceState::Failed { .. } | ServiceState::CrashLoop { .. } => failed += 1,
+            ServiceState::Stopped | ServiceState::External { healthy: false } => stopped += 1,
+        }
+    }
+    (running, starting, stopped, failed)
+}
+
+fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
+    // Centered modal, sized to the longest key-binding line. Wide enough
+    // to read at a glance, narrow enough that the underlying layout is
+    // still partly visible around it.
+    let w = 56u16.min(area.width.saturating_sub(4));
+    let h = 22u16.min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let modal = Rect { x, y, width: w, height: h };
+
+    // Clear erases anything behind the modal so the overlay text isn't
+    // tangled with the layout underneath.
+    frame.render_widget(Clear, modal);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " help ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let key = |k: &'static str| {
+        Span::styled(
+            format!(" {k:<10}"),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )
+    };
+    let desc = |d: &'static str| Span::styled(d, Style::default().fg(Color::Gray));
+    let section = |title: &'static str| {
+        Line::from(vec![Span::styled(
+            title,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )])
+    };
+
+    let lines: Vec<Line> = vec![
+        section("navigation"),
+        Line::from(vec![key("←→ / hl"), desc("service tab")]),
+        Line::from(vec![key("↑↓ / jk"), desc("stack")]),
+        Line::default(),
+        section("log viewport"),
+        Line::from(vec![key("b / space"), desc("page up / down")]),
+        Line::from(vec![key("J / K"), desc("scroll one line")]),
+        Line::from(vec![key("g / G"), desc("top / live tail")]),
+        Line::from(vec![key("wheel"), desc("scroll (Option to copy)")]),
+        Line::default(),
+        section("service actions"),
+        Line::from(vec![key("S"), desc("start selected")]),
+        Line::from(vec![key("s"), desc("stop selected")]),
+        Line::from(vec![key("r"), desc("restart selected")]),
+        Line::default(),
+        section("session"),
+        Line::from(vec![key("D"), desc("detach (keep services running)")]),
+        Line::from(vec![key("q / Esc"), desc("quit (stops everything)")]),
+        Line::from(vec![key("?"), desc("toggle this overlay")]),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -606,17 +729,45 @@ mod tests {
     #[test]
     fn footer_lists_basic_key_bindings() {
         let state = TuiState::default();
-        let text = render_to_text(&state, 100, 12);
+        // 140 wide so the centre hints all fit without truncation.
+        let text = render_to_text(&state, 140, 12);
         let last = text.lines().last().unwrap_or("");
-        assert!(last.contains("quit"), "footer missing 'quit':\n{text}");
-        assert!(
-            last.contains("stack"),
-            "footer missing stack nav hint:\n{text}"
-        );
-        assert!(
-            last.contains("service"),
-            "footer missing service nav hint:\n{text}"
-        );
+        assert!(last.contains("help"), "footer missing 'help' (was: {last})");
+        assert!(last.contains("stack"), "footer missing stack nav (was: {last})");
+        assert!(last.contains("svc"), "footer missing svc nav (was: {last})");
+        assert!(last.contains("quit"), "footer missing quit (was: {last})");
+    }
+
+    #[test]
+    fn footer_shows_health_summary_glyphs() {
+        let mut state = TuiState::default();
+        state.apply(ServerMessage::Subscribed {
+            services: vec![
+                svc("a", ServiceState::Running { degraded: false, started_without: vec![] }),
+                svc("b", ServiceState::Running { degraded: false, started_without: vec![] }),
+                svc("c", ServiceState::Stopped),
+                svc("d", ServiceState::Failed { exit_code: Some(1) }),
+            ],
+            steps: vec![],
+        });
+        let text = render_to_text(&state, 140, 14);
+        let last = text.lines().last().unwrap_or("");
+        assert!(last.contains("●2"), "expected 2 running in footer: {last}");
+        assert!(last.contains("○1"), "expected 1 stopped in footer: {last}");
+        assert!(last.contains("✗1"), "expected 1 failed in footer: {last}");
+    }
+
+    #[test]
+    fn help_overlay_renders_when_toggled() {
+        let mut state = TuiState::default();
+        let text = render_to_text(&state, 100, 30);
+        assert!(!text.contains("toggle this overlay"), "overlay leaked when hidden");
+        state.toggle_help();
+        let text = render_to_text(&state, 100, 30);
+        assert!(text.contains("toggle this overlay"), "overlay help text missing");
+        state.toggle_help();
+        let text = render_to_text(&state, 100, 30);
+        assert!(!text.contains("toggle this overlay"), "overlay should hide again");
     }
 
     #[test]

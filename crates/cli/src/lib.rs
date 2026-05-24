@@ -22,6 +22,16 @@ pub struct Cli {
     /// agents). Fails closed: any prompt aborts with exit code 2.
     #[arg(long, global = true)]
     pub no_input: bool,
+
+    /// Suppress informational/progress output on stderr. Errors still print.
+    /// Combines with `NO_COLOR=1` and `--no-color` for fully-quiet pipes.
+    #[arg(long, short = 'q', global = true)]
+    pub quiet: bool,
+
+    /// Strip ANSI color codes from all output. Also honored: the `NO_COLOR`
+    /// environment variable (see https://no-color.org) and a non-TTY stdout.
+    #[arg(long, global = true)]
+    pub no_color: bool,
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -34,9 +44,22 @@ pub enum Command {
         /// running in the background; use `devme down` to stop it.
         #[arg(long, short = 'd')]
         detach: bool,
+        /// With `-d`, block until every service is healthy (or has Started)
+        /// before exiting. Pairs with `--timeout` to cap the wait.
+        #[arg(long)]
+        wait: bool,
+        /// Seconds to wait for `--wait`. 0 means "no timeout" (docker
+        /// convention). Default 30s, only consulted with `--wait`.
+        #[arg(long, default_value_t = 30, requires = "wait")]
+        timeout: u64,
     },
     /// Shut down this instance's supervisor.
-    Down,
+    Down {
+        /// Seconds to wait for graceful service stops before SIGKILL.
+        /// Matches `docker compose down -t`.
+        #[arg(long, short = 't', default_value_t = 10)]
+        timeout: u64,
+    },
     /// Print a snapshot of current service status.
     Status,
     /// Restart a service.
@@ -50,6 +73,11 @@ pub enum Command {
         service: String,
         #[arg(long, short)]
         follow: bool,
+        /// Show only the last N lines of buffered output before following.
+        /// 0 means "all" (the daemon's full ring). Default 200 — a `docker
+        /// compose logs` of a long-running service is a wall of text.
+        #[arg(long, default_value_t = 200)]
+        tail: usize,
     },
     /// Print a shell completion script. Pipe into your shell's completion
     /// directory: `devme completions fish > ~/.config/fish/completions/devme.fish`.
@@ -111,6 +139,8 @@ mod tests {
             Some(Command::Up {
                 services: vec!["backend".into(), "db".into()],
                 detach: false,
+                wait: false,
+                timeout: 30,
             })
         );
     }
@@ -120,7 +150,7 @@ mod tests {
         let cli = Cli::parse_from(["devme", "up"]);
         assert_eq!(
             cli.command,
-            Some(Command::Up { services: vec![], detach: false })
+            Some(Command::Up { services: vec![], detach: false, wait: false, timeout: 30 })
         );
     }
 
@@ -129,7 +159,7 @@ mod tests {
         let cli = Cli::parse_from(["devme", "up", "-d"]);
         assert_eq!(
             cli.command,
-            Some(Command::Up { services: vec![], detach: true })
+            Some(Command::Up { services: vec![], detach: true, wait: false, timeout: 30 })
         );
     }
 
@@ -141,6 +171,8 @@ mod tests {
             Some(Command::Up {
                 services: vec!["backend".into()],
                 detach: true,
+                wait: false,
+                timeout: 30,
             })
         );
     }
@@ -200,7 +232,8 @@ mod tests {
             cli.command,
             Some(Command::Logs {
                 service: "api".into(),
-                follow: true
+                follow: true,
+                tail: 200,
             })
         );
     }
@@ -290,7 +323,8 @@ mod tests {
             cli.command,
             Some(Command::Logs {
                 service: "api".into(),
-                follow: true
+                follow: true,
+                tail: 200,
             })
         );
     }

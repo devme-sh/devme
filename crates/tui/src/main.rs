@@ -131,6 +131,10 @@ async fn run(
                         // "I'm done"; we shut the daemon down rather than
                         // detach. Power-user detach (keep services running)
                         // is `D` (capital).
+                        // `?` toggles the help overlay; Esc inside the
+                        // overlay just dismisses it (doesn't quit).
+                        KeyCode::Char('?') => state.toggle_help(),
+                        KeyCode::Esc if state.help_visible() => state.hide_help(),
                         KeyCode::Char('q') | KeyCode::Esc => {
                             let _ = client.send(ClientMessage::Shutdown).await;
                             return Ok(());
