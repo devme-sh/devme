@@ -468,6 +468,7 @@ dependencies = [
  "anyhow",
  "crossterm 0.29.0",
  "devme-client",
+ "devme-config",
  "devme-core",
  "ratatui",
  "serde",

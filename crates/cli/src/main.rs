@@ -22,10 +22,13 @@ fn main() {
 
 async fn run(cli: Cli) -> i32 {
     match cli.command {
-        None => {
-            eprintln!("devme: TUI mode not yet implemented");
-            1
-        }
+        None => match launch_tui().await {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("devme: {e}");
+                1
+            }
+        },
         Some(Command::Status) => match status(cli.json).await {
             Ok(()) => 0,
             Err(e) => {
@@ -88,6 +91,29 @@ async fn status(as_json: bool) -> anyhow::Result<()> {
     }
 }
 
+/// Launch the TUI by exec'ing devme-tui — keeps the CLI binary small and
+/// avoids pulling crossterm/ratatui into it. Daemon is auto-spawned first.
+async fn launch_tui() -> anyhow::Result<i32> {
+    let sock = socket_path();
+    ensure_daemon(&sock).await?;
+
+    let tui_path = find_sibling_binary("devme-tui")?;
+    let status = std::process::Command::new(&tui_path).status()?;
+    Ok(status.code().unwrap_or(0))
+}
+
+fn find_sibling_binary(name: &str) -> anyhow::Result<std::path::PathBuf> {
+    if let Ok(self_exe) = std::env::current_exe()
+        && let Some(parent) = self_exe.parent()
+    {
+        let candidate = parent.join(name);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Ok(std::path::PathBuf::from(name))
+}
+
 /// Make sure a daemon is listening on `sock`. If not, fork the supervisor
 /// binary and wait up to ~5s for it to bind.
 async fn ensure_daemon(sock: &std::path::Path) -> anyhow::Result<()> {
@@ -116,18 +142,7 @@ async fn ensure_daemon(sock: &std::path::Path) -> anyhow::Result<()> {
 }
 
 fn find_supervisor_binary() -> anyhow::Result<std::path::PathBuf> {
-    // First look right next to the running `devme` binary so a `cargo build`
-    // workspace works without anything being in PATH.
-    if let Ok(self_exe) = std::env::current_exe()
-        && let Some(parent) = self_exe.parent()
-    {
-        let candidate = parent.join("devme-supervisor");
-        if candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-    // Fall back to PATH — for installed builds.
-    Ok(std::path::PathBuf::from("devme-supervisor"))
+    find_sibling_binary("devme-supervisor")
 }
 
 fn socket_path() -> std::path::PathBuf {
