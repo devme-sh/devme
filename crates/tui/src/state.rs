@@ -204,10 +204,12 @@ impl TuiState {
                 if let Some(text) = decoded {
                     let buf = self
                         .logs
-                        .entry(service)
+                        .entry(service.clone())
                         .or_insert_with(|| VecDeque::with_capacity(TUI_LOG_CAP.min(64)));
+                    let len_before = buf.len();
                     // LogChunk payloads are single lines from the PTY reader,
                     // but split defensively in case that ever changes.
+                    let mut pushed = 0usize;
                     for line in text.split('\n') {
                         let line = line.trim_end_matches('\r');
                         if line.is_empty() {
@@ -217,6 +219,24 @@ impl TuiState {
                             buf.pop_front();
                         }
                         buf.push_back(line.to_string());
+                        pushed += 1;
+                    }
+                    let len_after = buf.len();
+                    // Stable viewport while scrolled off-tail: when the user
+                    // has scrolled up (offset > 0), bump the offset by the
+                    // net growth of the buffer so `end = len - offset` keeps
+                    // pointing at the same lines. When the buffer is at cap
+                    // (eviction == push count) net growth is 0 — the window
+                    // slowly drifts in absolute terms, but that's unavoidable
+                    // without monotonic line IDs, and the user will hit `G`
+                    // long before drifting matters.
+                    let net_growth = len_after.saturating_sub(len_before);
+                    if pushed > 0
+                        && net_growth > 0
+                        && let Some(off) = self.log_scroll.get_mut(&service)
+                        && *off > 0
+                    {
+                        *off = off.saturating_add(net_growth).min(len_after);
                     }
                 }
             }
@@ -415,6 +435,67 @@ mod tests {
         s.log_scroll_top();
         assert_eq!(s.log_scroll_offset(), 50);
         s.log_scroll_bottom();
+        assert_eq!(s.log_scroll_offset(), 0);
+    }
+
+    #[test]
+    fn scrolled_viewport_stays_stable_when_new_logs_arrive() {
+        // Once the user has scrolled up, new lines must NOT push the window
+        // forward — they should accumulate behind the user. The visible
+        // "end" of the logs (logs.len() - scroll_offset) must point to the
+        // same line before and after.
+        let mut s = TuiState::default();
+        s.apply(snapshot_msg(&["api"]));
+        let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
+        for i in 0..30 {
+            s.apply(ServerMessage::LogChunk {
+                service: "api".into(),
+                bytes: enc(&format!("line {i}")),
+                ts: i as u64,
+            });
+        }
+        s.log_page_up(10);
+        // Visible "end" line index right after page-up.
+        let end_before =
+            s.service_logs("api").len() - s.log_scroll_offset();
+        let line_before = s
+            .service_logs("api")
+            .get(end_before - 1)
+            .cloned()
+            .unwrap();
+        for i in 30..40 {
+            s.apply(ServerMessage::LogChunk {
+                service: "api".into(),
+                bytes: enc(&format!("line {i}")),
+                ts: i as u64,
+            });
+        }
+        let end_after = s.service_logs("api").len() - s.log_scroll_offset();
+        let line_after = s
+            .service_logs("api")
+            .get(end_after - 1)
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            line_before, line_after,
+            "viewport bottom drifted while user was scrolled off-tail"
+        );
+    }
+
+    #[test]
+    fn scroll_at_tail_keeps_following_new_logs() {
+        // The complement of the above: when offset == 0, new lines should
+        // continue to be visible (auto-follow), i.e., offset stays at 0.
+        let mut s = TuiState::default();
+        s.apply(snapshot_msg(&["api"]));
+        let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
+        for i in 0..10 {
+            s.apply(ServerMessage::LogChunk {
+                service: "api".into(),
+                bytes: enc(&format!("line {i}")),
+                ts: i as u64,
+            });
+        }
         assert_eq!(s.log_scroll_offset(), 0);
     }
 

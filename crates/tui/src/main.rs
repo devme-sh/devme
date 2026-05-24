@@ -10,10 +10,16 @@
 use std::io::Stdout;
 use std::path::Path;
 
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseEventKind,
+};
 
 /// Lines per PgUp / PgDn step. A "screen" worth of scroll.
 const LOG_PAGE: usize = 20;
+/// Lines per mouse-wheel notch. Trackpads emit many events; 3 is the
+/// terminal-emulator-typical value (matches xterm, iterm2).
+const MOUSE_SCROLL_LINES: usize = 3;
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
 use devme_client::Client;
@@ -40,7 +46,7 @@ fn main() {
         Err(e) => {
             // Ensure we leave the terminal in a sane state before printing.
             let _ = disable_raw_mode();
-            let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+            let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
             eprintln!("devme-tui: {e}");
             1
         }
@@ -78,14 +84,19 @@ async fn real_main() -> anyhow::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // EnableMouseCapture lets us see scroll-wheel events. Trade-off: it
+    // also captures clicks/drags, so the terminal's native text selection
+    // is intercepted — on macOS Terminal/iTerm, hold Option to bypass and
+    // select normally. Worth it for trackpad scrolling, which is otherwise
+    // a deal-breaker for log-heavy use.
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run(&mut terminal, &mut state, &mut client).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     result
@@ -178,7 +189,12 @@ async fn run(
                         _ => {}
                     }
                 }
-                Some(_) => {} // resize, mouse — handled by redraw on next loop
+                Some(Event::Mouse(me)) => match me.kind {
+                    MouseEventKind::ScrollUp => state.log_scroll_up(MOUSE_SCROLL_LINES),
+                    MouseEventKind::ScrollDown => state.log_scroll_down(MOUSE_SCROLL_LINES),
+                    _ => {}
+                }
+                Some(_) => {} // resize — handled by redraw on next loop
                 None => return Ok(()),
             },
             msg = client.next_event() => match msg? {

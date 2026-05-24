@@ -28,7 +28,10 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Tabs,
+    Wrap,
+};
 
 use crate::state::TuiState;
 use devme_core::{ServiceState, StepState};
@@ -286,7 +289,6 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 }
 
 fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let inner_area = area;
     let svc = match state.selected_service() {
         Some(s) => s,
         None => {
@@ -294,7 +296,7 @@ fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 "no service selected",
                 Style::default().fg(Color::DarkGray).italic(),
             )));
-            frame.render_widget(msg, inner_area);
+            frame.render_widget(msg, area);
             return;
         }
     };
@@ -309,16 +311,29 @@ fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             placeholder,
             Style::default().fg(Color::DarkGray).italic(),
         )));
-        frame.render_widget(msg, inner_area);
+        frame.render_widget(msg, area);
         return;
     }
 
+    // Carve a 1-column gutter on the right edge for the scrollbar so the
+    // log text doesn't overlap it. If the pane is too narrow (< 3 cols)
+    // we skip the scrollbar entirely.
+    let (text_area, sb_area) = if area.width >= 3 {
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(area);
+        (split[0], Some(split[1]))
+    } else {
+        (area, None)
+    };
+
     // The viewport is anchored to the tail by default. When the user
     // scrolls up, `offset` shifts the window earlier in the buffer; new
-    // lines still arrive into `logs` but don't disturb what's on screen.
-    let viewport = (inner_area.height as usize).max(1);
+    // lines arrive into `logs` and the state model bumps `offset` to match
+    // so the visible window stays still — see TuiState::apply.
+    let viewport = (text_area.height as usize).max(1);
     let offset = state.log_scroll_offset();
-    // `end` is the (exclusive) index just past the last line to show.
     let end = logs.len().saturating_sub(offset);
     let start = end.saturating_sub(viewport);
     let mut text = Text::default();
@@ -331,19 +346,41 @@ fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             text.lines.push(parsed_line);
         }
     }
-    frame.render_widget(Paragraph::new(text), inner_area);
-    // Scroll indicator when not at the tail — small badge top-right.
+    frame.render_widget(Paragraph::new(text), text_area);
+
+    // Scrollbar: track length = full log buffer, thumb position = top of
+    // the visible window (i.e., `start`). Ratatui sizes the thumb from the
+    // ratio of `viewport / content_length` implicitly through its render.
+    if let Some(sb_area) = sb_area {
+        let content_length = logs.len();
+        let mut sb_state = ScrollbarState::new(content_length)
+            .position(start)
+            .viewport_content_length(viewport);
+        let sb = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .style(Style::default().fg(Color::DarkGray))
+            .thumb_style(if offset > 0 {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Gray)
+            })
+            .begin_symbol(None)
+            .end_symbol(None);
+        frame.render_stateful_widget(sb, sb_area, &mut sb_state);
+    }
+
+    // When the user is parked off-tail, show a "PAUSED" pill so it's
+    // obvious the viewport is frozen and they're not seeing live output.
     if offset > 0 {
-        let indicator = format!(" ↑ {offset} ↑ ");
+        let indicator = format!(" PAUSED · {offset} behind · G to follow ");
         let style = Style::default()
             .fg(Color::Black)
             .bg(Color::Yellow)
             .add_modifier(Modifier::BOLD);
         let w = indicator.chars().count() as u16;
-        if w <= inner_area.width {
+        if w <= text_area.width {
             let badge_area = Rect {
-                x: inner_area.x + inner_area.width - w,
-                y: inner_area.y,
+                x: text_area.x + text_area.width - w,
+                y: text_area.y,
                 width: w,
                 height: 1,
             };
@@ -647,6 +684,32 @@ mod tests {
         });
         let text = render_to_text(&state, 100, 14);
         assert!(text.contains("1/2 running"), "header count missing:\n{text}");
+    }
+
+    #[test]
+    fn paused_indicator_shows_when_scrolled_off_tail() {
+        let mut state = TuiState::default();
+        state.apply(ServerMessage::Subscribed {
+            services: vec![svc("api", ServiceState::Running { degraded: false, started_without: vec![] })],
+            steps: vec![],
+        });
+        let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
+        for i in 0..50 {
+            state.apply(ServerMessage::LogChunk {
+                service: "api".into(),
+                bytes: enc(&format!("line {i}")),
+                ts: i,
+            });
+        }
+        // At tail — no PAUSED.
+        let text = render_to_text(&state, 100, 14);
+        assert!(!text.contains("PAUSED"), "PAUSED visible at tail:\n{text}");
+
+        // Scroll up; pill must appear.
+        state.log_page_up(10);
+        let text = render_to_text(&state, 100, 14);
+        assert!(text.contains("PAUSED"), "PAUSED missing while scrolled:\n{text}");
+        assert!(text.contains("G to follow"), "hint missing:\n{text}");
     }
 
     #[test]
