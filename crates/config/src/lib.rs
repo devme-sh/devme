@@ -4,6 +4,7 @@
 //! See `CONTEXT.md` at the repo root and ADR-0001.
 
 mod error;
+mod graph;
 mod interpolate;
 mod provision;
 mod service;
@@ -12,6 +13,7 @@ mod step;
 mod validate;
 
 pub use error::ConfigError;
+pub use graph::{DepStatus, Graph, GraphError, SatisfactionOutcome};
 pub use interpolate::{InterpContext, InterpError, interpolate};
 pub use provision::Provision;
 pub use service::Service;
