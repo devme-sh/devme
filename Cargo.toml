@@ -59,6 +59,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # Encoding
 base64 = "0.22"
 
+# ANSI escape parser for log rendering
+ansi-to-tui = "7"
+
 # Logging / error handling
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

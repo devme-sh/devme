@@ -2,6 +2,7 @@
 //! dump the buffer to stdout. Useful for eyeballing layout changes
 //! without leaving the editor — `cargo run --example preview -p devme-tui`.
 
+use base64::Engine;
 use devme_core::{
     ServerMessage, ServiceSnapshot, ServiceState, StepSnapshot, StepState,
 };
@@ -62,7 +63,29 @@ fn main() {
         ],
     });
 
-    let (w, h) = (100, 30);
+    let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
+    for (svc, line) in [
+        ("backend", "INFO  starting uv server on :8080"),
+        ("backend", "INFO  GET  /api/health         200  1.2ms"),
+        ("backend", "INFO  POST /api/login          200  18ms"),
+        ("backend", "\x1b[33mWARN \x1b[0m queue depth high (n=137)"),
+        ("backend", "INFO  GET  /api/dashboards     200  4.8ms"),
+        ("backend", "\x1b[31mERROR\x1b[0m upstream timeout on /api/billing"),
+        ("backend", "INFO  GET  /api/users/42       200  2.1ms"),
+        ("backend", "INFO  GET  /api/dashboards/9   200  3.0ms"),
+        ("db", "LOG: database system is ready to accept connections"),
+        ("db", "LOG: checkpoint starting: time"),
+    ] {
+        state.apply(ServerMessage::LogChunk {
+            service: svc.into(),
+            bytes: enc(line),
+            ts: 0,
+        });
+    }
+    // Select the second tab so the preview shows the busier service.
+    state.select_next();
+
+    let (w, h) = (110, 30);
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
     terminal.draw(|f| render(f, &state)).unwrap();
     print_buffer(terminal.backend().buffer());

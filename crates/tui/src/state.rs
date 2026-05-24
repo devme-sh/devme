@@ -1,7 +1,15 @@
 //! TUI state model. Pure data: absorb daemon messages, expose what the
 //! renderer needs to draw, route key events to selection / scroll updates.
 
+use std::collections::{HashMap, VecDeque};
+
+use base64::Engine;
 use devme_core::{ServerMessage, ServiceSnapshot, StepSnapshot};
+
+/// Per-service log cap inside the TUI. The daemon's ring is the source of
+/// truth (~2000 lines); the TUI keeps a smaller working buffer so even on a
+/// chatty service the viewport draw stays cheap.
+const TUI_LOG_CAP: usize = 1000;
 
 /// Which top-level focus the user has. Drives keybinding behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +29,7 @@ pub struct TuiState {
     selected_service: Option<usize>,
     focus: Focus,
     instance_label: String,
+    logs: HashMap<String, VecDeque<String>>,
 }
 
 impl Default for TuiState {
@@ -31,6 +40,7 @@ impl Default for TuiState {
             selected_service: None,
             focus: Focus::Tabs,
             instance_label: String::new(),
+            logs: HashMap::new(),
         }
     }
 }
@@ -63,6 +73,15 @@ impl TuiState {
         self.selected_service.and_then(|i| self.services.get(i))
     }
 
+    /// Buffered log lines for `service`, oldest first. Empty if nothing has
+    /// arrived for that service yet.
+    pub fn service_logs(&self, service: &str) -> &VecDeque<String> {
+        static EMPTY: std::sync::OnceLock<VecDeque<String>> = std::sync::OnceLock::new();
+        self.logs
+            .get(service)
+            .unwrap_or_else(|| EMPTY.get_or_init(VecDeque::new))
+    }
+
     /// Absorb a [`ServerMessage`] coming off the IPC stream.
     pub fn apply(&mut self, msg: ServerMessage) {
         match msg {
@@ -81,8 +100,31 @@ impl TuiState {
                     s.state = state;
                 }
             }
-            // LogChunk, Notice, Error, Goodbye don't yet move the model —
-            // routed by the runner directly to the log viewport.
+            ServerMessage::LogChunk { service, bytes, .. } => {
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(bytes.as_bytes())
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok());
+                if let Some(text) = decoded {
+                    let buf = self
+                        .logs
+                        .entry(service)
+                        .or_insert_with(|| VecDeque::with_capacity(TUI_LOG_CAP.min(64)));
+                    // LogChunk payloads are single lines from the PTY reader,
+                    // but split defensively in case that ever changes.
+                    for line in text.split('\n') {
+                        let line = line.trim_end_matches('\r');
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if buf.len() == TUI_LOG_CAP {
+                            buf.pop_front();
+                        }
+                        buf.push_back(line.to_string());
+                    }
+                }
+            }
+            // Notice, Error, Goodbye don't yet move the model.
             _ => {}
         }
     }
@@ -227,6 +269,55 @@ mod tests {
         s.apply(snapshot_msg(&["a", "b", "c"]));
         s.select_prev();
         assert_eq!(s.selected_service().unwrap().name, "c");
+    }
+
+    #[test]
+    fn log_chunks_append_to_per_service_buffer() {
+        let mut s = TuiState::default();
+        s.apply(snapshot_msg(&["db", "api"]));
+        let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
+
+        s.apply(ServerMessage::LogChunk {
+            service: "db".into(),
+            bytes: enc("postgres ready"),
+            ts: 1,
+        });
+        s.apply(ServerMessage::LogChunk {
+            service: "api".into(),
+            bytes: enc("listening on 8080"),
+            ts: 2,
+        });
+        s.apply(ServerMessage::LogChunk {
+            service: "db".into(),
+            bytes: enc("connection accepted"),
+            ts: 3,
+        });
+
+        let db_logs: Vec<_> = s.service_logs("db").iter().cloned().collect();
+        let api_logs: Vec<_> = s.service_logs("api").iter().cloned().collect();
+        assert_eq!(db_logs, vec!["postgres ready", "connection accepted"]);
+        assert_eq!(api_logs, vec!["listening on 8080"]);
+        assert!(s.service_logs("ghost").is_empty());
+    }
+
+    #[test]
+    fn log_buffer_drops_oldest_when_capacity_reached() {
+        let mut s = TuiState::default();
+        s.apply(snapshot_msg(&["svc"]));
+        let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
+        // Push more than TUI_LOG_CAP lines.
+        for i in 0..(super::TUI_LOG_CAP + 5) {
+            s.apply(ServerMessage::LogChunk {
+                service: "svc".into(),
+                bytes: enc(&format!("line {i}")),
+                ts: i as u64,
+            });
+        }
+        let buf: Vec<_> = s.service_logs("svc").iter().cloned().collect();
+        assert_eq!(buf.len(), super::TUI_LOG_CAP);
+        // Oldest survivor should be line 5 (lines 0..=4 evicted).
+        assert_eq!(buf.first().unwrap(), "line 5");
+        assert_eq!(buf.last().unwrap(), &format!("line {}", super::TUI_LOG_CAP + 4));
     }
 
     #[test]

@@ -22,3 +22,5 @@ tokio = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+base64 = { workspace = true }
+ansi-to-tui = { workspace = true }

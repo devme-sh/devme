@@ -104,6 +104,27 @@ async fn run(
                         KeyCode::Up | KeyCode::Char('k') | KeyCode::Left | KeyCode::Char('h') => {
                             state.select_prev();
                         }
+                        KeyCode::Char('S') => {
+                            if let Some(name) = state.selected_service().map(|s| s.name.clone()) {
+                                let _ = client
+                                    .send(ClientMessage::Start { service: name, skip_deps: false })
+                                    .await;
+                            }
+                        }
+                        KeyCode::Char('s') => {
+                            if let Some(name) = state.selected_service().map(|s| s.name.clone()) {
+                                let _ = client
+                                    .send(ClientMessage::Stop { service: name })
+                                    .await;
+                            }
+                        }
+                        KeyCode::Char('r') => {
+                            if let Some(name) = state.selected_service().map(|s| s.name.clone()) {
+                                let _ = client
+                                    .send(ClientMessage::Restart { service: name })
+                                    .await;
+                            }
+                        }
                         _ => {}
                     }
                 }
