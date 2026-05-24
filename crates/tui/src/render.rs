@@ -292,11 +292,16 @@ fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         return;
     }
 
-    // Show the most-recent lines that fit. ANSI-aware parsing colors them.
-    let take = (inner_area.height as usize).max(1);
-    let start = logs.len().saturating_sub(take);
+    // The viewport is anchored to the tail by default. When the user
+    // scrolls up, `offset` shifts the window earlier in the buffer; new
+    // lines still arrive into `logs` but don't disturb what's on screen.
+    let viewport = (inner_area.height as usize).max(1);
+    let offset = state.log_scroll_offset();
+    // `end` is the (exclusive) index just past the last line to show.
+    let end = logs.len().saturating_sub(offset);
+    let start = end.saturating_sub(viewport);
     let mut text = Text::default();
-    for line in logs.iter().skip(start) {
+    for line in logs.iter().skip(start).take(end - start) {
         let parsed = line
             .as_bytes()
             .into_text()
@@ -306,6 +311,24 @@ fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         }
     }
     frame.render_widget(Paragraph::new(text), inner_area);
+    // Scroll indicator when not at the tail — small badge top-right.
+    if offset > 0 {
+        let indicator = format!(" ↑ {offset} ↑ ");
+        let style = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
+        let w = indicator.chars().count() as u16;
+        if w <= inner_area.width {
+            let badge_area = Rect {
+                x: inner_area.x + inner_area.width - w,
+                y: inner_area.y,
+                width: w,
+                height: 1,
+            };
+            frame.render_widget(Paragraph::new(Span::styled(indicator, style)), badge_area);
+        }
+    }
 }
 
 fn render_service_meta(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {

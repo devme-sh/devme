@@ -35,6 +35,10 @@ pub struct TuiState {
     instances: Vec<String>,
     selected_instance: Option<usize>,
     logs: HashMap<String, VecDeque<String>>,
+    /// How many lines from the bottom we're scrolled back, per service.
+    /// 0 = pinned to the tail; a non-zero value freezes the viewport so new
+    /// lines arrive into the buffer without disturbing what's on screen.
+    log_scroll: HashMap<String, usize>,
 }
 
 impl Default for TuiState {
@@ -47,6 +51,7 @@ impl Default for TuiState {
             instances: Vec::new(),
             selected_instance: None,
             logs: HashMap::new(),
+            log_scroll: HashMap::new(),
         }
     }
 }
@@ -110,6 +115,67 @@ impl TuiState {
         self.logs
             .get(service)
             .unwrap_or_else(|| EMPTY.get_or_init(VecDeque::new))
+    }
+
+    /// Lines-from-bottom scroll offset for the selected service. 0 = tail.
+    pub fn log_scroll_offset(&self) -> usize {
+        match self.selected_service() {
+            Some(s) => self.log_scroll.get(&s.name).copied().unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    fn set_scroll_for_selected(&mut self, value: usize) {
+        if let Some(name) = self.selected_service().map(|s| s.name.clone()) {
+            if value == 0 {
+                self.log_scroll.remove(&name);
+            } else {
+                self.log_scroll.insert(name, value);
+            }
+        }
+    }
+
+    /// Scroll the log viewport one screen back (older lines). `viewport`
+    /// is the current draw height; the offset is clamped to the buffer
+    /// length so we can't scroll past the start.
+    pub fn log_page_up(&mut self, viewport: usize) {
+        let max = self.max_scroll_for_selected();
+        let cur = self.log_scroll_offset();
+        let next = cur.saturating_add(viewport.max(1)).min(max);
+        self.set_scroll_for_selected(next);
+    }
+
+    pub fn log_page_down(&mut self, viewport: usize) {
+        let cur = self.log_scroll_offset();
+        let next = cur.saturating_sub(viewport.max(1));
+        self.set_scroll_for_selected(next);
+    }
+
+    /// One line back / forward — for j/k or arrow nudges in the viewport.
+    pub fn log_scroll_up(&mut self, lines: usize) {
+        let max = self.max_scroll_for_selected();
+        let next = self.log_scroll_offset().saturating_add(lines).min(max);
+        self.set_scroll_for_selected(next);
+    }
+
+    pub fn log_scroll_down(&mut self, lines: usize) {
+        let next = self.log_scroll_offset().saturating_sub(lines);
+        self.set_scroll_for_selected(next);
+    }
+
+    pub fn log_scroll_top(&mut self) {
+        let max = self.max_scroll_for_selected();
+        self.set_scroll_for_selected(max);
+    }
+
+    pub fn log_scroll_bottom(&mut self) {
+        self.set_scroll_for_selected(0);
+    }
+
+    fn max_scroll_for_selected(&self) -> usize {
+        self.selected_service()
+            .map(|s| self.service_logs(&s.name).len())
+            .unwrap_or(0)
     }
 
     /// Absorb a [`ServerMessage`] coming off the IPC stream.
@@ -325,6 +391,72 @@ mod tests {
         s.apply(snapshot_msg(&["a", "b", "c"]));
         s.select_prev_service();
         assert_eq!(s.selected_service().unwrap().name, "c");
+    }
+
+    #[test]
+    fn log_scroll_pages_back_then_returns_to_tail() {
+        let mut s = TuiState::default();
+        s.apply(snapshot_msg(&["api"]));
+        let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
+        for i in 0..50 {
+            s.apply(ServerMessage::LogChunk {
+                service: "api".into(),
+                bytes: enc(&format!("line {i}")),
+                ts: i as u64,
+            });
+        }
+        assert_eq!(s.log_scroll_offset(), 0);
+        s.log_page_up(10);
+        assert_eq!(s.log_scroll_offset(), 10);
+        s.log_page_up(10);
+        assert_eq!(s.log_scroll_offset(), 20);
+        s.log_page_down(15);
+        assert_eq!(s.log_scroll_offset(), 5);
+        s.log_scroll_top();
+        assert_eq!(s.log_scroll_offset(), 50);
+        s.log_scroll_bottom();
+        assert_eq!(s.log_scroll_offset(), 0);
+    }
+
+    #[test]
+    fn log_scroll_clamps_to_buffer_length() {
+        let mut s = TuiState::default();
+        s.apply(snapshot_msg(&["api"]));
+        let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
+        for i in 0..5 {
+            s.apply(ServerMessage::LogChunk {
+                service: "api".into(),
+                bytes: enc(&format!("line {i}")),
+                ts: i as u64,
+            });
+        }
+        s.log_page_up(100);
+        assert_eq!(s.log_scroll_offset(), 5, "should clamp to buffer length");
+    }
+
+    #[test]
+    fn log_scroll_is_independent_per_service() {
+        let mut s = TuiState::default();
+        s.apply(snapshot_msg(&["a", "b"]));
+        let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
+        for n in 0..20 {
+            s.apply(ServerMessage::LogChunk {
+                service: "a".into(),
+                bytes: enc(&format!("a-{n}")),
+                ts: n,
+            });
+            s.apply(ServerMessage::LogChunk {
+                service: "b".into(),
+                bytes: enc(&format!("b-{n}")),
+                ts: n,
+            });
+        }
+        s.log_page_up(5); // scrolling "a"
+        assert_eq!(s.log_scroll_offset(), 5);
+        s.select_next_service(); // now "b" is selected
+        assert_eq!(s.log_scroll_offset(), 0, "b should not inherit a's scroll");
+        s.select_prev_service(); // back to "a"
+        assert_eq!(s.log_scroll_offset(), 5, "a's scroll should persist");
     }
 
     #[test]

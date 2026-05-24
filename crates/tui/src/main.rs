@@ -11,6 +11,9 @@ use std::io::Stdout;
 use std::path::Path;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+
+/// Lines per PgUp / PgDn step. A "screen" worth of scroll.
+const LOG_PAGE: usize = 20;
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
 use devme_client::Client;
@@ -122,6 +125,17 @@ async fn run(
                         // Horizontal = service tabs.
                         KeyCode::Right | KeyCode::Char('l') => state.select_next_service(),
                         KeyCode::Left | KeyCode::Char('h') => state.select_prev_service(),
+                        // Log viewport scrolling.
+                        KeyCode::PageUp => state.log_page_up(LOG_PAGE),
+                        KeyCode::PageDown => state.log_page_down(LOG_PAGE),
+                        KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                            state.log_scroll_up(LOG_PAGE / 2);
+                        }
+                        KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                            state.log_scroll_down(LOG_PAGE / 2);
+                        }
+                        KeyCode::Char('g') => state.log_scroll_top(),
+                        KeyCode::Char('G') => state.log_scroll_bottom(),
                         KeyCode::Char('S') => {
                             if let Some(name) = state.selected_service().map(|s| s.name.clone()) {
                                 let _ = client
