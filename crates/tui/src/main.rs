@@ -29,7 +29,7 @@ use devme_core::ClientMessage;
 use devme_tui::discovery::Registry;
 use devme_tui::render::render;
 use devme_tui::state::TuiState;
-use devme_tui::worktree::AutoSpawner;
+use devme_tui::worktree::{AutoSpawner, WorktreeEvent};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
@@ -65,8 +65,9 @@ async fn real_main() -> anyhow::Result<()> {
     let home_id = devme_config::paths::instance_id(&cwd);
 
     let mut registry = Registry::bind(&runtime_dir).await?;
-    // Hold the spawner so its watcher stays alive for the TUI's lifetime.
-    let _spawner = AutoSpawner::bind(&cwd).await?;
+    let (wt_tx, wt_rx) = mpsc::unbounded_channel::<WorktreeEvent>();
+    // Hold the spawner so its watchers stay alive for the TUI's lifetime.
+    let _spawner = AutoSpawner::bind(&cwd, wt_tx).await?;
     let mut state = TuiState::default();
 
     enable_raw_mode()?;
@@ -78,7 +79,7 @@ async fn real_main() -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal, &mut state, &mut registry, &home_id).await;
+    let result = run(&mut terminal, &mut state, &mut registry, wt_rx, &home_id).await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
@@ -91,6 +92,7 @@ async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     state: &mut TuiState,
     registry: &mut Registry,
+    mut wt_rx: mpsc::UnboundedReceiver<WorktreeEvent>,
     home_id: &str,
 ) -> anyhow::Result<()> {
     let (key_tx, mut key_rx) = mpsc::unbounded_channel::<Event>();
@@ -102,28 +104,36 @@ async fn run(
         }
     });
 
-    // Send Start to the cwd daemon (if it attaches) so opening the TUI
-    // implies "bring this stack up" — matches docker compose `up` UX.
-    // We do this once when the home daemon first appears, not eagerly,
-    // because the daemon may not have finished binding yet.
-    let mut home_started = false;
+    // Auto-Start every attached daemon on its first `Subscribed`. Opens
+    // the TUI implying "bring everything up" — matches docker compose
+    // `up` UX. Tracked per id so reconnects don't re-Start (which is
+    // idempotent server-side anyway, but keeps the log noise down).
+    let mut started: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut home_selected = false;
 
     loop {
         terminal.draw(|f| render(f, state))?;
 
-        if !home_started && state.has_instance(home_id) {
-            registry
-                .send_to(
-                    home_id,
-                    ClientMessage::Start {
-                        service: String::new(),
-                        skip_deps: false,
-                    },
-                )
-                .await;
+        if !home_selected && state.has_instance(home_id) {
             // Auto-select the home stack on first appearance.
             state.select_instance_by_id(home_id);
-            home_started = true;
+            home_selected = true;
+        }
+        // Send Start to any daemon whose Subscribed has populated services
+        // but which we haven't sent Start to yet. Skips placeholders (no
+        // services) since their daemon isn't bound.
+        for id in state.attached_instance_ids() {
+            if started.insert(id.clone()) {
+                registry
+                    .send_to(
+                        &id,
+                        ClientMessage::Start {
+                            service: String::new(),
+                            skip_deps: false,
+                        },
+                    )
+                    .await;
+            }
         }
 
         tokio::select! {
@@ -196,6 +206,15 @@ async fn run(
             tagged = registry.recv() => match tagged {
                 Some(t) => state.apply_from(&t.instance_id, t.message),
                 None => return Ok(()),
+            },
+            wt = wt_rx.recv() => match wt {
+                Some(WorktreeEvent::Discovered { id, label, cwd }) => {
+                    // Idempotent: if a daemon has already attached and
+                    // populated this instance, add_placeholder_instance is
+                    // a no-op (id collision short-circuits).
+                    state.add_placeholder_instance(id, label, cwd);
+                }
+                None => {} // sender dropped; ignore
             },
         }
     }

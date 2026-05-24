@@ -178,6 +178,46 @@ impl TuiState {
         }
     }
 
+    /// Add a placeholder for a worktree the autospawner has seen but for
+    /// which no daemon has bound yet (typically because the worktree has
+    /// no `devme.toml`). The `id` must match the future
+    /// `paths::instance_id(path)` so the real `Subscribed` message — when
+    /// it eventually arrives — upserts the same row instead of adding a
+    /// duplicate.
+    pub fn add_placeholder_instance(
+        &mut self,
+        id: impl Into<String>,
+        label: impl Into<String>,
+        cwd: impl Into<String>,
+    ) {
+        let id = id.into();
+        if self.find_instance(&id).is_some() {
+            return;
+        }
+        let info = InstanceInfo { id, label: label.into(), cwd: cwd.into() };
+        self.instances.push(InstanceData::new(info));
+        if self.selected_instance.is_none() {
+            self.selected_instance = Some(0);
+        }
+    }
+
+    /// True if the currently-selected instance has no services attached
+    /// (i.e. no daemon ever responded with a `Subscribed`). The renderer
+    /// uses this to show a friendlier "waiting for devme.toml" message
+    /// instead of an empty tab row.
+    pub fn current_instance_is_placeholder(&self) -> bool {
+        self.current_instance()
+            .map(|i| i.services.is_empty() && i.steps.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Filesystem cwd of the currently-selected instance. The renderer
+    /// uses this to surface "drop a devme.toml here" hints for
+    /// placeholders.
+    pub fn current_instance_cwd(&self) -> &str {
+        self.current_instance().map(|i| i.info.cwd.as_str()).unwrap_or("")
+    }
+
     // ── proxies to the selected instance ────────────────────────────────
 
     pub fn services(&self) -> &[ServiceSnapshot] {
@@ -367,6 +407,18 @@ impl TuiState {
     /// True if an InstanceData with this id is in the sidebar.
     pub fn has_instance(&self, id: &str) -> bool {
         self.find_instance(id).is_some()
+    }
+
+    /// Ids of instances that have at least one service — i.e. whose
+    /// daemon has responded with a `Subscribed`. The caller uses this to
+    /// drive "send Start once" semantics; placeholders (no daemon yet)
+    /// are skipped.
+    pub fn attached_instance_ids(&self) -> Vec<String> {
+        self.instances
+            .iter()
+            .filter(|i| !i.services.is_empty())
+            .map(|i| i.info.id.clone())
+            .collect()
     }
 
     /// Move selection to the instance with this id, if it exists.

@@ -369,8 +369,16 @@ fn format_main_title(state: &TuiState) -> Line<'_> {
 
 fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     if state.services().is_empty() {
+        let text = if state.current_instance_is_placeholder() {
+            format!(
+                "no devme.toml in {} — add one to start services",
+                state.current_instance_cwd()
+            )
+        } else {
+            "no services declared in devme.toml".to_string()
+        };
         let msg = Paragraph::new(Line::from(Span::styled(
-            "no services declared in devme.toml",
+            text,
             Style::default().fg(Color::DarkGray).italic(),
         )));
         frame.render_widget(msg, area);
