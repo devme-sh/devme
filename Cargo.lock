@@ -351,8 +351,12 @@ name = "devstack-client"
 version = "0.1.0"
 dependencies = [
  "devstack-core",
+ "devstack-ipc",
+ "devstack-supervisor",
+ "futures-util",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

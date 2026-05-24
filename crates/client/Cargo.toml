@@ -3,11 +3,19 @@ name = "devstack-client"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 devstack-core = { workspace = true }
+devstack-ipc = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+futures-util = { version = "0.3", features = ["sink"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+devstack-supervisor = { path = "../supervisor" }
+tempfile = { workspace = true }
