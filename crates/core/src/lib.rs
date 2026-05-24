@@ -3,6 +3,7 @@
 //! See `CONTEXT.md` at the repo root for the domain vocabulary modeled here.
 
 mod dep;
+mod health;
 pub mod ipc;
 mod port;
 mod restart;
@@ -13,6 +14,7 @@ mod trust;
 pub mod wizard;
 
 pub use dep::Dependency;
+pub use health::HealthCheck;
 pub use ipc::{
     ClientMessage, Envelope, ErrorCode, NoticeLevel, SCHEMA_VERSION, ServerMessage,
     ServiceSnapshot, StepSnapshot,
