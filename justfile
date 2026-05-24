@@ -23,7 +23,7 @@ link: build
 tui-dev EXAMPLE="smoke":
     @cargo watch --version >/dev/null 2>&1 || cargo install cargo-watch
     cd examples/{{EXAMPLE}} && cargo run --release -p devme -- up -d
-    cd examples/{{EXAMPLE}} && cargo watch \
-        -w ../../crates/tui/src \
-        -w ../../crates/core/src \
-        -x "run -p devme-tui"
+    cargo watch \
+        -w {{justfile_directory()}}/crates/tui/src \
+        -w {{justfile_directory()}}/crates/core/src \
+        -s 'cd {{justfile_directory()}}/examples/{{EXAMPLE}} && cargo run -p devme-tui'
