@@ -16,12 +16,72 @@ pub fn supervisor_socket(cwd: &Path) -> std::io::Result<PathBuf> {
 /// Stable per-worktree identifier. Same input → same hex every time within
 /// a single build.
 pub fn instance_id(cwd: &Path) -> String {
-    use std::hash::{Hash, Hasher};
+    hash_path(&std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf()))
+}
 
-    let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+/// Stable per-*repo* identifier. Every worktree of the same git repo
+/// resolves to the same id, so a repo-scoped supervisor binds to one
+/// socket regardless of which worktree spawned it.
+///
+/// Resolution: `git rev-parse --git-common-dir` from `cwd`, canonicalized
+/// and hashed. If `cwd` is not inside a git repo, falls back to
+/// [`instance_id`] — equivalent to "treat this directory as its own repo",
+/// which is the right behavior for non-git devme setups.
+pub fn repo_id(cwd: &Path) -> String {
+    match git_common_dir(cwd) {
+        Some(dir) => hash_path(&dir),
+        None => instance_id(cwd),
+    }
+}
+
+fn hash_path(p: &Path) -> String {
+    use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    canonical.hash(&mut h);
+    p.hash(&mut h);
     format!("{:016x}", h.finish())
+}
+
+/// Returns the canonical path to the *shared* `.git` directory for the
+/// repo containing `cwd`, or None if `cwd` is not inside a git repo. For a
+/// regular worktree this is `<repo>/.git`; for a linked worktree
+/// (`git worktree add`) it's still the main repo's `.git`, which is the
+/// point — both worktrees agree on the same path.
+fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(out.stdout).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // `--git-common-dir` may be relative to cwd; resolve against it.
+    let p = PathBuf::from(trimmed);
+    let abs = if p.is_absolute() { p } else { cwd.join(p) };
+    std::fs::canonicalize(&abs).ok()
+}
+
+/// Unix socket path for the shared-services supervisor of the repo
+/// containing `cwd`. See ADR-0007.
+pub fn shared_socket(cwd: &Path) -> std::io::Result<PathBuf> {
+    let dir = shared_dir(cwd)?;
+    Ok(dir.join("shared.sock"))
+}
+
+/// `~/.local/share/devme/repos/<repo-id>/`, created if missing. Per-repo
+/// state (the shared socket, lock files) lives here.
+pub fn shared_dir(cwd: &Path) -> std::io::Result<PathBuf> {
+    let dir = runtime_dir_inner()?
+        .join("repos")
+        .join(repo_id(cwd));
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
 }
 
 /// Shared slot-allocator registry path. One file per host coordinates
@@ -68,6 +128,49 @@ mod tests {
         let a = TempDir::new().unwrap();
         let b = TempDir::new().unwrap();
         assert_ne!(instance_id(a.path()), instance_id(b.path()));
+    }
+
+    #[test]
+    fn repo_id_falls_back_to_instance_id_outside_git() {
+        // A non-git tempdir has no rev-parse; repo_id should match
+        // instance_id so a non-git devme setup still gets a stable hash.
+        let dir = TempDir::new().unwrap();
+        let r = repo_id(dir.path());
+        let i = instance_id(dir.path());
+        assert_eq!(r, i);
+    }
+
+    #[test]
+    fn repo_id_is_same_for_subdirectories_of_the_same_git_repo() {
+        // Two subdirectories of the same git repo must hash to the same
+        // repo_id — this is the property linked worktrees rely on.
+        let dir = TempDir::new().unwrap();
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .arg("init")
+            .arg("-q")
+            .status();
+        if !matches!(ok, Ok(s) if s.success()) {
+            // No git available — skip.
+            return;
+        }
+        let sub_a = dir.path().join("a");
+        let sub_b = dir.path().join("b/c");
+        std::fs::create_dir_all(&sub_a).unwrap();
+        std::fs::create_dir_all(&sub_b).unwrap();
+        let id_a = repo_id(&sub_a);
+        let id_b = repo_id(&sub_b);
+        let id_root = repo_id(dir.path());
+        assert_eq!(id_a, id_root);
+        assert_eq!(id_b, id_root);
+    }
+
+    #[test]
+    fn shared_socket_path_ends_in_shared_dot_sock() {
+        let dir = TempDir::new().unwrap();
+        let p = shared_socket(dir.path()).unwrap();
+        assert!(p.ends_with("shared.sock"), "got: {}", p.display());
     }
 
     #[test]

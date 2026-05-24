@@ -427,13 +427,17 @@ name = "devme-shared-supervisor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "devme-client",
  "devme-config",
  "devme-core",
+ "devme-ipc",
+ "futures-util",
  "portable-pty",
  "process_alive",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
 ]
