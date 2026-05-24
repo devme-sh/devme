@@ -4,6 +4,7 @@
 //! `--json` everywhere, semantic exit codes, no spinner without a tty.
 
 use clap::{Parser, Subcommand};
+use clap_complete::Shell;
 use devme_core::{ServiceSnapshot, StepSnapshot};
 
 #[derive(Debug, Parser, PartialEq, Eq)]
@@ -29,6 +30,10 @@ pub enum Command {
     Up {
         /// Restrict to a subset of services. Empty = all.
         services: Vec<String>,
+        /// Start services then exit without tailing logs. The daemon keeps
+        /// running in the background; use `devme down` to stop it.
+        #[arg(long, short = 'd')]
+        detach: bool,
     },
     /// Shut down this instance's supervisor.
     Down,
@@ -45,6 +50,12 @@ pub enum Command {
         service: String,
         #[arg(long, short)]
         follow: bool,
+    },
+    /// Print a shell completion script. Pipe into your shell's completion
+    /// directory: `devme completions fish > ~/.config/fish/completions/devme.fish`.
+    Completions {
+        /// Target shell.
+        shell: Shell,
     },
 }
 
@@ -98,7 +109,8 @@ mod tests {
         assert_eq!(
             cli.command,
             Some(Command::Up {
-                services: vec!["backend".into(), "db".into()]
+                services: vec!["backend".into(), "db".into()],
+                detach: false,
             })
         );
     }
@@ -106,7 +118,55 @@ mod tests {
     #[test]
     fn up_without_services_is_empty_list() {
         let cli = Cli::parse_from(["devme", "up"]);
-        assert_eq!(cli.command, Some(Command::Up { services: vec![] }));
+        assert_eq!(
+            cli.command,
+            Some(Command::Up { services: vec![], detach: false })
+        );
+    }
+
+    #[test]
+    fn up_detach_short_flag_parses() {
+        let cli = Cli::parse_from(["devme", "up", "-d"]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Up { services: vec![], detach: true })
+        );
+    }
+
+    #[test]
+    fn up_detach_long_flag_parses() {
+        let cli = Cli::parse_from(["devme", "up", "--detach", "backend"]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Up {
+                services: vec!["backend".into()],
+                detach: true,
+            })
+        );
+    }
+
+    #[test]
+    fn completions_subcommand_parses() {
+        let cli = Cli::parse_from(["devme", "completions", "fish"]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Completions { shell: Shell::Fish })
+        );
+    }
+
+    #[test]
+    fn completions_renders_a_non_empty_script() {
+        // Direct rendering check — we don't want a regression that produces
+        // an empty / mangled script for any of the supported shells.
+        let shells = [Shell::Bash, Shell::Zsh, Shell::Fish, Shell::PowerShell];
+        let mut cmd = <Cli as clap::CommandFactory>::command();
+        for shell in shells {
+            let mut buf: Vec<u8> = Vec::new();
+            clap_complete::generate(shell, &mut cmd, "devme", &mut buf);
+            let s = String::from_utf8(buf).unwrap();
+            assert!(!s.is_empty(), "{shell:?} completion script was empty");
+            assert!(s.contains("devme"), "{shell:?} script omits binary name");
+        }
     }
 
     #[test]

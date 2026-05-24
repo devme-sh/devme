@@ -2,7 +2,8 @@
 //! formatters live in [`devme_cli`]; this binary dispatches.
 
 use base64::Engine;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::{Shell, generate};
 use devme_cli::{Cli, Command, format_status_json, format_status_text};
 use devme_core::{ClientMessage, ServerMessage, ServiceState};
 
@@ -32,11 +33,15 @@ async fn run(cli: Cli) -> i32 {
         },
         Some(Command::Status) => status(cli.json).await,
         Some(Command::Down) => down().await,
-        Some(Command::Up { services }) => up(services).await,
+        Some(Command::Up { services, detach }) => up(services, detach).await,
         Some(Command::Start { service }) => start(service).await,
         Some(Command::Stop { service }) => stop(service).await,
         Some(Command::Restart { service }) => restart(service).await,
         Some(Command::Logs { service, follow }) => logs(service, follow).await,
+        Some(Command::Completions { shell }) => {
+            print_completions(shell);
+            Ok(())
+        }
     };
     match result {
         Ok(()) => 0,
@@ -85,14 +90,16 @@ async fn status(as_json: bool) -> anyhow::Result<()> {
     }
 }
 
-async fn up(_services: Vec<String>) -> anyhow::Result<()> {
+async fn up(_services: Vec<String>, detach: bool) -> anyhow::Result<()> {
     // `services` is ignored for v1; the daemon advances the whole graph and
     // the executor decides what's eligible. Per-service Up filtering would
     // need a new executor entry point.
     //
-    // Foreground semantics: stream every service's log lines with a name
-    // prefix, prefixed in distinct colours, until the user hits Ctrl-C.
-    // Ctrl-C tears the daemon down rather than detaching.
+    // Foreground semantics (default): stream every service's log lines with a
+    // name prefix in distinct colours until Ctrl-C, which tears the daemon
+    // down rather than detaching.
+    //
+    // Detached (`-d`): kick the graph and exit, leaving the daemon running.
     let sock = socket_path();
     ensure_daemon(&sock).await?;
     let mut client = devme_client::Client::connect(&sock).await?;
@@ -117,6 +124,18 @@ async fn up(_services: Vec<String>) -> anyhow::Result<()> {
             skip_deps: false,
         })
         .await?;
+
+    if detach {
+        let n = snapshot.len();
+        println!(
+            "devme: started {n} service{}; daemon running in background.\n\
+             devme logs <service>   tail one service\n\
+             devme status           snapshot\n\
+             devme down             stop everything",
+            if n == 1 { "" } else { "s" }
+        );
+        return Ok(());
+    }
 
     eprintln!(
         "devme: streaming logs ({} service{}). Press Ctrl-C to stop everything.",
@@ -281,7 +300,7 @@ async fn logs(service: String, follow: bool) -> anyhow::Result<()> {
                     base64::engine::general_purpose::STANDARD.decode(bytes.as_bytes())
                     && let Ok(text) = String::from_utf8(decoded)
                 {
-                    println!("{text}");
+                    print_prefixed(&service, &text);
                     printed_any = true;
                 }
             }
@@ -313,7 +332,7 @@ async fn logs(service: String, follow: bool) -> anyhow::Result<()> {
                         base64::engine::general_purpose::STANDARD.decode(bytes.as_bytes())
                         && let Ok(text) = String::from_utf8(decoded)
                     {
-                        println!("{text}");
+                        print_prefixed(&service, &text);
                     }
                 }
                 Some(ServerMessage::Goodbye { .. }) | None => return Ok(()),
@@ -321,6 +340,11 @@ async fn logs(service: String, follow: bool) -> anyhow::Result<()> {
             }
         }
     }
+}
+
+fn print_completions(shell: Shell) {
+    let mut cmd = Cli::command();
+    generate(shell, &mut cmd, "devme", &mut std::io::stdout());
 }
 
 /// Launch the TUI by exec'ing devme-tui — keeps the CLI binary small and
