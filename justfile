@@ -21,6 +21,7 @@ link: build
 
 # Live TUI dev loop — detached daemon + cargo-watch restart of TUI. `devme down` in the example dir when done.
 tui-dev EXAMPLE="smoke":
+    @cargo watch --version >/dev/null 2>&1 || cargo install cargo-watch
     cd examples/{{EXAMPLE}} && cargo run --release -p devme -- up -d
     cd examples/{{EXAMPLE}} && cargo watch \
         -w ../../crates/tui/src \
