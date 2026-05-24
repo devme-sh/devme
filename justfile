@@ -19,44 +19,10 @@ link: build
     ln -sf "$(pwd)/target/release/devme" ~/.local/bin/devme
     @echo "linked → $(readlink ~/.local/bin/devme)"
 
-# Live TUI dev loop — daemon + auto-restart TUI on src change.
+# Live TUI dev loop — detached daemon + cargo-watch restart of TUI. `devme down` in the example dir when done.
 tui-dev EXAMPLE="smoke":
-    # Start (or reuse) a detached daemon for the example.
     cd examples/{{EXAMPLE}} && cargo run --release -p devme -- up -d
-    @echo "rebuilding + restarting TUI on each change…"
     cd examples/{{EXAMPLE}} && cargo watch \
         -w ../../crates/tui/src \
         -w ../../crates/core/src \
         -x "run -p devme-tui"
-
-# Stop the dev daemon started by `tui-dev`.
-tui-dev-stop EXAMPLE="smoke":
-    cd examples/{{EXAMPLE}} && cargo run --release -p devme -- down
-
-# Watch render tests — fastest feedback loop for pure render tweaks.
-render-watch:
-    cargo watch -w crates/tui/src -x "test -p devme-tui render::"
-
-# Copy examples/smoke into /tmp so you can poke at it without polluting the repo.
-spawn-smoke:
-    rm -rf /tmp/devme-smoke
-    cp -r examples/smoke /tmp/devme-smoke
-    @echo "ready: cd /tmp/devme-smoke && devme"
-
-# Copy the shared-service demo into /tmp — see its README for current limitations.
-spawn-shared:
-    rm -rf /tmp/devme-shared-test
-    cp -r examples/shared /tmp/devme-shared-test
-    @echo "ready: see /tmp/devme-shared-test/README.md"
-
-# Tear down any leftover devme socket or supervisor process under /tmp.
-clean-tmp:
-    -find /tmp -maxdepth 2 -name 'devme*.sock' -print -delete 2>/dev/null
-    -pkill -f devme-supervisor 2>/dev/null
-    @echo "ok"
-
-# Pre-commit gate — fmt-check, clippy, tests.
-check:
-    cargo fmt --all -- --check
-    cargo clippy --workspace --all-targets -- -D warnings
-    cargo test --workspace
