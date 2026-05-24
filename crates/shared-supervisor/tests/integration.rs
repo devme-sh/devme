@@ -153,6 +153,99 @@ async fn binds_and_responds_to_subscribe_with_shared_identity() {
 }
 
 #[tokio::test]
+async fn spawns_repo_scoped_services_from_devme_toml_and_streams_logs() {
+    use base64::Engine;
+    let tmp = ShortTmp::new();
+    let runtime = tmp.path().join("runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let cwd = tmp.path().join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    // Two services: one repo-scoped (must spawn), one instance-scoped
+    // (must NOT spawn — proves filtering).
+    std::fs::write(
+        cwd.join("devme.toml"),
+        r#"
+schema_version = 1
+
+[service.cache]
+cmd = "while true; do echo SHARED-MARKER; sleep 0.2; done"
+scope = "repo"
+
+[service.web]
+cmd = "while true; do echo INSTANCE-MARKER; sleep 0.2; done"
+"#,
+    )
+    .unwrap();
+
+    let mut child = Command::new(binary_path())
+        .current_dir(&cwd)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let sock = wait_for_shared_socket_or_diag(&runtime, &mut child).await;
+    let mut client = Client::connect(&sock).await.unwrap();
+
+    // Subscribe; the snapshot must contain `cache` but not `web`.
+    let resp = client
+        .request(ClientMessage::Subscribe { services: vec![] })
+        .await
+        .unwrap();
+    let services = match resp {
+        ServerMessage::Subscribed { services, .. } => services,
+        other => panic!("expected Subscribed, got {other:?}"),
+    };
+    let names: Vec<&str> = services.iter().map(|s| s.name.as_str()).collect();
+    assert!(names.contains(&"cache"), "cache must be spawned, got {names:?}");
+    assert!(
+        !names.contains(&"web"),
+        "instance-scoped 'web' must NOT be spawned by shared daemon, got {names:?}"
+    );
+
+    // Drain events until we see the SHARED-MARKER from the cache service.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut saw_marker = false;
+    while std::time::Instant::now() < deadline && !saw_marker {
+        let next = tokio::time::timeout(Duration::from_millis(200), client.next_event()).await;
+        match next {
+            Ok(Ok(Some(ServerMessage::LogChunk { service, bytes, .. }))) => {
+                if service != "cache" {
+                    continue;
+                }
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(bytes.as_bytes())
+                    .unwrap();
+                let line = String::from_utf8_lossy(&decoded);
+                if line.contains("SHARED-MARKER") {
+                    saw_marker = true;
+                }
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    assert!(
+        saw_marker,
+        "did not receive SHARED-MARKER LogChunk within 3s"
+    );
+
+    let _ = client.send(ClientMessage::Shutdown).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(Some(_)) = child.try_wait() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let _ = child.kill();
+}
+
+#[tokio::test]
 async fn second_instance_refuses_to_bind_when_one_is_running() {
     let tmp = ShortTmp::new();
     let runtime = tmp.path().join("runtime");

@@ -427,10 +427,12 @@ name = "devme-shared-supervisor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "devme-client",
  "devme-config",
  "devme-core",
  "devme-ipc",
+ "devme-supervisor",
  "futures-util",
  "portable-pty",
  "process_alive",

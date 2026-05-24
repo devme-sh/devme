@@ -12,11 +12,13 @@ path = "src/main.rs"
 devme-core = { workspace = true }
 devme-config = { workspace = true }
 devme-ipc = { workspace = true }
+devme-supervisor = { path = "../supervisor" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures-util = { version = "0.3", features = ["sink"] }
 portable-pty = { workspace = true }
 process_alive = { workspace = true }
+base64 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -25,3 +27,4 @@ anyhow = { workspace = true }
 
 [dev-dependencies]
 devme-client = { workspace = true }
+base64 = { workspace = true }
