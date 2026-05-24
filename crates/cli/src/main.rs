@@ -89,6 +89,10 @@ async fn up(_services: Vec<String>) -> anyhow::Result<()> {
     // `services` is ignored for v1; the daemon advances the whole graph and
     // the executor decides what's eligible. Per-service Up filtering would
     // need a new executor entry point.
+    //
+    // Foreground semantics: stream every service's log lines with a name
+    // prefix, prefixed in distinct colours, until the user hits Ctrl-C.
+    // Ctrl-C tears the daemon down rather than detaching.
     let sock = socket_path();
     ensure_daemon(&sock).await?;
     let mut client = devme_client::Client::connect(&sock).await?;
@@ -98,15 +102,11 @@ async fn up(_services: Vec<String>) -> anyhow::Result<()> {
     let snapshot = match client.next_event().await? {
         Some(ServerMessage::Subscribed { services, .. }) => services,
         Some(other) => {
-            return Err(anyhow::anyhow!(
-                "unexpected initial reply: {other:?}"
-            ));
+            return Err(anyhow::anyhow!("unexpected initial reply: {other:?}"));
         }
         None => return Err(anyhow::anyhow!("daemon closed before snapshot")),
     };
-    let expected: std::collections::HashSet<String> =
-        snapshot.iter().map(|s| s.name.clone()).collect();
-    if expected.is_empty() {
+    if snapshot.is_empty() {
         println!("devme: no services declared");
         return Ok(());
     }
@@ -118,57 +118,99 @@ async fn up(_services: Vec<String>) -> anyhow::Result<()> {
         })
         .await?;
 
-    let mut running: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut failed: std::collections::HashMap<String, Option<i32>> =
-        std::collections::HashMap::new();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    eprintln!(
+        "devme: streaming logs ({} service{}). Press Ctrl-C to stop everything.",
+        snapshot.len(),
+        if snapshot.len() == 1 { "" } else { "s" }
+    );
 
-    while running.len() + failed.len() < expected.len() {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(anyhow::anyhow!(
-                "timed out waiting for services to settle"
-            ));
-        }
-        let next = match tokio::time::timeout(remaining, client.next_event()).await {
-            Ok(Ok(Some(m))) => m,
-            Ok(Ok(None)) => break,
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_) => {
-                return Err(anyhow::anyhow!(
-                    "timed out waiting for services to settle"
-                ));
+    let interrupt = tokio::signal::ctrl_c();
+    let mut pinned_interrupt = std::pin::pin!(interrupt);
+
+    loop {
+        tokio::select! {
+            _ = &mut pinned_interrupt => {
+                eprintln!("\ndevme: shutting down…");
+                let _ = client.send(ClientMessage::Shutdown).await;
+                // Drain the Goodbye + any final messages so the daemon
+                // exits cleanly before we return.
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    drain_until_goodbye(&mut client),
+                )
+                .await;
+                return Ok(());
             }
-        };
-        match next {
-            ServerMessage::StatusUpdate { service, state, .. } if expected.contains(&service) => {
-                match state {
-                    ServiceState::Running { .. } => {
-                        running.insert(service.clone());
-                        failed.remove(&service);
-                        println!("  up: {service}");
+            msg = client.next_event() => {
+                let m = match msg? {
+                    Some(m) => m,
+                    None => return Ok(()),
+                };
+                match m {
+                    ServerMessage::LogChunk { service, bytes, .. } => {
+                        if let Ok(decoded) =
+                            base64::engine::general_purpose::STANDARD.decode(bytes.as_bytes())
+                            && let Ok(text) = String::from_utf8(decoded)
+                        {
+                            print_prefixed(&service, &text);
+                        }
                     }
-                    ServiceState::Failed { exit_code } => {
-                        failed.insert(service.clone(), exit_code);
-                        running.remove(&service);
-                        println!("  fail: {service} (exit {exit_code:?})");
+                    ServerMessage::StatusUpdate { service, state, .. } => {
+                        if let Some(label) = transition_label(&state) {
+                            eprintln!("[{service}] {label}");
+                        }
                     }
+                    ServerMessage::Notice { level, message } => {
+                        eprintln!("[devme {level:?}] {message}");
+                    }
+                    ServerMessage::Goodbye { .. } => return Ok(()),
                     _ => {}
                 }
             }
-            ServerMessage::Goodbye { .. } => break,
-            _ => {}
         }
     }
+}
 
-    if failed.is_empty() {
-        Ok(())
-    } else {
-        let names: Vec<_> = failed.keys().cloned().collect();
-        Err(anyhow::anyhow!(
-            "service(s) failed during up: {}",
-            names.join(", ")
-        ))
+async fn drain_until_goodbye(client: &mut devme_client::Client) {
+    while let Ok(Some(msg)) = client.next_event().await {
+        if matches!(msg, ServerMessage::Goodbye { .. }) {
+            return;
+        }
+    }
+}
+
+fn transition_label(state: &ServiceState) -> Option<&'static str> {
+    use ServiceState as S;
+    Some(match state {
+        S::Starting => "starting",
+        S::Running { .. } => "running",
+        S::Stopped => "stopped",
+        S::Failed { .. } => "failed",
+        S::CrashLoop { .. } => "crash-loop",
+        _ => return None,
+    })
+}
+
+/// Hash a service name to a stable terminal-color escape so each service's
+/// lines are visually distinct in `up`'s combined stream.
+fn print_prefixed(service: &str, text: &str) {
+    let colors: &[&str] = &[
+        "\x1b[36m", "\x1b[33m", "\x1b[35m", "\x1b[32m", "\x1b[34m", "\x1b[91m", "\x1b[96m",
+        "\x1b[93m",
+    ];
+    let reset = "\x1b[0m";
+    let dim = "\x1b[2m";
+    let mut h: u32 = 5381;
+    for b in service.bytes() {
+        h = h.wrapping_mul(33).wrapping_add(b as u32);
+    }
+    let color = colors[(h as usize) % colors.len()];
+    for line in text.split('\n') {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        println!("{color}{service:>10}{reset} {dim}|{reset} {line}");
     }
 }
 
@@ -204,60 +246,81 @@ async fn logs(service: String, follow: bool) -> anyhow::Result<()> {
     let sock = socket_path();
     ensure_daemon(&sock).await?;
     let mut client = devme_client::Client::connect(&sock).await?;
-    client
-        .send(ClientMessage::Subscribe {
+
+    // Confirm the requested name is actually known to the daemon — otherwise
+    // we'd silently sit waiting for logs that can never arrive.
+    let snap = client
+        .request(ClientMessage::Subscribe {
             services: vec![service.clone()],
         })
         .await?;
-    // Discard the snapshot — log replay (if any) arrives as LogChunk after it.
-    let _ = client.next_event().await?;
+    let known = match &snap {
+        ServerMessage::Subscribed { services, steps } => {
+            services.iter().any(|s| s.name == service)
+                || steps.iter().any(|s| s.name == service)
+        }
+        _ => false,
+    };
+    if !known {
+        return Err(anyhow::anyhow!(
+            "no service or step named {service:?} in devme.toml"
+        ));
+    }
+
+    // Drain buffered lines that arrived alongside the snapshot. We can't tell
+    // from the wire alone when replay ends, so we read with a short idle
+    // timeout; the first miss is "replay done".
+    let mut printed_any = false;
+    let drain_idle = std::time::Duration::from_millis(80);
     loop {
-        let next = match client.next_event().await? {
-            Some(m) => m,
-            None => break,
-        };
-        match next {
-            ServerMessage::LogChunk {
-                service: s, bytes, ..
-            } if s == service => {
+        match tokio::time::timeout(drain_idle, client.next_event()).await {
+            Ok(Ok(Some(ServerMessage::LogChunk { service: s, bytes, .. })))
+                if s == service =>
+            {
                 if let Ok(decoded) =
                     base64::engine::general_purpose::STANDARD.decode(bytes.as_bytes())
                     && let Ok(text) = String::from_utf8(decoded)
                 {
                     println!("{text}");
+                    printed_any = true;
                 }
             }
-            ServerMessage::Goodbye { .. } => break,
-            _ => {}
+            Ok(Ok(Some(_))) => {}
+            Ok(Ok(None)) | Ok(Err(_)) => return Ok(()),
+            Err(_) => break, // idle — replay finished
         }
-        if !follow {
-            // Without --follow, we'd want to drain "what's already there" and
-            // exit. The buffer replay arrives synchronously after Subscribed;
-            // we can't tell where it ends without a sentinel. For v1, treat
-            // "no --follow" as "exit after a brief idle period".
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                client.next_event(),
-            )
-            .await
-            {
-                Ok(Ok(Some(m))) => {
-                    if let ServerMessage::LogChunk {
-                        service: s, bytes, ..
-                    } = m
-                        && s == service
-                        && let Ok(decoded) =
-                            base64::engine::general_purpose::STANDARD.decode(bytes.as_bytes())
+    }
+
+    if !follow {
+        if !printed_any {
+            eprintln!("devme: no buffered logs for {service:?} yet (try --follow to wait)");
+        }
+        return Ok(());
+    }
+
+    // --follow: keep streaming new lines indefinitely. Ctrl-C exits cleanly.
+    if !printed_any {
+        eprintln!("devme: tailing {service:?} (Ctrl-C to stop)");
+    }
+    let interrupt = tokio::signal::ctrl_c();
+    let mut pinned_interrupt = std::pin::pin!(interrupt);
+    loop {
+        tokio::select! {
+            _ = &mut pinned_interrupt => return Ok(()),
+            msg = client.next_event() => match msg? {
+                Some(ServerMessage::LogChunk { service: s, bytes, .. }) if s == service => {
+                    if let Ok(decoded) =
+                        base64::engine::general_purpose::STANDARD.decode(bytes.as_bytes())
                         && let Ok(text) = String::from_utf8(decoded)
                     {
                         println!("{text}");
                     }
                 }
-                _ => return Ok(()),
+                Some(ServerMessage::Goodbye { .. }) | None => return Ok(()),
+                _ => {}
             }
         }
     }
-    Ok(())
 }
 
 /// Launch the TUI by exec'ing devme-tui — keeps the CLI binary small and

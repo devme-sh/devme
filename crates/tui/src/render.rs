@@ -54,16 +54,18 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect) {
     let spans = vec![
         Span::styled(" q", key),
         Span::styled(" quit  ", dim),
-        Span::styled("↑↓/jk", key),
-        Span::styled(" instance  ", dim),
+        Span::styled("D", key),
+        Span::styled(" detach  ", dim),
         Span::styled("←→/hl", key),
         Span::styled(" service  ", dim),
-        Span::styled("S", key),
-        Span::styled(" start  ", dim),
-        Span::styled("s", key),
-        Span::styled(" stop  ", dim),
-        Span::styled("r", key),
-        Span::styled(" restart", dim),
+        Span::styled("↑↓/jk", key),
+        Span::styled(" instance  ", dim),
+        Span::styled("b/space", key),
+        Span::styled(" scroll  ", dim),
+        Span::styled("g/G", key),
+        Span::styled(" top/bot  ", dim),
+        Span::styled("S/s/r", key),
+        Span::styled(" start/stop/restart", dim),
     ];
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }

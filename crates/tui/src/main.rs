@@ -115,25 +115,43 @@ async fn run(
                         continue;
                     }
                     match k.code {
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                        // `q` / Esc / Ctrl-C — tear the stack down. The TUI
+                        // is the foreground process; quitting it means
+                        // "I'm done"; we shut the daemon down rather than
+                        // detach. Power-user detach (keep services running)
+                        // is `D` (capital).
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            let _ = client.send(ClientMessage::Shutdown).await;
                             return Ok(());
                         }
+                        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                            let _ = client.send(ClientMessage::Shutdown).await;
+                            return Ok(());
+                        }
+                        // Detach: leave the TUI but keep services running.
+                        KeyCode::Char('D') => return Ok(()),
                         // Vertical = instance list (sidebar).
                         KeyCode::Down | KeyCode::Char('j') => state.select_next_instance(),
                         KeyCode::Up | KeyCode::Char('k') => state.select_prev_instance(),
                         // Horizontal = service tabs.
                         KeyCode::Right | KeyCode::Char('l') => state.select_next_service(),
                         KeyCode::Left | KeyCode::Char('h') => state.select_prev_service(),
-                        // Log viewport scrolling.
-                        KeyCode::PageUp => state.log_page_up(LOG_PAGE),
-                        KeyCode::PageDown => state.log_page_down(LOG_PAGE),
+                        // Log viewport scrolling. The arrow keys are taken
+                        // by navigation; use these instead.
+                        KeyCode::PageUp | KeyCode::Char('b') => state.log_page_up(LOG_PAGE),
+                        KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('f') => {
+                            state.log_page_down(LOG_PAGE)
+                        }
                         KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                             state.log_scroll_up(LOG_PAGE / 2);
                         }
                         KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                             state.log_scroll_down(LOG_PAGE / 2);
                         }
+                        // Single-line nudges using `J` / `K` so they don't
+                        // collide with instance nav on `j` / `k`.
+                        KeyCode::Char('J') => state.log_scroll_down(1),
+                        KeyCode::Char('K') => state.log_scroll_up(1),
                         KeyCode::Char('g') => state.log_scroll_top(),
                         KeyCode::Char('G') => state.log_scroll_bottom(),
                         KeyCode::Char('S') => {
