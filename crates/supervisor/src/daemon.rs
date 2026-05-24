@@ -1,222 +1,751 @@
-//! Unix-socket IPC server for the per-instance supervisor.
+//! Single-task event-loop daemon.
 //!
-//! Clients (TUI, CLI, agents) connect, send [`ClientMessage`]s, and receive
-//! [`ServerMessage`]s, all framed by [`devme_ipc::FrameCodec`] and
-//! carried as JSON in an [`Envelope`].
+//! All state — [`Executor`], child processes, log ring buffers, connected
+//! clients — lives on one task. The accept loop, per-connection sockets, and
+//! per-process line/exit readers run on their own tasks and forward
+//! [`InternalEvent`]s through an mpsc into the event loop. Outbound
+//! [`ServerMessage`]s go the other way through per-client mpsc senders.
+//!
+//! See ADR-0003 (daemon lifecycle) and ADR-0010 (architecture).
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
-use devme_config::Stack;
+use base64::Engine;
+use devme_config::{Graph, Stack};
 use devme_core::{
-    ClientMessage, Envelope, ServerMessage, ServiceSnapshot, ServiceState, StepSnapshot, StepState,
+    ClientMessage, Envelope, ErrorCode, NoticeLevel, ServerMessage, ServiceSnapshot,
+    ServiceState, StepSnapshot, StepState,
 };
+use devme_executor::{Action, Event as ExecEvent, Executor, NodeStatus};
 use devme_ipc::FrameCodec;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 
-/// Initial snapshot built from a [`Stack`] — every service starts `Stopped`,
-/// every step starts `Unknown`. Subsequent process events mutate the real
-/// state machine; this is just the pre-run picture.
-fn initial_snapshot(stack: &Stack) -> (Vec<ServiceSnapshot>, Vec<StepSnapshot>) {
-    let services = stack
-        .service
-        .iter()
-        .map(|(name, _)| ServiceSnapshot {
-            name: name.clone(),
-            state: ServiceState::Stopped,
-            pid: None,
-            port: None,
-            restart_count: 0,
-        })
-        .collect();
-    let steps = stack
-        .step
-        .iter()
-        .map(|(name, _)| StepSnapshot {
-            name: name.clone(),
-            state: StepState::Unknown,
-        })
-        .collect();
-    (services, steps)
+use crate::process::ChildProcess;
+
+/// Per-service log ring capacity. ~2000 lines is enough to scroll back a
+/// minute or two of moderately chatty output without unbounded memory.
+const RING_CAPACITY: usize = 2000;
+
+/// Grace period between spawning a service and treating it as healthy when
+/// it has no explicit health probe. Long enough to skip the "Starting"
+/// flicker for instant-up commands; short enough that the user still sees
+/// the transition.
+const HEALTH_GRACE_MS: u64 = 150;
+
+type ClientId = u64;
+type ClientTx = mpsc::UnboundedSender<ServerMessage>;
+
+/// Events posted to the central event loop. Everything that mutates state
+/// flows through this enum.
+enum InternalEvent {
+    ClientConnected {
+        id: ClientId,
+        tx: ClientTx,
+    },
+    ClientMessage {
+        id: ClientId,
+        msg: ClientMessage,
+    },
+    ClientDisconnected {
+        id: ClientId,
+    },
+    ProcessLine {
+        service: String,
+        generation: u64,
+        line: String,
+    },
+    ProcessExited {
+        service: String,
+        generation: u64,
+        exit_code: Option<i32>,
+    },
+    ServiceGracePassed {
+        service: String,
+        generation: u64,
+    },
+}
+
+struct ChildRecord {
+    generation: u64,
+    pid: u32,
+    port: Option<u16>,
+    restart_count: u32,
+    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+}
+
+struct RingBuffer {
+    capacity: usize,
+    lines: VecDeque<(u64, String)>,
+}
+
+impl RingBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            lines: VecDeque::with_capacity(capacity.min(64)),
+        }
+    }
+
+    fn push(&mut self, ts: u64, line: String) {
+        if self.lines.len() == self.capacity {
+            self.lines.pop_front();
+        }
+        self.lines.push_back((ts, line));
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &(u64, String)> {
+        self.lines.iter()
+    }
+}
+
+struct DaemonState {
+    stack: Arc<Stack>,
+    executor: Executor,
+    children: HashMap<String, ChildRecord>,
+    logs: HashMap<String, RingBuffer>,
+    clients: HashMap<ClientId, ClientTx>,
+    /// Per-client subscription filter. Empty vec = subscribed to everything.
+    subscriptions: HashMap<ClientId, Vec<String>>,
+    /// Services whose next exit should be reported as Stopped, not Failed —
+    /// because the user (or a restart sequence) asked them to stop.
+    intentional_stops: HashSet<String>,
+    /// Services that should be spawned again as soon as their previous
+    /// instance has exited. Populated by [`ClientMessage::Restart`].
+    pending_restarts: HashSet<String>,
+    next_generation: u64,
+    next_client_id: u64,
+    shutting_down: bool,
+}
+
+impl DaemonState {
+    fn new(stack: Arc<Stack>) -> Self {
+        let graph = Graph::from_stack(&stack);
+        Self {
+            stack,
+            executor: Executor::new(graph),
+            children: HashMap::new(),
+            logs: HashMap::new(),
+            clients: HashMap::new(),
+            subscriptions: HashMap::new(),
+            intentional_stops: HashSet::new(),
+            pending_restarts: HashSet::new(),
+            next_generation: 0,
+            next_client_id: 0,
+            shutting_down: false,
+        }
+    }
+
+    fn alloc_generation(&mut self) -> u64 {
+        self.next_generation += 1;
+        self.next_generation
+    }
+
+    fn current_service_state(&self, name: &str) -> ServiceState {
+        match self.executor.state(name) {
+            Some(NodeStatus::Service(s)) => s.clone(),
+            _ => ServiceState::Stopped,
+        }
+    }
+
+    fn current_step_state(&self, name: &str) -> StepState {
+        match self.executor.state(name) {
+            Some(NodeStatus::Step(s)) => *s,
+            _ => StepState::Unknown,
+        }
+    }
+
+    fn snapshot(&self) -> (Vec<ServiceSnapshot>, Vec<StepSnapshot>) {
+        let services = self
+            .stack
+            .service
+            .iter()
+            .map(|(name, _)| {
+                let rec = self.children.get(name);
+                ServiceSnapshot {
+                    name: name.clone(),
+                    state: self.current_service_state(name),
+                    pid: rec.map(|r| r.pid),
+                    port: rec.and_then(|r| r.port),
+                    restart_count: rec.map(|r| r.restart_count).unwrap_or(0),
+                }
+            })
+            .collect();
+        let steps = self
+            .stack
+            .step
+            .iter()
+            .map(|(name, _)| StepSnapshot {
+                name: name.clone(),
+                state: self.current_step_state(name),
+            })
+            .collect();
+        (services, steps)
+    }
+
+    /// Send `msg` to every connected client whose subscription matches `svc`.
+    /// `svc = None` means "broadcast unconditionally" (e.g. Notice/Goodbye).
+    fn broadcast(&self, svc: Option<&str>, msg: ServerMessage) {
+        for (id, tx) in &self.clients {
+            if let Some(s) = svc {
+                let subs = self.subscriptions.get(id);
+                let included = match subs {
+                    None => true, // not yet subscribed; harmless
+                    Some(v) if v.is_empty() => true,
+                    Some(v) => v.iter().any(|x| x == s),
+                };
+                if !included {
+                    continue;
+                }
+            }
+            let _ = tx.send(msg.clone());
+        }
+    }
 }
 
 /// Server-side handle to the supervisor's IPC socket.
 pub struct DaemonServer {
     listener: UnixListener,
     path: PathBuf,
-    stack: Option<Arc<Stack>>,
+    stack: Arc<Stack>,
 }
 
 impl DaemonServer {
-    /// Bind a Unix socket at `path` with no loaded config. `Subscribe`
-    /// returns an empty snapshot — useful for daemon-handshake tests.
+    /// Bind with an empty stack — useful only for handshake-shape tests.
     pub fn bind(path: &Path) -> std::io::Result<Self> {
-        Self::bind_inner(path, None)
+        Self::bind_with_stack(path, Stack::parse("schema_version = 1\n").unwrap())
     }
 
-    /// Bind a Unix socket and serve responses derived from `stack`.
+    /// Bind a Unix socket and prepare to serve `stack`.
     pub fn bind_with_stack(path: &Path, stack: Stack) -> std::io::Result<Self> {
-        Self::bind_inner(path, Some(Arc::new(stack)))
-    }
-
-    fn bind_inner(path: &Path, stack: Option<Arc<Stack>>) -> std::io::Result<Self> {
-        // Remove a stale socket file from a prior daemon that died without
-        // cleanup. Bind would otherwise fail with EADDRINUSE.
         let _ = std::fs::remove_file(path);
         let listener = UnixListener::bind(path)?;
         Ok(Self {
             listener,
             path: path.to_path_buf(),
-            stack,
+            stack: Arc::new(stack),
         })
     }
 
-    /// Accept one connection and send a [`ServerMessage::Goodbye`] before
-    /// closing — placeholder until the full request handling lands.
-    pub async fn accept_and_goodbye(&self) -> std::io::Result<()> {
-        let (stream, _) = self.listener.accept().await?;
-        let mut conn = framed(stream);
-        send(&mut conn, ServerMessage::Goodbye {
-            reason: "placeholder".into(),
-        })
-        .await
-    }
-
-    /// Accept one connection, read one [`ClientMessage`], reply with a
-    /// matching [`ServerMessage`], then close. Used as a building block
-    /// for the eventual long-running serve loop and for tests.
-    pub async fn handle_one_request(&self) -> std::io::Result<()> {
-        let (stream, _) = self.listener.accept().await?;
-        let mut conn = framed(stream);
-        let bytes = match conn.next().await {
-            Some(Ok(b)) => b,
-            Some(Err(e)) => return Err(e),
-            None => return Ok(()),
-        };
-        let req: Envelope<ClientMessage> = serde_json::from_slice(&bytes)?;
-        let reply = handle_message(&req.payload, self.stack.as_deref());
-        send(&mut conn, reply).await
-    }
-
-    /// Long-running serve loop. Accepts connections concurrently; each one
-    /// handles its own request stream. Exits cleanly when any client sends
-    /// [`ClientMessage::Shutdown`] — pending connections receive Goodbye
-    /// and disconnect.
+    /// Long-running serve loop. Returns when a client requests Shutdown or
+    /// the listener errors.
     pub async fn serve(self) -> std::io::Result<()> {
-        // capacity=16 because we only ever send one shutdown event; the
-        // extra slots are for transient drops with slow connection tasks.
-        let (shutdown_tx, _) = broadcast::channel::<()>(16);
-        let stack = self.stack.clone();
+        let (internal_tx, internal_rx) = mpsc::unbounded_channel::<InternalEvent>();
+        let accept_tx = internal_tx.clone();
+        let DaemonServer { listener, path, stack } = self;
 
-        loop {
-            let mut shutdown_rx = shutdown_tx.subscribe();
-            tokio::select! {
-                accepted = self.listener.accept() => {
-                    let (stream, _) = match accepted {
-                        Ok(pair) => pair,
-                        Err(e) => return Err(e),
-                    };
-                    let shutdown_tx = shutdown_tx.clone();
-                    let conn_shutdown_rx = shutdown_tx.subscribe();
-                    let conn_stack = stack.clone();
-                    tokio::spawn(handle_connection(
-                        stream,
-                        conn_stack,
-                        shutdown_tx,
-                        conn_shutdown_rx,
-                    ));
-                }
-                _ = shutdown_rx.recv() => break,
-            }
-        }
-        Ok(())
+        tokio::spawn(accept_loop(listener, accept_tx));
+
+        let result = run_event_loop(internal_tx, internal_rx, stack).await;
+        // Best-effort socket cleanup. The next bind() also removes a stale
+        // file, so a daemon crash leaves no permanent debris.
+        let _ = std::fs::remove_file(&path);
+        result
     }
 }
 
-/// Per-connection handler. Reads requests until the socket closes or until
-/// the broadcast `shutdown_rx` fires. On `Shutdown`, signals the daemon to
-/// stop accepting AND replies with Goodbye on this connection.
+/// Per-connection task spawned from the accept loop. Owns both halves of the
+/// framed socket: parses inbound, forwards as `ClientMessage` events, and
+/// sends `ServerMessage`s pulled from `client_rx`.
 async fn handle_connection(
     stream: UnixStream,
-    stack: Option<Arc<Stack>>,
-    shutdown_tx: broadcast::Sender<()>,
-    mut shutdown_rx: broadcast::Receiver<()>,
-) -> std::io::Result<()> {
+    id: ClientId,
+    internal_tx: mpsc::UnboundedSender<InternalEvent>,
+    mut client_rx: mpsc::UnboundedReceiver<ServerMessage>,
+) {
     let mut conn = framed(stream);
-
     loop {
         tokio::select! {
-            item = conn.next() => {
-                let bytes = match item {
-                    Some(Ok(b)) => b,
-                    Some(Err(_)) | None => return Ok(()),
+            biased;
+            outgoing = client_rx.recv() => match outgoing {
+                Some(msg) => {
+                    let goodbye = matches!(msg, ServerMessage::Goodbye { .. });
+                    let env = Envelope::new(msg);
+                    let bytes = match serde_json::to_vec(&env) {
+                        Ok(b) => b,
+                        Err(_) => break,
+                    };
+                    if conn.send(bytes.as_slice()).await.is_err() {
+                        break;
+                    }
+                    if goodbye {
+                        // Give the kernel a beat to flush, then close.
+                        break;
+                    }
+                }
+                None => break,
+            },
+            incoming = conn.next() => match incoming {
+                Some(Ok(bytes)) => {
+                    match serde_json::from_slice::<Envelope<ClientMessage>>(&bytes) {
+                        Ok(env) => {
+                            if internal_tx
+                                .send(InternalEvent::ClientMessage { id, msg: env.payload })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let err = ServerMessage::Error {
+                                code: ErrorCode::Usage,
+                                message: format!("malformed request: {e}"),
+                            };
+                            let env = Envelope::new(err);
+                            if let Ok(b) = serde_json::to_vec(&env) {
+                                let _ = conn.send(b.as_slice()).await;
+                            }
+                        }
+                    }
+                }
+                Some(Err(_)) | None => break,
+            },
+        }
+    }
+    let _ = internal_tx.send(InternalEvent::ClientDisconnected { id });
+}
+
+async fn accept_loop(listener: UnixListener, internal_tx: mpsc::UnboundedSender<InternalEvent>) {
+    // Client ids are issued by the event loop; each accept here just
+    // creates the client's outbound mpsc and posts ClientConnected so the
+    // event loop can register both. The id is allocated by the event loop
+    // before sending the tx half back via a oneshot? Cleaner: allocate the
+    // id from a local counter here. The event loop's `next_client_id` is
+    // only used for diagnostics; the only invariant is uniqueness.
+    let mut next_id: u64 = 1;
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(_) => return,
+        };
+        let id = next_id;
+        next_id += 1;
+        let (client_tx, client_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        if internal_tx
+            .send(InternalEvent::ClientConnected { id, tx: client_tx })
+            .is_err()
+        {
+            return;
+        }
+        let conn_tx = internal_tx.clone();
+        tokio::spawn(handle_connection(stream, id, conn_tx, client_rx));
+    }
+}
+
+async fn run_event_loop(
+    internal_tx: mpsc::UnboundedSender<InternalEvent>,
+    mut internal_rx: mpsc::UnboundedReceiver<InternalEvent>,
+    stack: Arc<Stack>,
+) -> std::io::Result<()> {
+    let mut state = DaemonState::new(stack);
+
+    while let Some(event) = internal_rx.recv().await {
+        process_event(&mut state, event, &internal_tx);
+        if state.shutting_down && state.children.is_empty() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn process_event(
+    state: &mut DaemonState,
+    event: InternalEvent,
+    tx: &mpsc::UnboundedSender<InternalEvent>,
+) {
+    match event {
+        InternalEvent::ClientConnected { id, tx: ctx } => {
+            state.clients.insert(id, ctx);
+            // Override the local counter so diagnostics line up if anyone
+            // logs it.
+            if id > state.next_client_id {
+                state.next_client_id = id;
+            }
+        }
+        InternalEvent::ClientDisconnected { id } => {
+            state.clients.remove(&id);
+            state.subscriptions.remove(&id);
+        }
+        InternalEvent::ClientMessage { id, msg } => handle_client_message(state, id, msg, tx),
+        InternalEvent::ProcessLine {
+            service,
+            generation,
+            line,
+        } => handle_process_line(state, service, generation, line),
+        InternalEvent::ProcessExited {
+            service,
+            generation,
+            exit_code,
+        } => handle_process_exited(state, service, generation, exit_code, tx),
+        InternalEvent::ServiceGracePassed {
+            service,
+            generation,
+        } => handle_grace_passed(state, service, generation, tx),
+    }
+}
+
+fn handle_client_message(
+    state: &mut DaemonState,
+    id: ClientId,
+    msg: ClientMessage,
+    tx: &mpsc::UnboundedSender<InternalEvent>,
+) {
+    match msg {
+        ClientMessage::Subscribe { services } => {
+            let (svcs, steps) = state.snapshot();
+            if let Some(client) = state.clients.get(&id) {
+                let _ = client.send(ServerMessage::Subscribed {
+                    services: svcs,
+                    steps,
+                });
+                // Replay buffered logs for subscribed services.
+                let names: Vec<String> = if services.is_empty() {
+                    state.logs.keys().cloned().collect()
+                } else {
+                    services.clone()
                 };
-                let req: Envelope<ClientMessage> = match serde_json::from_slice(&bytes) {
-                    Ok(env) => env,
+                for name in names {
+                    if let Some(buf) = state.logs.get(&name) {
+                        for (ts, line) in buf.iter() {
+                            let _ = client.send(ServerMessage::LogChunk {
+                                service: name.clone(),
+                                bytes: encode_line(line),
+                                ts: *ts,
+                            });
+                        }
+                    }
+                }
+            }
+            state.subscriptions.insert(id, services);
+        }
+        ClientMessage::Unsubscribe => {
+            state.subscriptions.remove(&id);
+        }
+        ClientMessage::Start { service: _, .. } => {
+            // For v1, any Start triggers a global Event::Start. The service
+            // argument is informational; the executor advances the whole
+            // graph in topo order.
+            let actions = state.executor.handle(ExecEvent::Start);
+            enact_actions(state, actions, tx);
+        }
+        ClientMessage::Stop { service } => {
+            if state.children.contains_key(&service) {
+                state.intentional_stops.insert(service.clone());
+            }
+            let actions = state.executor.handle(ExecEvent::UserStop {
+                name: service.clone(),
+            });
+            enact_actions(state, actions, tx);
+            // If there was no running child, still emit a status update so
+            // subscribers see the transition.
+            if !state.children.contains_key(&service) {
+                state.broadcast(
+                    Some(&service),
+                    ServerMessage::StatusUpdate {
+                        service: service.clone(),
+                        state: ServiceState::Stopped,
+                        pid: None,
+                        port: None,
+                        restart_count: 0,
+                    },
+                );
+            }
+        }
+        ClientMessage::Restart { service } => {
+            state.pending_restarts.insert(service.clone());
+            if state.children.contains_key(&service) {
+                state.intentional_stops.insert(service.clone());
+                let actions = state.executor.handle(ExecEvent::UserStop {
+                    name: service.clone(),
+                });
+                enact_actions(state, actions, tx);
+            } else {
+                // Not running: just trigger restart immediately by resetting.
+                let actions = state.executor.reset(&service);
+                enact_actions(state, actions, tx);
+                state.pending_restarts.remove(&service);
+            }
+        }
+        ClientMessage::RecheckHealth => {
+            // Stub for v1 — no probe loop running yet.
+        }
+        ClientMessage::Shutdown => {
+            // Reply to all clients, kill children. Loop exits once children
+            // map drains.
+            state.broadcast(
+                None,
+                ServerMessage::Goodbye {
+                    reason: "shutdown requested".into(),
+                },
+            );
+            for (name, mut rec) in state.children.drain() {
+                state.intentional_stops.insert(name);
+                let _ = rec.killer.kill();
+            }
+            state.shutting_down = true;
+        }
+    }
+}
+
+fn handle_process_line(state: &mut DaemonState, service: String, generation: u64, line: String) {
+    let current_gen = state
+        .children
+        .get(&service)
+        .map(|r| r.generation)
+        .unwrap_or(0);
+    if current_gen != generation {
+        // Stale line from a killed instance — drop.
+        return;
+    }
+    let ts = now_ms();
+    let buf = state
+        .logs
+        .entry(service.clone())
+        .or_insert_with(|| RingBuffer::new(RING_CAPACITY));
+    buf.push(ts, line.clone());
+    state.broadcast(
+        Some(&service),
+        ServerMessage::LogChunk {
+            service: service.clone(),
+            bytes: encode_line(&line),
+            ts,
+        },
+    );
+}
+
+fn handle_process_exited(
+    state: &mut DaemonState,
+    service: String,
+    generation: u64,
+    exit_code: Option<i32>,
+    tx: &mpsc::UnboundedSender<InternalEvent>,
+) {
+    // Drop the record only if the generation still matches — otherwise this
+    // is an exit from an already-replaced instance.
+    let drop_it = state
+        .children
+        .get(&service)
+        .map(|r| r.generation == generation)
+        .unwrap_or(false);
+    if drop_it {
+        state.children.remove(&service);
+    }
+    let intentional = state.intentional_stops.remove(&service);
+
+    if intentional {
+        state.broadcast(
+            Some(&service),
+            ServerMessage::StatusUpdate {
+                service: service.clone(),
+                state: ServiceState::Stopped,
+                pid: None,
+                port: None,
+                restart_count: 0,
+            },
+        );
+        // We don't fire Event::ServiceExited because the user asked for this.
+        // The executor was already told via UserStop (in handle_client_message).
+    } else {
+        let actions = state.executor.handle(ExecEvent::ServiceExited {
+            name: service.clone(),
+            exit_code,
+        });
+        state.broadcast(
+            Some(&service),
+            ServerMessage::StatusUpdate {
+                service: service.clone(),
+                state: ServiceState::Failed { exit_code },
+                pid: None,
+                port: None,
+                restart_count: 0,
+            },
+        );
+        enact_actions(state, actions, tx);
+    }
+
+    if state.pending_restarts.remove(&service) {
+        let actions = state.executor.reset(&service);
+        enact_actions(state, actions, tx);
+    }
+}
+
+fn handle_grace_passed(
+    state: &mut DaemonState,
+    service: String,
+    generation: u64,
+    tx: &mpsc::UnboundedSender<InternalEvent>,
+) {
+    let still_running = state
+        .children
+        .get(&service)
+        .map(|r| r.generation == generation)
+        .unwrap_or(false);
+    if !still_running {
+        return;
+    }
+    let actions = state.executor.handle(ExecEvent::ServiceHealthy {
+        name: service.clone(),
+    });
+    let rec = state.children.get(&service).expect("checked");
+    state.broadcast(
+        Some(&service),
+        ServerMessage::StatusUpdate {
+            service: service.clone(),
+            state: ServiceState::Running {
+                degraded: false,
+                started_without: vec![],
+            },
+            pid: Some(rec.pid),
+            port: rec.port,
+            restart_count: rec.restart_count,
+        },
+    );
+    enact_actions(state, actions, tx);
+}
+
+fn enact_actions(
+    state: &mut DaemonState,
+    actions: Vec<Action>,
+    tx: &mpsc::UnboundedSender<InternalEvent>,
+) {
+    let mut work: Vec<Action> = actions;
+    while let Some(action) = work.pop() {
+        match action {
+            Action::StartService(name) => {
+                let svc = match state.stack.service.get(&name) {
+                    Some(s) => s.clone(),
+                    None => continue,
+                };
+                let generation = state.alloc_generation();
+                let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+                let env: Vec<(String, String)> = svc
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                let env_slice: Vec<(&str, &str)> =
+                    env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+                let parts = match ChildProcess::spawn_parts::<&str>(&svc.cmd, &cwd, &env_slice) {
+                    Ok(p) => p,
                     Err(e) => {
-                        let _ = send(&mut conn, ServerMessage::Error {
-                            code: devme_core::ErrorCode::Usage,
-                            message: format!("malformed request: {e}"),
-                        }).await;
+                        state.broadcast(
+                            None,
+                            ServerMessage::Notice {
+                                level: NoticeLevel::Error,
+                                message: format!("spawn {name}: {e}"),
+                            },
+                        );
                         continue;
                     }
                 };
 
-                match req.payload {
-                    ClientMessage::Shutdown => {
-                        let _ = send(&mut conn, ServerMessage::Goodbye {
-                            reason: "shutdown requested".into(),
-                        }).await;
-                        let _ = shutdown_tx.send(());
-                        return Ok(());
+                state.children.insert(
+                    name.clone(),
+                    ChildRecord {
+                        generation,
+                        pid: parts.pid,
+                        port: None,
+                        restart_count: 0,
+                        killer: parts.killer,
+                    },
+                );
+                state.broadcast(
+                    Some(&name),
+                    ServerMessage::StatusUpdate {
+                        service: name.clone(),
+                        state: ServiceState::Starting,
+                        pid: Some(parts.pid),
+                        port: None,
+                        restart_count: 0,
+                    },
+                );
+
+                // Per-process tasks: line reader and exit waiter.
+                let lines_tx = tx.clone();
+                let lines_name = name.clone();
+                let mut lines_rx = parts.lines;
+                tokio::spawn(async move {
+                    while let Some(line) = lines_rx.recv().await {
+                        if lines_tx
+                            .send(InternalEvent::ProcessLine {
+                                service: lines_name.clone(),
+                                generation,
+                                line,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
-                    other => {
-                        let reply = handle_message(&other, stack.as_deref());
-                        send(&mut conn, reply).await?;
-                    }
+                });
+
+                let exit_tx = tx.clone();
+                let exit_name = name.clone();
+                let exit_rx = parts.exit;
+                tokio::spawn(async move {
+                    let code = exit_rx.await.ok();
+                    let _ = exit_tx.send(InternalEvent::ProcessExited {
+                        service: exit_name,
+                        generation,
+                        exit_code: code,
+                    });
+                });
+
+                // Grace timer for the "no probe → healthy" path.
+                let grace_tx = tx.clone();
+                let grace_name = name.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(HEALTH_GRACE_MS)).await;
+                    let _ = grace_tx.send(InternalEvent::ServiceGracePassed {
+                        service: grace_name,
+                        generation,
+                    });
+                });
+            }
+            Action::StopService(name) => {
+                if let Some(mut rec) = state.children.remove(&name) {
+                    let _ = rec.killer.kill();
                 }
             }
-            _ = shutdown_rx.recv() => {
-                let _ = send(&mut conn, ServerMessage::Goodbye {
-                    reason: "daemon shutting down".into(),
-                }).await;
-                return Ok(());
+            Action::RunCheck(name) => {
+                // V1: no real check spawning yet — treat every check as
+                // passing so dependents can advance. Real spawning will
+                // mirror the service path and route StepCheckCompleted.
+                let follow_up = state.executor.handle(ExecEvent::StepCheckCompleted {
+                    name: name.clone(),
+                    passed: true,
+                });
+                state.broadcast(
+                    None,
+                    ServerMessage::StepStatusUpdate {
+                        step: name.clone(),
+                        state: StepState::Passed,
+                    },
+                );
+                work.extend(follow_up);
+            }
+            Action::RunProvision(_) => {
+                // V1: provisioning is out of scope for this first wiring pass.
             }
         }
     }
 }
 
-fn handle_message(msg: &ClientMessage, stack: Option<&Stack>) -> ServerMessage {
-    match msg {
-        ClientMessage::Subscribe { .. } => {
-            let (services, steps) = match stack {
-                Some(s) => initial_snapshot(s),
-                None => (Vec::new(), Vec::new()),
-            };
-            ServerMessage::Subscribed { services, steps }
-        }
-        _ => ServerMessage::Goodbye {
-            reason: format!("unhandled: {msg:?}"),
-        },
-    }
+fn encode_line(line: &str) -> String {
+    base64::engine::general_purpose::STANDARD.encode(line.as_bytes())
 }
 
-async fn send(
-    conn: &mut Framed<UnixStream, FrameCodec>,
-    msg: ServerMessage,
-) -> std::io::Result<()> {
-    let env = Envelope::new(msg);
-    let bytes = serde_json::to_vec(&env)?;
-    conn.send(bytes.as_slice()).await
-}
-
-impl Drop for DaemonServer {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 pub fn framed(stream: UnixStream) -> Framed<UnixStream, FrameCodec> {
@@ -228,177 +757,290 @@ mod tests {
     use super::*;
     use devme_core::ClientMessage;
     use tempfile::TempDir;
-    use tokio_stream::StreamExt;
 
-    #[tokio::test]
-    async fn daemon_serves_goodbye_to_one_client() {
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("d.sock");
+    async fn connect(sock: &Path) -> Framed<UnixStream, FrameCodec> {
+        for _ in 0..50 {
+            if let Ok(s) = UnixStream::connect(sock).await {
+                return framed(s);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("could not connect to {}", sock.display());
+    }
 
-        let server = DaemonServer::bind(&sock).unwrap();
-        let server_task = tokio::spawn(async move { server.accept_and_goodbye().await });
+    async fn send_msg(
+        conn: &mut Framed<UnixStream, FrameCodec>,
+        msg: ClientMessage,
+    ) {
+        let env = Envelope::new(msg);
+        let bytes = serde_json::to_vec(&env).unwrap();
+        conn.send(bytes.as_slice()).await.unwrap();
+    }
 
-        // Tiny delay so accept() runs before we connect.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let client = UnixStream::connect(&sock).await.unwrap();
-        let mut client_framed = framed(client);
-
-        let bytes = client_framed
-            .next()
-            .await
-            .expect("expected one frame")
-            .unwrap();
+    async fn recv_msg(conn: &mut Framed<UnixStream, FrameCodec>) -> ServerMessage {
+        let bytes = conn.next().await.expect("frame").unwrap();
         let env: Envelope<ServerMessage> = serde_json::from_slice(&bytes).unwrap();
-        assert!(matches!(env.payload, ServerMessage::Goodbye { .. }));
+        env.payload
+    }
 
-        server_task.await.unwrap().unwrap();
+    fn make_stack(s: &str) -> Stack {
+        Stack::parse(s).unwrap()
     }
 
     #[tokio::test]
-    async fn daemon_replies_to_subscribe_with_initial_snapshot() {
+    async fn subscribe_returns_snapshot_of_configured_services() {
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("d.sock");
-
-        let server = DaemonServer::bind(&sock).unwrap();
-        let server_task = tokio::spawn(async move { server.handle_one_request().await });
-
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let client = UnixStream::connect(&sock).await.unwrap();
-        let mut client_framed = framed(client);
-
-        let req = Envelope::new(ClientMessage::Subscribe { services: vec![] });
-        let bytes = serde_json::to_vec(&req).unwrap();
-        client_framed.send(bytes.as_slice()).await.unwrap();
-
-        let resp_bytes = client_framed
-            .next()
-            .await
-            .expect("expected response")
-            .unwrap();
-        let resp: Envelope<ServerMessage> = serde_json::from_slice(&resp_bytes).unwrap();
-        assert!(matches!(
-            resp.payload,
-            ServerMessage::Subscribed { ref services, ref steps } if services.is_empty() && steps.is_empty()
-        ));
-
-        server_task.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn subscribe_reflects_configured_services_in_stopped_state() {
-        use devme_config::Stack;
-
-        let dir = TempDir::new().unwrap();
-        let sock = dir.path().join("d.sock");
-
-        let stack = Stack::parse(
-            r#"
+        let server = DaemonServer::bind_with_stack(
+            &sock,
+            make_stack(
+                r#"
 schema_version = 1
 
-[step.tools]
-check = "true"
-
 [service.db]
-cmd = "postgres"
+cmd = "true"
 
-[service.backend]
-cmd = "server"
+[service.api]
+cmd = "true"
 "#,
+            ),
         )
         .unwrap();
+        let task = tokio::spawn(server.serve());
 
-        let server = DaemonServer::bind_with_stack(&sock, stack).unwrap();
-        let server_task = tokio::spawn(server.serve());
-
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let stream = UnixStream::connect(&sock).await.unwrap();
-        let mut conn = framed(stream);
-        let req = Envelope::new(ClientMessage::Subscribe { services: vec![] });
-        conn.send(serde_json::to_vec(&req).unwrap().as_slice())
-            .await
-            .unwrap();
-        let resp: Envelope<ServerMessage> =
-            serde_json::from_slice(&conn.next().await.unwrap().unwrap()).unwrap();
-
-        match resp.payload {
-            ServerMessage::Subscribed { services, steps } => {
-                let svc_names: Vec<_> = services.iter().map(|s| s.name.as_str()).collect();
-                assert_eq!(svc_names, vec!["db", "backend"]);
-                assert_eq!(steps.len(), 1);
-                assert_eq!(steps[0].name, "tools");
-                // All services start Stopped; the step starts Unknown.
-                assert!(matches!(
-                    services[0].state,
-                    devme_core::ServiceState::Stopped
-                ));
-                assert!(matches!(
-                    steps[0].state,
-                    devme_core::StepState::Unknown
-                ));
+        let mut conn = connect(&sock).await;
+        send_msg(&mut conn, ClientMessage::Subscribe { services: vec![] }).await;
+        match recv_msg(&mut conn).await {
+            ServerMessage::Subscribed { services, .. } => {
+                let names: Vec<_> = services.iter().map(|s| s.name.as_str()).collect();
+                assert_eq!(names, vec!["db", "api"]);
+                assert!(services.iter().all(|s| matches!(s.state, ServiceState::Stopped)));
             }
             other => panic!("expected Subscribed, got {other:?}"),
         }
 
-        // Clean shutdown.
-        let shutdown = Envelope::new(ClientMessage::Shutdown);
-        conn.send(serde_json::to_vec(&shutdown).unwrap().as_slice())
-            .await
-            .unwrap();
-        let _ = conn.next().await;
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_task).await;
+        send_msg(&mut conn, ClientMessage::Shutdown).await;
+        let _ = recv_msg(&mut conn).await; // Goodbye
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
     }
 
     #[tokio::test]
-    async fn serve_handles_two_clients_then_shuts_down_on_request() {
-        use std::time::Duration;
-
+    async fn start_spawns_service_and_reports_running() {
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("d.sock");
+        let server = DaemonServer::bind_with_stack(
+            &sock,
+            make_stack(
+                r#"
+schema_version = 1
 
-        let server = DaemonServer::bind(&sock).unwrap();
-        let server_task = tokio::spawn(server.serve());
+[service.tick]
+cmd = "sleep 5"
+"#,
+            ),
+        )
+        .unwrap();
+        let task = tokio::spawn(server.serve());
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut conn = connect(&sock).await;
+        send_msg(&mut conn, ClientMessage::Subscribe { services: vec![] }).await;
+        let _ = recv_msg(&mut conn).await; // Subscribed snapshot
 
-        // Client A subscribes; expects snapshot back.
-        let stream_a = UnixStream::connect(&sock).await.unwrap();
-        let mut a = framed(stream_a);
-        let req = Envelope::new(ClientMessage::Subscribe { services: vec![] });
-        a.send(serde_json::to_vec(&req).unwrap().as_slice())
+        send_msg(
+            &mut conn,
+            ClientMessage::Start {
+                service: "tick".into(),
+                skip_deps: false,
+            },
+        )
+        .await;
+
+        // Expect Starting then Running.
+        let mut saw_starting = false;
+        let mut saw_running = false;
+        for _ in 0..6 {
+            match tokio::time::timeout(Duration::from_secs(2), recv_msg(&mut conn))
+                .await
+                .expect("timed out waiting for status updates")
+            {
+                ServerMessage::StatusUpdate { service, state, .. } if service == "tick" => {
+                    if matches!(state, ServiceState::Starting) {
+                        saw_starting = true;
+                    }
+                    if matches!(state, ServiceState::Running { .. }) {
+                        saw_running = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_starting, "expected to see Starting");
+        assert!(saw_running, "expected to see Running");
+
+        send_msg(&mut conn, ClientMessage::Shutdown).await;
+        // Drain — Goodbye may arrive interleaved with final status updates.
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn process_lines_arrive_as_log_chunks() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("d.sock");
+        let server = DaemonServer::bind_with_stack(
+            &sock,
+            make_stack(
+                r#"
+schema_version = 1
+
+[service.echo]
+cmd = "printf 'one\\ntwo\\n'; sleep 5"
+"#,
+            ),
+        )
+        .unwrap();
+        let task = tokio::spawn(server.serve());
+
+        let mut conn = connect(&sock).await;
+        send_msg(&mut conn, ClientMessage::Subscribe { services: vec![] }).await;
+        let _ = recv_msg(&mut conn).await;
+        send_msg(
+            &mut conn,
+            ClientMessage::Start {
+                service: "echo".into(),
+                skip_deps: false,
+            },
+        )
+        .await;
+
+        let mut got = Vec::new();
+        for _ in 0..20 {
+            let msg = tokio::time::timeout(Duration::from_secs(2), recv_msg(&mut conn))
+                .await
+                .expect("timed out waiting for log chunks");
+            if let ServerMessage::LogChunk {
+                service,
+                bytes,
+                ..
+            } = msg
+            {
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(bytes.as_bytes())
+                    .unwrap();
+                let line = String::from_utf8(decoded).unwrap();
+                let trimmed = line.trim().to_string();
+                if service == "echo" {
+                    got.push(trimmed);
+                }
+            }
+            if got.contains(&"one".to_string()) && got.contains(&"two".to_string()) {
+                break;
+            }
+        }
+        assert!(got.contains(&"one".to_string()), "missing 'one': {got:?}");
+        assert!(got.contains(&"two".to_string()), "missing 'two': {got:?}");
+
+        send_msg(&mut conn, ClientMessage::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn stop_kills_service_and_reports_stopped() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("d.sock");
+        let server = DaemonServer::bind_with_stack(
+            &sock,
+            make_stack(
+                r#"
+schema_version = 1
+
+[service.tick]
+cmd = "sleep 30"
+"#,
+            ),
+        )
+        .unwrap();
+        let task = tokio::spawn(server.serve());
+
+        let mut conn = connect(&sock).await;
+        send_msg(&mut conn, ClientMessage::Subscribe { services: vec![] }).await;
+        let _ = recv_msg(&mut conn).await;
+        send_msg(
+            &mut conn,
+            ClientMessage::Start {
+                service: "tick".into(),
+                skip_deps: false,
+            },
+        )
+        .await;
+
+        // Wait until Running.
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(2), recv_msg(&mut conn))
+                .await
+                .expect("timed out waiting for Running");
+            if matches!(
+                msg,
+                ServerMessage::StatusUpdate {
+                    ref service,
+                    state: ServiceState::Running { .. },
+                    ..
+                } if service == "tick"
+            ) {
+                break;
+            }
+        }
+
+        send_msg(
+            &mut conn,
+            ClientMessage::Stop {
+                service: "tick".into(),
+            },
+        )
+        .await;
+
+        let mut saw_stopped = false;
+        for _ in 0..6 {
+            let msg = tokio::time::timeout(Duration::from_secs(2), recv_msg(&mut conn))
+                .await
+                .expect("timed out waiting for Stopped");
+            if matches!(
+                msg,
+                ServerMessage::StatusUpdate {
+                    ref service,
+                    state: ServiceState::Stopped,
+                    ..
+                } if service == "tick"
+            ) {
+                saw_stopped = true;
+                break;
+            }
+        }
+        assert!(saw_stopped, "expected Stopped after Stop");
+
+        send_msg(&mut conn, ClientMessage::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_sends_goodbye_and_exits() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("d.sock");
+        let server = DaemonServer::bind_with_stack(
+            &sock,
+            make_stack("schema_version = 1\n"),
+        )
+        .unwrap();
+        let task = tokio::spawn(server.serve());
+
+        let mut conn = connect(&sock).await;
+        send_msg(&mut conn, ClientMessage::Shutdown).await;
+        let msg = recv_msg(&mut conn).await;
+        assert!(matches!(msg, ServerMessage::Goodbye { .. }));
+
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
             .await
-            .unwrap();
-        let resp_a: Envelope<ServerMessage> =
-            serde_json::from_slice(&a.next().await.unwrap().unwrap()).unwrap();
-        assert!(matches!(resp_a.payload, ServerMessage::Subscribed { .. }));
-
-        // Client B subscribes on a separate connection, concurrently.
-        let stream_b = UnixStream::connect(&sock).await.unwrap();
-        let mut b = framed(stream_b);
-        b.send(serde_json::to_vec(&req).unwrap().as_slice())
-            .await
-            .unwrap();
-        let resp_b: Envelope<ServerMessage> =
-            serde_json::from_slice(&b.next().await.unwrap().unwrap()).unwrap();
-        assert!(matches!(resp_b.payload, ServerMessage::Subscribed { .. }));
-
-        // Client A sends Shutdown; daemon should send Goodbye to both.
-        let shutdown = Envelope::new(ClientMessage::Shutdown);
-        a.send(serde_json::to_vec(&shutdown).unwrap().as_slice())
-            .await
-            .unwrap();
-
-        let goodbye_a: Envelope<ServerMessage> =
-            serde_json::from_slice(&a.next().await.unwrap().unwrap()).unwrap();
-        assert!(matches!(goodbye_a.payload, ServerMessage::Goodbye { .. }));
-
-        let goodbye_b: Envelope<ServerMessage> =
-            serde_json::from_slice(&b.next().await.unwrap().unwrap()).unwrap();
-        assert!(matches!(goodbye_b.payload, ServerMessage::Goodbye { .. }));
-
-        // Server task should exit cleanly.
-        let result = tokio::time::timeout(Duration::from_secs(2), server_task)
-            .await
-            .expect("serve() didn't exit after Shutdown");
+            .expect("serve didn't exit");
         result.unwrap().unwrap();
     }
 }

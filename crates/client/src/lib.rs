@@ -75,19 +75,20 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn client_receives_goodbye_from_daemon() {
+    async fn client_receives_goodbye_from_daemon_on_shutdown() {
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("d.sock");
 
         let server = DaemonServer::bind(&sock).unwrap();
-        let server_task = tokio::spawn(async move { server.accept_and_goodbye().await });
+        let server_task: tokio::task::JoinHandle<std::io::Result<()>> =
+            tokio::spawn(server.serve());
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let mut client = Client::connect(&sock).await.unwrap();
-        let msg = client.next_event().await.unwrap().unwrap();
-        assert!(matches!(msg, ServerMessage::Goodbye { .. }));
+        let resp = client.request(ClientMessage::Shutdown).await.unwrap();
+        assert!(matches!(resp, ServerMessage::Goodbye { .. }));
 
-        server_task.await.unwrap().unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_task).await;
     }
 
     #[tokio::test]
@@ -96,7 +97,8 @@ mod tests {
         let sock = dir.path().join("d.sock");
 
         let server = DaemonServer::bind(&sock).unwrap();
-        let server_task = tokio::spawn(async move { server.handle_one_request().await });
+        let server_task: tokio::task::JoinHandle<std::io::Result<()>> =
+            tokio::spawn(server.serve());
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let mut client = Client::connect(&sock).await.unwrap();
@@ -109,6 +111,7 @@ mod tests {
             ServerMessage::Subscribed { ref services, ref steps } if services.is_empty() && steps.is_empty()
         ));
 
-        server_task.await.unwrap().unwrap();
+        let _ = client.send(ClientMessage::Shutdown).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_task).await;
     }
 }

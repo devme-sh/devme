@@ -78,6 +78,14 @@ impl Executor {
         self.nodes.get(name)
     }
 
+    /// Forget a node's tracked state so [`Self::handle(Event::Start)`] (or
+    /// any other call into [`Self::advance`]) treats it as eligible to run
+    /// again. Used by the supervisor to honor user-initiated restarts.
+    pub fn reset(&mut self, name: &str) -> Vec<Action> {
+        self.nodes.remove(name);
+        self.advance()
+    }
+
     pub fn handle(&mut self, event: Event) -> Vec<Action> {
         match event {
             Event::Start => self.advance(),
@@ -425,6 +433,24 @@ depends_on = ["tools"]
         let actions = e.handle(Event::Start);
         // Only the step's check runs first; the service waits.
         assert_eq!(actions, vec![Action::RunCheck("tools".into())]);
+    }
+
+    #[test]
+    fn reset_after_stop_lets_service_start_again() {
+        let mut e = Executor::new(graph(
+            r#"
+schema_version = 1
+
+[service.db]
+cmd = "postgres"
+"#,
+        ));
+        e.handle(Event::Start);
+        e.handle(Event::ServiceHealthy { name: "db".into() });
+        e.handle(Event::UserStop { name: "db".into() });
+        // After UserStop, db is marked Stopped; advance() wouldn't re-pick it.
+        let actions = e.reset("db");
+        assert_eq!(actions, vec![Action::StartService("db".into())]);
     }
 
     #[test]

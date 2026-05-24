@@ -27,11 +27,37 @@ pub struct ChildProcess {
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
 }
 
+/// Splittable, task-friendly version of [`ChildProcess`]. The daemon's event
+/// loop holds the killer; per-process tasks own the receivers.
+pub struct SpawnParts {
+    pub pid: u32,
+    pub lines: mpsc::UnboundedReceiver<String>,
+    pub exit: oneshot::Receiver<i32>,
+    pub killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+}
+
 impl ChildProcess {
     /// Spawn `cmd` via `sh -c`, with `cwd` as the working directory and the
     /// caller's environment.
     pub fn spawn(cmd: &str, cwd: &Path) -> Result<Self, SpawnError> {
         Self::spawn_with_env::<&str>(cmd, cwd, &[])
+    }
+
+    /// Spawn into [`SpawnParts`] instead of bundling everything into one
+    /// struct. Useful when the caller wants to hand the receivers to
+    /// different tasks but keep the killer.
+    pub fn spawn_parts<S: AsRef<str>>(
+        cmd: &str,
+        cwd: &Path,
+        extra_env: &[(S, S)],
+    ) -> Result<SpawnParts, SpawnError> {
+        let cp = Self::spawn_with_env(cmd, cwd, extra_env)?;
+        Ok(SpawnParts {
+            pid: cp.pid,
+            lines: cp.lines_rx,
+            exit: cp.exit_rx.expect("exit_rx populated on fresh spawn"),
+            killer: cp.killer,
+        })
     }
 
     /// Spawn `cmd` via `sh -c`, with extra environment variables overlaid
@@ -182,6 +208,24 @@ mod tests {
         .unwrap();
         let line = child.next_line().await.unwrap();
         assert_eq!(line.trim(), "winning");
+    }
+
+    #[tokio::test]
+    async fn spawn_parts_streams_lines_and_exit_independently() {
+        let mut parts = ChildProcess::spawn_parts::<&str>(
+            "printf 'a\\nb\\n'",
+            &std::env::temp_dir(),
+            &[],
+        )
+        .unwrap();
+        let mut lines = Vec::new();
+        while let Some(l) = parts.lines.recv().await {
+            lines.push(l.trim().to_string());
+        }
+        assert_eq!(lines, vec!["a", "b"]);
+        let exit = parts.exit.await.unwrap();
+        assert_eq!(exit, 0);
+        assert!(parts.pid > 0);
     }
 
     #[tokio::test]

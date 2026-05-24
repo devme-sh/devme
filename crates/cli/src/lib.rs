@@ -36,6 +36,10 @@ pub enum Command {
     Status,
     /// Restart a service.
     Restart { service: String },
+    /// Stop a single service (keep the daemon running).
+    Stop { service: String },
+    /// Start a single service.
+    Start { service: String },
     /// Tail logs for a service.
     Logs {
         service: String,
@@ -195,6 +199,28 @@ mod tests {
     #[test]
     fn empty_snapshot_formats_to_empty_text() {
         assert_eq!(format_status_text(&[], &[]), "");
+    }
+
+    #[test]
+    fn stop_requires_a_service_name() {
+        let cli = Cli::parse_from(["devme", "stop", "backend"]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Stop {
+                service: "backend".into()
+            })
+        );
+    }
+
+    #[test]
+    fn start_requires_a_service_name() {
+        let cli = Cli::parse_from(["devme", "start", "backend"]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Start {
+                service: "backend".into()
+            })
+        );
     }
 
     #[test]

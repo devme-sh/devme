@@ -334,6 +334,7 @@ name = "devme"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "clap_complete",
  "devme-client",
@@ -441,6 +442,7 @@ name = "devme-supervisor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "devme-config",
  "devme-core",
  "devme-executor",
