@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
 use devme_config::{Graph, InterpContext, Stack, interpolate};
@@ -47,6 +47,13 @@ const PROBE_INTERVAL_MS: u64 = 1000;
 const RESTART_BACKOFF_BASE_MS: u64 = 500;
 const RESTART_BACKOFF_MAX_MS: u64 = 30_000;
 const BACKOFF_CAP_POW: u32 = 6;
+
+/// Crash-loop detection: if a service exits N times in W seconds, stop
+/// trying to restart it and mark it `CrashLoop`. Tuned to be permissive
+/// enough for normal flaky-during-startup services but tight enough that a
+/// truly broken cmd doesn't burn CPU forever.
+const CRASH_LOOP_THRESHOLD: usize = 5;
+const CRASH_LOOP_WINDOW_SECS: u64 = 60;
 
 type ClientId = u64;
 type ClientTx = mpsc::UnboundedSender<ServerMessage>;
@@ -149,6 +156,13 @@ struct DaemonState {
     /// causes an auto-restart; reset when the user explicitly Starts/Stops.
     /// Powers the backoff curve and the `restart_count` in StatusUpdates.
     restart_counts: HashMap<String, u32>,
+    /// Rolling window of recent exit timestamps per service. Used to detect
+    /// "crashing every few seconds" patterns. Trimmed on every exit so the
+    /// memory stays bounded.
+    recent_exits: HashMap<String, VecDeque<Instant>>,
+    /// Services whose auto-restart loop has been disabled because they're
+    /// crash-looping. Reset on user Start/Stop/Restart.
+    crash_looped: HashSet<String>,
     next_generation: u64,
     next_client_id: u64,
     shutting_down: bool,
@@ -168,6 +182,8 @@ impl DaemonState {
             intentional_stops: HashSet::new(),
             pending_restarts: HashSet::new(),
             restart_counts: HashMap::new(),
+            recent_exits: HashMap::new(),
+            crash_looped: HashSet::new(),
             next_generation: 0,
             next_client_id: 0,
             shutting_down: false,
@@ -544,12 +560,27 @@ fn handle_client_message(
             // counter so the backoff resets after intentional interaction.
             if !service.is_empty() {
                 state.restart_counts.remove(&service);
+                state.recent_exits.remove(&service);
+                state.crash_looped.remove(&service);
+                // If the service is currently parked in CrashLoop, reset its
+                // executor entry so advance() picks it up again.
+                if matches!(
+                    state.executor.state(&service),
+                    Some(NodeStatus::Service(ServiceState::CrashLoop { .. }))
+                        | Some(NodeStatus::Service(ServiceState::Failed { .. }))
+                ) {
+                    let actions = state.executor.reset(&service);
+                    enact_actions(state, actions, tx);
+                    return;
+                }
             }
             let actions = state.executor.handle(ExecEvent::Start);
             enact_actions(state, actions, tx);
         }
         ClientMessage::Stop { service } => {
             state.restart_counts.remove(&service);
+            state.recent_exits.remove(&service);
+            state.crash_looped.remove(&service);
             if state.children.contains_key(&service) {
                 state.intentional_stops.insert(service.clone());
             }
@@ -573,6 +604,8 @@ fn handle_client_message(
             }
         }
         ClientMessage::Restart { service } => {
+            state.recent_exits.remove(&service);
+            state.crash_looped.remove(&service);
             state.pending_restarts.insert(service.clone());
             if state.children.contains_key(&service) {
                 state.intentional_stops.insert(service.clone());
@@ -689,15 +722,59 @@ fn handle_process_exited(
         if !state.pending_restarts.contains(&service)
             && should_auto_restart(&state.stack, &service, exit_code)
         {
-            let prev = state.restart_counts.entry(service.clone()).or_insert(0);
-            *prev = prev.saturating_add(1);
-            let delay_ms = backoff_for(*prev);
-            let svc_name = service.clone();
-            let restart_tx = tx.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                let _ = restart_tx.send(InternalEvent::AutoRestart { service: svc_name });
-            });
+            // Record this exit in the crash-loop window and trim old entries.
+            let now = Instant::now();
+            let exits = state
+                .recent_exits
+                .entry(service.clone())
+                .or_insert_with(|| VecDeque::with_capacity(CRASH_LOOP_THRESHOLD + 1));
+            let window = Duration::from_secs(CRASH_LOOP_WINDOW_SECS);
+            while exits.front().is_some_and(|&t| now.duration_since(t) > window) {
+                exits.pop_front();
+            }
+            exits.push_back(now);
+
+            if exits.len() >= CRASH_LOOP_THRESHOLD {
+                // Trip the breaker: stop trying to restart this service and
+                // surface a Notice so clients can flag it loudly. The
+                // service stays in CrashLoop until the user explicitly
+                // intervenes via Start / Restart / Stop.
+                state.crash_looped.insert(service.clone());
+                let count = *state.restart_counts.get(&service).unwrap_or(&0);
+                state.broadcast(
+                    Some(&service),
+                    ServerMessage::StatusUpdate {
+                        service: service.clone(),
+                        state: ServiceState::CrashLoop {
+                            restart_count: count,
+                        },
+                        pid: None,
+                        port: None,
+                        restart_count: count,
+                    },
+                );
+                state.broadcast(
+                    None,
+                    ServerMessage::Notice {
+                        level: NoticeLevel::Error,
+                        message: format!(
+                            "service {service} crash-looped \
+                             ({CRASH_LOOP_THRESHOLD} exits in \
+                             {CRASH_LOOP_WINDOW_SECS}s) — auto-restart disabled"
+                        ),
+                    },
+                );
+            } else {
+                let prev = state.restart_counts.entry(service.clone()).or_insert(0);
+                *prev = prev.saturating_add(1);
+                let delay_ms = backoff_for(*prev);
+                let svc_name = service.clone();
+                let restart_tx = tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    let _ = restart_tx.send(InternalEvent::AutoRestart { service: svc_name });
+                });
+            }
         }
     }
 
@@ -1546,6 +1623,62 @@ restart = "on-failure"
             starting_count >= 2,
             "expected ≥2 Starting transitions (auto-restart), got {starting_count}"
         );
+
+        send_msg(&mut conn, ClientMessage::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn relentless_crasher_is_quarantined_as_crash_loop() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("d.sock");
+        // Instant-failing cmd with a flat-ish backoff window — within the
+        // 60s detection window we'll see 5 exits before the test deadline.
+        let server = DaemonServer::bind_with_stack(
+            &sock,
+            make_stack(
+                r#"
+schema_version = 1
+
+[service.brokenloop]
+cmd = "exit 1"
+restart = "always"
+"#,
+            ),
+        )
+        .unwrap();
+        let task = tokio::spawn(server.serve());
+
+        let mut conn = connect(&sock).await;
+        send_msg(&mut conn, ClientMessage::Subscribe { services: vec![] }).await;
+        let _ = recv_msg(&mut conn).await;
+        send_msg(
+            &mut conn,
+            ClientMessage::Start {
+                service: String::new(),
+                skip_deps: false,
+            },
+        )
+        .await;
+
+        let mut saw_crash_loop = false;
+        // 5 restarts with backoff 0.5, 1, 2, 4, 8s would take 15.5s. But the
+        // 5th attempt's failure trips the breaker, not the 5th attempt
+        // starting — so by ~7.5s we should see CrashLoop.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline && !saw_crash_loop {
+            match tokio::time::timeout(Duration::from_secs(2), recv_msg(&mut conn)).await {
+                Ok(ServerMessage::StatusUpdate {
+                    service,
+                    state: ServiceState::CrashLoop { .. },
+                    ..
+                }) if service == "brokenloop" => {
+                    saw_crash_loop = true;
+                }
+                Ok(_) | Err(_) => {}
+            }
+        }
+        assert!(saw_crash_loop, "service never reached CrashLoop");
 
         send_msg(&mut conn, ClientMessage::Shutdown).await;
         let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
