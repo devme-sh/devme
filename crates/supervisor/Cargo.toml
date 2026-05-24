@@ -21,6 +21,8 @@ devstack-executor = { workspace = true }
 devstack-ipc = { workspace = true }
 devstack-slot-allocator = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { version = "0.3", features = ["sink"] }
 portable-pty = { workspace = true }
 reqwest = { workspace = true }
 process_alive = { workspace = true }
@@ -30,3 +32,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio-stream = "0.1"
