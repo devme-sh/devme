@@ -1,10 +1,16 @@
 //! TUI state model. Pure data: absorb daemon messages, expose what the
 //! renderer needs to draw, route key events to selection / scroll updates.
+//!
+//! Multi-stack ready: the state is `Vec<InstanceData>`. Single-daemon use
+//! has one entry; future socket-discovery work appends more. Accessors
+//! return the *currently-selected* instance's data, so the renderer can
+//! treat the TUI as if it were single-stack and let the navigation layer
+//! handle which stack is in focus.
 
 use std::collections::{HashMap, VecDeque};
 
 use base64::Engine;
-use devme_core::{ServerMessage, ServiceSnapshot, StepSnapshot};
+use devme_core::{InstanceInfo, ServerMessage, ServiceSnapshot, StepSnapshot};
 
 /// Per-service log cap inside the TUI. The daemon's ring is the source of
 /// truth (~2000 lines); the TUI keeps a smaller working buffer so even on a
@@ -22,62 +28,100 @@ pub enum Focus {
     Viewport,
 }
 
+/// One daemon's worth of TUI state. Selected by `selected_instance`; all
+/// the per-stack mutations route here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceData {
+    pub info: InstanceInfo,
+    pub services: Vec<ServiceSnapshot>,
+    pub steps: Vec<StepSnapshot>,
+    pub selected_service: Option<usize>,
+    pub logs: HashMap<String, VecDeque<String>>,
+    /// How many lines from the bottom we're scrolled back, per service.
+    /// 0 = pinned to tail; non-zero freezes the viewport so new lines
+    /// accumulate behind the user without disturbing what's on screen.
+    pub log_scroll: HashMap<String, usize>,
+}
+
+impl InstanceData {
+    fn new(info: InstanceInfo) -> Self {
+        Self {
+            info,
+            services: Vec::new(),
+            steps: Vec::new(),
+            selected_service: None,
+            logs: HashMap::new(),
+            log_scroll: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiState {
-    services: Vec<ServiceSnapshot>,
-    steps: Vec<StepSnapshot>,
-    selected_service: Option<usize>,
-    focus: Focus,
-    /// Workspaces/worktrees visible in the sidebar. v1 has just one (the
-    /// local instance), but the navigation model is set up for future
-    /// multi-instance support (e.g. shared-supervisor or a TUI attached to
-    /// multiple worktrees at once).
-    instances: Vec<String>,
+    instances: Vec<InstanceData>,
     selected_instance: Option<usize>,
-    logs: HashMap<String, VecDeque<String>>,
-    /// How many lines from the bottom we're scrolled back, per service.
-    /// 0 = pinned to the tail; a non-zero value freezes the viewport so new
-    /// lines arrive into the buffer without disturbing what's on screen.
-    log_scroll: HashMap<String, usize>,
-    /// Whether the `?` help overlay is showing. Pure UI state.
+    focus: Focus,
     help_visible: bool,
 }
 
 impl Default for TuiState {
     fn default() -> Self {
         Self {
-            services: Vec::new(),
-            steps: Vec::new(),
-            selected_service: None,
-            focus: Focus::Tabs,
             instances: Vec::new(),
             selected_instance: None,
-            logs: HashMap::new(),
-            log_scroll: HashMap::new(),
+            focus: Focus::Tabs,
             help_visible: false,
         }
     }
 }
 
 impl TuiState {
-    pub fn services(&self) -> &[ServiceSnapshot] {
-        &self.services
+    // ── instance navigation ─────────────────────────────────────────────
+
+    /// The currently selected InstanceData, if any.
+    pub fn current_instance(&self) -> Option<&InstanceData> {
+        self.selected_instance.and_then(|i| self.instances.get(i))
     }
 
-    pub fn steps(&self) -> &[StepSnapshot] {
-        &self.steps
+    fn current_instance_mut(&mut self) -> Option<&mut InstanceData> {
+        self.selected_instance
+            .and_then(|i| self.instances.get_mut(i))
+    }
+
+    /// Find an instance by id. Returns its index.
+    fn find_instance(&self, id: &str) -> Option<usize> {
+        self.instances.iter().position(|i| i.info.id == id)
+    }
+
+    /// Ensure an InstanceData exists for `info` and return its index. New
+    /// instances become the selected one only if no instance is selected.
+    fn upsert_instance(&mut self, info: InstanceInfo) -> usize {
+        match self.find_instance(&info.id) {
+            Some(idx) => {
+                // Refresh the info in case label/cwd changed (worktree
+                // renamed, daemon restarted with new identity).
+                self.instances[idx].info = info;
+                idx
+            }
+            None => {
+                self.instances.push(InstanceData::new(info));
+                let idx = self.instances.len() - 1;
+                if self.selected_instance.is_none() {
+                    self.selected_instance = Some(idx);
+                }
+                idx
+            }
+        }
     }
 
     pub fn focus(&self) -> Focus {
         self.focus
     }
 
-    /// Is the `?` help overlay currently shown?
     pub fn help_visible(&self) -> bool {
         self.help_visible
     }
 
-    /// Toggle the help overlay. `?` shows or hides it; `Esc` also hides.
     pub fn toggle_help(&mut self) {
         self.help_visible = !self.help_visible;
     }
@@ -86,75 +130,106 @@ impl TuiState {
         self.help_visible = false;
     }
 
+    // ── sidebar labels (back-compat with single-stack callers) ──────────
+
     /// Human-friendly label for the currently selected instance, or "" if
     /// none. Surfaced in the sidebar header.
     pub fn instance_label(&self) -> &str {
-        self.selected_instance
-            .and_then(|i| self.instances.get(i))
-            .map(|s| s.as_str())
+        self.current_instance()
+            .map(|i| i.info.label.as_str())
             .unwrap_or("")
     }
 
-    /// All known instances, in the order they appear in the sidebar.
-    pub fn instances(&self) -> &[String] {
-        &self.instances
+    /// All instance labels, in sidebar order. Mostly for the renderer.
+    pub fn instances(&self) -> Vec<&str> {
+        self.instances.iter().map(|i| i.info.label.as_str()).collect()
     }
 
     pub fn selected_instance_index(&self) -> Option<usize> {
         self.selected_instance
     }
 
-    /// Replace the instance list with a single label and select it. For v1
-    /// the TUI shows exactly one instance.
+    /// Replace the instance list with a single label and select it. Used by
+    /// `devme-tui`'s startup path to pre-populate the sidebar from cwd
+    /// before the daemon's own InstanceInfo arrives via `Subscribed`.
     pub fn set_instance_label(&mut self, label: impl Into<String>) {
-        self.instances = vec![label.into()];
+        let label = label.into();
+        let info = InstanceInfo {
+            id: format!("local::{label}"),
+            label,
+            cwd: ".".into(),
+        };
+        self.instances = vec![InstanceData::new(info)];
         self.selected_instance = Some(0);
     }
 
     /// Append a new instance to the sidebar list. The first call also
-    /// selects it. Reserved for multi-instance support.
+    /// selects it.
     pub fn add_instance(&mut self, label: impl Into<String>) {
-        self.instances.push(label.into());
+        let label = label.into();
+        let info = InstanceInfo {
+            id: format!("local::{label}"),
+            label,
+            cwd: ".".into(),
+        };
+        self.instances.push(InstanceData::new(info));
         if self.selected_instance.is_none() {
             self.selected_instance = Some(0);
         }
     }
 
-    /// The currently-focused service, if any.
-    pub fn selected_service(&self) -> Option<&ServiceSnapshot> {
-        self.selected_service.and_then(|i| self.services.get(i))
+    // ── proxies to the selected instance ────────────────────────────────
+
+    pub fn services(&self) -> &[ServiceSnapshot] {
+        self.current_instance().map(|i| i.services.as_slice()).unwrap_or(&[])
     }
 
-    /// Buffered log lines for `service`, oldest first. Empty if nothing has
-    /// arrived for that service yet.
+    pub fn steps(&self) -> &[StepSnapshot] {
+        self.current_instance().map(|i| i.steps.as_slice()).unwrap_or(&[])
+    }
+
+    pub fn selected_service(&self) -> Option<&ServiceSnapshot> {
+        self.current_instance()
+            .and_then(|i| i.selected_service.and_then(|idx| i.services.get(idx)))
+    }
+
+    /// Buffered log lines for `service` in the current instance.
     pub fn service_logs(&self, service: &str) -> &VecDeque<String> {
         static EMPTY: std::sync::OnceLock<VecDeque<String>> = std::sync::OnceLock::new();
-        self.logs
-            .get(service)
+        self.current_instance()
+            .and_then(|i| i.logs.get(service))
             .unwrap_or_else(|| EMPTY.get_or_init(VecDeque::new))
     }
 
     /// Lines-from-bottom scroll offset for the selected service. 0 = tail.
     pub fn log_scroll_offset(&self) -> usize {
-        match self.selected_service() {
-            Some(s) => self.log_scroll.get(&s.name).copied().unwrap_or(0),
+        let Some(inst) = self.current_instance() else {
+            return 0;
+        };
+        match inst.selected_service.and_then(|idx| inst.services.get(idx)) {
+            Some(s) => inst.log_scroll.get(&s.name).copied().unwrap_or(0),
             None => 0,
         }
     }
 
     fn set_scroll_for_selected(&mut self, value: usize) {
-        if let Some(name) = self.selected_service().map(|s| s.name.clone()) {
-            if value == 0 {
-                self.log_scroll.remove(&name);
-            } else {
-                self.log_scroll.insert(name, value);
-            }
+        let Some(inst) = self.current_instance_mut() else {
+            return;
+        };
+        let Some(name) = inst
+            .selected_service
+            .and_then(|idx| inst.services.get(idx))
+            .map(|s| s.name.clone())
+        else {
+            return;
+        };
+        if value == 0 {
+            inst.log_scroll.remove(&name);
+        } else {
+            inst.log_scroll.insert(name, value);
         }
     }
 
-    /// Scroll the log viewport one screen back (older lines). `viewport`
-    /// is the current draw height; the offset is clamped to the buffer
-    /// length so we can't scroll past the start.
     pub fn log_page_up(&mut self, viewport: usize) {
         let max = self.max_scroll_for_selected();
         let cur = self.log_scroll_offset();
@@ -168,7 +243,6 @@ impl TuiState {
         self.set_scroll_for_selected(next);
     }
 
-    /// One line back / forward — for j/k or arrow nudges in the viewport.
     pub fn log_scroll_up(&mut self, lines: usize) {
         let max = self.max_scroll_for_selected();
         let next = self.log_scroll_offset().saturating_add(lines).min(max);
@@ -190,31 +264,41 @@ impl TuiState {
     }
 
     fn max_scroll_for_selected(&self) -> usize {
-        self.selected_service()
-            .map(|s| self.service_logs(&s.name).len())
-            .unwrap_or(0)
+        let Some(inst) = self.current_instance() else {
+            return 0;
+        };
+        match inst.selected_service.and_then(|idx| inst.services.get(idx)) {
+            Some(s) => inst.logs.get(&s.name).map(|l| l.len()).unwrap_or(0),
+            None => 0,
+        }
     }
 
-    /// Absorb a [`ServerMessage`] coming off the IPC stream.
+    /// Absorb a [`ServerMessage`] coming off the IPC stream. Routes to the
+    /// instance identified by `Subscribed`'s `instance.id`. Other message
+    /// kinds target the *currently selected* instance for now; that's
+    /// correct as long as the TUI holds at most one daemon connection.
+    /// Once the discovery layer lands (task #22) the caller will tag each
+    /// incoming message with its source instance id.
     pub fn apply(&mut self, msg: ServerMessage) {
         match msg {
-            ServerMessage::Subscribed { services, steps, instance: _ } => {
-                // The `instance` field is on the wire so the TUI can route
-                // per-daemon state once multi-stack lands (task #21). For
-                // now we accept it but leave the sidebar's instance list
-                // alone — the runtime caller still drives that explicitly
-                // via set_instance_label so user-set labels survive.
-                self.services = services;
-                self.steps = steps;
-                self.selected_service = if self.services.is_empty() { None } else { Some(0) };
+            ServerMessage::Subscribed { services, steps, instance } => {
+                let idx = self.upsert_instance(instance);
+                let inst = &mut self.instances[idx];
+                inst.services = services;
+                inst.steps = steps;
+                inst.selected_service = if inst.services.is_empty() { None } else { Some(0) };
             }
             ServerMessage::StatusUpdate { service, state, .. } => {
-                if let Some(s) = self.services.iter_mut().find(|s| s.name == service) {
+                if let Some(inst) = self.current_instance_mut()
+                    && let Some(s) = inst.services.iter_mut().find(|s| s.name == service)
+                {
                     s.state = state;
                 }
             }
             ServerMessage::StepStatusUpdate { step, state } => {
-                if let Some(s) = self.steps.iter_mut().find(|s| s.name == step) {
+                if let Some(inst) = self.current_instance_mut()
+                    && let Some(s) = inst.steps.iter_mut().find(|s| s.name == step)
+                {
                     s.state = state;
                 }
             }
@@ -223,43 +307,40 @@ impl TuiState {
                     .decode(bytes.as_bytes())
                     .ok()
                     .and_then(|b| String::from_utf8(b).ok());
-                if let Some(text) = decoded {
-                    let buf = self
-                        .logs
-                        .entry(service.clone())
-                        .or_insert_with(|| VecDeque::with_capacity(TUI_LOG_CAP.min(64)));
-                    let len_before = buf.len();
-                    // LogChunk payloads are single lines from the PTY reader,
-                    // but split defensively in case that ever changes.
-                    let mut pushed = 0usize;
-                    for line in text.split('\n') {
-                        let line = line.trim_end_matches('\r');
-                        if line.is_empty() {
-                            continue;
-                        }
-                        if buf.len() == TUI_LOG_CAP {
-                            buf.pop_front();
-                        }
-                        buf.push_back(line.to_string());
-                        pushed += 1;
+                let Some(text) = decoded else {
+                    return;
+                };
+                let Some(inst) = self.current_instance_mut() else {
+                    return;
+                };
+                let buf = inst
+                    .logs
+                    .entry(service.clone())
+                    .or_insert_with(|| VecDeque::with_capacity(TUI_LOG_CAP.min(64)));
+                let len_before = buf.len();
+                let mut pushed = 0usize;
+                for line in text.split('\n') {
+                    let line = line.trim_end_matches('\r');
+                    if line.is_empty() {
+                        continue;
                     }
-                    let len_after = buf.len();
-                    // Stable viewport while scrolled off-tail: when the user
-                    // has scrolled up (offset > 0), bump the offset by the
-                    // net growth of the buffer so `end = len - offset` keeps
-                    // pointing at the same lines. When the buffer is at cap
-                    // (eviction == push count) net growth is 0 — the window
-                    // slowly drifts in absolute terms, but that's unavoidable
-                    // without monotonic line IDs, and the user will hit `G`
-                    // long before drifting matters.
-                    let net_growth = len_after.saturating_sub(len_before);
-                    if pushed > 0
-                        && net_growth > 0
-                        && let Some(off) = self.log_scroll.get_mut(&service)
-                        && *off > 0
-                    {
-                        *off = off.saturating_add(net_growth).min(len_after);
+                    if buf.len() == TUI_LOG_CAP {
+                        buf.pop_front();
                     }
+                    buf.push_back(line.to_string());
+                    pushed += 1;
+                }
+                let len_after = buf.len();
+                // Stable viewport while paused: bump scroll offset by net
+                // growth so the visible window keeps pointing at the same
+                // absolute lines. See render_log_viewport for the geometry.
+                let net_growth = len_after.saturating_sub(len_before);
+                if pushed > 0
+                    && net_growth > 0
+                    && let Some(off) = inst.log_scroll.get_mut(&service)
+                    && *off > 0
+                {
+                    *off = off.saturating_add(net_growth).min(len_after);
                 }
             }
             // Notice, Error, Goodbye don't yet move the model.
@@ -269,25 +350,31 @@ impl TuiState {
 
     /// Horizontal navigation across service tabs (`h`/`l` / `←`/`→`).
     pub fn select_next_service(&mut self) {
-        if self.services.is_empty() {
+        let Some(inst) = self.current_instance_mut() else {
+            return;
+        };
+        if inst.services.is_empty() {
             return;
         }
-        let next = match self.selected_service {
-            Some(i) => (i + 1) % self.services.len(),
+        let next = match inst.selected_service {
+            Some(i) => (i + 1) % inst.services.len(),
             None => 0,
         };
-        self.selected_service = Some(next);
+        inst.selected_service = Some(next);
     }
 
     pub fn select_prev_service(&mut self) {
-        if self.services.is_empty() {
+        let Some(inst) = self.current_instance_mut() else {
+            return;
+        };
+        if inst.services.is_empty() {
             return;
         }
-        let prev = match self.selected_service {
-            Some(0) | None => self.services.len() - 1,
+        let prev = match inst.selected_service {
+            Some(0) | None => inst.services.len() - 1,
             Some(i) => i - 1,
         };
-        self.selected_service = Some(prev);
+        inst.selected_service = Some(prev);
     }
 
     /// Vertical navigation through the sidebar's instance list
@@ -599,15 +686,45 @@ mod tests {
 
     #[test]
     fn service_and_instance_navigation_are_independent() {
+        // Multi-instance semantics: each instance carries its own
+        // services + selected_service. Switching between instances must
+        // not reset the per-instance service selection.
         let mut s = TuiState::default();
-        s.add_instance("repo-a");
-        s.add_instance("repo-b");
-        s.apply(snapshot_msg(&["api", "db"]));
+
+        let info_a = InstanceInfo {
+            id: "a".into(),
+            label: "repo-a".into(),
+            cwd: "/a".into(),
+        };
+        let info_b = InstanceInfo {
+            id: "b".into(),
+            label: "repo-b".into(),
+            cwd: "/b".into(),
+        };
+        s.apply(ServerMessage::Subscribed {
+            instance: info_a,
+            services: vec![svc("api"), svc("db")],
+            steps: vec![],
+        });
+        s.apply(ServerMessage::Subscribed {
+            instance: info_b,
+            services: vec![svc("api"), svc("db")],
+            steps: vec![],
+        });
+
+        // Both instances exist; we're still on the first (repo-a).
+        assert_eq!(s.instance_label(), "repo-a");
         s.select_next_service();
         assert_eq!(s.selected_service().unwrap().name, "db");
-        assert_eq!(s.instance_label(), "repo-a");
+
+        // Switch to repo-b — its own selected_service starts at index 0.
         s.select_next_instance();
         assert_eq!(s.instance_label(), "repo-b");
+        assert_eq!(s.selected_service().unwrap().name, "api");
+
+        // Switch back — repo-a's selection survived.
+        s.select_prev_instance();
+        assert_eq!(s.instance_label(), "repo-a");
         assert_eq!(s.selected_service().unwrap().name, "db");
     }
 

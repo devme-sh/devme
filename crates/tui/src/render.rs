@@ -255,7 +255,7 @@ fn render_stacks_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             lines.push(Line::from(vec![
                 Span::styled("▸ ", Style::default().fg(Color::Cyan)),
                 Span::styled(
-                    label.clone(),
+                    label.to_string(),
                     Style::default()
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
@@ -264,7 +264,7 @@ fn render_stacks_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         } else {
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(label.clone(), Style::default().fg(Color::Gray)),
+                Span::styled(label.to_string(), Style::default().fg(Color::Gray)),
             ]));
         }
     }
