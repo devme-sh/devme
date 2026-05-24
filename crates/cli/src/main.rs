@@ -272,12 +272,16 @@ async fn launch_tui() -> anyhow::Result<i32> {
 }
 
 fn find_sibling_binary(name: &str) -> anyhow::Result<std::path::PathBuf> {
-    if let Ok(self_exe) = std::env::current_exe()
-        && let Some(parent) = self_exe.parent()
-    {
-        let candidate = parent.join(name);
-        if candidate.exists() {
-            return Ok(candidate);
+    if let Ok(self_exe) = std::env::current_exe() {
+        // Resolve symlinks — when devme is installed via `ln -s` into
+        // ~/.local/bin or similar, current_exe() returns the symlink path
+        // on macOS, and the sibling binaries live next to the *target*.
+        let resolved = std::fs::canonicalize(&self_exe).unwrap_or(self_exe);
+        if let Some(parent) = resolved.parent() {
+            let candidate = parent.join(name);
+            if candidate.exists() {
+                return Ok(candidate);
+            }
         }
     }
     Ok(std::path::PathBuf::from(name))
