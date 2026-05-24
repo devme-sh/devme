@@ -6,6 +6,7 @@
 mod error;
 mod graph;
 mod interpolate;
+pub mod paths;
 mod provision;
 mod service;
 mod stack;

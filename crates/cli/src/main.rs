@@ -33,10 +33,35 @@ async fn run(cli: Cli) -> i32 {
                 1
             }
         },
+        Some(Command::Down) => match down().await {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("devme: {e}");
+                1
+            }
+        },
         Some(_) => {
             eprintln!("devme: subcommand not yet implemented");
             1
         }
+    }
+}
+
+async fn down() -> anyhow::Result<()> {
+    let sock = socket_path();
+    let mut client = match devme_client::Client::connect(&sock).await {
+        Ok(c) => c,
+        Err(_) => {
+            // No daemon running — `down` is a no-op success.
+            return Ok(());
+        }
+    };
+    let reply = client.request(ClientMessage::Shutdown).await?;
+    match reply {
+        ServerMessage::Goodbye { .. } => Ok(()),
+        other => Err(anyhow::anyhow!(
+            "daemon replied with unexpected message: {other:?}"
+        )),
     }
 }
 
@@ -63,10 +88,7 @@ async fn status(as_json: bool) -> anyhow::Result<()> {
 }
 
 fn socket_path() -> std::path::PathBuf {
-    // V1: single fixed location. Per-instance routing comes with the
-    // instance_id work (ADR-0006).
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return std::path::PathBuf::from(dir).join("devme.sock");
-    }
-    std::path::PathBuf::from("/tmp/devme.sock")
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    devme_config::paths::supervisor_socket(&cwd)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/devme.sock"))
 }

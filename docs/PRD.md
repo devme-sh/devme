@@ -17,14 +17,16 @@ A developer who clones a multi-service repo today still needs to read a README, 
 
 ## Solution
 
-A single CLI + TUI tool, **devme** (working name), that:
+A single CLI + TUI tool, **devme**, that replaces the project README as the canonical way to set up and run a dev environment:
 
+- **The executable README.** `devme.toml` is the single source of truth for prerequisites, services, ports, and setup steps. The traditional README is derived from it — generated deterministically via templates — not the other way around. Running `devme` *is* reading the README.
 - Detects what a repo needs and walks the user from missing prerequisites to a running stack with one command (`devme`).
-- Treats every git worktree as a first-class **Stack instance** with stable port allocations so multiple worktrees coexist.
+- Treats every git worktree as a first-class **Stack instance** with stable port allocations so multiple worktrees coexist. The supervisor auto-detects worktree creation and removal — no wrapper commands needed, just `git worktree add`.
 - Exposes a JSON-everywhere CLI surface designed to be driven by AI coding agents as well as humans.
 - Ships a lazygit-quality TUI with a fixed three-pane layout (instances sidebar, per-service tabs, live log viewport) and a Catppuccin-aligned default theme.
 - Handles shared infrastructure (`repo`-scoped services like a cloud-sql-proxy) via a per-repo coordinator daemon, with crash-isolated lifecycles per worktree.
 - Provides a first-run wizard that feels like fly.io's `fly launch`: detect → one big question → review-before-commit → drop into the working TUI as the success state.
+- **Configuration-driven.** Features like worktree port injection, README generation, and custom health checks are built-in capabilities enabled per-project in `devme.toml`. Lifecycle hooks (`on_worktree_create`, `pre_setup`, `post_up`, etc.) are the escape hatch for project-specific logic.
 
 The result: typing `devme` in any configured repo gets the developer from zero to a running, supervised stack with no README required.
 
@@ -40,6 +42,19 @@ The result: typing `devme` in any configured repo gets the developer from zero t
 6. As a developer, I want services to be cleanly killed when I close the TUI in foreground mode, so that I don't accumulate orphan processes.
 7. As a developer, I want a detached mode (`devme up`) where services survive me closing the TUI, so that I can leave my dev stack running in the background.
 8. As a developer, I want to reattach to a running detached stack from any terminal (`devme attach`), so that I can come and go without losing state.
+
+### Worktree auto-detection
+
+9. As a developer, I want the supervisor to automatically detect when I `git worktree add` or `git worktree remove`, so that I keep using git normally without wrapper commands.
+10. As a developer, I want new worktrees to get a port range allocated on detection, so that `devme up` in the new worktree just works with no port conflicts.
+11. As a developer, I want `on_worktree_create` and `on_worktree_remove` hooks in `devme.toml`, so that project-specific setup (`.env` rewriting, database cloning, symlink creation) runs automatically when a worktree appears or disappears.
+12. As a developer, I want `devme worktree list` to show active worktrees with their allocated port ranges and running status, so that I can see the full picture.
+
+### README generation
+
+13. As a config author, I want `devme readme` to generate a Markdown README from `devme.toml` using templates, so that the README is always in sync with the actual setup.
+14. As a config author, I want the generated README to include install commands, service descriptions, port mappings, and startup instructions derived from the config, so that I never manually maintain setup docs.
+15. As a CI maintainer, I want to assert that the README matches `devme readme --check`, so that stale docs fail the build.
 
 ### Setup, prerequisites, and consent
 
@@ -186,6 +201,26 @@ The result: typing `devme` in any configured repo gets the developer from zero t
 - **First instance daemon needing a `repo`-scoped service** → spawn `shared-supervisor` (per-repo). Subsequent instances attach as clients of the shared daemon. Last instance disconnects → shared daemon shuts down.
 - **Hard kill of any daemon** → other daemons detect dropped sockets; one elects itself (lowest slot) and respawns the shared daemon if needed.
 
+### Worktree auto-detection
+
+- The shared supervisor watches `.git/worktrees/` (via filesystem events or periodic poll) to detect worktree creation and removal without requiring wrapper commands.
+- **New worktree detected** → allocate port range from the slot registry → run `on_worktree_create` hook if configured → worktree is ready for `devme up`.
+- **Worktree removed** → run `on_worktree_remove` hook if configured → release port range → clean up instance state.
+- **`devme worktree list`** — read-only command showing active worktrees, their port ranges, and running status. The only worktree-related CLI surface.
+
+### Lifecycle hooks
+
+- Hooks are shell commands declared in `devme.toml` that run at specific lifecycle points. They are the extensibility escape hatch — if enough projects implement the same hook, the behavior gets promoted to a first-class config option.
+- Available hooks: `on_worktree_create`, `on_worktree_remove`, `pre_setup`, `post_setup`, `pre_up`, `post_up`, `pre_down`, `post_down`, `on_health_fail`.
+- Hooks receive context via environment variables (`DEVME_WORKTREE_PATH`, `DEVME_PORT_BASE`, `DEVME_INSTANCE_ID`, etc.).
+- Hook failure is non-fatal by default; `hook_fail = "abort"` makes it fatal.
+
+### README generation
+
+- `devme readme` renders a Markdown README from `devme.toml` + optional template files in `.devme/templates/`.
+- Default template produces: project description, prerequisites list with install commands, services table with ports, startup instructions (`devme` one-liner), and environment variable reference.
+- `devme readme --check` exits non-zero if the current README diverges from what the config would generate — designed for CI.
+
 ### Failure model (ADR-0005)
 
 - **Failed `check`** → failure overlay with four actions: `Enter` (install), `r` (retry), `s` (skip-once), `i` (mark-installed → persisted Override).
@@ -276,7 +311,7 @@ The Rust ecosystem has well-trodden patterns for each test category:
 - **Native Windows support.** WSL is the v1 path; tokio + ratatui work on Windows but the supervisor model (PTYs, Unix sockets) needs nontrivial work to be cross-platform.
 - **Web-based onboarding fallback.** The terminal wizard covers the v1 surface; a web fallback (à la `fly launch`) is a v1.1 candidate if the form grows.
 - **Mandatory telemetry.** Off by default; deferred consent after 7 days.
-- **Plugin system / extensibility beyond wizard scripts.** The wizard protocol is the extension point.
+
 - **AUR, nixpkgs, apt, yum packaging.** Community-maintained if they appear; not officially shipped.
 
 ## Further Notes
