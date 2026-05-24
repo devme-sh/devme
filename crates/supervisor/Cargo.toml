@@ -3,6 +3,12 @@ name = "devstack-supervisor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "devstack_supervisor"
+path = "src/lib.rs"
 
 [[bin]]
 name = "devstack-supervisor"
@@ -11,11 +17,15 @@ path = "src/main.rs"
 [dependencies]
 devstack-core = { workspace = true }
 devstack-config = { workspace = true }
+devstack-executor = { workspace = true }
+devstack-ipc = { workspace = true }
+devstack-slot-allocator = { workspace = true }
 tokio = { workspace = true }
 portable-pty = { workspace = true }
 process_alive = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
