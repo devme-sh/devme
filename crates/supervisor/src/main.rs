@@ -5,6 +5,7 @@
 //! See `docs/adr/0003-daemon-per-instance-lifecycle.md`.
 
 use devme_config::Stack;
+use devme_slot_allocator::SlotAllocator;
 use devme_supervisor::daemon::DaemonServer;
 
 fn main() {
@@ -32,17 +33,37 @@ fn real_main() -> anyhow::Result<()> {
     })?;
 
     let sock_path = devme_config::paths::supervisor_socket(&cwd)?;
-    eprintln!("devme-supervisor: listening on {}", sock_path.display());
+    let instance_id = devme_config::paths::instance_id(&cwd);
+
+    // Claim our port slot before binding so the IPC handshake never sees a
+    // partially-configured daemon. Held for the daemon's lifetime; released
+    // on Drop via the explicit `release` call below.
+    let registry = devme_config::paths::slot_registry()?;
+    let allocator = SlotAllocator::open(&registry);
+    let slot = allocator
+        .claim(&instance_id)
+        .map_err(|e| anyhow::anyhow!("claiming port slot: {e}"))?;
+
+    eprintln!(
+        "devme-supervisor: slot {slot} • listening on {}",
+        sock_path.display()
+    );
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async move {
+    let result = runtime.block_on(async move {
         // bind must run inside the tokio runtime — UnixListener registers
         // with the reactor at creation time.
-        let server = DaemonServer::bind_with_stack(&sock_path, stack)?;
+        let server = DaemonServer::bind_with_stack_and_slot(&sock_path, stack, slot)?;
         server.serve().await
-    })?;
+    });
+
+    // Release the slot whether the loop exited cleanly or errored out, so a
+    // crashed daemon doesn't hog a slot that the next process needs.
+    let _ = allocator.release(&instance_id);
+
+    result?;
     Ok(())
 }
 

@@ -24,6 +24,12 @@ pub fn instance_id(cwd: &Path) -> String {
     format!("{:016x}", h.finish())
 }
 
+/// Shared slot-allocator registry path. One file per host coordinates
+/// port-slot assignments across every devme daemon on the machine.
+pub fn slot_registry() -> std::io::Result<PathBuf> {
+    Ok(runtime_dir()?.join("slots.json"))
+}
+
 /// `~/.local/share/devme/` or platform equivalent, created if missing.
 fn runtime_dir() -> std::io::Result<PathBuf> {
     let dir = if let Some(d) = std::env::var_os("XDG_RUNTIME_DIR") {

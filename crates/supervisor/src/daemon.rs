@@ -14,10 +14,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use base64::Engine;
-use devme_config::{Graph, Stack};
+use devme_config::{Graph, InterpContext, Stack, interpolate};
 use devme_core::{
-    ClientMessage, Envelope, ErrorCode, NoticeLevel, RestartPolicy, ServerMessage,
-    ServiceSnapshot, ServiceState, StepSnapshot, StepState,
+    ClientMessage, Envelope, ErrorCode, HealthCheck, NoticeLevel, RestartPolicy, ServerMessage,
+    ServiceSnapshot, ServiceState, Slot, StepSnapshot, StepState,
 };
 use devme_executor::{Action, Event as ExecEvent, Executor, NodeStatus};
 use devme_ipc::FrameCodec;
@@ -131,6 +131,9 @@ impl RingBuffer {
 struct DaemonState {
     stack: Arc<Stack>,
     executor: Executor,
+    /// Slot assigned by the cross-worktree allocator. Drives the `{slot}`
+    /// and `{port}` interpolation for every service.
+    slot: Slot,
     children: HashMap<String, ChildRecord>,
     logs: HashMap<String, RingBuffer>,
     clients: HashMap<ClientId, ClientTx>,
@@ -152,11 +155,12 @@ struct DaemonState {
 }
 
 impl DaemonState {
-    fn new(stack: Arc<Stack>) -> Self {
+    fn new(stack: Arc<Stack>, slot: Slot) -> Self {
         let graph = Graph::from_stack(&stack);
         Self {
             stack,
             executor: Executor::new(graph),
+            slot,
             children: HashMap::new(),
             logs: HashMap::new(),
             clients: HashMap::new(),
@@ -247,22 +251,37 @@ pub struct DaemonServer {
     listener: UnixListener,
     path: PathBuf,
     stack: Arc<Stack>,
+    slot: Slot,
 }
 
 impl DaemonServer {
-    /// Bind with an empty stack — useful only for handshake-shape tests.
+    /// Bind with an empty stack and slot 0. Useful for handshake-shape tests
+    /// that don't need real port allocation.
     pub fn bind(path: &Path) -> std::io::Result<Self> {
         Self::bind_with_stack(path, Stack::parse("schema_version = 1\n").unwrap())
     }
 
-    /// Bind a Unix socket and prepare to serve `stack`.
+    /// Bind a Unix socket and prepare to serve `stack`. Uses slot 0 — for
+    /// real multi-instance behaviour the supervisor's `main` chooses a slot
+    /// via the cross-worktree allocator.
     pub fn bind_with_stack(path: &Path, stack: Stack) -> std::io::Result<Self> {
+        Self::bind_with_stack_and_slot(path, stack, Slot::ZERO)
+    }
+
+    /// Bind a Unix socket and prepare to serve `stack` at the given `slot`.
+    /// `slot` drives `{port}` and `{slot}` interpolation across services.
+    pub fn bind_with_stack_and_slot(
+        path: &Path,
+        stack: Stack,
+        slot: Slot,
+    ) -> std::io::Result<Self> {
         let _ = std::fs::remove_file(path);
         let listener = UnixListener::bind(path)?;
         Ok(Self {
             listener,
             path: path.to_path_buf(),
             stack: Arc::new(stack),
+            slot,
         })
     }
 
@@ -271,11 +290,11 @@ impl DaemonServer {
     pub async fn serve(self) -> std::io::Result<()> {
         let (internal_tx, internal_rx) = mpsc::unbounded_channel::<InternalEvent>();
         let accept_tx = internal_tx.clone();
-        let DaemonServer { listener, path, stack } = self;
+        let DaemonServer { listener, path, stack, slot } = self;
 
         tokio::spawn(accept_loop(listener, accept_tx));
 
-        let result = run_event_loop(internal_tx, internal_rx, stack).await;
+        let result = run_event_loop(internal_tx, internal_rx, stack, slot).await;
         // Best-effort socket cleanup. The next bind() also removes a stale
         // file, so a daemon crash leaves no permanent debris.
         let _ = std::fs::remove_file(&path);
@@ -375,8 +394,9 @@ async fn run_event_loop(
     internal_tx: mpsc::UnboundedSender<InternalEvent>,
     mut internal_rx: mpsc::UnboundedReceiver<InternalEvent>,
     stack: Arc<Stack>,
+    slot: Slot,
 ) -> std::io::Result<()> {
-    let mut state = DaemonState::new(stack);
+    let mut state = DaemonState::new(stack, slot);
 
     while let Some(event) = internal_rx.recv().await {
         process_event(&mut state, event, &internal_tx);
@@ -753,15 +773,38 @@ fn enact_actions(
                 };
                 let generation = state.alloc_generation();
                 let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+
+                // Resolve the service's port (if it declared one), then build
+                // an interpolation context with {slot} and {port} so cmd /
+                // env / health all see the same numbers.
+                let port = svc.port.map(|spec| spec.resolve(state.slot.as_u8()));
+                let ctx = interp_ctx(state.slot, port);
+
+                let cmd = match interpolate(&svc.cmd, &ctx) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        state.broadcast(
+                            None,
+                            ServerMessage::Notice {
+                                level: NoticeLevel::Error,
+                                message: format!("service {name}: cmd interpolation: {e}"),
+                            },
+                        );
+                        continue;
+                    }
+                };
                 let env: Vec<(String, String)> = svc
                     .env
                     .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .map(|(k, v)| {
+                        let v_resolved = interpolate(v, &ctx).unwrap_or_else(|_| v.clone());
+                        (k.clone(), v_resolved)
+                    })
                     .collect();
                 let env_slice: Vec<(&str, &str)> =
                     env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
-                let parts = match ChildProcess::spawn_parts::<&str>(&svc.cmd, &cwd, &env_slice) {
+                let parts = match ChildProcess::spawn_parts::<&str>(&cmd, &cwd, &env_slice) {
                     Ok(p) => p,
                     Err(e) => {
                         state.broadcast(
@@ -781,7 +824,7 @@ fn enact_actions(
                     ChildRecord {
                         generation,
                         pid: parts.pid,
-                        port: None,
+                        port,
                         restart_count,
                         killer: parts.killer,
                     },
@@ -792,7 +835,7 @@ fn enact_actions(
                         service: name.clone(),
                         state: ServiceState::Starting,
                         pid: Some(parts.pid),
-                        port: None,
+                        port,
                         restart_count,
                     },
                 );
@@ -832,6 +875,7 @@ fn enact_actions(
                 // poll it until it passes. Otherwise fall back to a short
                 // grace timer.
                 if let Some(check) = svc.health.clone() {
+                    let check = interpolate_health(&check, &ctx);
                     let probe_tx = tx.clone();
                     let probe_name = name.clone();
                     tokio::spawn(async move {
@@ -878,6 +922,8 @@ fn enact_actions(
                     .get(&name)
                     .map(|s| s.check.clone());
                 let Some(cmd) = cmd else { continue };
+                let ctx = interp_ctx(state.slot, None);
+                let cmd = interpolate(&cmd, &ctx).unwrap_or(cmd);
                 let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
                 let check_tx = tx.clone();
                 let step_name = name.clone();
@@ -896,8 +942,9 @@ fn enact_actions(
                     .get(&name)
                     .and_then(|s| s.provision.clone());
                 let Some(provision) = provision else { continue };
+                let ctx = interp_ctx(state.slot, None);
                 let cmd = match provision {
-                    devme_config::Provision::Shell(c) => c,
+                    devme_config::Provision::Shell(c) => interpolate(&c, &ctx).unwrap_or(c),
                     devme_config::Provision::Wizard { wizard } => {
                         state.broadcast(
                             None,
@@ -933,6 +980,30 @@ fn enact_actions(
 
 fn encode_line(line: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(line.as_bytes())
+}
+
+/// Build the interpolation context for a service spawn. `{slot}` is always
+/// available; `{port}` is set only if the service declared a port spec.
+fn interp_ctx(slot: Slot, port: Option<u16>) -> InterpContext {
+    let mut ctx = InterpContext::new().set("slot", slot.to_string());
+    if let Some(p) = port {
+        ctx.insert("port", p.to_string());
+    }
+    ctx
+}
+
+/// Interpolate `{port}` / `{slot}` inside a health-check target. Falls back
+/// to the original string if interpolation errors out (rather than failing
+/// the spawn) — the probe will just be slightly wrong and report unhealthy.
+fn interpolate_health(check: &HealthCheck, ctx: &InterpContext) -> HealthCheck {
+    let resolve = |s: &str| interpolate(s, ctx).unwrap_or_else(|_| s.to_string());
+    match check {
+        HealthCheck::Tcp { tcp } => HealthCheck::Tcp { tcp: resolve(tcp) },
+        HealthCheck::Http { http } => HealthCheck::Http { http: resolve(http) },
+        HealthCheck::Shell { shell } => HealthCheck::Shell {
+            shell: resolve(shell),
+        },
+    }
 }
 
 /// Run `cmd` under `sh -c`, discarding output. Returns true on exit code 0.
@@ -1228,6 +1299,80 @@ cmd = "sleep 30"
             }
         }
         assert!(saw_stopped, "expected Stopped after Stop");
+
+        send_msg(&mut conn, ClientMessage::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn service_port_is_interpolated_into_cmd_and_reported() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("d.sock");
+        let marker = dir.path().join("port-seen");
+        let marker_path = marker.to_string_lossy().to_string();
+        // Service echoes its port into a file, then sleeps; we read the
+        // file back to verify {port} was substituted before spawn.
+        let cmd = format!("echo {{port}} > {marker_path}; sleep 30");
+        let toml = format!(
+            r#"
+schema_version = 1
+
+[service.app]
+cmd = "{cmd}"
+port = {{ base = 9000, slot_offset = 10 }}
+"#,
+        );
+
+        let stack = make_stack(&toml);
+        // Slot 3 → 9000 + 3*10 = 9030.
+        let server = DaemonServer::bind_with_stack_and_slot(
+            &sock,
+            stack,
+            devme_core::Slot::new(3).unwrap(),
+        )
+        .unwrap();
+        let task = tokio::spawn(server.serve());
+
+        let mut conn = connect(&sock).await;
+        send_msg(&mut conn, ClientMessage::Subscribe { services: vec![] }).await;
+        let _ = recv_msg(&mut conn).await;
+        send_msg(
+            &mut conn,
+            ClientMessage::Start {
+                service: String::new(),
+                skip_deps: false,
+            },
+        )
+        .await;
+
+        // Wait for the marker file to exist and contain the resolved port.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut got: Option<String> = None;
+        while std::time::Instant::now() < deadline && got.is_none() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Ok(s) = std::fs::read_to_string(&marker) {
+                got = Some(s.trim().to_string());
+            }
+        }
+        assert_eq!(got.as_deref(), Some("9030"), "expected port 9030 in marker");
+
+        // The Running StatusUpdate should also carry the resolved port.
+        let mut saw_port_in_status = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline && !saw_port_in_status {
+            match tokio::time::timeout(Duration::from_millis(500), recv_msg(&mut conn)).await {
+                Ok(ServerMessage::StatusUpdate {
+                    service,
+                    port: Some(p),
+                    state: ServiceState::Running { .. },
+                    ..
+                }) if service == "app" && p == 9030 => {
+                    saw_port_in_status = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_port_in_status, "Running status didn't carry port 9030");
 
         send_msg(&mut conn, ClientMessage::Shutdown).await;
         let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
