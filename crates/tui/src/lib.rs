@@ -5,4 +5,5 @@
 //! events from the terminal, and produces the snapshot the renderer
 //! consumes.
 
+pub mod render;
 pub mod state;

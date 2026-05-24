@@ -20,6 +20,7 @@ pub struct TuiState {
     steps: Vec<StepSnapshot>,
     selected_service: Option<usize>,
     focus: Focus,
+    instance_label: String,
 }
 
 impl Default for TuiState {
@@ -29,6 +30,7 @@ impl Default for TuiState {
             steps: Vec::new(),
             selected_service: None,
             focus: Focus::Tabs,
+            instance_label: String::new(),
         }
     }
 }
@@ -44,6 +46,16 @@ impl TuiState {
 
     pub fn focus(&self) -> Focus {
         self.focus
+    }
+
+    /// Human-friendly label for this instance — e.g. the repo basename.
+    /// Surfaced in the sidebar.
+    pub fn instance_label(&self) -> &str {
+        &self.instance_label
+    }
+
+    pub fn set_instance_label(&mut self, label: impl Into<String>) {
+        self.instance_label = label.into();
     }
 
     /// The currently-focused service, if any.
