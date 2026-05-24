@@ -108,7 +108,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             resp,
-            ServerMessage::Subscribed { ref services, ref steps } if services.is_empty() && steps.is_empty()
+            ServerMessage::Subscribed { ref services, ref steps, .. } if services.is_empty() && steps.is_empty()
         ));
 
         let _ = client.send(ClientMessage::Shutdown).await;

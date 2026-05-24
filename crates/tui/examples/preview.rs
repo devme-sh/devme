@@ -18,6 +18,11 @@ fn main() {
     state.add_instance("internal-portal");
     state.add_instance("ingest-worker");
     state.apply(ServerMessage::Subscribed {
+        instance: devme_core::InstanceInfo {
+            id: "preview".into(),
+            label: "preview".into(),
+            cwd: "/tmp/preview".into(),
+        },
         services: vec![
             ServiceSnapshot {
                 name: "db".into(),

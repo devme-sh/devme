@@ -62,6 +62,23 @@ pub enum ClientMessage {
     Shutdown,
 }
 
+/// Identity of the daemon a client is connected to. Carried in `Subscribed`
+/// so the TUI can label tabs and route per-instance actions without having
+/// to hash the socket path itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstanceInfo {
+    /// Stable hash of the worktree path. Matches
+    /// [`devme_config::paths::instance_id`].
+    pub id: String,
+    /// Human-friendly label — typically the basename of the worktree.
+    pub label: String,
+    /// Absolute cwd the daemon was started in. Useful for the TUI to show
+    /// a tooltip / detail row and for clients to disambiguate identical
+    /// labels (e.g. two worktrees of a repo named "api").
+    pub cwd: String,
+}
+
 /// Messages sent from a Daemon to a Client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -70,6 +87,7 @@ pub enum ServerMessage {
     /// snapshot of service states so the client can render without first
     /// asking for status.
     Subscribed {
+        instance: InstanceInfo,
         services: Vec<ServiceSnapshot>,
         steps: Vec<StepSnapshot>,
     },
@@ -234,9 +252,19 @@ mod tests {
 
     #[test]
     fn server_message_round_trips_every_variant() {
+        let test_instance = InstanceInfo {
+            id: "abc".into(),
+            label: "demo".into(),
+            cwd: "/tmp/demo".into(),
+        };
         let cases = vec![
-            ServerMessage::Subscribed { services: vec![], steps: vec![] },
             ServerMessage::Subscribed {
+                instance: test_instance.clone(),
+                services: vec![],
+                steps: vec![],
+            },
+            ServerMessage::Subscribed {
+                instance: test_instance.clone(),
                 services: vec![ServiceSnapshot {
                     name: "backend".into(),
                     state: ServiceState::Running { degraded: false, started_without: vec![] },

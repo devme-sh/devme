@@ -440,10 +440,26 @@ fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         return;
     }
 
-    // Carve a 1-column gutter on the right edge for the scrollbar so the
-    // log text doesn't overlap it. If the pane is too narrow (< 3 cols)
-    // we skip the scrollbar entirely.
-    let (text_area, sb_area) = if area.width >= 3 {
+    // Horizontal layout of the log pane:
+    //   1 col left padding   • text breathes from the sidebar border
+    //   N cols log text
+    //   1 col right padding  • text breathes from the scrollbar
+    //   1 col scrollbar gutter
+    // The padding makes log lines easier to read at a glance; without it
+    // characters kissed the border on both sides.
+    let (text_area, sb_area) = if area.width >= 5 {
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        (split[1], Some(split[3]))
+    } else if area.width >= 3 {
+        // Narrow fallback: no padding, just text + scrollbar.
         let split = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -634,7 +650,15 @@ fn state_label(state: &ServiceState) -> &'static str {
 mod tests {
     use super::*;
     use base64::Engine;
-    use devme_core::{ServerMessage, ServiceSnapshot, ServiceState, StepSnapshot};
+    use devme_core::{InstanceInfo, ServerMessage, ServiceSnapshot, ServiceState, StepSnapshot};
+
+    fn test_instance() -> InstanceInfo {
+        InstanceInfo {
+            id: "test-id".into(),
+            label: "test".into(),
+            cwd: "/tmp/test".into(),
+        }
+    }
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -670,6 +694,7 @@ mod tests {
     fn tabs_row_has_visual_separators_between_services() {
         let mut state = TuiState::default();
         state.apply(ServerMessage::Subscribed {
+            instance: test_instance(),
             services: vec![
                 svc("a", ServiceState::Stopped),
                 svc("b", ServiceState::Stopped),
@@ -687,6 +712,7 @@ mod tests {
     fn tabs_row_shows_every_service_name() {
         let mut state = TuiState::default();
         state.apply(ServerMessage::Subscribed {
+            instance: test_instance(),
             services: vec![
                 svc("db", ServiceState::Stopped),
                 svc("backend", ServiceState::Stopped),
@@ -712,6 +738,7 @@ mod tests {
     fn steps_render_in_sidebar_with_status_glyphs() {
         let mut state = TuiState::default();
         state.apply(ServerMessage::Subscribed {
+            instance: test_instance(),
             services: vec![],
             steps: vec![
                 StepSnapshot {
@@ -751,6 +778,7 @@ mod tests {
     fn footer_shows_health_summary_glyphs() {
         let mut state = TuiState::default();
         state.apply(ServerMessage::Subscribed {
+            instance: test_instance(),
             services: vec![
                 svc("a", ServiceState::Running { degraded: false, started_without: vec![] }),
                 svc("b", ServiceState::Running { degraded: false, started_without: vec![] }),
@@ -783,6 +811,7 @@ mod tests {
     fn selected_service_meta_shows_state_and_pid_and_port() {
         let mut state = TuiState::default();
         state.apply(ServerMessage::Subscribed {
+            instance: test_instance(),
             services: vec![ServiceSnapshot {
                 name: "db".into(),
                 state: ServiceState::Running {
@@ -806,6 +835,7 @@ mod tests {
     fn log_lines_appear_in_viewport_for_selected_service() {
         let mut state = TuiState::default();
         state.apply(ServerMessage::Subscribed {
+            instance: test_instance(),
             services: vec![svc("api", ServiceState::Stopped)],
             steps: vec![],
         });
@@ -830,6 +860,7 @@ mod tests {
     fn header_shows_running_count() {
         let mut state = TuiState::default();
         state.apply(ServerMessage::Subscribed {
+            instance: test_instance(),
             services: vec![
                 svc(
                     "db",
@@ -850,6 +881,7 @@ mod tests {
     fn paused_indicator_shows_when_scrolled_off_tail() {
         let mut state = TuiState::default();
         state.apply(ServerMessage::Subscribed {
+            instance: test_instance(),
             services: vec![svc("api", ServiceState::Running { degraded: false, started_without: vec![] })],
             steps: vec![],
         });
@@ -876,6 +908,7 @@ mod tests {
     fn header_shows_failed_count_when_nonzero() {
         let mut state = TuiState::default();
         state.apply(ServerMessage::Subscribed {
+            instance: test_instance(),
             services: vec![
                 svc("boom", ServiceState::Failed { exit_code: Some(7) }),
                 svc("tick", ServiceState::Running { degraded: false, started_without: vec![] }),

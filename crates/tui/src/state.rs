@@ -198,7 +198,12 @@ impl TuiState {
     /// Absorb a [`ServerMessage`] coming off the IPC stream.
     pub fn apply(&mut self, msg: ServerMessage) {
         match msg {
-            ServerMessage::Subscribed { services, steps } => {
+            ServerMessage::Subscribed { services, steps, instance: _ } => {
+                // The `instance` field is on the wire so the TUI can route
+                // per-daemon state once multi-stack lands (task #21). For
+                // now we accept it but leave the sidebar's instance list
+                // alone — the runtime caller still drives that explicitly
+                // via set_instance_label so user-set labels survive.
                 self.services = services;
                 self.steps = steps;
                 self.selected_service = if self.services.is_empty() { None } else { Some(0) };
@@ -313,7 +318,15 @@ impl TuiState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use devme_core::{ServiceState, StepState};
+    use devme_core::{InstanceInfo, ServiceState, StepState};
+
+    fn test_instance() -> InstanceInfo {
+        InstanceInfo {
+            id: "test-id".into(),
+            label: "test".into(),
+            cwd: "/tmp/test".into(),
+        }
+    }
 
     fn svc(name: &str) -> ServiceSnapshot {
         ServiceSnapshot {
@@ -327,6 +340,7 @@ mod tests {
 
     fn snapshot_msg(names: &[&str]) -> ServerMessage {
         ServerMessage::Subscribed {
+            instance: test_instance(),
             services: names.iter().map(|n| svc(n)).collect(),
             steps: vec![],
         }
@@ -398,6 +412,7 @@ mod tests {
     fn step_status_update_replaces_step_state() {
         let mut s = TuiState::default();
         s.apply(ServerMessage::Subscribed {
+            instance: test_instance(),
             services: vec![],
             steps: vec![StepSnapshot {
                 name: "tools".into(),

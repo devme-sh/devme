@@ -16,8 +16,8 @@ use std::time::{Duration, Instant, SystemTime};
 use base64::Engine;
 use devme_config::{Graph, InterpContext, Stack, interpolate};
 use devme_core::{
-    ClientMessage, Envelope, ErrorCode, HealthCheck, NoticeLevel, RestartPolicy, ServerMessage,
-    ServiceSnapshot, ServiceState, Slot, StepSnapshot, StepState,
+    ClientMessage, Envelope, ErrorCode, HealthCheck, InstanceInfo, NoticeLevel, RestartPolicy,
+    ServerMessage, ServiceSnapshot, ServiceState, Slot, StepSnapshot, StepState,
 };
 use devme_executor::{Action, Event as ExecEvent, Executor, NodeStatus};
 use devme_ipc::FrameCodec;
@@ -144,6 +144,9 @@ impl RingBuffer {
 struct DaemonState {
     stack: Arc<Stack>,
     executor: Executor,
+    /// Identity the daemon advertises to every Subscriber — instance id,
+    /// label, cwd. Lets multi-instance TUIs tab between worktrees.
+    instance: InstanceInfo,
     /// Slot assigned by the cross-worktree allocator. Drives the `{slot}`
     /// and `{port}` interpolation for every service.
     slot: Slot,
@@ -175,11 +178,12 @@ struct DaemonState {
 }
 
 impl DaemonState {
-    fn new(stack: Arc<Stack>, slot: Slot) -> Self {
+    fn new(stack: Arc<Stack>, slot: Slot, instance: InstanceInfo) -> Self {
         let graph = Graph::from_stack(&stack);
         Self {
             stack,
             executor: Executor::new(graph),
+            instance,
             slot,
             children: HashMap::new(),
             logs: HashMap::new(),
@@ -274,6 +278,7 @@ pub struct DaemonServer {
     path: PathBuf,
     stack: Arc<Stack>,
     slot: Slot,
+    instance: InstanceInfo,
 }
 
 impl DaemonServer {
@@ -297,6 +302,30 @@ impl DaemonServer {
         stack: Stack,
         slot: Slot,
     ) -> std::io::Result<Self> {
+        // Default identity derived from the socket path's basename. Real
+        // daemons should call [`bind_with_instance`] so the InstanceInfo
+        // matches the worktree, not the socket file.
+        let instance = InstanceInfo {
+            id: path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("anon")
+                .to_string(),
+            label: "(unknown)".to_string(),
+            cwd: ".".to_string(),
+        };
+        Self::bind_with_instance(path, stack, slot, instance)
+    }
+
+    /// Bind a Unix socket with full control over identity. The supervisor
+    /// binary calls this with an InstanceInfo derived from its own cwd so
+    /// connected clients can label the stack in their UI.
+    pub fn bind_with_instance(
+        path: &Path,
+        stack: Stack,
+        slot: Slot,
+        instance: InstanceInfo,
+    ) -> std::io::Result<Self> {
         let _ = std::fs::remove_file(path);
         let listener = UnixListener::bind(path)?;
         Ok(Self {
@@ -304,6 +333,7 @@ impl DaemonServer {
             path: path.to_path_buf(),
             stack: Arc::new(stack),
             slot,
+            instance,
         })
     }
 
@@ -312,11 +342,11 @@ impl DaemonServer {
     pub async fn serve(self) -> std::io::Result<()> {
         let (internal_tx, internal_rx) = mpsc::unbounded_channel::<InternalEvent>();
         let accept_tx = internal_tx.clone();
-        let DaemonServer { listener, path, stack, slot } = self;
+        let DaemonServer { listener, path, stack, slot, instance } = self;
 
         tokio::spawn(accept_loop(listener, accept_tx));
 
-        let result = run_event_loop(internal_tx, internal_rx, stack, slot).await;
+        let result = run_event_loop(internal_tx, internal_rx, stack, slot, instance).await;
         // Best-effort socket cleanup. The next bind() also removes a stale
         // file, so a daemon crash leaves no permanent debris.
         let _ = std::fs::remove_file(&path);
@@ -417,8 +447,9 @@ async fn run_event_loop(
     mut internal_rx: mpsc::UnboundedReceiver<InternalEvent>,
     stack: Arc<Stack>,
     slot: Slot,
+    instance: InstanceInfo,
 ) -> std::io::Result<()> {
-    let mut state = DaemonState::new(stack, slot);
+    let mut state = DaemonState::new(stack, slot, instance);
 
     while let Some(event) = internal_rx.recv().await {
         process_event(&mut state, event, &internal_tx);
@@ -547,6 +578,7 @@ fn handle_client_message(
             let (svcs, steps) = state.snapshot();
             if let Some(client) = state.clients.get(&id) {
                 let _ = client.send(ServerMessage::Subscribed {
+                    instance: state.instance.clone(),
                     services: svcs,
                     steps,
                 });

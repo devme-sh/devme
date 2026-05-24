@@ -5,6 +5,7 @@
 //! See `docs/adr/0003-daemon-per-instance-lifecycle.md`.
 
 use devme_config::Stack;
+use devme_core::InstanceInfo;
 use devme_slot_allocator::SlotAllocator;
 use devme_supervisor::daemon::DaemonServer;
 
@@ -49,13 +50,30 @@ fn real_main() -> anyhow::Result<()> {
         sock_path.display()
     );
 
+    // Identity the daemon advertises over the wire. Label is the worktree
+    // basename so the TUI sidebar reads naturally (`smoke`, `web-app`, …);
+    // cwd is canonicalised so two paths that resolve to the same directory
+    // present the same identity. `id` is the path hash already used for
+    // socket naming.
+    let canonical_cwd = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+    let label = canonical_cwd
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("devme")
+        .to_string();
+    let instance = InstanceInfo {
+        id: instance_id.clone(),
+        label,
+        cwd: canonical_cwd.display().to_string(),
+    };
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let result = runtime.block_on(async move {
         // bind must run inside the tokio runtime — UnixListener registers
         // with the reactor at creation time.
-        let server = DaemonServer::bind_with_stack_and_slot(&sock_path, stack, slot)?;
+        let server = DaemonServer::bind_with_instance(&sock_path, stack, slot, instance)?;
         server.serve().await
     });
 

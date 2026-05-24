@@ -16,7 +16,7 @@ pub mod wizard;
 pub use dep::Dependency;
 pub use health::HealthCheck;
 pub use ipc::{
-    ClientMessage, Envelope, ErrorCode, NoticeLevel, SCHEMA_VERSION, ServerMessage,
+    ClientMessage, Envelope, ErrorCode, InstanceInfo, NoticeLevel, SCHEMA_VERSION, ServerMessage,
     ServiceSnapshot, StepSnapshot,
 };
 pub use port::PortSpec;

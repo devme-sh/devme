@@ -185,7 +185,7 @@ async fn status(as_json: bool) -> anyhow::Result<()> {
         .await?;
 
     match reply {
-        ServerMessage::Subscribed { services, steps } => {
+        ServerMessage::Subscribed { services, steps, .. } => {
             if as_json {
                 println!("{}", format_status_json(&services, &steps));
             } else {
@@ -472,7 +472,7 @@ async fn logs(service: String, follow: bool, tail: usize) -> anyhow::Result<()> 
         })
         .await?;
     let known = match &snap {
-        ServerMessage::Subscribed { services, steps } => {
+        ServerMessage::Subscribed { services, steps, .. } => {
             services.iter().any(|s| s.name == service)
                 || steps.iter().any(|s| s.name == service)
         }
@@ -597,19 +597,49 @@ async fn ensure_daemon(sock: &std::path::Path) -> anyhow::Result<bool> {
     if devme_client::Client::connect(sock).await.is_ok() {
         return Ok(false);
     }
-    let supervisor = find_supervisor_binary()?;
+    // Fail-fast checks that produce a useful error message *before* we
+    // burn 5 seconds waiting for a daemon that's never going to bind.
     let cwd = std::env::current_dir()?;
-    std::process::Command::new(&supervisor)
+    if !cwd.join("devme.toml").exists() {
+        return Err(anyhow::anyhow!(
+            "no devme.toml in {} (run from a directory containing one)",
+            cwd.display()
+        ));
+    }
+
+    let supervisor = find_supervisor_binary()?;
+    // Capture stderr so that if the daemon dies during startup we can show
+    // the user *why* instead of the generic "didn't come up in 5s" timeout.
+    let mut child = std::process::Command::new(&supervisor)
         .current_dir(&cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| anyhow::anyhow!("spawning {}: {e}", supervisor.display()))?;
+
     for _ in 0..50 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         if devme_client::Client::connect(sock).await.is_ok() {
+            // Daemon is up. Detach stderr so it doesn't fill the pipe and
+            // backpressure the daemon's writes; from this point on the
+            // daemon's own logs go to its log file, not our process.
+            drop(child.stderr.take());
             return Ok(true);
+        }
+        // Check whether the supervisor exited (config error, panic, etc.)
+        // before its grace period to surface its stderr immediately.
+        if let Ok(Some(_status)) = child.try_wait() {
+            let mut stderr = String::new();
+            if let Some(mut handle) = child.stderr.take() {
+                use std::io::Read;
+                let _ = handle.read_to_string(&mut stderr);
+            }
+            let stderr = stderr.trim();
+            return Err(anyhow::anyhow!(
+                "supervisor exited during startup\n{}",
+                if stderr.is_empty() { "(no stderr)" } else { stderr }
+            ));
         }
     }
     Err(anyhow::anyhow!(
