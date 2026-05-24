@@ -1,5 +1,5 @@
 [package]
-name = "devstack-slot-allocator"
+name = "devme-slot-allocator"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-devstack-core = { workspace = true }
+devme-core = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }

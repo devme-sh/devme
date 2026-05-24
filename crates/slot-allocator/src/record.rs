@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use devstack_core::Slot;
+use devme_core::Slot;
 
 /// One worktree's claim on a slot. Persisted as a row in `slots.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

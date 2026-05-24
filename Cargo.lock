@@ -330,15 +330,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "devstack"
+name = "devme"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
  "clap_complete",
- "devstack-client",
- "devstack-config",
- "devstack-core",
+ "devme-client",
+ "devme-config",
+ "devme-core",
  "serde",
  "serde_json",
  "tokio",
@@ -347,12 +347,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "devstack-client"
+name = "devme-client"
 version = "0.1.0"
 dependencies = [
- "devstack-core",
- "devstack-ipc",
- "devstack-supervisor",
+ "devme-core",
+ "devme-ipc",
+ "devme-supervisor",
  "futures-util",
  "serde",
  "serde_json",
@@ -363,10 +363,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "devstack-config"
+name = "devme-config"
 version = "0.1.0"
 dependencies = [
- "devstack-core",
+ "devme-core",
  "indexmap",
  "serde",
  "serde_json",
@@ -375,7 +375,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "devstack-core"
+name = "devme-core"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -384,19 +384,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "devstack-executor"
+name = "devme-executor"
 version = "0.1.0"
 dependencies = [
- "devstack-config",
- "devstack-core",
+ "devme-config",
+ "devme-core",
  "thiserror 2.0.18",
 ]
 
 [[package]]
-name = "devstack-ipc"
+name = "devme-ipc"
 version = "0.1.0"
 dependencies = [
- "devstack-core",
+ "devme-core",
  "futures",
  "serde",
  "serde_json",
@@ -408,12 +408,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "devstack-shared-supervisor"
+name = "devme-shared-supervisor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "devstack-config",
- "devstack-core",
+ "devme-config",
+ "devme-core",
  "portable-pty",
  "process_alive",
  "serde",
@@ -424,10 +424,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "devstack-slot-allocator"
+name = "devme-slot-allocator"
 version = "0.1.0"
 dependencies = [
- "devstack-core",
+ "devme-core",
  "process_alive",
  "serde",
  "tempfile",
@@ -436,15 +436,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "devstack-supervisor"
+name = "devme-supervisor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "devstack-config",
- "devstack-core",
- "devstack-executor",
- "devstack-ipc",
- "devstack-slot-allocator",
+ "devme-config",
+ "devme-core",
+ "devme-executor",
+ "devme-ipc",
+ "devme-slot-allocator",
  "futures-util",
  "portable-pty",
  "process_alive",
@@ -461,13 +461,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "devstack-tui"
+name = "devme-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm 0.29.0",
- "devstack-client",
- "devstack-core",
+ "devme-client",
+ "devme-core",
  "ratatui",
  "serde",
  "tokio",

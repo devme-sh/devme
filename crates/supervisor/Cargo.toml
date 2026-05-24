@@ -1,5 +1,5 @@
 [package]
-name = "devstack-supervisor"
+name = "devme-supervisor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,19 +7,19 @@ license.workspace = true
 repository.workspace = true
 
 [lib]
-name = "devstack_supervisor"
+name = "devme_supervisor"
 path = "src/lib.rs"
 
 [[bin]]
-name = "devstack-supervisor"
+name = "devme-supervisor"
 path = "src/main.rs"
 
 [dependencies]
-devstack-core = { workspace = true }
-devstack-config = { workspace = true }
-devstack-executor = { workspace = true }
-devstack-ipc = { workspace = true }
-devstack-slot-allocator = { workspace = true }
+devme-core = { workspace = true }
+devme-config = { workspace = true }
+devme-executor = { workspace = true }
+devme-ipc = { workspace = true }
+devme-slot-allocator = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures-util = { version = "0.3", features = ["sink"] }

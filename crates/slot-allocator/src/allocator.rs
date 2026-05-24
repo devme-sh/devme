@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use devstack_core::Slot;
+use devme_core::Slot;
 use tempfile::NamedTempFile;
 
 use crate::error::AllocError;

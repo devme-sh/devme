@@ -1,11 +1,11 @@
 [package]
-name = "devstack-config"
+name = "devme-config"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-devstack-core = { workspace = true }
+devme-core = { workspace = true }
 indexmap = { version = "2", features = ["serde"] }
 serde = { workspace = true }
 toml = { workspace = true }

@@ -1,4 +1,4 @@
-//! IPC client for talking to a devstack supervisor daemon.
+//! IPC client for talking to a devme supervisor daemon.
 //!
 //! Wraps a framed Unix socket with typed `request` and `next_event`
 //! helpers. The TUI and CLI consume this — no one else should be poking
@@ -8,8 +8,8 @@
 
 use std::path::Path;
 
-use devstack_core::{ClientMessage, Envelope, ServerMessage};
-use devstack_ipc::FrameCodec;
+use devme_core::{ClientMessage, Envelope, ServerMessage};
+use devme_ipc::FrameCodec;
 use futures_util::{SinkExt, StreamExt};
 use thiserror::Error;
 use tokio::net::UnixStream;
@@ -71,7 +71,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use devstack_supervisor::daemon::DaemonServer;
+    use devme_supervisor::daemon::DaemonServer;
     use tempfile::TempDir;
 
     #[tokio::test]

@@ -13,7 +13,7 @@
 //!   at config-resolution time, not at spawn time, so users see the
 //!   problem before a half-broken service tries to start.
 //!
-//! Devstack does **not** interpolate `$VAR` or `${VAR}` — the shell handles
+//! Devme does **not** interpolate `$VAR` or `${VAR}` — the shell handles
 //! environment variables at spawn time.
 
 use std::collections::HashMap;
@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn shell_dollar_vars_are_not_interpolated() {
-        // `$HOME` and `${PATH}` are the shell's job; devstack passes them
+        // `$HOME` and `${PATH}` are the shell's job; devme passes them
         // through unchanged.
         let out = interpolate("echo $HOME and ${PATH}", &ctx()).unwrap();
         assert_eq!(out, "echo $HOME and ${PATH}");

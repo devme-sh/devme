@@ -5,7 +5,7 @@
 
 ## Context
 
-Multiple devstack daemons coexist on one machine (one per worktree). At startup, each must atomically claim a numeric `slot` (0..9) so its services get unique port offsets. Slot claims must be:
+Multiple devme daemons coexist on one machine (one per worktree). At startup, each must atomically claim a numeric `slot` (0..9) so its services get unique port offsets. Slot claims must be:
 
 - Atomic across concurrent daemon startups
 - Stable across restarts (same instance_id reclaims its previous slot when possible)
@@ -22,7 +22,7 @@ Each slot record stores `(slot, instance_id, pid, start_time_epoch, claimed_at)`
 
 Use the `process_alive` crate (cross-platform, treats `EPERM` as alive, handles Windows correctly) for liveness checks.
 
-Detect NFS at the state directory (`~/.local/share/devstack`) on startup. Warn loudly and refuse to coordinate rather than risk silent broken locks. Document "do not place state on NFS."
+Detect NFS at the state directory (`~/.local/share/devme`) on startup. Warn loudly and refuse to coordinate rather than risk silent broken locks. Document "do not place state on NFS."
 
 ## Consequences
 
@@ -30,7 +30,7 @@ Detect NFS at the state directory (`~/.local/share/devstack`) on startup. Warn l
 - The sidecar + atomic-rename pattern keeps the data file always-valid for human inspection. No "truncate while locked" footguns.
 - The PID + start-time pair prevents the classic stale-PID-record bug where a record points at a recycled PID.
 - Cargo's `src/cargo/util/flock.rs` is the canonical reference if we hit edge cases.
-- We commit to MSRV 1.89+ for this choice. Older Rust users can't compile devstack.
+- We commit to MSRV 1.89+ for this choice. Older Rust users can't compile devme.
 
 ## Alternatives considered
 

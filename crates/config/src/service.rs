@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use devstack_core::{Dependency, HealthCheck, PortSpec, RestartPolicy, Scope};
+use devme_core::{Dependency, HealthCheck, PortSpec, RestartPolicy, Scope};
 use serde::{Deserialize, Serialize};
 
 /// One Service in the Stack graph. Stays alive after starting.
@@ -29,7 +29,7 @@ pub struct Service {
     pub cmd: String,
 
     /// Working directory for the spawned process. Defaults to the worktree
-    /// root (the directory containing `devstack.toml`).
+    /// root (the directory containing `devme.toml`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
 
@@ -55,7 +55,7 @@ pub struct Service {
     #[serde(default)]
     pub restart: RestartPolicy,
 
-    /// If true, devstack never manages the lifecycle — only health-checks.
+    /// If true, devme never manages the lifecycle — only health-checks.
     /// `health` becomes required when this is set.
     #[serde(default)]
     pub external: bool,

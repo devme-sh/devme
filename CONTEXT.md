@@ -1,6 +1,6 @@
-# devstack — Domain Context
+# devme — Domain Context
 
-devstack supervises multi-service dev environments. One running copy supervises one git worktree (or one non-git project). A user with multiple worktrees of the same repo runs multiple coexisting devstack instances on the same machine without port collisions or config conflicts. The CLI is designed to be driven by AI coding agents as well as humans.
+devme supervises multi-service dev environments. One running copy supervises one git worktree (or one non-git project). A user with multiple worktrees of the same repo runs multiple coexisting devme instances on the same machine without port collisions or config conflicts. The CLI is designed to be driven by AI coding agents as well as humans.
 
 This document is the glossary. Implementation lives in code; design decisions live in `docs/adr/`.
 
@@ -33,11 +33,11 @@ A third scope, machine-wide, is declared only in the [[User global config]] — 
 
 ### Repo config
 
-`devstack.toml` at the root of a repo. Branch-local (checked into git). Declares the [[Stack]] — every [[Step]] and [[Service]] for that repo. May reference machine-level dependencies via abstract checks (e.g. `docker info`) without naming how they are provided.
+`devme.toml` at the root of a repo. Branch-local (checked into git). Declares the [[Stack]] — every [[Step]] and [[Service]] for that repo. May reference machine-level dependencies via abstract checks (e.g. `docker info`) without naming how they are provided.
 
 ### User global config
 
-`~/.config/devstack/global.toml`. User-level. Declares machine-wide [[Step]]s and [[Service]]s and tool preferences. Resolves abstract dependencies declared in [[Repo config]] — for example, the user picks OrbStack as their Docker provider here.
+`~/.config/devme/global.toml`. User-level. Declares machine-wide [[Step]]s and [[Service]]s and tool preferences. Resolves abstract dependencies declared in [[Repo config]] — for example, the user picks OrbStack as their Docker provider here.
 
 ### Trust level
 
@@ -51,7 +51,7 @@ The global `--yes` flag promotes every `prompt` step to `auto` for a single invo
 
 ### Override
 
-A user-asserted bypass of a [[Step]]'s `check`. Stored in `.devstack/overrides.toml`. Visible in TUI and `devstack overrides list`. Created via the failure overlay's `i` action. Cleared per-step or wholesale via `devstack health --recheck`. Used when the check is wrong (the dep is satisfied via a path our check can't see) or when the user has chosen to assert satisfaction manually.
+A user-asserted bypass of a [[Step]]'s `check`. Stored in `.devme/overrides.toml`. Visible in TUI and `devme overrides list`. Created via the failure overlay's `i` action. Cleared per-step or wholesale via `devme health --recheck`. Used when the check is wrong (the dep is satisfied via a path our check can't see) or when the user has chosen to assert satisfaction manually.
 
 ### Optional dependency
 
@@ -63,14 +63,14 @@ Runtime override of a `required = true` dep. The service runs even though the de
 
 ### External service
 
-A [[Service]] with `external = true`. devstack never manages its lifecycle, only health-checks it (required `health` field) and optionally tails its log file (optional `log_tail` path). Status surfaces as `external (healthy)` or `external (unreachable)`. Used for infra the user manages outside devstack (system postgres, brew-services nginx).
+A [[Service]] with `external = true`. devme never manages its lifecycle, only health-checks it (required `health` field) and optionally tails its log file (optional `log_tail` path). Status surfaces as `external (healthy)` or `external (unreachable)`. Used for infra the user manages outside devme (system postgres, brew-services nginx).
 
 ### Daemon
 
 The supervisor process. Two variants:
 
-- **Instance daemon** — One per [[Stack instance]] (one per worktree). Owns the instance's `instance`-scoped services. Listens on `~/.local/share/devstack/instances/<id>.sock`. Ref-counts clients (TUI windows, CLI commands, agent processes). Shuts down when ref count hits zero, unless started in detached mode via `devstack up`.
-- **Shared-services daemon** — One per repo. Spawned on demand by the first [[Instance daemon]] that needs a `repo`-scoped service. Listens on `~/.local/share/devstack/repos/<repo-hash>/shared.sock`. Owns all `repo`-scoped services across all instances of that repo. Exits when no instance daemons are attached.
+- **Instance daemon** — One per [[Stack instance]] (one per worktree). Owns the instance's `instance`-scoped services. Listens on `~/.local/share/devme/instances/<id>.sock`. Ref-counts clients (TUI windows, CLI commands, agent processes). Shuts down when ref count hits zero, unless started in detached mode via `devme up`.
+- **Shared-services daemon** — One per repo. Spawned on demand by the first [[Instance daemon]] that needs a `repo`-scoped service. Listens on `~/.local/share/devme/repos/<repo-hash>/shared.sock`. Owns all `repo`-scoped services across all instances of that repo. Exits when no instance daemons are attached.
 
 ### Client
 
@@ -86,11 +86,11 @@ A hash of the canonical absolute worktree path. Stable: renaming the worktree di
 
 ### Wizard
 
-A custom interactive script in `.devstack/` that handles complex [[Step]] provisioning beyond a single shell command. Multi-field forms, choice lists with dynamic options, waiting for an external interactive process to complete. Speaks the [[Wizard protocol]] over stdin/stdout.
+A custom interactive script in `.devme/` that handles complex [[Step]] provisioning beyond a single shell command. Multi-field forms, choice lists with dynamic options, waiting for an external interactive process to complete. Speaks the [[Wizard protocol]] over stdin/stdout.
 
 ### Wizard protocol
 
-JSON-lines over stdin/stdout. The wizard writes events to stdout (`ask`, `progress`, `log`, `set_var`, `done`) and reads user responses from stdin. Language-agnostic — any executable that can do JSON works. devstack ships a thin Bun SDK at `@devstack/wizard-sdk` as a convenience wrapper.
+JSON-lines over stdin/stdout. The wizard writes events to stdout (`ask`, `progress`, `log`, `set_var`, `done`) and reads user responses from stdin. Language-agnostic — any executable that can do JSON works. devme ships a thin Bun SDK at `@devme/wizard-sdk` as a convenience wrapper.
 
 ### Service config hash
 

@@ -1,9 +1,9 @@
 //! Health check kinds used by Services (and by `external = true` Services as
-//! the only signal devstack has).
+//! the only signal devme has).
 
 use serde::{Deserialize, Serialize};
 
-/// How devstack determines whether a long-running Service is healthy.
+/// How devme determines whether a long-running Service is healthy.
 ///
 /// In TOML, one of:
 ///

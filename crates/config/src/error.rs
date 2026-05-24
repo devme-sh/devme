@@ -1,9 +1,9 @@
 use thiserror::Error;
 
-/// All ways a `devstack.toml` can be invalid after parsing succeeds.
+/// All ways a `devme.toml` can be invalid after parsing succeeds.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
-    #[error("schema_version {found} is not supported; this devstack expects {expected}")]
+    #[error("schema_version {found} is not supported; this devme expects {expected}")]
     UnsupportedSchemaVersion { found: u32, expected: u32 },
 
     #[error("name '{name}' is declared as both a step and a service; they share a namespace")]

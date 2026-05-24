@@ -5,7 +5,7 @@
 
 ## Context
 
-When a Step's `check` fails, devstack can run its `provision` command to satisfy it. Provisions can be anything from `mkdir tmp` to `brew install --cask google-cloud-sdk` to `gcloud auth login`. The consent model — when do we run vs ask vs only display — determines whether devstack feels magical or terrifying. Silent auto-installation of 500 MB packages without asking erodes trust permanently after one bad incident; requiring confirmation for every `mkdir` is dialog fatigue.
+When a Step's `check` fails, devme can run its `provision` command to satisfy it. Provisions can be anything from `mkdir tmp` to `brew install --cask google-cloud-sdk` to `gcloud auth login`. The consent model — when do we run vs ask vs only display — determines whether devme feels magical or terrifying. Silent auto-installation of 500 MB packages without asking erodes trust permanently after one bad incident; requiring confirmation for every `mkdir` is dialog fatigue.
 
 ## Decision
 
@@ -13,10 +13,10 @@ Each Step declares a `trust` level: `auto`, `prompt` (default), or `manual`. The
 
 ## Consequences
 
-- Users always see the literal command devstack is about to run before it runs. No hidden side effects.
+- Users always see the literal command devme is about to run before it runs. No hidden side effects.
 - CI works via `--yes` without any per-step config changes.
-- Config authors carry a small annotation burden: deciding `trust` per Step. Sensible defaults built into devstack help (anything invoking `brew`/`apt`/`pip`/`npm`/`cargo install` defaults to `prompt`; `mkdir`/`touch`/file-generation defaults to `auto`).
-- Reversing this decision later would break user expectations — users will rely on "devstack always asks before installing things." Treat this as load-bearing.
+- Config authors carry a small annotation burden: deciding `trust` per Step. Sensible defaults built into devme help (anything invoking `brew`/`apt`/`pip`/`npm`/`cargo install` defaults to `prompt`; `mkdir`/`touch`/file-generation defaults to `auto`).
+- Reversing this decision later would break user expectations — users will rely on "devme always asks before installing things." Treat this as load-bearing.
 
 ## Alternatives considered
 

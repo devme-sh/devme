@@ -1,4 +1,4 @@
-//! Per-instance devstack supervisor: spawns services in PTYs, watches them
+//! Per-instance devme supervisor: spawns services in PTYs, watches them
 //! for output and exit, feeds events into the executor, and serves an IPC
 //! socket for the client/TUI.
 //!

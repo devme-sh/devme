@@ -175,9 +175,9 @@ mod tests {
     #[tokio::test]
     async fn env_vars_passed_to_child() {
         let mut child = ChildProcess::spawn_with_env(
-            "echo $DEVSTACK_TEST_VAR",
+            "echo $DEVME_TEST_VAR",
             &std::env::temp_dir(),
-            &[("DEVSTACK_TEST_VAR", "winning")],
+            &[("DEVME_TEST_VAR", "winning")],
         )
         .unwrap();
         let line = child.next_line().await.unwrap();

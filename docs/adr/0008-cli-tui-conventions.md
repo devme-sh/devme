@@ -5,7 +5,7 @@
 
 ## Context
 
-devstack has both a CLI surface (used by humans and agents) and a TUI surface (used by humans). The 2025-2026 consensus on CLI design has consolidated around "structured, deterministic, machine-stable interfaces that AI agents can drive" — `--json` everywhere, semantic exit codes, non-interactive defaults, errors that enumerate valid values. We commit to following those principles rather than re-deriving them.
+devme has both a CLI surface (used by humans and agents) and a TUI surface (used by humans). The 2025-2026 consensus on CLI design has consolidated around "structured, deterministic, machine-stable interfaces that AI agents can drive" — `--json` everywhere, semantic exit codes, non-interactive defaults, errors that enumerate valid values. We commit to following those principles rather than re-deriving them.
 
 ## Decision
 
@@ -13,14 +13,14 @@ devstack has both a CLI surface (used by humans and agents) and a TUI surface (u
 
 - **`--json` boolean on every data-returning command.** JSON envelope `{ "schema_version": 1, ... }`. JSONL for streaming.
 - **Stdout = data contract; stderr = everything else** (progress, warnings, spinners, headers).
-- **Exit codes.** `0` success, `1` general, `2` usage (bad args), `3` not found, `4` permission, `5` conflict. Documented in `devstack errors --list` and unit-tested.
+- **Exit codes.** `0` success, `1` general, `2` usage (bad args), `3` not found, `4` permission, `5` conflict. Documented in `devme errors --list` and unit-tested.
 - **Flag conventions.** `--exclude <pattern>` (repeatable, glob) for item filtering. `--skip-<behaviour>` for skipping behaviors. `--no-input` to disable prompts (auto-implied when stdin isn't a TTY). `--yes`/`-y` to bypass confirmations.
 - **Color.** Respect `NO_COLOR` (precedence) and `FORCE_COLOR`/`CLICOLOR_FORCE`. TTY-aware by default.
 - **Logging.** `-v`/`-q` for ergonomics; `--log-level=trace|debug|info|warn|error` for agents.
 - **Subcommands.** Flat top-level verbs while small; promote to noun-verb only when 3+ verbs accumulate on the same noun.
-- **Completions.** `devstack completions {bash,zsh,fish,nu}` via `clap_complete`. No man pages.
-- **Idempotent mutations.** `devstack restart backend` succeeds whether running or not. `--dry-run` returns a structured JSON diff, not prose.
-- **`devstack agent-context`.** Machine-readable manifest of every command, flag, exit code, and JSON schema.
+- **Completions.** `devme completions {bash,zsh,fish,nu}` via `clap_complete`. No man pages.
+- **Idempotent mutations.** `devme restart backend` succeeds whether running or not. `--dry-run` returns a structured JSON diff, not prose.
+- **`devme agent-context`.** Machine-readable manifest of every command, flag, exit code, and JSON schema.
 
 ### TUI
 

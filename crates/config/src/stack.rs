@@ -1,16 +1,16 @@
-//! Top-level Stack config: the full result of parsing `devstack.toml`.
+//! Top-level Stack config: the full result of parsing `devme.toml`.
 
-use devstack_core::{RestartPolicy, Trust};
+use devme_core::{RestartPolicy, Trust};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use crate::service::Service;
 use crate::step::Step;
 
-/// Wire protocol version for `devstack.toml`. Bumped on every breaking change.
+/// Wire protocol version for `devme.toml`. Bumped on every breaking change.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// The parsed (not yet validated) shape of a `devstack.toml` file.
+/// The parsed (not yet validated) shape of a `devme.toml` file.
 ///
 /// Validation lives in [`crate::validate`] and produces a [`ValidatedStack`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,7 +33,7 @@ pub struct Stack {
 }
 
 impl Stack {
-    /// Parse a `devstack.toml` from a string. Does not validate.
+    /// Parse a `devme.toml` from a string. Does not validate.
     pub fn parse(toml_str: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(toml_str)
     }
@@ -43,7 +43,7 @@ impl Stack {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StackMeta {
-    /// Project name shown in the TUI sidebar and `devstack status`.
+    /// Project name shown in the TUI sidebar and `devme status`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Human-readable description.

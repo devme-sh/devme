@@ -25,11 +25,11 @@ pub enum ServiceState {
     /// Restarting after a crash; the next start attempt is scheduled.
     Restarting { attempt: u32 },
     /// Crashed too many times in too short a window; auto-restart suspended.
-    /// Resumes when the user hits `r` in the TUI or `devstack restart`.
+    /// Resumes when the user hits `r` in the TUI or `devme restart`.
     CrashLoop { restart_count: u32 },
     /// Exited or crashed. `exit_code = None` indicates terminated by signal.
     Failed { exit_code: Option<i32> },
-    /// Declared `external = true` in config. Devstack only health-checks.
+    /// Declared `external = true` in config. Devme only health-checks.
     External { healthy: bool },
 }
 

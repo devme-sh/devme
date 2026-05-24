@@ -1,4 +1,4 @@
-//! Graph executor — the brain of a devstack daemon.
+//! Graph executor — the brain of a devme daemon.
 //!
 //! Pure logic: consumes events from the I/O layer (the supervisor), updates
 //! its per-node state machine, and emits actions for the supervisor to
@@ -8,8 +8,8 @@
 
 use std::collections::HashMap;
 
-use devstack_config::{DepStatus, Graph, NodeKind, SatisfactionOutcome};
-use devstack_core::{ServiceState, StepState};
+use devme_config::{DepStatus, Graph, NodeKind, SatisfactionOutcome};
+use devme_core::{ServiceState, StepState};
 
 /// What the supervisor should do next. The executor never performs these
 /// itself — it just announces them.
@@ -194,7 +194,7 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use devstack_config::Stack;
+    use devme_config::Stack;
 
     fn graph(toml_str: &str) -> Graph {
         Graph::from_stack(&Stack::parse(toml_str).expect("parse"))

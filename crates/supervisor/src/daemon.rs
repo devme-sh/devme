@@ -1,13 +1,13 @@
 //! Unix-socket IPC server for the per-instance supervisor.
 //!
 //! Clients (TUI, CLI, agents) connect, send [`ClientMessage`]s, and receive
-//! [`ServerMessage`]s, all framed by [`devstack_ipc::FrameCodec`] and
+//! [`ServerMessage`]s, all framed by [`devme_ipc::FrameCodec`] and
 //! carried as JSON in an [`Envelope`].
 
 use std::path::{Path, PathBuf};
 
-use devstack_core::{ClientMessage, Envelope, ServerMessage};
-use devstack_ipc::FrameCodec;
+use devme_core::{ClientMessage, Envelope, ServerMessage};
+use devme_ipc::FrameCodec;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::codec::Framed;
@@ -94,7 +94,7 @@ pub fn framed(stream: UnixStream) -> Framed<UnixStream, FrameCodec> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use devstack_core::ClientMessage;
+    use devme_core::ClientMessage;
     use tempfile::TempDir;
     use tokio_stream::StreamExt;
 

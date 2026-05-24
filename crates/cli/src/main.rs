@@ -1,9 +1,9 @@
-//! `devstack` — user-facing CLI binary. Argument parsing and shared
-//! formatters live in [`devstack_cli`]; this binary dispatches.
+//! `devme` — user-facing CLI binary. Argument parsing and shared
+//! formatters live in [`devme_cli`]; this binary dispatches.
 
 use clap::Parser;
-use devstack_cli::{Cli, Command, format_status_json, format_status_text};
-use devstack_core::{ClientMessage, ServerMessage};
+use devme_cli::{Cli, Command, format_status_json, format_status_text};
+use devme_core::{ClientMessage, ServerMessage};
 
 fn main() {
     let cli = Cli::parse();
@@ -13,7 +13,7 @@ fn main() {
     {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("devstack: tokio init failed: {e}");
+            eprintln!("devme: tokio init failed: {e}");
             std::process::exit(1);
         }
     };
@@ -23,18 +23,18 @@ fn main() {
 async fn run(cli: Cli) -> i32 {
     match cli.command {
         None => {
-            eprintln!("devstack: TUI mode not yet implemented");
+            eprintln!("devme: TUI mode not yet implemented");
             1
         }
         Some(Command::Status) => match status(cli.json).await {
             Ok(()) => 0,
             Err(e) => {
-                eprintln!("devstack: {e}");
+                eprintln!("devme: {e}");
                 1
             }
         },
         Some(_) => {
-            eprintln!("devstack: subcommand not yet implemented");
+            eprintln!("devme: subcommand not yet implemented");
             1
         }
     }
@@ -42,7 +42,7 @@ async fn run(cli: Cli) -> i32 {
 
 async fn status(as_json: bool) -> anyhow::Result<()> {
     let sock = socket_path();
-    let mut client = devstack_client::Client::connect(&sock).await?;
+    let mut client = devme_client::Client::connect(&sock).await?;
     let reply = client
         .request(ClientMessage::Subscribe { services: vec![] })
         .await?;
@@ -66,7 +66,7 @@ fn socket_path() -> std::path::PathBuf {
     // V1: single fixed location. Per-instance routing comes with the
     // instance_id work (ADR-0006).
     if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return std::path::PathBuf::from(dir).join("devstack.sock");
+        return std::path::PathBuf::from(dir).join("devme.sock");
     }
-    std::path::PathBuf::from("/tmp/devstack.sock")
+    std::path::PathBuf::from("/tmp/devme.sock")
 }

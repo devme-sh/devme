@@ -2,6 +2,6 @@
 //! See `docs/adr/0003-daemon-per-instance-lifecycle.md`.
 
 fn main() {
-    eprintln!("devstack-supervisor: not yet implemented");
+    eprintln!("devme-supervisor: not yet implemented");
     std::process::exit(1);
 }

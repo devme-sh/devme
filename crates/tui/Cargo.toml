@@ -1,20 +1,20 @@
 [package]
-name = "devstack-tui"
+name = "devme-tui"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [lib]
-name = "devstack_tui"
+name = "devme_tui"
 path = "src/lib.rs"
 
 [[bin]]
-name = "devstack-tui"
+name = "devme-tui"
 path = "src/main.rs"
 
 [dependencies]
-devstack-core = { workspace = true }
-devstack-client = { workspace = true }
+devme-core = { workspace = true }
+devme-client = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true }

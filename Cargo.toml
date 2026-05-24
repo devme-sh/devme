@@ -22,12 +22,12 @@ repository = "TBD"
 
 [workspace.dependencies]
 # Internal crates
-devstack-core = { path = "crates/core" }
-devstack-config = { path = "crates/config" }
-devstack-slot-allocator = { path = "crates/slot-allocator" }
-devstack-executor = { path = "crates/executor" }
-devstack-ipc = { path = "crates/ipc" }
-devstack-client = { path = "crates/client" }
+devme-core = { path = "crates/core" }
+devme-config = { path = "crates/config" }
+devme-slot-allocator = { path = "crates/slot-allocator" }
+devme-executor = { path = "crates/executor" }
+devme-ipc = { path = "crates/ipc" }
+devme-client = { path = "crates/client" }
 
 # Async runtime + IPC
 tokio = { version = "1", features = ["full"] }

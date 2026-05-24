@@ -1,4 +1,4 @@
-//! How devstack satisfies a failed Step `check`. Either runs a shell command
+//! How devme satisfies a failed Step `check`. Either runs a shell command
 //! or invokes a wizard script at a relative path.
 
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// provision = "brew install --cask google-cloud-sdk"
 ///
 /// # Wizard form (table with `wizard`):
-/// provision = { wizard = ".devstack/setup/env.ts" }
+/// provision = { wizard = ".devme/setup/env.ts" }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
@@ -40,14 +40,14 @@ mod tests {
     fn parse_wizard_form_from_table() {
         // wrap in a key so we can use toml::from_str
         let toml_src = r#"
-provision = { wizard = ".devstack/setup/env.ts" }
+provision = { wizard = ".devme/setup/env.ts" }
 "#;
         #[derive(serde::Deserialize)]
         struct Wrap { provision: Provision }
 
         let w: Wrap = toml::from_str(toml_src).unwrap();
         let Provision::Wizard { wizard } = &w.provision else { panic!("expected wizard") };
-        assert_eq!(wizard, ".devstack/setup/env.ts");
+        assert_eq!(wizard, ".devme/setup/env.ts");
     }
 
     #[test]
@@ -60,7 +60,7 @@ provision = { wizard = ".devstack/setup/env.ts" }
 
     #[test]
     fn round_trip_wizard_form_via_json() {
-        let p = Provision::Wizard { wizard: ".devstack/setup.ts".into() };
+        let p = Provision::Wizard { wizard: ".devme/setup.ts".into() };
         let json = serde_json::to_string(&p).unwrap();
         let back: Provision = serde_json::from_str(&json).unwrap();
         assert_eq!(p, back);

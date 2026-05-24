@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use devstack_core::Dependency;
+use devme_core::Dependency;
 use thiserror::Error;
 
 use crate::stack::Stack;

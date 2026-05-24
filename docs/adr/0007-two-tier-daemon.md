@@ -18,7 +18,7 @@ Handoff via "I'm leaving, take over" only works on graceful exit; SIGKILL gives 
 Split the daemon role into two tiers:
 
 - **Instance daemon** — per-worktree, owns `instance`-scoped Services. Same as ADR-0003.
-- **Shared-services daemon** — per-repo, owns `repo`-scoped Services. Listens at `~/.local/share/devstack/repos/<repo-hash>/shared.sock`. Spawned on demand by the first Instance daemon that needs a `repo`-scoped Service. Instance daemons attach as clients; ref-counted. Exits when the last instance daemon disconnects.
+- **Shared-services daemon** — per-repo, owns `repo`-scoped Services. Listens at `~/.local/share/devme/repos/<repo-hash>/shared.sock`. Spawned on demand by the first Instance daemon that needs a `repo`-scoped Service. Instance daemons attach as clients; ref-counted. Exits when the last instance daemon disconnects.
 
 Lifecycle:
 
@@ -32,8 +32,8 @@ Lifecycle:
 ## Consequences
 
 - One robust code path for all owner-exit scenarios (graceful, hard kill, crash). No "handoff via signal" complexity.
-- The PTY of a `repo`-scoped Service is always owned by a process devstack controls (the shared daemon). We never depend on init reparenting tricks.
-- One extra binary mode to build and ship (`devstack-shared-supervisor`). About 200-400 lines of additional code.
+- The PTY of a `repo`-scoped Service is always owned by a process devme controls (the shared daemon). We never depend on init reparenting tricks.
+- One extra binary mode to build and ship (`devme-shared-supervisor`). About 200-400 lines of additional code.
 - Crash blast radius stays per-repo: a bug in one repo's shared daemon cannot affect another repo's Services. (A global daemon would couple unrelated repos.)
 - Discovery is filesystem-based (socket file present + lock-protected claim). Same primitive as slot allocation; familiar.
 

@@ -1,4 +1,4 @@
-//! Wire protocol for custom wizard scripts in `.devstack/`.
+//! Wire protocol for custom wizard scripts in `.devme/`.
 //!
 //! See ADR-0011 and the `Wizard protocol` entry in `CONTEXT.md`.
 //!
@@ -27,8 +27,8 @@ pub enum WizardEvent {
     ProgressEnd { id: String, message: Option<String> },
     /// Print a log line in the wizard panel.
     Log { level: WizardLogLevel, message: String },
-    /// Persist a key/value pair to `.devstack/state.json` so later steps in
-    /// the same wizard, or later launches of devstack, can read it.
+    /// Persist a key/value pair to `.devme/state.json` so later steps in
+    /// the same wizard, or later launches of devme, can read it.
     SetVar { key: String, value: serde_json::Value },
     /// Wizard finished. The runner closes the script's stdin and surfaces
     /// the `summary` in the Supervisor tab.

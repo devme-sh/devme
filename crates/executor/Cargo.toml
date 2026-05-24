@@ -1,5 +1,5 @@
 [package]
-name = "devstack-executor"
+name = "devme-executor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,6 +7,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-devstack-core = { workspace = true }
-devstack-config = { workspace = true }
+devme-core = { workspace = true }
+devme-config = { workspace = true }
 thiserror = { workspace = true }

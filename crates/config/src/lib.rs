@@ -1,5 +1,5 @@
-//! Parsing and validation of `devstack.toml` (repo config) and
-//! `~/.config/devstack/global.toml` (user global config).
+//! Parsing and validation of `devme.toml` (repo config) and
+//! `~/.config/devme/global.toml` (user global config).
 //!
 //! See `CONTEXT.md` at the repo root and ADR-0001.
 

@@ -1,4 +1,4 @@
-//! IPC framing for the devstack daemon protocol.
+//! IPC framing for the devme daemon protocol.
 //!
 //! Wire format: a 4-byte big-endian `u32` length followed by `length` bytes
 //! of JSON payload. Pure-byte framing (no newlines, no escaping concerns)

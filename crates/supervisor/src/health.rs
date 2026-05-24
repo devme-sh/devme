@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use devstack_core::HealthCheck;
+use devme_core::HealthCheck;
 use tokio::net::TcpStream;
 
 /// Probe `target` once and return its current healthy/unhealthy state.

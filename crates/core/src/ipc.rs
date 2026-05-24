@@ -55,7 +55,7 @@ pub enum ClientMessage {
         skip_deps: bool,
     },
     /// Re-run health checks across the whole graph. Equivalent to
-    /// `devstack health --recheck`.
+    /// `devme health --recheck`.
     RecheckHealth,
     /// Graceful daemon shutdown. The daemon stops services and exits.
     /// Distinct from client disconnect; the latter only decrements ref-count.
@@ -129,7 +129,7 @@ pub enum NoticeLevel {
 
 /// Discriminated error categories carried in `ServerMessage::Error`. These
 /// align with the CLI's semantic exit codes (see ADR-0008) so that
-/// `devstack`'s exit code is a direct projection of the last server error.
+/// `devme`'s exit code is a direct projection of the last server error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ErrorCode {

@@ -1,4 +1,4 @@
-# PRD — devstack v1
+# PRD — devme v1
 
 **Status**: Draft — to be moved to Linear
 **Last updated**: 2026-05-23
@@ -17,49 +17,49 @@ A developer who clones a multi-service repo today still needs to read a README, 
 
 ## Solution
 
-A single CLI + TUI tool, **devstack** (working name), that:
+A single CLI + TUI tool, **devme** (working name), that:
 
-- Detects what a repo needs and walks the user from missing prerequisites to a running stack with one command (`devstack`).
+- Detects what a repo needs and walks the user from missing prerequisites to a running stack with one command (`devme`).
 - Treats every git worktree as a first-class **Stack instance** with stable port allocations so multiple worktrees coexist.
 - Exposes a JSON-everywhere CLI surface designed to be driven by AI coding agents as well as humans.
 - Ships a lazygit-quality TUI with a fixed three-pane layout (instances sidebar, per-service tabs, live log viewport) and a Catppuccin-aligned default theme.
 - Handles shared infrastructure (`repo`-scoped services like a cloud-sql-proxy) via a per-repo coordinator daemon, with crash-isolated lifecycles per worktree.
 - Provides a first-run wizard that feels like fly.io's `fly launch`: detect → one big question → review-before-commit → drop into the working TUI as the success state.
 
-The result: typing `devstack` in any configured repo gets the developer from zero to a running, supervised stack with no README required.
+The result: typing `devme` in any configured repo gets the developer from zero to a running, supervised stack with no README required.
 
 ## User Stories
 
 ### Core developer experience
 
-1. As a developer, I want a single `devstack` command in any configured repo, so that I don't need to read a README to get the dev stack running.
-2. As a developer, I want devstack to detect what services my repo needs and propose sensible defaults, so that I don't have to configure each one by hand.
+1. As a developer, I want a single `devme` command in any configured repo, so that I don't need to read a README to get the dev stack running.
+2. As a developer, I want devme to detect what services my repo needs and propose sensible defaults, so that I don't have to configure each one by hand.
 3. As a developer, I want to run multiple worktrees of the same repo without port collisions, so that I can review one PR while continuing work on another.
 4. As a developer, I want each worktree to keep its slot stable across restarts, so that `localhost:5183` always points to the same worktree.
 5. As a developer, I want shared infrastructure (cloud-sql-proxy, docker daemon) to run once per repo rather than once per worktree, so that I'm not duplicating connections or fighting for ports.
 6. As a developer, I want services to be cleanly killed when I close the TUI in foreground mode, so that I don't accumulate orphan processes.
-7. As a developer, I want a detached mode (`devstack up`) where services survive me closing the TUI, so that I can leave my dev stack running in the background.
-8. As a developer, I want to reattach to a running detached stack from any terminal (`devstack attach`), so that I can come and go without losing state.
+7. As a developer, I want a detached mode (`devme up`) where services survive me closing the TUI, so that I can leave my dev stack running in the background.
+8. As a developer, I want to reattach to a running detached stack from any terminal (`devme attach`), so that I can come and go without losing state.
 
 ### Setup, prerequisites, and consent
 
 9. As a developer, I want missing prerequisites (gcloud, docker, the right Rust toolchain) to be detected automatically, so that fresh-clone setup is one command.
-10. As a developer, I want devstack to show me the exact command it's about to run before installing anything, so that I'm never surprised by what landed on my machine.
+10. As a developer, I want devme to show me the exact command it's about to run before installing anything, so that I'm never surprised by what landed on my machine.
 11. As a developer, I want safe operations (`mkdir`, `touch`, generating local files) to run without prompting, so that I'm not asked about every trivial action.
 12. As a developer, I want a `--yes` flag, so that CI and scripted runs can bypass all prompts.
-13. As a developer, I want to mark a prerequisite as installed when devstack's check is wrong (because I have it via nix / asdf / a custom path), so that I'm not blocked by a false-negative detection.
+13. As a developer, I want to mark a prerequisite as installed when devme's check is wrong (because I have it via nix / asdf / a custom path), so that I'm not blocked by a false-negative detection.
 14. As a developer, I want the failure overlay to give me four clear actions (Enter to install / r to retry / s to skip-once / i to mark-installed), so that I can choose the right escape hatch for each situation.
-15. As a developer, I want overrides to be visible in the TUI and listable via `devstack overrides list`, so that I can audit which checks I've bypassed.
-16. As a developer, I want overrides to be reversible (`devstack overrides clear <step>` or `devstack health --recheck`), so that I'm never stuck with a bad assertion.
+15. As a developer, I want overrides to be visible in the TUI and listable via `devme overrides list`, so that I can audit which checks I've bypassed.
+16. As a developer, I want overrides to be reversible (`devme overrides clear <step>` or `devme health --recheck`), so that I'm never stuck with a bad assertion.
 
 ### Service lifecycle and failure handling
 
 17. As a developer, I want services to auto-restart on failure with exponential backoff (1s → 32s), so that transient crashes don't require manual intervention.
 18. As a developer, I want a crash-loop guard (5 restarts in 60s → give up), so that a wedged service doesn't burn my CPU forever.
 19. As a developer, I want to declare some dependencies as optional with a `?` suffix (e.g. `depends_on = ["db", "proxy?"]`), so that my backend can start even when the proxy is unavailable.
-20. As a developer, I want to force-start a service whose required dependency is down (`devstack start backend --skip-deps` or `f` in the TUI), so that I can develop offline when needed.
+20. As a developer, I want to force-start a service whose required dependency is down (`devme start backend --skip-deps` or `f` in the TUI), so that I can develop offline when needed.
 21. As a developer, I want force-started services to display "started without proxy" status, so that I never silently think everything is fine.
-22. As a developer, I want to declare a service as `external = true`, so that devstack just monitors it instead of trying to manage its lifecycle (useful for `brew services` Postgres, host docker, etc.).
+22. As a developer, I want to declare a service as `external = true`, so that devme just monitors it instead of trying to manage its lifecycle (useful for `brew services` Postgres, host docker, etc.).
 23. As a developer, I want a service that crashes within 10s of starting up to trigger a recheck of its upstream prerequisites, so that I catch the "you just uninstalled gcloud" case.
 
 ### TUI experience
@@ -78,39 +78,39 @@ The result: typing `devstack` in any configured repo gets the developer from zer
 
 ### CLI surface
 
-35. As a developer at the command line, I want `devstack status` to show a table of services across all worktrees, so that I can see the big picture without opening the TUI.
-36. As a developer at the command line, I want `devstack logs <service>` to print the last 200 lines, so that I can pipe them to grep or save them to a file.
-37. As a developer at the command line, I want `devstack logs --follow`, `--since 5m`, `--lines 1000`, `--level error`, and `--grep <pattern>`, so that log inspection is composable.
-38. As a developer at the command line, I want `devstack errors` to give me a rich debugging packet per failure, so that I can diagnose without scrolling through hundreds of log lines.
-39. As a developer at the command line, I want `devstack ports` to show port allocations across instances, so that I can debug "what's using port 5183."
-40. As a developer at the command line, I want `devstack env <service>` to show resolved env vars, so that I can debug "why isn't DATABASE_URL set."
-41. As a developer at the command line, I want `devstack health` to run every check and report pass/fail, so that I can prove my setup is correct.
-42. As a developer at the command line, I want `devstack instances` to list every live Stack instance on the machine, so that I can see what's running across all my repos.
+35. As a developer at the command line, I want `devme status` to show a table of services across all worktrees, so that I can see the big picture without opening the TUI.
+36. As a developer at the command line, I want `devme logs <service>` to print the last 200 lines, so that I can pipe them to grep or save them to a file.
+37. As a developer at the command line, I want `devme logs --follow`, `--since 5m`, `--lines 1000`, `--level error`, and `--grep <pattern>`, so that log inspection is composable.
+38. As a developer at the command line, I want `devme errors` to give me a rich debugging packet per failure, so that I can diagnose without scrolling through hundreds of log lines.
+39. As a developer at the command line, I want `devme ports` to show port allocations across instances, so that I can debug "what's using port 5183."
+40. As a developer at the command line, I want `devme env <service>` to show resolved env vars, so that I can debug "why isn't DATABASE_URL set."
+41. As a developer at the command line, I want `devme health` to run every check and report pass/fail, so that I can prove my setup is correct.
+42. As a developer at the command line, I want `devme instances` to list every live Stack instance on the machine, so that I can see what's running across all my repos.
 43. As a developer at the command line, I want every command to default to the current worktree's instance, so that I rarely need `--instance <id>`.
 44. As a developer at the command line, I want every command to support `--json`, so that I can pipe structured output into other tools.
-45. As a developer at the command line, I want semantic exit codes documented in `devstack errors --list`, so that my scripts branch correctly on the kind of failure.
-46. As a developer at the command line, I want shell completions for bash/zsh/fish/nushell via `devstack completions <shell>`, so that I can discover the surface by Tab-completing.
+45. As a developer at the command line, I want semantic exit codes documented in `devme errors --list`, so that my scripts branch correctly on the kind of failure.
+46. As a developer at the command line, I want shell completions for bash/zsh/fish/nushell via `devme completions <shell>`, so that I can discover the surface by Tab-completing.
 
 ### AI coding agents
 
-47. As an AI coding agent, I want a stable JSON schema versioned with `schema_version`, so that I can parse output reliably across devstack versions.
-48. As an AI coding agent, I want `devstack agent-context` to enumerate every command, flag, exit code, and JSON schema, so that I can drive devstack without scraping `--help`.
-49. As an AI coding agent, I want `devstack errors --json` to return a complete debugging packet — service, kind, message, exit code, restart count, recent logs from the service AND its dependencies, env snapshot, command line, cwd, last successful start — so that I can diagnose without making additional tool calls.
-50. As an AI coding agent, I want commands to be idempotent, so that `devstack restart backend` works whether the service is running or not.
-51. As an AI coding agent, I want `--no-input` to disable interactive prompts (auto-implied when stdin isn't a TTY), so that I can drive devstack from a sandbox without hanging on a prompt.
+47. As an AI coding agent, I want a stable JSON schema versioned with `schema_version`, so that I can parse output reliably across devme versions.
+48. As an AI coding agent, I want `devme agent-context` to enumerate every command, flag, exit code, and JSON schema, so that I can drive devme without scraping `--help`.
+49. As an AI coding agent, I want `devme errors --json` to return a complete debugging packet — service, kind, message, exit code, restart count, recent logs from the service AND its dependencies, env snapshot, command line, cwd, last successful start — so that I can diagnose without making additional tool calls.
+50. As an AI coding agent, I want commands to be idempotent, so that `devme restart backend` works whether the service is running or not.
+51. As an AI coding agent, I want `--no-input` to disable interactive prompts (auto-implied when stdin isn't a TTY), so that I can drive devme from a sandbox without hanging on a prompt.
 52. As an AI coding agent, I want a Claude Code skill that codifies the workflows ("read errors and diagnose," "restart and verify"), so that I have high-level patterns rather than just primitives.
 53. As an AI coding agent, I want `--dry-run` to return a structured JSON diff (not prose), so that I can validate intent before committing.
 
 ### First-run wizard
 
-54. As a first-time user, I want to see what devstack detected about my project before any prompts, so that I trust the tool before it does anything.
+54. As a first-time user, I want to see what devme detected about my project before any prompts, so that I trust the tool before it does anything.
 55. As a first-time user, I want exactly one big choice ("recommended setup / customize / inspect-only"), so that I'm not overwhelmed by a questionnaire.
-56. As a first-time user, I want a review-before-commit screen showing every file and service action devstack will take, so that I see the full plan before confirming.
+56. As a first-time user, I want a review-before-commit screen showing every file and service action devme will take, so that I see the full plan before confirming.
 57. As a first-time user, I want the live TUI to appear immediately after setup, so that the working product is my success message instead of a "setup complete" toast.
 58. As a first-time user who Ctrl-C's mid-wizard, I want to resume where I left off on the next run, so that I don't have to repeat answers.
-59. As a first-time user, I want every wizard prompt to have a CLI-flag equivalent (`devstack init --yes`), so that scripted setups are deterministic.
+59. As a first-time user, I want every wizard prompt to have a CLI-flag equivalent (`devme init --yes`), so that scripted setups are deterministic.
 60. As a first-time user, I want telemetry to be off by default and only asked about after 7 days of use, so that I don't feel surveilled during onboarding.
-61. As a first-time user with a custom wizard script in `.devstack/`, I want to ask the user for a value via a multi-field form, so that complex setup (env collection, GCP project selection) feels native.
+61. As a first-time user with a custom wizard script in `.devme/`, I want to ask the user for a value via a multi-field form, so that complex setup (env collection, GCP project selection) feels native.
 
 ### Config authoring
 
@@ -122,11 +122,11 @@ The result: typing `devstack` in any configured repo gets the developer from zer
 
 ### Installation
 
-67. As a new user, I want a curl-piped install script (`curl -fsSL https://<host>/install | sh`), so that I can try devstack with one line.
-68. As a macOS user, I want devstack on Homebrew (`brew install <org>/devstack/devstack`), so that I can install via my normal package manager.
-69. As a Rust developer, I want `cargo install devstack`, so that I can install from source.
+67. As a new user, I want a curl-piped install script (`curl -fsSL https://<host>/install | sh`), so that I can try devme with one line.
+68. As a macOS user, I want devme on Homebrew (`brew install <org>/devme/devme`), so that I can install via my normal package manager.
+69. As a Rust developer, I want `cargo install devme`, so that I can install from source.
 70. As an enterprise/firewalled user, I want pre-built binaries on GitHub Releases, so that I can audit before installing.
-71. As a user updating devstack, I want to re-run the install command (no `devstack upgrade` in v1), so that the upgrade path is the same as the install path.
+71. As a user updating devme, I want to re-run the install command (no `devme upgrade` in v1), so that the upgrade path is the same as the install path.
 
 ## Implementation Decisions
 
@@ -163,13 +163,13 @@ The result: typing `devstack` in any configured repo gets the developer from zer
 
 - **IPC protocol** — Length-prefixed JSON-lines envelope (`{ "schema_version": 1, "kind": "...", ... }`). Messages: `Subscribe`, `Unsubscribe`, `LogChunk`, `StatusUpdate`, `Restart`, `Stop`, `Start`, `RecheckHealth`, `Shutdown`. Stable wire schema; breaking changes go through `schema_version` bumps.
 - **Wizard protocol** — Same JSON-lines envelope. Wizard events: `ask` (with subtypes `text`, `password`, `choice`, `multi_choice`, `confirm`, `form`), `progress` (`start`/`update`/`end`), `log` (`info`/`warn`/`error`), `set_var`, `done`. Wizard reads responses from stdin: `{ "value": ... }`.
-- **`devstack.toml`** — Repo config. Branch-local, checked into git. Declares Steps and Services with `scope` (`instance` | `repo`), `trust`, `depends_on`, `port`, `health`, `external`, etc.
-- **`~/.config/devstack/global.toml`** — User global config. Declares machine-wide Steps and Services.
-- **`.devstack/overrides.toml`** — Persisted mark-as-installed overrides.
-- **`.devstack/.first-run.json`** — Resumable wizard state; gitignored.
-- **`~/.local/share/devstack/instances/<id>.sock`** — Instance daemon socket.
-- **`~/.local/share/devstack/repos/<repo-hash>/shared.sock`** — Per-repo shared daemon socket.
-- **`~/.local/share/devstack/repos/<repo-hash>/slots.toml`** + **`.lock`** — Slot allocation registry.
+- **`devme.toml`** — Repo config. Branch-local, checked into git. Declares Steps and Services with `scope` (`instance` | `repo`), `trust`, `depends_on`, `port`, `health`, `external`, etc.
+- **`~/.config/devme/global.toml`** — User global config. Declares machine-wide Steps and Services.
+- **`.devme/overrides.toml`** — Persisted mark-as-installed overrides.
+- **`.devme/.first-run.json`** — Resumable wizard state; gitignored.
+- **`~/.local/share/devme/instances/<id>.sock`** — Instance daemon socket.
+- **`~/.local/share/devme/repos/<repo-hash>/shared.sock`** — Per-repo shared daemon socket.
+- **`~/.local/share/devme/repos/<repo-hash>/slots.toml`** + **`.lock`** — Slot allocation registry.
 
 ### Instance identity and slot allocation (ADR-0006)
 
@@ -179,10 +179,10 @@ The result: typing `devstack` in any configured repo gets the developer from zer
 
 ### Lifecycle (ADRs 0003, 0007)
 
-- **`devstack`** in a worktree → spawn instance daemon if none, attach TUI as client. On TUI exit, ref count drops; daemon shuts down services and exits.
-- **`devstack up`** → spawn instance daemon with sticky flag; services survive client disconnect until `devstack down`.
-- **`devstack attach`** → connect TUI to an existing instance daemon. Does not change the sticky flag.
-- **`devstack down`** → graceful shutdown signal to the daemon.
+- **`devme`** in a worktree → spawn instance daemon if none, attach TUI as client. On TUI exit, ref count drops; daemon shuts down services and exits.
+- **`devme up`** → spawn instance daemon with sticky flag; services survive client disconnect until `devme down`.
+- **`devme attach`** → connect TUI to an existing instance daemon. Does not change the sticky flag.
+- **`devme down`** → graceful shutdown signal to the daemon.
 - **First instance daemon needing a `repo`-scoped service** → spawn `shared-supervisor` (per-repo). Subsequent instances attach as clients of the shared daemon. Last instance disconnects → shared daemon shuts down.
 - **Hard kill of any daemon** → other daemons detect dropped sockets; one elects itself (lowest slot) and respawns the shared daemon if needed.
 
@@ -201,7 +201,7 @@ The result: typing `devstack` in any configured repo gets the developer from zer
 - `--exclude <pattern>` (repeatable, glob) for item filtering; `--skip-<behavior>` for behavior skipping; `--no-input` for non-interactive; `--yes` to bypass confirmations.
 - Respect `NO_COLOR` and `FORCE_COLOR`.
 - Flat top-level verbs while small; promote to noun-verb only when 3+ verbs accumulate on the same noun.
-- `devstack agent-context` emits a machine-readable manifest of every command, flag, exit code, and JSON schema.
+- `devme agent-context` emits a machine-readable manifest of every command, flag, exit code, and JSON schema.
 
 ### TUI (ADR-0010)
 
@@ -214,15 +214,15 @@ The result: typing `devstack` in any configured repo gets the developer from zer
 
 ### First-run wizard (ADR-0011)
 
-- Triggered by absence of `devstack.toml` in the repo.
+- Triggered by absence of `devme.toml` in the repo.
 - Five screens: detection banner (auto-advance) → one big question (recommended/customize/inspect) → optional batched form → review-before-commit → drop into live TUI.
-- Resumable state on Ctrl-C via `.devstack/.first-run.json`.
-- Every prompt has a CLI flag equivalent (`devstack init --yes --services=backend,frontend,db`).
+- Resumable state on Ctrl-C via `.devme/.first-run.json`.
+- Every prompt has a CLI flag equivalent (`devme init --yes --services=backend,frontend,db`).
 - Telemetry off by default; deferred prompt after 7 days of use.
 
 ### What we cache (revised down from earlier discussion)
 
-- **In-memory dedup within a run.** Each Step's check runs at most once per `devstack` launch.
+- **In-memory dedup within a run.** Each Step's check runs at most once per `devme` launch.
 - **No disk cache, no TTL, no invalidation.** Every fresh launch re-runs every check. Disk caching deferred to a post-v1 optimization once we have real data on which checks are slow enough to matter.
 
 ## Testing Decisions
@@ -249,7 +249,7 @@ The result: typing `devstack` in any configured repo gets the developer from zer
 7. **`daemon-server` + `client`** — end-to-end "spawn daemon, connect client, subscribe, see log stream" tests with real sockets in temp dirs.
 8. **`shared-supervisor` lifecycle** — first instance spawns it, second attaches, last disconnects → shared exits.
 9. **Multi-worktree slot allocation race** — spawn 10 daemons concurrently against a shared registry; assert no two get the same slot, all settle on distinct slots.
-10. **First-run wizard end-to-end** — run `devstack init --json` non-interactively with various flag combinations; assert byte-identical `devstack.toml` output for identical inputs.
+10. **First-run wizard end-to-end** — run `devme init --json` non-interactively with various flag combinations; assert byte-identical `devme.toml` output for identical inputs.
 
 ### Modules with minimal coverage (smoke-test only)
 
@@ -270,7 +270,7 @@ The Rust ecosystem has well-trodden patterns for each test category:
 ## Out of Scope (v1)
 
 - **Disk-based check caching.** Only in-memory dedup within a single run.
-- **`devstack upgrade` self-update.** Users re-run the install command to upgrade.
+- **`devme upgrade` self-update.** Users re-run the install command to upgrade.
 - **`Ctrl+P` command palette.** Deferred to v1.1 unless trivial to add.
 - **MCP server endpoint.** The CLI + skill is the canonical agent surface; an MCP wrapper can come later if there's demand.
 - **Native Windows support.** WSL is the v1 path; tokio + ratatui work on Windows but the supervisor model (PTYs, Unix sockets) needs nontrivial work to be cross-platform.
@@ -281,8 +281,8 @@ The Rust ecosystem has well-trodden patterns for each test category:
 
 ## Further Notes
 
-- **Working name.** "devstack" is provisional. The npm package and `.dev`/`.io`/`.sh` domains are taken, and OpenStack devstack collides on SEO. A public naming decision is required before v1.0; renaming an internal-only repo is cheap.
-- **Dogfooding.** Once `supervisor`, `cli`, and basic `tui` are functional, devstack should manage its own dev workflow (test watch, lint watch, mdbook docs) as a forcing function. CI assertion: fresh clone → `cargo install --path .` → `devstack up` → all services healthy within 30s → `devstack down` → no orphans.
+- **Name.** The project will be called **devme** (`devme.dev` domain available, crates.io clear). The name captures the core value prop: "just `devme` instead of reading the README." Crate names follow the `devme-*` prefix pattern.
+- **Dogfooding.** Once `supervisor`, `cli`, and basic `tui` are functional, devme should manage its own dev workflow (test watch, lint watch, mdbook docs) as a forcing function. CI assertion: fresh clone → `cargo install --path .` → `devme up` → all services healthy within 30s → `devme down` → no orphans.
 - **Reference implementations to study.** lazygit (TUI layout discipline), `fly launch` + Clack (first-run wizard UX), Cargo's `src/cargo/util/flock.rs` (file locking), uv / ruff / mise (modern Rust CLI conventions), atuin (curl-piped install + reattach-friendly).
 - **Naming-related findings to keep in mind.** The worktree-aware tooling space exploded in 2025–2026 — baton, grove, tend, marshal, wisp, muster, steward, tether are all already taken by direct or adjacent competitors. Differentiation will be on execution (agent-friendly CLI, wizard quality, `repo`-scope coordination), not the worktree concept alone.
 - **Domain glossary.** See `CONTEXT.md` at the repo root.

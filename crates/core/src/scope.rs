@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// Lifetime of a service or step within devstack's coordination model.
+/// Lifetime of a service or step within devme's coordination model.
 ///
 /// See ADR-0001 and the `Scope` entry in `CONTEXT.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]

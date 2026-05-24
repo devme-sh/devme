@@ -5,13 +5,13 @@
 
 ## Context
 
-Three kinds of failure happen during a typical devstack run:
+Three kinds of failure happen during a typical devme run:
 
 1. A Step's `check` fails (the prerequisite isn't satisfied).
 2. A Step's `provision` errors out (the install command failed).
 3. A Service crashes after startup.
 
-Each needs its own response. And there are real-world cases where the user knows better than devstack — checks can be wrong (gcloud installed via nix; not on PATH the way our probe expects), dependencies can be temporarily unavailable but the user wants to develop anyway, services can be intentionally external.
+Each needs its own response. And there are real-world cases where the user knows better than devme — checks can be wrong (gcloud installed via nix; not on PATH the way our probe expects), dependencies can be temporarily unavailable but the user wants to develop anyway, services can be intentionally external.
 
 A rigid "fail loud, halt the graph" model is safe but punishing. A permissive "skip whatever fails" model is dangerous. The right model gives the user multiple, visible, reversible escape hatches.
 
@@ -19,11 +19,11 @@ A rigid "fail loud, halt the graph" model is safe but punishing. A permissive "s
 
 Three mechanisms, each addressing a different failure case:
 
-1. **Mark-as-installed Override.** When a Step's check fails, the TUI offers `i` (mark as installed). This persists an Override in `.devstack/overrides.toml`. Future runs treat the Step as satisfied without running its check. The Override is visible in the TUI (`step.gcloud · ✓ (overridden)`) and via `devstack overrides list`; cleared via `devstack overrides clear <step>` or wholesale via `devstack health --recheck`.
+1. **Mark-as-installed Override.** When a Step's check fails, the TUI offers `i` (mark as installed). This persists an Override in `.devme/overrides.toml`. Future runs treat the Step as satisfied without running its check. The Override is visible in the TUI (`step.gcloud · ✓ (overridden)`) and via `devme overrides list`; cleared via `devme overrides clear <step>` or wholesale via `devme health --recheck`.
 
 2. **Optional dependencies.** A Service's `depends_on` edge can be marked optional with the `?` suffix (`depends_on = ["db", "proxy?"]`) or `required = false`. The dependent Service starts even if the dep is in `waiting_on_dependency` state.
 
-3. **Forced start.** A runtime override for required deps: `devstack start backend --skip-deps` (CLI) or `f` in the TUI when focused on a waiting Service. The Service runs in a visibly degraded state — `running (started without proxy)` — surfaced in `devstack status`, `devstack errors --json`, and the TUI.
+3. **Forced start.** A runtime override for required deps: `devme start backend --skip-deps` (CLI) or `f` in the TUI when focused on a waiting Service. The Service runs in a visibly degraded state — `running (started without proxy)` — surfaced in `devme status`, `devme errors --json`, and the TUI.
 
 `provision` failures halt the affected subtree (not the entire graph) and show an inline retry/skip/abort overlay. Service crashes follow systemd-style policies: `restart = "on-failure"` default, exponential backoff (1s → 32s), crash-loop guard at 5 restarts in 60 seconds.
 

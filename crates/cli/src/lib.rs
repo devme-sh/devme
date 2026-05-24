@@ -1,13 +1,13 @@
-//! devstack CLI — clap-derive parser and command dispatch.
+//! devme CLI — clap-derive parser and command dispatch.
 //!
 //! Conventions per ADR-0008 (clig.dev + agent-native):
 //! `--json` everywhere, semantic exit codes, no spinner without a tty.
 
 use clap::{Parser, Subcommand};
-use devstack_core::{ServiceSnapshot, StepSnapshot};
+use devme_core::{ServiceSnapshot, StepSnapshot};
 
 #[derive(Debug, Parser, PartialEq, Eq)]
-#[command(name = "devstack", version, about = "Multi-service dev environment supervisor")]
+#[command(name = "devme", version, about = "Multi-service dev environment supervisor")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -76,21 +76,21 @@ mod tests {
 
     #[test]
     fn parses_status_subcommand() {
-        let cli = Cli::parse_from(["devstack", "status"]);
+        let cli = Cli::parse_from(["devme", "status"]);
         assert_eq!(cli.command, Some(Command::Status));
         assert!(!cli.json);
     }
 
     #[test]
     fn no_subcommand_defaults_to_none() {
-        // Bare `devstack` enters the TUI mode — represented by None here.
-        let cli = Cli::parse_from(["devstack"]);
+        // Bare `devme` enters the TUI mode — represented by None here.
+        let cli = Cli::parse_from(["devme"]);
         assert_eq!(cli.command, None);
     }
 
     #[test]
     fn up_collects_service_list() {
-        let cli = Cli::parse_from(["devstack", "up", "backend", "db"]);
+        let cli = Cli::parse_from(["devme", "up", "backend", "db"]);
         assert_eq!(
             cli.command,
             Some(Command::Up {
@@ -101,20 +101,20 @@ mod tests {
 
     #[test]
     fn up_without_services_is_empty_list() {
-        let cli = Cli::parse_from(["devstack", "up"]);
+        let cli = Cli::parse_from(["devme", "up"]);
         assert_eq!(cli.command, Some(Command::Up { services: vec![] }));
     }
 
     #[test]
     fn json_flag_is_global() {
-        let cli = Cli::parse_from(["devstack", "--json", "status"]);
+        let cli = Cli::parse_from(["devme", "--json", "status"]);
         assert!(cli.json);
         assert_eq!(cli.command, Some(Command::Status));
     }
 
     #[test]
     fn restart_requires_a_service_name() {
-        let cli = Cli::parse_from(["devstack", "restart", "backend"]);
+        let cli = Cli::parse_from(["devme", "restart", "backend"]);
         assert_eq!(
             cli.command,
             Some(Command::Restart {
@@ -125,13 +125,13 @@ mod tests {
 
     #[test]
     fn restart_without_service_is_an_error() {
-        let result = Cli::try_parse_from(["devstack", "restart"]);
+        let result = Cli::try_parse_from(["devme", "restart"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn logs_follow_flag_parses() {
-        let cli = Cli::parse_from(["devstack", "logs", "api", "--follow"]);
+        let cli = Cli::parse_from(["devme", "logs", "api", "--follow"]);
         assert_eq!(
             cli.command,
             Some(Command::Logs {
@@ -141,7 +141,7 @@ mod tests {
         );
     }
 
-    use devstack_core::{ServiceState, StepState};
+    use devme_core::{ServiceState, StepState};
 
     fn svc(name: &str, state: ServiceState) -> ServiceSnapshot {
         ServiceSnapshot {
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn logs_short_follow_flag_parses() {
-        let cli = Cli::parse_from(["devstack", "logs", "api", "-f"]);
+        let cli = Cli::parse_from(["devme", "logs", "api", "-f"]);
         assert_eq!(
             cli.command,
             Some(Command::Logs {

@@ -43,7 +43,7 @@ fn check_dependency_targets_exist(stack: &Stack, errors: &mut Vec<ConfigError>) 
         .map(String::as_str)
         .collect();
 
-    let mut check = |from: &str, deps: &[devstack_core::Dependency]| {
+    let mut check = |from: &str, deps: &[devme_core::Dependency]| {
         for d in deps {
             if !known.contains(d.name.as_str()) {
                 errors.push(ConfigError::UnknownDependency {

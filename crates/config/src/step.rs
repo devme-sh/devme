@@ -1,6 +1,6 @@
 //! Step (oneshot graph node) config schema.
 
-use devstack_core::{Dependency, Trust};
+use devme_core::{Dependency, Trust};
 use serde::{Deserialize, Serialize};
 
 use crate::provision::Provision;
@@ -92,9 +92,9 @@ description = "gcloud ADC login"
         let s = parse_one(r#"
 [step.env_file]
 check = "test -f .env"
-provision = { wizard = ".devstack/setup/env.ts" }
+provision = { wizard = ".devme/setup/env.ts" }
 "#);
-        assert_eq!(s.provision, Some(Provision::Wizard { wizard: ".devstack/setup/env.ts".into() }));
+        assert_eq!(s.provision, Some(Provision::Wizard { wizard: ".devme/setup/env.ts".into() }));
     }
 
     #[test]

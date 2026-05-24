@@ -1,7 +1,7 @@
 //! File-locked slot allocator — coordinates port-slot ownership across
 //! worktrees on the same machine.
 //!
-//! Each devstack daemon, on startup, calls [`SlotAllocator::claim`] with the
+//! Each devme daemon, on startup, calls [`SlotAllocator::claim`] with the
 //! worktree's `instance_id` (a hash of the worktree path). The allocator
 //! returns the lowest free slot, persisting the claim to disk so concurrent
 //! daemons agree. On shutdown the daemon calls [`SlotAllocator::release`].

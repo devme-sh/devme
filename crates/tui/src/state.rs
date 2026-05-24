@@ -1,7 +1,7 @@
 //! TUI state model. Pure data: absorb daemon messages, expose what the
 //! renderer needs to draw, route key events to selection / scroll updates.
 
-use devstack_core::{ServerMessage, ServiceSnapshot, StepSnapshot};
+use devme_core::{ServerMessage, ServiceSnapshot, StepSnapshot};
 
 /// Which top-level focus the user has. Drives keybinding behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,7 +100,7 @@ impl TuiState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use devstack_core::{ServiceState, StepState};
+    use devme_core::{ServiceState, StepState};
 
     fn svc(name: &str) -> ServiceSnapshot {
         ServiceSnapshot {

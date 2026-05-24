@@ -1,4 +1,4 @@
-//! devstack TUI — state model and renderer.
+//! devme TUI — state model and renderer.
 //!
 //! Lazygit-style fixed three-pane layout (see ADR-0010). The state model
 //! here is pure data: it absorbs `ServerMessage`s from the daemon and key

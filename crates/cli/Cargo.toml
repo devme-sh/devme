@@ -1,5 +1,5 @@
 [package]
-name = "devstack"
+name = "devme"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,17 +7,17 @@ license.workspace = true
 repository.workspace = true
 
 [lib]
-name = "devstack_cli"
+name = "devme_cli"
 path = "src/lib.rs"
 
 [[bin]]
-name = "devstack"
+name = "devme"
 path = "src/main.rs"
 
 [dependencies]
-devstack-core = { workspace = true }
-devstack-config = { workspace = true }
-devstack-client = { workspace = true }
+devme-core = { workspace = true }
+devme-config = { workspace = true }
+devme-client = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 tokio = { workspace = true }
