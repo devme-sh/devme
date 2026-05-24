@@ -16,8 +16,8 @@ use std::time::{Duration, SystemTime};
 use base64::Engine;
 use devme_config::{Graph, Stack};
 use devme_core::{
-    ClientMessage, Envelope, ErrorCode, NoticeLevel, ServerMessage, ServiceSnapshot,
-    ServiceState, StepSnapshot, StepState,
+    ClientMessage, Envelope, ErrorCode, NoticeLevel, RestartPolicy, ServerMessage,
+    ServiceSnapshot, ServiceState, StepSnapshot, StepState,
 };
 use devme_executor::{Action, Event as ExecEvent, Executor, NodeStatus};
 use devme_ipc::FrameCodec;
@@ -26,6 +26,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 
+use crate::health::probe;
 use crate::process::ChildProcess;
 
 /// Per-service log ring capacity. ~2000 lines is enough to scroll back a
@@ -37,6 +38,15 @@ const RING_CAPACITY: usize = 2000;
 /// flicker for instant-up commands; short enough that the user still sees
 /// the transition.
 const HEALTH_GRACE_MS: u64 = 150;
+
+/// How often the health probe re-runs while a service is in `Starting`.
+const PROBE_INTERVAL_MS: u64 = 1000;
+
+/// Base restart backoff. Real delay = `BASE * 2^min(count, BACKOFF_CAP_POW)`,
+/// capped at [`RESTART_BACKOFF_MAX_MS`].
+const RESTART_BACKOFF_BASE_MS: u64 = 500;
+const RESTART_BACKOFF_MAX_MS: u64 = 30_000;
+const BACKOFF_CAP_POW: u32 = 6;
 
 type ClientId = u64;
 type ClientTx = mpsc::UnboundedSender<ServerMessage>;
@@ -68,6 +78,20 @@ enum InternalEvent {
     ServiceGracePassed {
         service: String,
         generation: u64,
+    },
+    /// Restart-policy backoff timer expired — try to bring the service back.
+    AutoRestart {
+        service: String,
+    },
+    /// A step's `check` command finished. `passed=true` for exit code 0.
+    StepCheckResult {
+        step: String,
+        passed: bool,
+    },
+    /// A step's `provision` command finished.
+    StepProvisionResult {
+        step: String,
+        passed: bool,
     },
 }
 
@@ -118,6 +142,10 @@ struct DaemonState {
     /// Services that should be spawned again as soon as their previous
     /// instance has exited. Populated by [`ClientMessage::Restart`].
     pending_restarts: HashSet<String>,
+    /// Cumulative restart counter per service. Incremented when an exit
+    /// causes an auto-restart; reset when the user explicitly Starts/Stops.
+    /// Powers the backoff curve and the `restart_count` in StatusUpdates.
+    restart_counts: HashMap<String, u32>,
     next_generation: u64,
     next_client_id: u64,
     shutting_down: bool,
@@ -135,6 +163,7 @@ impl DaemonState {
             subscriptions: HashMap::new(),
             intentional_stops: HashSet::new(),
             pending_restarts: HashSet::new(),
+            restart_counts: HashMap::new(),
             next_generation: 0,
             next_client_id: 0,
             shutting_down: false,
@@ -167,12 +196,17 @@ impl DaemonState {
             .iter()
             .map(|(name, _)| {
                 let rec = self.children.get(name);
+                // restart_count persists across crash/restart cycles, so a
+                // momentarily-Failed service still shows its accumulated
+                // count — readers can tell apart a fresh failure from a
+                // service that's been bouncing for a while.
+                let count = *self.restart_counts.get(name).unwrap_or(&0);
                 ServiceSnapshot {
                     name: name.clone(),
                     state: self.current_service_state(name),
                     pid: rec.map(|r| r.pid),
                     port: rec.and_then(|r| r.port),
-                    restart_count: rec.map(|r| r.restart_count).unwrap_or(0),
+                    restart_count: count,
                 }
             })
             .collect();
@@ -386,7 +420,63 @@ fn process_event(
             service,
             generation,
         } => handle_grace_passed(state, service, generation, tx),
+        InternalEvent::AutoRestart { service } => handle_auto_restart(state, service, tx),
+        InternalEvent::StepCheckResult { step, passed } => {
+            let actions = state.executor.handle(ExecEvent::StepCheckCompleted {
+                name: step.clone(),
+                passed,
+            });
+            let new_state = match state.executor.state(&step) {
+                Some(NodeStatus::Step(s)) => *s,
+                _ if passed => StepState::Passed,
+                _ => StepState::Failed,
+            };
+            state.broadcast(
+                None,
+                ServerMessage::StepStatusUpdate {
+                    step: step.clone(),
+                    state: new_state,
+                },
+            );
+            enact_actions(state, actions, tx);
+        }
+        InternalEvent::StepProvisionResult { step, passed } => {
+            let actions = state.executor.handle(ExecEvent::StepProvisionCompleted {
+                name: step.clone(),
+                passed,
+            });
+            let new_state = match state.executor.state(&step) {
+                Some(NodeStatus::Step(s)) => *s,
+                _ if passed => StepState::Unknown,
+                _ => StepState::ProvisionFailed,
+            };
+            state.broadcast(
+                None,
+                ServerMessage::StepStatusUpdate {
+                    step,
+                    state: new_state,
+                },
+            );
+            enact_actions(state, actions, tx);
+        }
     }
+}
+
+fn handle_auto_restart(
+    state: &mut DaemonState,
+    service: String,
+    tx: &mpsc::UnboundedSender<InternalEvent>,
+) {
+    // Bail if a child is already running, the user stopped it in the
+    // meantime, or shutdown is in progress.
+    if state.shutting_down
+        || state.children.contains_key(&service)
+        || state.intentional_stops.contains(&service)
+    {
+        return;
+    }
+    let actions = state.executor.reset(&service);
+    enact_actions(state, actions, tx);
 }
 
 fn handle_client_message(
@@ -426,14 +516,20 @@ fn handle_client_message(
         ClientMessage::Unsubscribe => {
             state.subscriptions.remove(&id);
         }
-        ClientMessage::Start { service: _, .. } => {
+        ClientMessage::Start { service, .. } => {
             // For v1, any Start triggers a global Event::Start. The service
             // argument is informational; the executor advances the whole
             // graph in topo order.
+            // If the user is explicitly starting a service, clear its restart
+            // counter so the backoff resets after intentional interaction.
+            if !service.is_empty() {
+                state.restart_counts.remove(&service);
+            }
             let actions = state.executor.handle(ExecEvent::Start);
             enact_actions(state, actions, tx);
         }
         ClientMessage::Stop { service } => {
+            state.restart_counts.remove(&service);
             if state.children.contains_key(&service) {
                 state.intentional_stops.insert(service.clone());
             }
@@ -538,6 +634,7 @@ fn handle_process_exited(
     let intentional = state.intentional_stops.remove(&service);
 
     if intentional {
+        state.restart_counts.remove(&service);
         state.broadcast(
             Some(&service),
             ServerMessage::StatusUpdate {
@@ -548,13 +645,12 @@ fn handle_process_exited(
                 restart_count: 0,
             },
         );
-        // We don't fire Event::ServiceExited because the user asked for this.
-        // The executor was already told via UserStop (in handle_client_message).
     } else {
         let actions = state.executor.handle(ExecEvent::ServiceExited {
             name: service.clone(),
             exit_code,
         });
+        let restart_count = *state.restart_counts.get(&service).unwrap_or(&0);
         state.broadcast(
             Some(&service),
             ServerMessage::StatusUpdate {
@@ -562,16 +658,50 @@ fn handle_process_exited(
                 state: ServiceState::Failed { exit_code },
                 pid: None,
                 port: None,
-                restart_count: 0,
+                restart_count,
             },
         );
         enact_actions(state, actions, tx);
+
+        // Decide whether to auto-restart per the service's policy. User-
+        // initiated restarts (pending_restarts) take precedence below and
+        // skip this branch.
+        if !state.pending_restarts.contains(&service)
+            && should_auto_restart(&state.stack, &service, exit_code)
+        {
+            let prev = state.restart_counts.entry(service.clone()).or_insert(0);
+            *prev = prev.saturating_add(1);
+            let delay_ms = backoff_for(*prev);
+            let svc_name = service.clone();
+            let restart_tx = tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                let _ = restart_tx.send(InternalEvent::AutoRestart { service: svc_name });
+            });
+        }
     }
 
     if state.pending_restarts.remove(&service) {
         let actions = state.executor.reset(&service);
         enact_actions(state, actions, tx);
     }
+}
+
+fn should_auto_restart(stack: &Stack, name: &str, exit_code: Option<i32>) -> bool {
+    let Some(svc) = stack.service.get(name) else {
+        return false;
+    };
+    match svc.restart {
+        RestartPolicy::Never => false,
+        RestartPolicy::Always => true,
+        RestartPolicy::OnFailure => !matches!(exit_code, Some(0)),
+    }
+}
+
+fn backoff_for(count: u32) -> u64 {
+    let pow = count.saturating_sub(1).min(BACKOFF_CAP_POW);
+    let raw = RESTART_BACKOFF_BASE_MS.saturating_mul(1u64 << pow);
+    raw.min(RESTART_BACKOFF_MAX_MS)
 }
 
 fn handle_grace_passed(
@@ -645,13 +775,14 @@ fn enact_actions(
                     }
                 };
 
+                let restart_count = *state.restart_counts.get(&name).unwrap_or(&0);
                 state.children.insert(
                     name.clone(),
                     ChildRecord {
                         generation,
                         pid: parts.pid,
                         port: None,
-                        restart_count: 0,
+                        restart_count,
                         killer: parts.killer,
                     },
                 );
@@ -662,7 +793,7 @@ fn enact_actions(
                         state: ServiceState::Starting,
                         pid: Some(parts.pid),
                         port: None,
-                        restart_count: 0,
+                        restart_count,
                     },
                 );
 
@@ -697,16 +828,43 @@ fn enact_actions(
                     });
                 });
 
-                // Grace timer for the "no probe → healthy" path.
-                let grace_tx = tx.clone();
-                let grace_name = name.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(HEALTH_GRACE_MS)).await;
-                    let _ = grace_tx.send(InternalEvent::ServiceGracePassed {
-                        service: grace_name,
-                        generation,
+                // Readiness path: if the service declared a health probe,
+                // poll it until it passes. Otherwise fall back to a short
+                // grace timer.
+                if let Some(check) = svc.health.clone() {
+                    let probe_tx = tx.clone();
+                    let probe_name = name.clone();
+                    tokio::spawn(async move {
+                        let mut ticker =
+                            tokio::time::interval(Duration::from_millis(PROBE_INTERVAL_MS));
+                        ticker.set_missed_tick_behavior(
+                            tokio::time::MissedTickBehavior::Delay,
+                        );
+                        // Skip the immediate first tick — give the service a
+                        // beat to actually start listening.
+                        ticker.tick().await;
+                        loop {
+                            ticker.tick().await;
+                            if probe(&check).await {
+                                let _ = probe_tx.send(InternalEvent::ServiceGracePassed {
+                                    service: probe_name,
+                                    generation,
+                                });
+                                return;
+                            }
+                        }
                     });
-                });
+                } else {
+                    let grace_tx = tx.clone();
+                    let grace_name = name.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(HEALTH_GRACE_MS)).await;
+                        let _ = grace_tx.send(InternalEvent::ServiceGracePassed {
+                            service: grace_name,
+                            generation,
+                        });
+                    });
+                }
             }
             Action::StopService(name) => {
                 if let Some(mut rec) = state.children.remove(&name) {
@@ -714,24 +872,60 @@ fn enact_actions(
                 }
             }
             Action::RunCheck(name) => {
-                // V1: no real check spawning yet — treat every check as
-                // passing so dependents can advance. Real spawning will
-                // mirror the service path and route StepCheckCompleted.
-                let follow_up = state.executor.handle(ExecEvent::StepCheckCompleted {
-                    name: name.clone(),
-                    passed: true,
+                let cmd = state
+                    .stack
+                    .step
+                    .get(&name)
+                    .map(|s| s.check.clone());
+                let Some(cmd) = cmd else { continue };
+                let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+                let check_tx = tx.clone();
+                let step_name = name.clone();
+                tokio::spawn(async move {
+                    let passed = run_shell_quiet(&cmd, &cwd).await;
+                    let _ = check_tx.send(InternalEvent::StepCheckResult {
+                        step: step_name,
+                        passed,
+                    });
                 });
-                state.broadcast(
-                    None,
-                    ServerMessage::StepStatusUpdate {
-                        step: name.clone(),
-                        state: StepState::Passed,
-                    },
-                );
-                work.extend(follow_up);
             }
-            Action::RunProvision(_) => {
-                // V1: provisioning is out of scope for this first wiring pass.
+            Action::RunProvision(name) => {
+                let provision = state
+                    .stack
+                    .step
+                    .get(&name)
+                    .and_then(|s| s.provision.clone());
+                let Some(provision) = provision else { continue };
+                let cmd = match provision {
+                    devme_config::Provision::Shell(c) => c,
+                    devme_config::Provision::Wizard { wizard } => {
+                        state.broadcast(
+                            None,
+                            ServerMessage::Notice {
+                                level: NoticeLevel::Warn,
+                                message: format!(
+                                    "step {name}: wizard provision ({wizard}) not yet \
+                                     supported — treating as failed"
+                                ),
+                            },
+                        );
+                        let _ = tx.send(InternalEvent::StepProvisionResult {
+                            step: name,
+                            passed: false,
+                        });
+                        continue;
+                    }
+                };
+                let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+                let provision_tx = tx.clone();
+                let step_name = name.clone();
+                tokio::spawn(async move {
+                    let passed = run_shell_quiet(&cmd, &cwd).await;
+                    let _ = provision_tx.send(InternalEvent::StepProvisionResult {
+                        step: step_name,
+                        passed,
+                    });
+                });
             }
         }
     }
@@ -739,6 +933,23 @@ fn enact_actions(
 
 fn encode_line(line: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(line.as_bytes())
+}
+
+/// Run `cmd` under `sh -c`, discarding output. Returns true on exit code 0.
+async fn run_shell_quiet(cmd: &str, cwd: &Path) -> bool {
+    match tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+    {
+        Ok(status) => status.success(),
+        Err(_) => false,
+    }
 }
 
 fn now_ms() -> u64 {
@@ -1020,6 +1231,306 @@ cmd = "sleep 30"
 
         send_msg(&mut conn, ClientMessage::Shutdown).await;
         let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn step_with_passing_check_unblocks_dependent_service() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("d.sock");
+        let server = DaemonServer::bind_with_stack(
+            &sock,
+            make_stack(
+                r#"
+schema_version = 1
+
+[step.tools]
+check = "true"
+
+[service.app]
+cmd = "sleep 30"
+depends_on = ["tools"]
+"#,
+            ),
+        )
+        .unwrap();
+        let task = tokio::spawn(server.serve());
+
+        let mut conn = connect(&sock).await;
+        send_msg(&mut conn, ClientMessage::Subscribe { services: vec![] }).await;
+        let _ = recv_msg(&mut conn).await;
+        send_msg(
+            &mut conn,
+            ClientMessage::Start {
+                service: String::new(),
+                skip_deps: false,
+            },
+        )
+        .await;
+
+        // Expect a StepStatusUpdate (tools → Passed), then app reaches Running.
+        let mut saw_step_passed = false;
+        let mut saw_app_running = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && (!saw_step_passed || !saw_app_running) {
+            match tokio::time::timeout(Duration::from_millis(500), recv_msg(&mut conn)).await {
+                Ok(ServerMessage::StepStatusUpdate {
+                    step,
+                    state: StepState::Passed,
+                }) if step == "tools" => {
+                    saw_step_passed = true;
+                }
+                Ok(ServerMessage::StatusUpdate {
+                    service,
+                    state: ServiceState::Running { .. },
+                    ..
+                }) if service == "app" => {
+                    saw_app_running = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_step_passed, "step never reported Passed");
+        assert!(saw_app_running, "service blocked on step never reached Running");
+
+        send_msg(&mut conn, ClientMessage::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn step_with_failing_check_and_passing_provision_reruns_check() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("d.sock");
+        // Marker-file pattern: check passes only after provision creates the marker.
+        let marker = dir.path().join("marker");
+        let marker_path = marker.to_string_lossy().to_string();
+        let check = format!("test -f {marker_path}");
+        let provision = format!("touch {marker_path}");
+        let toml = format!(
+            r#"
+schema_version = 1
+
+[step.bootstrap]
+check = "{check}"
+provision = "{provision}"
+"#,
+        );
+        let server = DaemonServer::bind_with_stack(&sock, make_stack(&toml)).unwrap();
+        let task = tokio::spawn(server.serve());
+
+        let mut conn = connect(&sock).await;
+        send_msg(&mut conn, ClientMessage::Subscribe { services: vec![] }).await;
+        let _ = recv_msg(&mut conn).await;
+        send_msg(
+            &mut conn,
+            ClientMessage::Start {
+                service: String::new(),
+                skip_deps: false,
+            },
+        )
+        .await;
+
+        let mut last_state: Option<StepState> = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline
+            && !matches!(last_state, Some(StepState::Passed))
+        {
+            match tokio::time::timeout(Duration::from_millis(500), recv_msg(&mut conn)).await {
+                Ok(ServerMessage::StepStatusUpdate { step, state }) if step == "bootstrap" => {
+                    last_state = Some(state);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            last_state,
+            Some(StepState::Passed),
+            "step never reached Passed after provision"
+        );
+
+        send_msg(&mut conn, ClientMessage::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn on_failure_service_is_auto_restarted() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("d.sock");
+        let server = DaemonServer::bind_with_stack(
+            &sock,
+            make_stack(
+                r#"
+schema_version = 1
+
+[service.flaky]
+cmd = "exit 1"
+restart = "on-failure"
+"#,
+            ),
+        )
+        .unwrap();
+        let task = tokio::spawn(server.serve());
+
+        let mut conn = connect(&sock).await;
+        send_msg(&mut conn, ClientMessage::Subscribe { services: vec![] }).await;
+        let _ = recv_msg(&mut conn).await;
+
+        send_msg(
+            &mut conn,
+            ClientMessage::Start {
+                service: String::new(),
+                skip_deps: false,
+            },
+        )
+        .await;
+
+        let mut starting_count = 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        while std::time::Instant::now() < deadline && starting_count < 2 {
+            match tokio::time::timeout(Duration::from_millis(500), recv_msg(&mut conn)).await {
+                Ok(ServerMessage::StatusUpdate {
+                    service,
+                    state: ServiceState::Starting,
+                    ..
+                }) if service == "flaky" => {
+                    starting_count += 1;
+                }
+                Ok(_) | Err(_) => {}
+            }
+        }
+        assert!(
+            starting_count >= 2,
+            "expected ≥2 Starting transitions (auto-restart), got {starting_count}"
+        );
+
+        send_msg(&mut conn, ClientMessage::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn never_policy_does_not_restart() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("d.sock");
+        let server = DaemonServer::bind_with_stack(
+            &sock,
+            make_stack(
+                r#"
+schema_version = 1
+
+[service.boom]
+cmd = "exit 1"
+restart = "never"
+"#,
+            ),
+        )
+        .unwrap();
+        let task = tokio::spawn(server.serve());
+
+        let mut conn = connect(&sock).await;
+        send_msg(&mut conn, ClientMessage::Subscribe { services: vec![] }).await;
+        let _ = recv_msg(&mut conn).await;
+        send_msg(
+            &mut conn,
+            ClientMessage::Start {
+                service: String::new(),
+                skip_deps: false,
+            },
+        )
+        .await;
+
+        // Collect StatusUpdates for ~2s; should see only one Starting then Failed.
+        let mut starting_count = 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(400), recv_msg(&mut conn)).await {
+                Ok(ServerMessage::StatusUpdate {
+                    service,
+                    state: ServiceState::Starting,
+                    ..
+                }) if service == "boom" => {
+                    starting_count += 1;
+                }
+                Ok(_) | Err(_) => {}
+            }
+        }
+        assert_eq!(
+            starting_count, 1,
+            "expected exactly one Starting transition with restart=never"
+        );
+
+        send_msg(&mut conn, ClientMessage::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn health_probe_gates_running_transition() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("d.sock");
+        // Use a shell probe that passes only after the marker file exists.
+        let marker = dir.path().join("ready");
+        let marker_path = marker.to_string_lossy().to_string();
+        let cmd = format!("sleep 1.5; touch {marker_path}; sleep 30");
+        let probe_cmd = format!("test -f {marker_path}");
+        let toml = format!(
+            r#"
+schema_version = 1
+
+[service.app]
+cmd = "{cmd}"
+health = {{ shell = "{probe_cmd}" }}
+"#,
+        );
+
+        let server = DaemonServer::bind_with_stack(&sock, make_stack(&toml)).unwrap();
+        let task = tokio::spawn(server.serve());
+
+        let mut conn = connect(&sock).await;
+        send_msg(&mut conn, ClientMessage::Subscribe { services: vec![] }).await;
+        let _ = recv_msg(&mut conn).await;
+        send_msg(
+            &mut conn,
+            ClientMessage::Start {
+                service: String::new(),
+                skip_deps: false,
+            },
+        )
+        .await;
+
+        let start = std::time::Instant::now();
+        let mut running_at: Option<Duration> = None;
+        let deadline = start + Duration::from_secs(8);
+        while std::time::Instant::now() < deadline && running_at.is_none() {
+            match tokio::time::timeout(Duration::from_secs(2), recv_msg(&mut conn)).await {
+                Ok(ServerMessage::StatusUpdate {
+                    service,
+                    state: ServiceState::Running { .. },
+                    ..
+                }) if service == "app" => {
+                    running_at = Some(start.elapsed());
+                }
+                Ok(_) | Err(_) => {}
+            }
+        }
+        let running_at = running_at.expect("service never reached Running");
+        // Must be after the marker is touched (~1.5s); not from the 150ms grace.
+        assert!(
+            running_at >= Duration::from_millis(1200),
+            "Running too soon ({running_at:?}); probe was bypassed"
+        );
+
+        send_msg(&mut conn, ClientMessage::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    #[test]
+    fn backoff_grows_then_caps() {
+        assert_eq!(backoff_for(0), RESTART_BACKOFF_BASE_MS);
+        assert_eq!(backoff_for(1), RESTART_BACKOFF_BASE_MS);
+        assert_eq!(backoff_for(2), RESTART_BACKOFF_BASE_MS * 2);
+        assert_eq!(backoff_for(3), RESTART_BACKOFF_BASE_MS * 4);
+        assert_eq!(backoff_for(6), RESTART_BACKOFF_BASE_MS * 32);
+        // 500 * 64 = 32000 would exceed the 30s cap.
+        assert_eq!(backoff_for(7), RESTART_BACKOFF_MAX_MS);
+        assert_eq!(backoff_for(100), RESTART_BACKOFF_MAX_MS);
     }
 
     #[tokio::test]
