@@ -29,6 +29,7 @@ use devme_core::ClientMessage;
 use devme_tui::discovery::Registry;
 use devme_tui::render::render;
 use devme_tui::state::TuiState;
+use devme_tui::worktree::AutoSpawner;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
@@ -64,6 +65,8 @@ async fn real_main() -> anyhow::Result<()> {
     let home_id = devme_config::paths::instance_id(&cwd);
 
     let mut registry = Registry::bind(&runtime_dir).await?;
+    // Hold the spawner so its watcher stays alive for the TUI's lifetime.
+    let _spawner = AutoSpawner::bind(&cwd).await?;
     let mut state = TuiState::default();
 
     enable_raw_mode()?;

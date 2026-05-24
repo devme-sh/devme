@@ -7,3 +7,4 @@
 pub mod daemon;
 pub mod health;
 pub mod process;
+pub mod spawn;

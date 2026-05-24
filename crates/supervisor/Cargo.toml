@@ -19,6 +19,7 @@ devme-core = { workspace = true }
 devme-config = { workspace = true }
 devme-executor = { workspace = true }
 devme-ipc = { workspace = true }
+devme-client = { workspace = true }
 devme-slot-allocator = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

@@ -18,6 +18,7 @@ path = "src/main.rs"
 devme-core = { workspace = true }
 devme-config = { workspace = true }
 devme-client = { workspace = true }
+devme-supervisor = { path = "../supervisor" }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 tokio = { workspace = true }

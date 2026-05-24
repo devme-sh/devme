@@ -353,6 +353,7 @@ dependencies = [
  "devme-client",
  "devme-config",
  "devme-core",
+ "devme-supervisor",
  "serde",
  "serde_json",
  "tokio",
@@ -462,6 +463,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "devme-client",
  "devme-config",
  "devme-core",
  "devme-executor",
@@ -493,6 +495,7 @@ dependencies = [
  "devme-client",
  "devme-config",
  "devme-core",
+ "devme-supervisor",
  "notify",
  "ratatui",
  "serde",

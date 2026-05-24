@@ -16,6 +16,7 @@ path = "src/main.rs"
 devme-core = { workspace = true }
 devme-config = { workspace = true }
 devme-client = { workspace = true }
+devme-supervisor = { path = "../supervisor" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true }

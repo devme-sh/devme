@@ -572,84 +572,16 @@ async fn launch_tui() -> anyhow::Result<i32> {
     Ok(status.code().unwrap_or(0))
 }
 
-fn find_sibling_binary(name: &str) -> anyhow::Result<std::path::PathBuf> {
-    if let Ok(self_exe) = std::env::current_exe() {
-        // Resolve symlinks — when devme is installed via `ln -s` into
-        // ~/.local/bin or similar, current_exe() returns the symlink path
-        // on macOS, and the sibling binaries live next to the *target*.
-        let resolved = std::fs::canonicalize(&self_exe).unwrap_or(self_exe);
-        if let Some(parent) = resolved.parent() {
-            let candidate = parent.join(name);
-            if candidate.exists() {
-                return Ok(candidate);
-            }
-        }
-    }
-    Ok(std::path::PathBuf::from(name))
-}
+use devme_supervisor::spawn::{
+    ensure_daemon as ensure_daemon_inner, find_sibling_binary,
+};
 
-/// Make sure a daemon is listening on `sock`. If not, fork the supervisor
-/// binary and wait up to ~5s for it to bind. Returns `true` if a new
-/// daemon was spawned, `false` if one was already running — callers use
-/// this to switch between "started N services" and "attaching to N
-/// services" banners (docker compose `up` re-entrancy).
+/// Make sure a daemon is listening on `sock` for the current cwd. Thin
+/// wrapper that pins `cwd` to the process's working directory; see
+/// `devme_supervisor::spawn::ensure_daemon` for the underlying logic.
 async fn ensure_daemon(sock: &std::path::Path) -> anyhow::Result<bool> {
-    if devme_client::Client::connect(sock).await.is_ok() {
-        return Ok(false);
-    }
-    // Fail-fast checks that produce a useful error message *before* we
-    // burn 5 seconds waiting for a daemon that's never going to bind.
     let cwd = std::env::current_dir()?;
-    if !cwd.join("devme.toml").exists() {
-        return Err(anyhow::anyhow!(
-            "no devme.toml in {} (run from a directory containing one)",
-            cwd.display()
-        ));
-    }
-
-    let supervisor = find_supervisor_binary()?;
-    // Capture stderr so that if the daemon dies during startup we can show
-    // the user *why* instead of the generic "didn't come up in 5s" timeout.
-    let mut child = std::process::Command::new(&supervisor)
-        .current_dir(&cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("spawning {}: {e}", supervisor.display()))?;
-
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if devme_client::Client::connect(sock).await.is_ok() {
-            // Daemon is up. Detach stderr so it doesn't fill the pipe and
-            // backpressure the daemon's writes; from this point on the
-            // daemon's own logs go to its log file, not our process.
-            drop(child.stderr.take());
-            return Ok(true);
-        }
-        // Check whether the supervisor exited (config error, panic, etc.)
-        // before its grace period to surface its stderr immediately.
-        if let Ok(Some(_status)) = child.try_wait() {
-            let mut stderr = String::new();
-            if let Some(mut handle) = child.stderr.take() {
-                use std::io::Read;
-                let _ = handle.read_to_string(&mut stderr);
-            }
-            let stderr = stderr.trim();
-            return Err(anyhow::anyhow!(
-                "supervisor exited during startup\n{}",
-                if stderr.is_empty() { "(no stderr)" } else { stderr }
-            ));
-        }
-    }
-    Err(anyhow::anyhow!(
-        "daemon didn't come up at {} within 5s",
-        sock.display()
-    ))
-}
-
-fn find_supervisor_binary() -> anyhow::Result<std::path::PathBuf> {
-    find_sibling_binary("devme-supervisor")
+    ensure_daemon_inner(sock, &cwd).await
 }
 
 fn socket_path() -> std::path::PathBuf {
