@@ -67,6 +67,7 @@ async fn down() -> anyhow::Result<()> {
 
 async fn status(as_json: bool) -> anyhow::Result<()> {
     let sock = socket_path();
+    ensure_daemon(&sock).await?;
     let mut client = devme_client::Client::connect(&sock).await?;
     let reply = client
         .request(ClientMessage::Subscribe { services: vec![] })
@@ -85,6 +86,48 @@ async fn status(as_json: bool) -> anyhow::Result<()> {
             "daemon replied with unexpected message: {other:?}"
         )),
     }
+}
+
+/// Make sure a daemon is listening on `sock`. If not, fork the supervisor
+/// binary and wait up to ~5s for it to bind.
+async fn ensure_daemon(sock: &std::path::Path) -> anyhow::Result<()> {
+    if devme_client::Client::connect(sock).await.is_ok() {
+        return Ok(());
+    }
+    let supervisor = find_supervisor_binary()?;
+    let cwd = std::env::current_dir()?;
+    std::process::Command::new(&supervisor)
+        .current_dir(&cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawning {}: {e}", supervisor.display()))?;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if devme_client::Client::connect(sock).await.is_ok() {
+            return Ok(());
+        }
+    }
+    Err(anyhow::anyhow!(
+        "daemon didn't come up at {} within 5s",
+        sock.display()
+    ))
+}
+
+fn find_supervisor_binary() -> anyhow::Result<std::path::PathBuf> {
+    // First look right next to the running `devme` binary so a `cargo build`
+    // workspace works without anything being in PATH.
+    if let Ok(self_exe) = std::env::current_exe()
+        && let Some(parent) = self_exe.parent()
+    {
+        let candidate = parent.join("devme-supervisor");
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    // Fall back to PATH — for installed builds.
+    Ok(std::path::PathBuf::from("devme-supervisor"))
 }
 
 fn socket_path() -> std::path::PathBuf {
