@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 /// identifier so the resulting path stays a reasonable length even if the
 /// repo is deeply nested.
 pub fn supervisor_socket(cwd: &Path) -> std::io::Result<PathBuf> {
-    Ok(runtime_dir()?.join(format!("{}.sock", instance_id(cwd))))
+    Ok(runtime_dir_inner()?.join(format!("{}.sock", instance_id(cwd))))
 }
 
 /// Stable per-worktree identifier. Same input → same hex every time within
@@ -27,11 +27,18 @@ pub fn instance_id(cwd: &Path) -> String {
 /// Shared slot-allocator registry path. One file per host coordinates
 /// port-slot assignments across every devme daemon on the machine.
 pub fn slot_registry() -> std::io::Result<PathBuf> {
-    Ok(runtime_dir()?.join("slots.json"))
+    Ok(runtime_dir_inner()?.join("slots.json"))
+}
+
+/// Directory where every devme daemon on this host binds its socket. The
+/// TUI watches this directory to discover sibling stacks (other worktrees
+/// with a running supervisor).
+pub fn runtime_dir() -> std::io::Result<PathBuf> {
+    runtime_dir_inner()
 }
 
 /// `~/.local/share/devme/` or platform equivalent, created if missing.
-fn runtime_dir() -> std::io::Result<PathBuf> {
+fn runtime_dir_inner() -> std::io::Result<PathBuf> {
     let dir = if let Some(d) = std::env::var_os("XDG_RUNTIME_DIR") {
         PathBuf::from(d).join("devme")
     } else if let Some(d) = std::env::var_os("TMPDIR") {

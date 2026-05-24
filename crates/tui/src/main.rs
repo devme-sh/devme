@@ -1,14 +1,17 @@
-//! `devme-tui` — opens the supervisor socket and drives the TUI.
+//! `devme-tui` — discovers every supervisor on this host, multiplexes their
+//! event streams, and drives the TUI.
 //!
 //! Wires together:
-//! - `devme_client::Client` for the IPC subscription stream
+//! - [`devme_tui::discovery::Registry`] — one client per running daemon,
+//!   with a directory watcher that picks up new worktrees while the TUI
+//!   is open
 //! - `crossterm` for raw-mode terminal input
-//! - `ratatui` + `devme_tui::render` for drawing
+//! - `ratatui` + [`devme_tui::render`] for drawing
 //!
-//! Quit on `q`, `Esc`, or `Ctrl-C`. Navigate tabs with `↑`/`↓` or `h`/`l`.
+//! Quit on `q`, `Esc`, or `Ctrl-C`. Navigate stacks with `j`/`k`, services
+//! with `h`/`l`.
 
 use std::io::Stdout;
-use std::path::Path;
 
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -22,8 +25,8 @@ const LOG_PAGE: usize = 20;
 const MOUSE_SCROLL_LINES: usize = 3;
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
-use devme_client::Client;
 use devme_core::ClientMessage;
+use devme_tui::discovery::Registry;
 use devme_tui::render::render;
 use devme_tui::state::TuiState;
 use ratatui::Terminal;
@@ -44,7 +47,6 @@ fn main() {
     let exit_code = match runtime.block_on(real_main()) {
         Ok(()) => 0,
         Err(e) => {
-            // Ensure we leave the terminal in a sane state before printing.
             let _ = disable_raw_mode();
             let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
             eprintln!("devme-tui: {e}");
@@ -52,48 +54,28 @@ fn main() {
         }
     };
     // Force exit so the spawn_blocking thread reading from crossterm's
-    // (blocking) event stream doesn't keep the process alive — its blocking
-    // syscall ignores tokio runtime shutdown, so otherwise `q` would render
-    // cleanup but leave the user staring at a hung terminal until Ctrl-C.
+    // (blocking) event stream doesn't keep the process alive.
     std::process::exit(exit_code);
 }
 
 async fn real_main() -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
-    let sock = devme_config::paths::supervisor_socket(&cwd)?;
+    let runtime_dir = devme_config::paths::runtime_dir()?;
+    let home_id = devme_config::paths::instance_id(&cwd);
 
-    let mut client = Client::connect(&sock).await?;
-    client
-        .send(ClientMessage::Subscribe { services: vec![] })
-        .await?;
-    // Opening the TUI implies "bring this stack up." Start is idempotent —
-    // services already running stay running; only newly-eligible ones spawn.
-    // Services the user has explicitly stopped this session stay stopped
-    // because the executor still has them tracked as Stopped.
-    client
-        .send(ClientMessage::Start {
-            service: String::new(),
-            skip_deps: false,
-        })
-        .await?;
-
+    let mut registry = Registry::bind(&runtime_dir).await?;
     let mut state = TuiState::default();
-    if let Some(name) = cwd.file_name().and_then(|s| s.to_str()) {
-        state.set_instance_label(name);
-    }
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     // EnableMouseCapture lets us see scroll-wheel events. Trade-off: it
     // also captures clicks/drags, so the terminal's native text selection
-    // is intercepted — on macOS Terminal/iTerm, hold Option to bypass and
-    // select normally. Worth it for trackpad scrolling, which is otherwise
-    // a deal-breaker for log-heavy use.
+    // is intercepted — on macOS Terminal/iTerm, hold Option to bypass.
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal, &mut state, &mut client).await;
+    let result = run(&mut terminal, &mut state, &mut registry, &home_id).await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
@@ -105,7 +87,8 @@ async fn real_main() -> anyhow::Result<()> {
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     state: &mut TuiState,
-    client: &mut Client,
+    registry: &mut Registry,
+    home_id: &str,
 ) -> anyhow::Result<()> {
     let (key_tx, mut key_rx) = mpsc::unbounded_channel::<Event>();
     tokio::task::spawn_blocking(move || {
@@ -116,8 +99,29 @@ async fn run(
         }
     });
 
+    // Send Start to the cwd daemon (if it attaches) so opening the TUI
+    // implies "bring this stack up" — matches docker compose `up` UX.
+    // We do this once when the home daemon first appears, not eagerly,
+    // because the daemon may not have finished binding yet.
+    let mut home_started = false;
+
     loop {
         terminal.draw(|f| render(f, state))?;
+
+        if !home_started && state.has_instance(home_id) {
+            registry
+                .send_to(
+                    home_id,
+                    ClientMessage::Start {
+                        service: String::new(),
+                        skip_deps: false,
+                    },
+                )
+                .await;
+            // Auto-select the home stack on first appearance.
+            state.select_instance_by_id(home_id);
+            home_started = true;
+        }
 
         tokio::select! {
             evt = key_rx.recv() => match evt {
@@ -126,33 +130,24 @@ async fn run(
                         continue;
                     }
                     match k.code {
-                        // `q` / Esc / Ctrl-C — tear the stack down. The TUI
-                        // is the foreground process; quitting it means
-                        // "I'm done"; we shut the daemon down rather than
-                        // detach. Power-user detach (keep services running)
-                        // is `D` (capital).
-                        // `?` toggles the help overlay; Esc inside the
-                        // overlay just dismisses it (doesn't quit).
+                        // `?` toggles help; Esc inside the overlay dismisses.
                         KeyCode::Char('?') => state.toggle_help(),
                         KeyCode::Esc if state.help_visible() => state.hide_help(),
+                        // `q` / Esc / Ctrl-C — shut down every attached daemon.
                         KeyCode::Char('q') | KeyCode::Esc => {
-                            let _ = client.send(ClientMessage::Shutdown).await;
+                            registry.broadcast(ClientMessage::Shutdown).await;
                             return Ok(());
                         }
                         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let _ = client.send(ClientMessage::Shutdown).await;
+                            registry.broadcast(ClientMessage::Shutdown).await;
                             return Ok(());
                         }
                         // Detach: leave the TUI but keep services running.
                         KeyCode::Char('D') => return Ok(()),
-                        // Vertical = instance list (sidebar).
                         KeyCode::Down | KeyCode::Char('j') => state.select_next_instance(),
                         KeyCode::Up | KeyCode::Char('k') => state.select_prev_instance(),
-                        // Horizontal = service tabs.
                         KeyCode::Right | KeyCode::Char('l') => state.select_next_service(),
                         KeyCode::Left | KeyCode::Char('h') => state.select_prev_service(),
-                        // Log viewport scrolling. The arrow keys are taken
-                        // by navigation; use these instead.
                         KeyCode::PageUp | KeyCode::Char('b') => state.log_page_up(LOG_PAGE),
                         KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('f') => {
                             state.log_page_down(LOG_PAGE)
@@ -163,31 +158,25 @@ async fn run(
                         KeyCode::Char('d') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                             state.log_scroll_down(LOG_PAGE / 2);
                         }
-                        // Single-line nudges using `J` / `K` so they don't
-                        // collide with instance nav on `j` / `k`.
                         KeyCode::Char('J') => state.log_scroll_down(1),
                         KeyCode::Char('K') => state.log_scroll_up(1),
                         KeyCode::Char('g') => state.log_scroll_top(),
                         KeyCode::Char('G') => state.log_scroll_bottom(),
                         KeyCode::Char('S') => {
-                            if let Some(name) = state.selected_service().map(|s| s.name.clone()) {
-                                let _ = client
-                                    .send(ClientMessage::Start { service: name, skip_deps: false })
+                            if let Some((id, name)) = state.selected_instance_and_service() {
+                                registry
+                                    .send_to(&id, ClientMessage::Start { service: name, skip_deps: false })
                                     .await;
                             }
                         }
                         KeyCode::Char('s') => {
-                            if let Some(name) = state.selected_service().map(|s| s.name.clone()) {
-                                let _ = client
-                                    .send(ClientMessage::Stop { service: name })
-                                    .await;
+                            if let Some((id, name)) = state.selected_instance_and_service() {
+                                registry.send_to(&id, ClientMessage::Stop { service: name }).await;
                             }
                         }
                         KeyCode::Char('r') => {
-                            if let Some(name) = state.selected_service().map(|s| s.name.clone()) {
-                                let _ = client
-                                    .send(ClientMessage::Restart { service: name })
-                                    .await;
+                            if let Some((id, name)) = state.selected_instance_and_service() {
+                                registry.send_to(&id, ClientMessage::Restart { service: name }).await;
                             }
                         }
                         _ => {}
@@ -201,13 +190,10 @@ async fn run(
                 Some(_) => {} // resize — handled by redraw on next loop
                 None => return Ok(()),
             },
-            msg = client.next_event() => match msg? {
-                Some(m) => state.apply(m),
+            tagged = registry.recv() => match tagged {
+                Some(t) => state.apply_from(&t.instance_id, t.message),
                 None => return Ok(()),
             },
         }
     }
 }
-
-#[allow(dead_code)]
-fn _suppress_unused(_p: &Path) {}

@@ -273,13 +273,11 @@ impl TuiState {
         }
     }
 
-    /// Absorb a [`ServerMessage`] coming off the IPC stream. Routes to the
-    /// instance identified by `Subscribed`'s `instance.id`. Other message
-    /// kinds target the *currently selected* instance for now; that's
-    /// correct as long as the TUI holds at most one daemon connection.
-    /// Once the discovery layer lands (task #22) the caller will tag each
-    /// incoming message with its source instance id.
-    pub fn apply(&mut self, msg: ServerMessage) {
+    /// Absorb a [`ServerMessage`] tagged with the id of the daemon that
+    /// sent it. Routes the update to the matching [`InstanceData`] rather
+    /// than the currently-selected one, so multiplexed input from the
+    /// discovery layer doesn't cross-pollute stacks.
+    pub fn apply_from(&mut self, source_id: &str, msg: ServerMessage) {
         match msg {
             ServerMessage::Subscribed { services, steps, instance } => {
                 let idx = self.upsert_instance(instance);
@@ -289,15 +287,18 @@ impl TuiState {
                 inst.selected_service = if inst.services.is_empty() { None } else { Some(0) };
             }
             ServerMessage::StatusUpdate { service, state, .. } => {
-                if let Some(inst) = self.current_instance_mut()
-                    && let Some(s) = inst.services.iter_mut().find(|s| s.name == service)
+                if let Some(idx) = self.find_instance(source_id)
+                    && let Some(s) = self.instances[idx]
+                        .services
+                        .iter_mut()
+                        .find(|s| s.name == service)
                 {
                     s.state = state;
                 }
             }
             ServerMessage::StepStatusUpdate { step, state } => {
-                if let Some(inst) = self.current_instance_mut()
-                    && let Some(s) = inst.steps.iter_mut().find(|s| s.name == step)
+                if let Some(idx) = self.find_instance(source_id)
+                    && let Some(s) = self.instances[idx].steps.iter_mut().find(|s| s.name == step)
                 {
                     s.state = state;
                 }
@@ -310,9 +311,10 @@ impl TuiState {
                 let Some(text) = decoded else {
                     return;
                 };
-                let Some(inst) = self.current_instance_mut() else {
+                let Some(idx) = self.find_instance(source_id) else {
                     return;
                 };
+                let inst = &mut self.instances[idx];
                 let buf = inst
                     .logs
                     .entry(service.clone())
@@ -346,6 +348,40 @@ impl TuiState {
             // Notice, Error, Goodbye don't yet move the model.
             _ => {}
         }
+    }
+
+    /// Single-source convenience for tests and the preview example. Looks
+    /// up the source id from `Subscribed` if present, else falls back to
+    /// the currently-selected instance.
+    pub fn apply(&mut self, msg: ServerMessage) {
+        let source_id = match &msg {
+            ServerMessage::Subscribed { instance, .. } => instance.id.clone(),
+            _ => self
+                .current_instance()
+                .map(|i| i.info.id.clone())
+                .unwrap_or_default(),
+        };
+        self.apply_from(&source_id, msg);
+    }
+
+    /// True if an InstanceData with this id is in the sidebar.
+    pub fn has_instance(&self, id: &str) -> bool {
+        self.find_instance(id).is_some()
+    }
+
+    /// Move selection to the instance with this id, if it exists.
+    pub fn select_instance_by_id(&mut self, id: &str) {
+        if let Some(idx) = self.find_instance(id) {
+            self.selected_instance = Some(idx);
+        }
+    }
+
+    /// `(instance_id, service_name)` of the currently-selected service, for
+    /// routing commands back to the right daemon.
+    pub fn selected_instance_and_service(&self) -> Option<(String, String)> {
+        let inst = self.current_instance()?;
+        let svc = inst.selected_service.and_then(|i| inst.services.get(i))?;
+        Some((inst.info.id.clone(), svc.name.clone()))
     }
 
     /// Horizontal navigation across service tabs (`h`/`l` / `←`/`→`).
@@ -755,6 +791,65 @@ mod tests {
         assert_eq!(db_logs, vec!["postgres ready", "connection accepted"]);
         assert_eq!(api_logs, vec!["listening on 8080"]);
         assert!(s.service_logs("ghost").is_empty());
+    }
+
+    #[test]
+    fn apply_from_routes_log_chunks_to_the_source_instance_only() {
+        // Two instances subscribed; log chunks tagged with each instance's
+        // id must land in that instance's buffer, not the currently-
+        // selected one.
+        let mut s = TuiState::default();
+        let a = InstanceInfo { id: "A".into(), label: "a".into(), cwd: "/a".into() };
+        let b = InstanceInfo { id: "B".into(), label: "b".into(), cwd: "/b".into() };
+        s.apply_from(
+            "A",
+            ServerMessage::Subscribed {
+                instance: a.clone(),
+                services: vec![svc("api")],
+                steps: vec![],
+            },
+        );
+        s.apply_from(
+            "B",
+            ServerMessage::Subscribed {
+                instance: b.clone(),
+                services: vec![svc("api")],
+                steps: vec![],
+            },
+        );
+        // Even though instance "B" is the second one added, route a log
+        // chunk tagged from "A" — it must land in A.
+        let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
+        s.apply_from(
+            "A",
+            ServerMessage::LogChunk {
+                service: "api".into(),
+                bytes: enc("only for A"),
+                ts: 0,
+            },
+        );
+
+        // Switch selection to A, read its logs — should see the line.
+        s.select_instance_by_id("A");
+        let a_logs: Vec<_> = s.service_logs("api").iter().cloned().collect();
+        assert_eq!(a_logs, vec!["only for A"]);
+
+        // Switch selection to B, read its logs — should be empty.
+        s.select_instance_by_id("B");
+        let b_logs: Vec<_> = s.service_logs("api").iter().cloned().collect();
+        assert!(b_logs.is_empty(), "log chunk leaked to B: {b_logs:?}");
+    }
+
+    #[test]
+    fn selected_instance_and_service_returns_id_and_service_name() {
+        let mut s = TuiState::default();
+        s.apply(snapshot_msg(&["db", "api"]));
+        let (id, name) = s.selected_instance_and_service().unwrap();
+        assert_eq!(id, "test-id");
+        assert_eq!(name, "db");
+        s.select_next_service();
+        let (_, name) = s.selected_instance_and_service().unwrap();
+        assert_eq!(name, "api");
     }
 
     #[test]
