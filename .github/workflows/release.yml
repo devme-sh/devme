@@ -51,14 +51,14 @@ jobs:
 
       - name: Install cross (Linux ARM64 only)
         if: matrix.cross
-        run: cargo install cross --locked
+        run: cargo install cross
 
       - name: Build
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --locked --target ${{ matrix.target }}
+            cross build --release --target ${{ matrix.target }}
           else
-            cargo build --release --locked --target ${{ matrix.target }}
+            cargo build --release --target ${{ matrix.target }}
           fi
 
       - name: Package binaries
