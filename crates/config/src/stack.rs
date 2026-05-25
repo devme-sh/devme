@@ -4,6 +4,7 @@ use devme_core::{RestartPolicy, Trust};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+use crate::env_var::EnvVar;
 use crate::service::Service;
 use crate::step::Step;
 
@@ -22,6 +23,11 @@ pub struct Stack {
     /// Optional project-level metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stack: Option<StackMeta>,
+
+    /// Declared environment variables keyed by name (e.g. `DATABASE_URL`).
+    /// See ADR-0014. Resolved before step checks on every `devme` run.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub env: IndexMap<String, EnvVar>,
 
     /// Setup nodes keyed by name.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
@@ -173,6 +179,7 @@ unsupported_meta = true
         let s = Stack {
             schema_version: 1,
             stack: None,
+            env: IndexMap::new(),
             step: IndexMap::new(),
             service: IndexMap::new(),
         };
@@ -185,5 +192,45 @@ unsupported_meta = true
     fn schema_version_constant_is_one() {
         // Guards against accidental edits — bumping requires a checklist.
         assert_eq!(SCHEMA_VERSION, 1);
+    }
+
+    #[test]
+    fn parse_config_with_env_vars() {
+        let s = Stack::parse(r#"
+schema_version = 1
+
+[env.DATABASE_URL]
+required = true
+default = "postgres://localhost/dev"
+help = "Connection string for the dev database"
+
+[env.SECRET_KEY]
+generate = "openssl rand -hex 32"
+
+[env.REGION]
+choices = ["us-east-1", "eu-west-1"]
+default = "eu-west-1"
+
+[service.web]
+cmd = "npm run dev"
+"#).unwrap();
+
+        assert_eq!(s.env.len(), 3);
+        assert!(s.env["DATABASE_URL"].required);
+        assert_eq!(s.env["SECRET_KEY"].generate.as_deref(), Some("openssl rand -hex 32"));
+        assert_eq!(s.env["REGION"].choices, vec!["us-east-1", "eu-west-1"]);
+    }
+
+    #[test]
+    fn env_table_omitted_from_serialization_when_empty() {
+        let s = Stack {
+            schema_version: 1,
+            stack: None,
+            env: IndexMap::new(),
+            step: IndexMap::new(),
+            service: IndexMap::new(),
+        };
+        let toml_str = toml::to_string(&s).unwrap();
+        assert!(!toml_str.contains("[env"), "got: {toml_str}");
     }
 }

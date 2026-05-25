@@ -5,6 +5,7 @@
 //! See ADR-0003 for daemon lifecycle and ADR-0007 for the two-tier model.
 
 pub mod daemon;
+pub mod env_resolve;
 pub mod health;
 pub mod process;
 pub mod spawn;

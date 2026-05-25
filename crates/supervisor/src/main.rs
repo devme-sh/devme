@@ -23,7 +23,13 @@ fn real_main() -> anyhow::Result<()> {
     let toml = std::fs::read_to_string(&config_path).map_err(|e| {
         anyhow::anyhow!("reading {}: {e}", config_path.display())
     })?;
-    let stack = Stack::parse(&toml).map_err(|e| anyhow::anyhow!("parsing config: {e}"))?;
+    let mut stack = Stack::parse(&toml).map_err(|e| anyhow::anyhow!("parsing config: {e}"))?;
+
+    // Filter out repo-scoped services — those are owned by the shared
+    // supervisor (ADR-0007). The instance daemon only manages instance-scoped
+    // services.
+    stack.service.retain(|_, svc| svc.scope != devme_core::Scope::Repo);
+
     devme_config::validate(&stack).map_err(|errors| {
         let joined = errors
             .iter()

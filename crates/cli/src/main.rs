@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use base64::Engine;
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
-use devme_cli::{Cli, Command, format_status_json, format_status_text};
+use devme_cli::{Cli, Command, ConfigAction, format_status_json, format_status_text};
+use devme_config::Stack;
 use devme_core::{ClientMessage, ServerMessage, ServiceState};
 
 /// True when output should be ANSI-color-free. Set once in `main` from
@@ -78,6 +79,8 @@ async fn run(cli: Cli) -> i32 {
             print_completions(shell);
             Ok(())
         }
+        Some(Command::Doctor { tail }) => doctor(tail).await,
+        Some(Command::Config { action }) => config_cmd(action),
     };
     match result {
         Ok(()) => 0,
@@ -556,6 +559,154 @@ async fn logs(service: String, follow: bool, tail: usize) -> anyhow::Result<()> 
     }
 }
 
+async fn doctor(tail: usize) -> anyhow::Result<()> {
+    let sock = socket_path();
+    let mut client = match devme_client::Client::connect(&sock).await {
+        Ok(c) => c,
+        Err(_) => {
+            let report = serde_json::json!({
+                "status": "no_daemon",
+                "message": "no devme daemon running — start one with `devme up -d`",
+                "services": [],
+                "steps": [],
+            });
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            return Ok(());
+        }
+    };
+
+    client
+        .send(ClientMessage::Subscribe { services: vec![] })
+        .await?;
+    let (services, steps) = match client.next_event().await? {
+        Some(ServerMessage::Subscribed { services, steps, .. }) => (services, steps),
+        _ => return Err(anyhow::anyhow!("unexpected reply from daemon")),
+    };
+
+    let drain_idle = std::time::Duration::from_millis(80);
+    let mut all_logs: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    loop {
+        match tokio::time::timeout(drain_idle, client.next_event()).await {
+            Ok(Ok(Some(ServerMessage::LogChunk { service, bytes, .. }))) => {
+                if let Ok(decoded) =
+                    base64::engine::general_purpose::STANDARD.decode(bytes.as_bytes())
+                    && let Ok(text) = String::from_utf8(decoded)
+                {
+                    let buf = all_logs.entry(service).or_default();
+                    for line in text.split('\n') {
+                        let line = line.trim_end_matches('\r');
+                        if !line.is_empty() {
+                            buf.push(line.to_string());
+                        }
+                    }
+                }
+            }
+            Ok(Ok(Some(_))) => {}
+            Ok(Ok(None)) | Ok(Err(_)) => break,
+            Err(_) => break,
+        }
+    }
+
+    let has_failures = services.iter().any(|s| {
+        matches!(
+            s.state,
+            ServiceState::Failed { .. } | ServiceState::CrashLoop { .. }
+        )
+    }) || steps.iter().any(|s| {
+        matches!(
+            s.state,
+            devme_core::StepState::Failed | devme_core::StepState::ProvisionFailed
+        )
+    });
+
+    let svc_json: Vec<serde_json::Value> = services
+        .iter()
+        .map(|s| {
+            let mut logs = all_logs
+                .get(&s.name)
+                .cloned()
+                .unwrap_or_default();
+            let skip = if tail == 0 { 0 } else { logs.len().saturating_sub(tail) };
+            logs = logs.into_iter().skip(skip).collect();
+            serde_json::json!({
+                "name": s.name,
+                "state": format!("{:?}", s.state),
+                "pid": s.pid,
+                "port": s.port,
+                "restart_count": s.restart_count,
+                "logs": logs,
+            })
+        })
+        .collect();
+
+    let step_json: Vec<serde_json::Value> = steps
+        .iter()
+        .map(|s| {
+            let logs = all_logs
+                .get(&s.name)
+                .cloned()
+                .unwrap_or_default();
+            serde_json::json!({
+                "name": s.name,
+                "state": format!("{:?}", s.state),
+                "logs": logs,
+            })
+        })
+        .collect();
+
+    let report = serde_json::json!({
+        "status": if has_failures { "unhealthy" } else { "healthy" },
+        "services": svc_json,
+        "steps": step_json,
+    });
+
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn config_cmd(action: Option<ConfigAction>) -> anyhow::Result<()> {
+    use devme_config::GlobalConfig;
+
+    match action {
+        None => {
+            let cfg = GlobalConfig::load();
+            for (key, desc) in GlobalConfig::keys() {
+                let value = cfg.get(key).unwrap_or_else(|| "(unset)".into());
+                println!("{key:<24} {value:<20} # {desc}");
+            }
+            Ok(())
+        }
+        Some(ConfigAction::Get { key }) => {
+            let cfg = GlobalConfig::load();
+            match cfg.get(&key) {
+                Some(v) => {
+                    println!("{v}");
+                    Ok(())
+                }
+                None => {
+                    println!("(unset)");
+                    Ok(())
+                }
+            }
+        }
+        Some(ConfigAction::Set { key, value }) => {
+            let mut cfg = GlobalConfig::load();
+            cfg.set(&key, &value).map_err(|e| anyhow::anyhow!("{e}"))?;
+            cfg.save()?;
+            info!("devme: {key} = {value}");
+            Ok(())
+        }
+        Some(ConfigAction::Unset { key }) => {
+            let mut cfg = GlobalConfig::load();
+            cfg.unset(&key).map_err(|e| anyhow::anyhow!("{e}"))?;
+            cfg.save()?;
+            info!("devme: unset {key}");
+            Ok(())
+        }
+    }
+}
+
 fn print_completions(shell: Shell) {
     let mut cmd = Cli::command();
     generate(shell, &mut cmd, "devme", &mut std::io::stdout());
@@ -579,9 +730,106 @@ use devme_supervisor::spawn::{
 /// Make sure a daemon is listening on `sock` for the current cwd. Thin
 /// wrapper that pins `cwd` to the process's working directory; see
 /// `devme_supervisor::spawn::ensure_daemon` for the underlying logic.
+///
+/// Before spawning a new daemon, resolves any declared `[env.*]` vars
+/// from `devme.toml` — prompting the user for missing values while we
+/// still have a terminal attached (ADR-0014).
 async fn ensure_daemon(sock: &std::path::Path) -> anyhow::Result<bool> {
     let cwd = std::env::current_dir()?;
+
+    let config_path = cwd.join("devme.toml");
+    if let Ok(toml_str) = std::fs::read_to_string(&config_path) {
+        if let Ok(stack) = Stack::parse(&toml_str) {
+            if !stack.env.is_empty() {
+                let env_file = devme_supervisor::env_resolve::default_env_file(&cwd);
+                let env_pairs: Vec<(String, devme_config::EnvVar)> =
+                    stack.env.into_iter().collect();
+                let interactive = std::io::stdin().is_terminal();
+                let mut stdin = std::io::BufReader::new(std::io::stdin());
+                let mut stderr = std::io::stderr();
+                if let Err(e) = devme_supervisor::env_resolve::resolve_env_vars(
+                    &env_pairs, &env_file, &cwd, &mut stdin, &mut stderr, interactive,
+                ) {
+                    eprintln!("devme: env resolution failed: {e}");
+                }
+            }
+            // Re-parse since we moved `stack.env` above
+            if let Ok(stack) = Stack::parse(&toml_str) {
+                ensure_docker_if_needed(&stack)?;
+            }
+        }
+    }
+
     ensure_daemon_inner(sock, &cwd).await
+}
+
+/// If the stack has services that use Docker and Docker isn't running,
+/// start the user's preferred daemon (prompting on first use).
+fn ensure_docker_if_needed(stack: &Stack) -> anyhow::Result<()> {
+    use devme_config::{GlobalConfig, docker};
+
+    if !docker::stack_needs_docker(stack) {
+        return Ok(());
+    }
+    if docker::is_docker_running() {
+        return Ok(());
+    }
+
+    let mut cfg = GlobalConfig::load();
+
+    let daemon_id = match &cfg.docker.daemon {
+        Some(id) => id.clone(),
+        None => {
+            let installed = docker::detect_installed();
+            if installed.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "services require Docker but no Docker daemon is installed\n\
+                     install OrbStack, Docker Desktop, or Colima"
+                ));
+            }
+            if installed.len() == 1 {
+                let id = installed[0].id.clone();
+                info!("devme: auto-selected {} (only daemon installed)", installed[0].label);
+                cfg.docker.daemon = Some(id.clone());
+                let _ = cfg.save();
+                id
+            } else {
+                if !std::io::stdin().is_terminal() {
+                    return Err(anyhow::anyhow!(
+                        "Docker is not running and no daemon is configured\n\
+                         run: devme config set docker.daemon <name>"
+                    ));
+                }
+                eprintln!("Docker is required but not running. Which daemon should devme start?\n");
+                for (i, d) in installed.iter().enumerate() {
+                    eprintln!("  [{}] {}", i + 1, d.label);
+                }
+                eprint!("\nChoice [1]: ");
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                let trimmed = input.trim();
+                let idx = if trimmed.is_empty() {
+                    0
+                } else {
+                    trimmed.parse::<usize>()
+                        .map_err(|_| anyhow::anyhow!("invalid choice"))?
+                        .checked_sub(1)
+                        .ok_or_else(|| anyhow::anyhow!("invalid choice"))?
+                };
+                let chosen = installed.get(idx)
+                    .ok_or_else(|| anyhow::anyhow!("invalid choice"))?;
+                info!("devme: saved docker.daemon = {}", chosen.id);
+                cfg.docker.daemon = Some(chosen.id.clone());
+                let _ = cfg.save();
+                chosen.id.clone()
+            }
+        }
+    };
+
+    info!("devme: starting Docker via {daemon_id}…");
+    docker::start_daemon(&daemon_id).map_err(|e| anyhow::anyhow!("{e}"))?;
+    info!("devme: Docker is ready");
+    Ok(())
 }
 
 fn socket_path() -> std::path::PathBuf {
