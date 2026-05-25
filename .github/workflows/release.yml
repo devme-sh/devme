@@ -124,3 +124,58 @@ jobs:
           files: |
             devme-*.tar.gz
             devme-*.tar.gz.sha256
+
+  update-homebrew:
+    name: Update Homebrew formula
+    needs: release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout tap repo
+        uses: actions/checkout@v4
+        with:
+          repository: devme-sh/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Download checksums
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: artifacts
+
+      - name: Update formula
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          formula="Formula/devme.rb"
+
+          sha_darwin_arm=$(awk '{print $1}' artifacts/devme-aarch64-apple-darwin.tar.gz.sha256)
+          sha_darwin_x86=$(awk '{print $1}' artifacts/devme-x86_64-apple-darwin.tar.gz.sha256)
+          sha_linux_arm=$(awk '{print $1}' artifacts/devme-aarch64-unknown-linux-gnu.tar.gz.sha256)
+          sha_linux_x86=$(awk '{print $1}' artifacts/devme-x86_64-unknown-linux-gnu.tar.gz.sha256)
+
+          sed -i "s/version \".*\"/version \"${version}\"/" "$formula"
+
+          # Update SHA256 values in order of appearance (macOS ARM, macOS Intel, Linux ARM, Linux Intel)
+          python3 -c "
+          import re
+          with open('$formula') as f:
+              content = f.read()
+          shas = ['$sha_darwin_arm', '$sha_darwin_x86', '$sha_linux_arm', '$sha_linux_x86']
+          i = 0
+          def replace_sha(m):
+              global i
+              result = f'sha256 \"{shas[i]}\"'
+              i += 1
+              return result
+          content = re.sub(r'sha256 \"[^\"]+\"', replace_sha, content)
+          with open('$formula', 'w') as f:
+              f.write(content)
+          "
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/devme.rb
+          git commit -m "devme ${GITHUB_REF_NAME}"
+          git push
