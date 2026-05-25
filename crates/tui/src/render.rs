@@ -153,19 +153,30 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Span::styled(breadcrumb, Style::default().fg(Color::White)),
     ]));
 
-    let centre = Paragraph::new(Line::from(vec![
-        Span::styled("? ", key),
-        Span::styled("help  ", dim),
-        Span::styled("hl ", key),
-        Span::styled("svc  ", dim),
-        Span::styled("jk ", key),
-        Span::styled("stack  ", dim),
-        Span::styled("S/s/r ", key),
-        Span::styled("start/stop/restart  ", dim),
-        Span::styled("q ", key),
-        Span::styled("quit", dim),
-    ]))
-    .alignment(ratatui::layout::Alignment::Center);
+    let centre_line = if state.show_skill_hint() {
+        Line::from(vec![
+            Span::styled("hint: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("npx skills add devme-sh/skills", Style::default().fg(Color::Yellow)),
+            Span::styled("  (suppress: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("devme config set hints.skills false", Style::default().fg(Color::DarkGray)),
+            Span::styled(")", Style::default().fg(Color::DarkGray)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("? ", key),
+            Span::styled("help  ", dim),
+            Span::styled("hl ", key),
+            Span::styled("svc  ", dim),
+            Span::styled("jk ", key),
+            Span::styled("stack  ", dim),
+            Span::styled("S/s/r ", key),
+            Span::styled("start/stop/restart  ", dim),
+            Span::styled("q ", key),
+            Span::styled("quit", dim),
+        ])
+    };
+    let centre = Paragraph::new(centre_line)
+        .alignment(ratatui::layout::Alignment::Center);
 
     let (running, starting, stopped, failed) = aggregate_states(state);
     let right_spans = vec![
@@ -875,6 +886,7 @@ mod tests {
     #[test]
     fn footer_lists_basic_key_bindings() {
         let mut state = TuiState::default();
+        state.suppress_skill_hint();
         // 140 wide so the centre hints all fit without truncation.
         let text = render_to_text(&mut state, 140, 12);
         let last = text.lines().last().unwrap_or("");

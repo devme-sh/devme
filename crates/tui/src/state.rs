@@ -84,6 +84,11 @@ pub struct TuiState {
     /// Full-screen log view for text selection. Mouse capture is disabled
     /// so the terminal handles selection natively.
     copy_mode: bool,
+    /// Whether the skill install hint is eligible to show in the footer.
+    /// Checked once at startup from the backoff state file and config.
+    skill_hint_eligible: bool,
+    /// Instant when the TUI started, used to time hint rotation.
+    started_at: std::time::Instant,
 }
 
 impl Default for TuiState {
@@ -97,7 +102,31 @@ impl Default for TuiState {
             help_visible: false,
             viewport_height: 20,
             copy_mode: false,
+            skill_hint_eligible: check_skill_hint_eligible(),
+            started_at: std::time::Instant::now(),
         }
+    }
+}
+
+fn check_skill_hint_eligible() -> bool {
+    let cfg = devme_config::GlobalConfig::load();
+    if cfg.get("hints.skills") == Some("false".into()) {
+        return false;
+    }
+    let config_dir = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        std::path::PathBuf::from(xdg).join("devme")
+    } else if let Some(home) = std::env::var_os("HOME") {
+        std::path::PathBuf::from(home).join(".config").join("devme")
+    } else {
+        return false;
+    };
+    let state_file = config_dir.join("skills-hint-state");
+    match std::fs::read_to_string(&state_file) {
+        Ok(contents) => {
+            let count: u32 = contents.lines().next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            count < 4
+        }
+        Err(_) => true,
     }
 }
 
@@ -173,6 +202,23 @@ impl TuiState {
 
     pub fn help_visible(&self) -> bool {
         self.help_visible
+    }
+
+    #[cfg(test)]
+    pub fn suppress_skill_hint(&mut self) {
+        self.skill_hint_eligible = false;
+    }
+
+    /// True when the footer should show the skill hint instead of keybindings.
+    /// Alternates: 8s hint, 30s keybindings, repeating.
+    pub fn show_skill_hint(&self) -> bool {
+        if !self.skill_hint_eligible {
+            return false;
+        }
+        let elapsed = self.started_at.elapsed().as_secs();
+        let cycle = 38; // 8s hint + 30s keys
+        let pos = elapsed % cycle;
+        pos < 8
     }
 
     pub fn toggle_help(&mut self) {
