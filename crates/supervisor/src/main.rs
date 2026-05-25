@@ -25,10 +25,24 @@ fn real_main() -> anyhow::Result<()> {
     })?;
     let mut stack = Stack::parse(&toml).map_err(|e| anyhow::anyhow!("parsing config: {e}"))?;
 
-    // Filter out repo-scoped services — those are owned by the shared
-    // supervisor (ADR-0007). The instance daemon only manages instance-scoped
-    // services.
-    stack.service.retain(|_, svc| svc.scope != devme_core::Scope::Repo);
+    // Repo-scoped services are owned by the shared supervisor (ADR-0007).
+    // Convert them to external services with a health check so the
+    // dependency graph stays intact — dependents like db_migrate can still
+    // wait for postgres to be healthy without the instance supervisor
+    // trying to spawn it.
+    for svc in stack.service.values_mut() {
+        if svc.scope == devme_core::Scope::Repo {
+            svc.external = true;
+            if svc.health.is_none() {
+                if let Some(port) = svc.port {
+                    let resolved = port.resolve(0);
+                    svc.health = Some(devme_core::HealthCheck::Tcp {
+                        tcp: format!("localhost:{resolved}"),
+                    });
+                }
+            }
+        }
+    }
 
     devme_config::validate(&stack).map_err(|errors| {
         let joined = errors
