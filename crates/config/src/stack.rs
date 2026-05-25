@@ -61,6 +61,11 @@ pub struct StackMeta {
     /// Default `restart` policy for any Service that doesn't specify its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_restart: Option<RestartPolicy>,
+    /// Shell command to run once when a new worktree is created
+    /// (`git worktree add`). Typical use: install deps, copy config.
+    /// A `.devme-initialized` marker file prevents re-running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_create: Option<String>,
 }
 
 #[cfg(test)]

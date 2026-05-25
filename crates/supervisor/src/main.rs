@@ -62,11 +62,13 @@ fn real_main() -> anyhow::Result<()> {
     // present the same identity. `id` is the path hash already used for
     // socket naming.
     let canonical_cwd = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
-    let label = canonical_cwd
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("devme")
-        .to_string();
+    let label = git_branch_name(&canonical_cwd).unwrap_or_else(|| {
+        canonical_cwd
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("devme")
+            .to_string()
+    });
     let instance = InstanceInfo {
         id: instance_id.clone(),
         label,
@@ -89,5 +91,23 @@ fn real_main() -> anyhow::Result<()> {
 
     result?;
     Ok(())
+}
+
+fn git_branch_name(cwd: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8(out.stdout).ok()?;
+    let trimmed = branch.trim();
+    if trimmed.is_empty() || trimmed == "HEAD" {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 

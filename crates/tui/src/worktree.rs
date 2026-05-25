@@ -158,13 +158,32 @@ impl AutoSpawner {
 /// the TUI dedupes by id.
 fn emit_discovered(tx: &mpsc::UnboundedSender<WorktreeEvent>, path: &Path) {
     let id = devme_config::paths::instance_id(path);
-    let label = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("worktree")
-        .to_string();
+    let label = git_branch_name(path).unwrap_or_else(|| {
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("worktree")
+            .to_string()
+    });
     let cwd = path.display().to_string();
     let _ = tx.send(WorktreeEvent::Discovered { id, label, cwd });
+}
+
+fn git_branch_name(cwd: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8(out.stdout).ok()?;
+    let trimmed = branch.trim();
+    if trimmed.is_empty() || trimmed == "HEAD" {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 /// Watch a single worktree's root non-recursively. When `devme.toml`
@@ -229,6 +248,7 @@ async fn ensure_for(path: &Path) {
     if !path.join("devme.toml").exists() {
         return;
     }
+    run_on_create_if_needed(path);
     ensure_docker_for(path);
     let Ok(sock) = devme_config::paths::supervisor_socket(path) else {
         return;
@@ -266,6 +286,51 @@ fn ensure_docker_for(path: &Path) {
     tracing::info!(daemon = %daemon_id, "starting Docker");
     if let Err(e) = docker::start_daemon(daemon_id) {
         tracing::warn!(error = %e, "failed to start Docker daemon");
+    }
+}
+
+/// Run the `[stack] on_create` script if this worktree hasn't been
+/// initialized yet. A `.devme-initialized` marker file prevents re-running.
+fn run_on_create_if_needed(path: &Path) {
+    use devme_config::Stack;
+
+    let marker = path.join(".devme-initialized");
+    if marker.exists() {
+        return;
+    }
+    let Ok(toml_str) = std::fs::read_to_string(path.join("devme.toml")) else {
+        return;
+    };
+    let Ok(stack) = Stack::parse(&toml_str) else {
+        return;
+    };
+    let cmd = match stack.stack.as_ref().and_then(|s| s.on_create.as_ref()) {
+        Some(c) => c.clone(),
+        None => {
+            let _ = std::fs::write(&marker, "");
+            return;
+        }
+    };
+    tracing::info!(worktree = %path.display(), "running on_create script");
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .current_dir(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            let _ = std::fs::write(&marker, "");
+            tracing::info!(worktree = %path.display(), "on_create completed");
+        }
+        Ok(s) => {
+            tracing::warn!(worktree = %path.display(), exit = ?s.code(), "on_create failed");
+        }
+        Err(e) => {
+            tracing::warn!(worktree = %path.display(), error = %e, "on_create spawn failed");
+        }
     }
 }
 
