@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 pub struct GlobalConfig {
     #[serde(default, skip_serializing_if = "DockerConfig::is_empty")]
     pub docker: DockerConfig,
+    #[serde(default, skip_serializing_if = "HintsConfig::is_empty")]
+    pub hints: HintsConfig,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +26,18 @@ pub struct DockerConfig {
 impl DockerConfig {
     fn is_empty(&self) -> bool {
         self.daemon.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HintsConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<String>,
+}
+
+impl HintsConfig {
+    fn is_empty(&self) -> bool {
+        self.skills.is_none()
     }
 }
 
@@ -55,6 +69,7 @@ impl GlobalConfig {
     pub fn get(&self, key: &str) -> Option<String> {
         match key {
             "docker.daemon" => self.docker.daemon.clone(),
+            "hints.skills" => self.hints.skills.clone(),
             _ => None,
         }
     }
@@ -63,6 +78,10 @@ impl GlobalConfig {
         match key {
             "docker.daemon" => {
                 self.docker.daemon = Some(value.to_string());
+                Ok(())
+            }
+            "hints.skills" => {
+                self.hints.skills = Some(value.to_string());
                 Ok(())
             }
             _ => Err(format!("unknown config key: {key}")),
@@ -75,6 +94,10 @@ impl GlobalConfig {
                 self.docker.daemon = None;
                 Ok(())
             }
+            "hints.skills" => {
+                self.hints.skills = None;
+                Ok(())
+            }
             _ => Err(format!("unknown config key: {key}")),
         }
     }
@@ -82,6 +105,7 @@ impl GlobalConfig {
     pub fn keys() -> &'static [(&'static str, &'static str)] {
         &[
             ("docker.daemon", "Docker daemon to start (orbstack, docker-desktop, colima, rancher-desktop)"),
+            ("hints.skills", "Show AI skill install hint (true/false)"),
         ]
     }
 }

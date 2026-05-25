@@ -873,6 +873,15 @@ fn ensure_docker_if_needed(stack: &Stack) -> anyhow::Result<()> {
 }
 
 fn maybe_show_skills_hint() {
+    if QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+
+    let cfg = devme_config::GlobalConfig::load();
+    if cfg.get("hints.skills") == Some("false".into()) {
+        return;
+    }
+
     let config_dir = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         std::path::PathBuf::from(xdg).join("devme")
     } else if let Some(home) = std::env::var_os("HOME") {
@@ -880,16 +889,49 @@ fn maybe_show_skills_hint() {
     } else {
         return;
     };
-    let flag = config_dir.join("skills-hint-shown");
-    if flag.exists() {
+
+    let state_file = config_dir.join("skills-hint-state");
+    let (count, last_shown) = match std::fs::read_to_string(&state_file) {
+        Ok(contents) => {
+            let mut lines = contents.lines();
+            let count: u32 = lines.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let ts: u64 = lines.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            (count, ts)
+        }
+        Err(_) => (0, 0),
+    };
+
+    if count >= 4 {
         return;
     }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Backoff: 0s, 3 days, 2 weeks, 6 weeks
+    let min_gap_secs: u64 = match count {
+        0 => 0,
+        1 => 3 * 86400,
+        2 => 14 * 86400,
+        3 => 42 * 86400,
+        _ => return,
+    };
+
+    if now.saturating_sub(last_shown) < min_gap_secs {
+        return;
+    }
+
     eprintln!(
-        "\n  Tip: Using an AI coding agent? Add the devme skill:\n\
-         \n       npx skills add devme-sh/skills\n"
+        "hint: devme has an AI coding skill. Run: npx skills add devme-sh/skills"
     );
+    if count == 0 {
+        eprintln!("hint: suppress with: devme config set hints.skills false");
+    }
+
     let _ = std::fs::create_dir_all(&config_dir);
-    let _ = std::fs::write(&flag, "");
+    let _ = std::fs::write(&state_file, format!("{}\n{now}", count + 1));
 }
 
 fn socket_path() -> std::path::PathBuf {
