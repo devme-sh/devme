@@ -5,7 +5,7 @@
 <h3 align="center">Your dev stack, supervised.</h3>
 
 <p align="center">
-  Multi-service dev environments that just work — across worktrees, without Docker.
+  Multi-service dev environments that just work. Across worktrees, without Docker.
 </p>
 
 <p align="center">
@@ -14,23 +14,18 @@
 
 ---
 
-devme spawns, monitors, restarts, and tails logs from every service in your project — backend, frontend, database, proxy — declared in a single `devme.toml`. Each git worktree gets its own coexisting stack with automatically non-colliding ports.
+devme spawns, monitors, restarts, and tails logs from every service in your project. Backend, frontend, database, proxy, whatever you've got. Declare them in a single `devme.toml` and each git worktree gets its own coexisting stack with non-colliding ports.
 
 <!-- TODO: Replace with VHS-generated GIF of `devme up` starting services + TUI -->
 <!-- ![devme TUI demo](assets/demo.gif) -->
 
 ## Why devme?
 
-Running a modern project means juggling 3–8 services. Open five terminals, remember the right order, hope nothing grabs the wrong port. Now multiply that by worktrees.
+Running a modern project means juggling 3-8 services. Open five terminals, remember the right startup order, hope nothing grabs the wrong port. Now multiply that by worktrees.
 
-devme fixes this:
+devme fixes this. One command, `devme up`, starts everything in dependency order with health checks. Each worktree gets its own port slot, so `main` and `feature-branch` run side by side without collisions. There's a TUI dashboard for real-time status and logs. Every command supports `--json` and semantic exit codes, so AI agents can drive it too. No Docker required.
 
-- **One command** — `devme up` starts everything in dependency order with health checks
-- **Worktree-aware** — Slot-based port allocation means `main` and `feature-branch` run side by side without collisions
-- **TUI dashboard** — Real-time status, logs, and controls for every service
-- **Agent-friendly** — Every command supports `--json`, exit codes are semantic, `devme agent-context` emits a machine-readable manifest
-- **No Docker required** — Supervises native processes directly
-- **Smart provisioning** — Steps with trust levels (`auto`/`prompt`/`manual`) handle setup dependencies safely
+Setup steps have trust levels (`auto`, `prompt`, `manual`) so dependencies get provisioned safely.
 
 ## Quick Start
 
@@ -60,7 +55,7 @@ port = 5432
 health = { command = "pg_isready -p {{port}}" }
 ```
 
-Ports automatically offset per worktree slot — slot 0 keeps defaults, slot 1 gets `+10`, etc.
+Ports automatically offset per worktree slot. Slot 0 keeps defaults, slot 1 gets `+10`, and so on.
 
 ## How It Compares
 
@@ -90,7 +85,7 @@ crates/
   cli/               CLI surface (clap)
 ```
 
-Two-tier daemon architecture: an **instance daemon** per worktree manages instance-scoped services, while a **shared-services daemon** per repo handles services shared across worktrees (e.g., a cloud SQL proxy).
+Two-tier daemon architecture. An instance daemon per worktree manages instance-scoped services, while a shared-services daemon per repo handles things like a cloud SQL proxy that multiple worktrees need.
 
 ## Development
 
@@ -105,14 +100,14 @@ cargo clippy --all-targets
 <details>
 <summary>Design documentation</summary>
 
-- [`CONTEXT.md`](./CONTEXT.md) — Domain glossary and invariants
-- [`docs/adr/`](./docs/adr/) — Architectural decisions (numbered, append-only)
+- [`CONTEXT.md`](./CONTEXT.md): Domain glossary and invariants
+- [`docs/adr/`](./docs/adr/): Architectural decisions (numbered, append-only)
 
 </details>
 
 ## Status
 
-Early development — not yet published. The design is captured and implementation is progressing through the crate structure above. Contributions welcome once the core stabilizes.
+Early development, not yet published. Design is captured and implementation is progressing through the crate structure above. Contributions welcome once the core stabilizes.
 
 ## License
 
