@@ -302,10 +302,11 @@ fn build_debug_prompt(state: &TuiState) -> String {
     let mut prompt = format!("My devme dev environment ({label}).\n\nWorking directory: {cwd}\n\n");
 
     if services.is_empty() {
-        if state.current_instance_is_placeholder() {
+        let has_toml = std::path::Path::new(cwd).join("devme.toml").exists();
+        if !has_toml {
             prompt.push_str("No devme.toml found in this directory.\n\n");
         } else {
-            prompt.push_str("No services declared.\n\n");
+            prompt.push_str("devme.toml exists but no services are running (daemon may not have started yet).\n\n");
         }
     } else {
         prompt.push_str("## Service states\n\n");
