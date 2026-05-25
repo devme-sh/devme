@@ -116,4 +116,4 @@ Early development — not yet published. The design is captured and implementati
 
 ## License
 
-TBD before public release.
+[MIT](./LICENSE)
