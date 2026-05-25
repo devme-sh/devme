@@ -6,11 +6,20 @@
 
 use std::path::{Path, PathBuf};
 
-/// Unix socket path for the supervisor of `cwd`. Hashes `cwd` to a short
-/// identifier so the resulting path stays a reasonable length even if the
-/// repo is deeply nested.
+/// Unix socket path for the supervisor of `cwd`. Lives under the repo-scoped
+/// directory so the TUI only discovers sockets belonging to the same repo.
 pub fn supervisor_socket(cwd: &Path) -> std::io::Result<PathBuf> {
-    Ok(runtime_dir_inner()?.join(format!("{}.sock", instance_id(cwd))))
+    let dir = repo_socket_dir(cwd)?;
+    Ok(dir.join(format!("{}.sock", instance_id(cwd))))
+}
+
+/// `<runtime>/devme/repos/<repo-id>/` — the directory where all instance
+/// sockets for a given repo live. The TUI watches this directory to
+/// discover sibling stacks without cross-contamination from unrelated repos.
+pub fn repo_socket_dir(cwd: &Path) -> std::io::Result<PathBuf> {
+    let dir = runtime_dir_inner()?.join("repos").join(repo_id(cwd));
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
 }
 
 /// Stable per-worktree identifier. Same input → same hex every time within
@@ -74,14 +83,10 @@ pub fn shared_socket(cwd: &Path) -> std::io::Result<PathBuf> {
     Ok(dir.join("shared.sock"))
 }
 
-/// `~/.local/share/devme/repos/<repo-id>/`, created if missing. Per-repo
-/// state (the shared socket, lock files) lives here.
+/// `<runtime>/devme/repos/<repo-id>/`, created if missing. Per-repo
+/// state (instance sockets, shared socket, lock files) lives here.
 pub fn shared_dir(cwd: &Path) -> std::io::Result<PathBuf> {
-    let dir = runtime_dir_inner()?
-        .join("repos")
-        .join(repo_id(cwd));
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
+    repo_socket_dir(cwd)
 }
 
 /// Shared slot-allocator registry path. One file per host coordinates

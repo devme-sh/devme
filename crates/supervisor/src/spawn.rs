@@ -66,6 +66,49 @@ pub async fn ensure_daemon(sock: &Path, cwd: &Path) -> anyhow::Result<bool> {
     ))
 }
 
+/// Like [`ensure_daemon`] but for the repo-scoped shared supervisor.
+/// Spawns `devme-shared-supervisor` in `cwd` if no daemon is listening
+/// on the shared socket yet. The shared daemon manages `scope = "repo"`
+/// services for all worktrees of the same git repo.
+pub async fn ensure_shared_daemon(cwd: &Path) -> anyhow::Result<bool> {
+    let sock = devme_config::paths::shared_socket(cwd)?;
+    if devme_client::Client::connect(&sock).await.is_ok() {
+        return Ok(false);
+    }
+
+    let binary = find_sibling_binary("devme-shared-supervisor")?;
+    let mut child = std::process::Command::new(&binary)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawning {}: {e}", binary.display()))?;
+
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if devme_client::Client::connect(&sock).await.is_ok() {
+            drop(child.stderr.take());
+            return Ok(true);
+        }
+        if let Ok(Some(_)) = child.try_wait() {
+            let mut stderr = String::new();
+            if let Some(mut handle) = child.stderr.take() {
+                let _ = handle.read_to_string(&mut stderr);
+            }
+            let stderr = stderr.trim();
+            return Err(anyhow::anyhow!(
+                "shared supervisor exited during startup\n{}",
+                if stderr.is_empty() { "(no stderr)" } else { stderr }
+            ));
+        }
+    }
+    Err(anyhow::anyhow!(
+        "shared daemon didn't come up at {} within 5s",
+        sock.display()
+    ))
+}
+
 /// Resolve a sibling binary next to the calling executable. Handles
 /// symlink installs (e.g. `ln -s` into `~/.local/bin`) by canonicalizing
 /// `current_exe()` before reading its parent.

@@ -23,7 +23,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use devme_supervisor::spawn::ensure_daemon;
+use devme_supervisor::spawn::{ensure_daemon, ensure_shared_daemon};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
@@ -85,7 +85,13 @@ impl AutoSpawner {
             }
         }
         let initial_paths: Vec<PathBuf> = initial.iter().map(|w| w.path.clone()).collect();
+        let cwd_for_shared = cwd.to_path_buf();
         tokio::spawn(async move {
+            // Spawn the repo-scoped shared supervisor first — it owns
+            // scope=repo services that instance supervisors have filtered out.
+            if let Err(e) = ensure_shared_daemon(&cwd_for_shared).await {
+                tracing::debug!(error = %e, "shared supervisor not started (may have no repo-scoped services)");
+            }
             for p in initial_paths {
                 ensure_for(&p).await;
             }
@@ -223,6 +229,7 @@ async fn ensure_for(path: &Path) {
     if !path.join("devme.toml").exists() {
         return;
     }
+    ensure_docker_for(path);
     let Ok(sock) = devme_config::paths::supervisor_socket(path) else {
         return;
     };
@@ -232,6 +239,33 @@ async fn ensure_for(path: &Path) {
             error = %e,
             "auto-spawn supervisor failed; worktree will not appear until manually started"
         );
+    }
+}
+
+/// If the stack at `path` needs Docker and Docker isn't running, start the
+/// configured daemon. No prompting — the TUI doesn't own a terminal for
+/// interactive input; the user sets `docker.daemon` via `devme config set`
+/// or by running `devme up` once (which prompts).
+fn ensure_docker_for(path: &Path) {
+    use devme_config::{GlobalConfig, Stack, docker};
+
+    let Ok(toml_str) = std::fs::read_to_string(path.join("devme.toml")) else {
+        return;
+    };
+    let Ok(stack) = Stack::parse(&toml_str) else {
+        return;
+    };
+    if !docker::stack_needs_docker(&stack) || docker::is_docker_running() {
+        return;
+    }
+    let cfg = GlobalConfig::load();
+    let Some(daemon_id) = &cfg.docker.daemon else {
+        tracing::warn!("services need Docker but no daemon configured — run: devme config set docker.daemon <name>");
+        return;
+    };
+    tracing::info!(daemon = %daemon_id, "starting Docker");
+    if let Err(e) = docker::start_daemon(daemon_id) {
+        tracing::warn!(error = %e, "failed to start Docker daemon");
     }
 }
 

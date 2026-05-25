@@ -94,7 +94,7 @@ fn main() {
 
     let (w, h) = (110, 30);
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-    terminal.draw(|f| render(f, &state)).unwrap();
+    terminal.draw(|f| render(f, &mut state)).unwrap();
     print_buffer(terminal.backend().buffer());
 }
 

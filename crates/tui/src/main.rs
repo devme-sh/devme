@@ -13,6 +13,8 @@
 
 use std::io::Stdout;
 
+use base64::Engine;
+
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
     MouseEventKind,
@@ -20,8 +22,6 @@ use crossterm::event::{
 
 /// Lines per PgUp / PgDn step. A "screen" worth of scroll.
 const LOG_PAGE: usize = 20;
-/// Lines per mouse-wheel notch. Trackpads emit many events; 3 is the
-/// terminal-emulator-typical value (matches xterm, iterm2).
 const MOUSE_SCROLL_LINES: usize = 3;
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
@@ -60,11 +60,13 @@ fn main() {
 }
 
 async fn real_main() -> anyhow::Result<()> {
+    let no_shutdown = std::env::args().any(|a| a == "--no-shutdown");
+
     let cwd = std::env::current_dir()?;
-    let runtime_dir = devme_config::paths::runtime_dir()?;
+    let repo_dir = devme_config::paths::repo_socket_dir(&cwd)?;
     let home_id = devme_config::paths::instance_id(&cwd);
 
-    let mut registry = Registry::bind(&runtime_dir).await?;
+    let mut registry = Registry::bind(&repo_dir).await?;
     let (wt_tx, wt_rx) = mpsc::unbounded_channel::<WorktreeEvent>();
     // Hold the spawner so its watchers stay alive for the TUI's lifetime.
     let _spawner = AutoSpawner::bind(&cwd, wt_tx).await?;
@@ -72,14 +74,11 @@ async fn real_main() -> anyhow::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    // EnableMouseCapture lets us see scroll-wheel events. Trade-off: it
-    // also captures clicks/drags, so the terminal's native text selection
-    // is intercepted — on macOS Terminal/iTerm, hold Option to bypass.
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal, &mut state, &mut registry, wt_rx, &home_id).await;
+    let result = run(&mut terminal, &mut state, &mut registry, wt_rx, &home_id, no_shutdown).await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
@@ -94,6 +93,7 @@ async fn run(
     registry: &mut Registry,
     mut wt_rx: mpsc::UnboundedReceiver<WorktreeEvent>,
     home_id: &str,
+    no_shutdown: bool,
 ) -> anyhow::Result<()> {
     let (key_tx, mut key_rx) = mpsc::unbounded_channel::<Event>();
     tokio::task::spawn_blocking(move || {
@@ -143,16 +143,55 @@ async fn run(
                         continue;
                     }
                     match k.code {
+                        // Copy mode: full-screen log view with mouse capture
+                        // disabled for native text selection.
+                        KeyCode::Esc if state.copy_mode() => {
+                            state.exit_copy_mode();
+                            execute!(terminal.backend_mut(), EnableMouseCapture)?;
+                        }
+                        KeyCode::Char('v') if !state.copy_mode() => {
+                            state.enter_copy_mode();
+                            execute!(terminal.backend_mut(), DisableMouseCapture)?;
+                        }
+                        // Scrolling still works in copy mode.
+                        _ if state.copy_mode() => match k.code {
+                            KeyCode::Char('j') | KeyCode::Down => state.log_scroll_down(1),
+                            KeyCode::Char('k') | KeyCode::Up => state.log_scroll_up(1),
+                            KeyCode::Char('g') => state.log_scroll_top(),
+                            KeyCode::Char('G') => state.log_scroll_bottom(),
+                            KeyCode::PageUp | KeyCode::Char('b') => state.log_page_up(LOG_PAGE),
+                            KeyCode::PageDown | KeyCode::Char(' ') => state.log_page_down(LOG_PAGE),
+                            KeyCode::Char('y') => {
+                                copy_to_clipboard(&state.visible_log_lines());
+                                state.exit_copy_mode();
+                                execute!(terminal.backend_mut(), EnableMouseCapture)?;
+                            }
+                            KeyCode::Char('Y') => {
+                                copy_to_clipboard(&state.all_log_lines());
+                                state.exit_copy_mode();
+                                execute!(terminal.backend_mut(), EnableMouseCapture)?;
+                            }
+                            KeyCode::Char('q') => {
+                                state.exit_copy_mode();
+                                execute!(terminal.backend_mut(), EnableMouseCapture)?;
+                            }
+                            _ => {}
+                        }
                         // `?` toggles help; Esc inside the overlay dismisses.
                         KeyCode::Char('?') => state.toggle_help(),
                         KeyCode::Esc if state.help_visible() => state.hide_help(),
-                        // `q` / Esc / Ctrl-C — shut down every attached daemon.
+                        // `q` / Esc / Ctrl-C — shut down every attached daemon
+                        // (unless --no-shutdown, which detaches instead).
                         KeyCode::Char('q') | KeyCode::Esc => {
-                            registry.broadcast(ClientMessage::Shutdown).await;
+                            if !no_shutdown {
+                                registry.broadcast(ClientMessage::Shutdown).await;
+                            }
                             return Ok(());
                         }
                         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                            registry.broadcast(ClientMessage::Shutdown).await;
+                            if !no_shutdown {
+                                registry.broadcast(ClientMessage::Shutdown).await;
+                            }
                             return Ok(());
                         }
                         // Detach: leave the TUI but keep services running.
@@ -192,6 +231,12 @@ async fn run(
                                 registry.send_to(&id, ClientMessage::Restart { service: name }).await;
                             }
                         }
+                        KeyCode::Char('y') => {
+                            copy_to_clipboard(&state.visible_log_lines());
+                        }
+                        KeyCode::Char('Y') => {
+                            copy_to_clipboard(&state.all_log_lines());
+                        }
                         _ => {}
                     }
                 }
@@ -219,3 +264,18 @@ async fn run(
         }
     }
 }
+
+fn copy_to_clipboard(lines: &[&str]) {
+    if lines.is_empty() {
+        return;
+    }
+    let text = lines.join("\n");
+    // OSC 52 escape sequence — works in most modern terminals (iTerm2,
+    // Ghostty, kitty, tmux with set-clipboard on) regardless of OS.
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let _ = std::io::Write::write_all(
+        &mut std::io::stdout(),
+        format!("\x1b]52;c;{encoded}\x07").as_bytes(),
+    );
+}
+

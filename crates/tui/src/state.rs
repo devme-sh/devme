@@ -56,12 +56,31 @@ impl InstanceData {
     }
 }
 
+/// Repo-scoped shared daemon state. These services are merged into every
+/// instance's tab row rather than appearing as a separate sidebar entry.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct SharedData {
+    /// Instance id of the shared daemon (e.g. `shared::<repo_id>`).
+    id: Option<String>,
+    services: Vec<ServiceSnapshot>,
+    logs: HashMap<String, VecDeque<String>>,
+    log_scroll: HashMap<String, usize>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiState {
     instances: Vec<InstanceData>,
     selected_instance: Option<usize>,
+    /// Shared (repo-scoped) daemon state, merged into every instance view.
+    shared: SharedData,
     focus: Focus,
     help_visible: bool,
+    /// Last-known log viewport height (rows). Updated each render pass so
+    /// scroll clamping accounts for how many lines the user can see at once.
+    viewport_height: usize,
+    /// Full-screen log view for text selection. Mouse capture is disabled
+    /// so the terminal handles selection natively.
+    copy_mode: bool,
 }
 
 impl Default for TuiState {
@@ -69,10 +88,18 @@ impl Default for TuiState {
         Self {
             instances: Vec::new(),
             selected_instance: None,
+            shared: SharedData::default(),
             focus: Focus::Tabs,
             help_visible: false,
+            viewport_height: 20,
+            copy_mode: false,
         }
     }
+}
+
+/// Returns true if the instance id belongs to the shared supervisor.
+fn is_shared_id(id: &str) -> bool {
+    id.starts_with("shared::")
 }
 
 impl TuiState {
@@ -116,6 +143,18 @@ impl TuiState {
 
     pub fn focus(&self) -> Focus {
         self.focus
+    }
+
+    pub fn copy_mode(&self) -> bool {
+        self.copy_mode
+    }
+
+    pub fn enter_copy_mode(&mut self) {
+        self.copy_mode = true;
+    }
+
+    pub fn exit_copy_mode(&mut self) {
+        self.copy_mode = false;
     }
 
     pub fn help_visible(&self) -> bool {
@@ -207,7 +246,7 @@ impl TuiState {
     /// instead of an empty tab row.
     pub fn current_instance_is_placeholder(&self) -> bool {
         self.current_instance()
-            .map(|i| i.services.is_empty() && i.steps.is_empty())
+            .map(|i| i.services.is_empty() && i.steps.is_empty() && self.shared.services.is_empty())
             .unwrap_or(false)
     }
 
@@ -220,8 +259,38 @@ impl TuiState {
 
     // ── proxies to the selected instance ────────────────────────────────
 
-    pub fn services(&self) -> &[ServiceSnapshot] {
-        self.current_instance().map(|i| i.services.as_slice()).unwrap_or(&[])
+    /// Combined service count: instance services + shared (repo-scoped) services.
+    fn combined_service_count(&self) -> usize {
+        let inst = self.current_instance().map(|i| i.services.len()).unwrap_or(0);
+        inst + self.shared.services.len()
+    }
+
+    /// Resolve a combined index into either an instance or shared service.
+    fn resolve_service_index(&self, idx: usize) -> Option<&ServiceSnapshot> {
+        let inst = self.current_instance()?;
+        if idx < inst.services.len() {
+            inst.services.get(idx)
+        } else {
+            self.shared.services.get(idx - inst.services.len())
+        }
+    }
+
+    /// True if the given combined index refers to a shared service.
+    fn is_shared_service_index(&self, idx: usize) -> bool {
+        self.current_instance()
+            .map(|i| idx >= i.services.len())
+            .unwrap_or(false)
+    }
+
+    /// All services visible in the current instance's tab row: instance-
+    /// scoped services first, then repo-scoped (shared) services.
+    pub fn services(&self) -> Vec<ServiceSnapshot> {
+        let mut out: Vec<ServiceSnapshot> = self
+            .current_instance()
+            .map(|i| i.services.clone())
+            .unwrap_or_default();
+        out.extend(self.shared.services.iter().cloned());
+        out
     }
 
     pub fn steps(&self) -> &[StepSnapshot] {
@@ -229,15 +298,17 @@ impl TuiState {
     }
 
     pub fn selected_service(&self) -> Option<&ServiceSnapshot> {
-        self.current_instance()
-            .and_then(|i| i.selected_service.and_then(|idx| i.services.get(idx)))
+        let inst = self.current_instance()?;
+        let idx = inst.selected_service?;
+        self.resolve_service_index(idx)
     }
 
-    /// Buffered log lines for `service` in the current instance.
+    /// Buffered log lines for `service` — checks both instance and shared logs.
     pub fn service_logs(&self, service: &str) -> &VecDeque<String> {
         static EMPTY: std::sync::OnceLock<VecDeque<String>> = std::sync::OnceLock::new();
         self.current_instance()
             .and_then(|i| i.logs.get(service))
+            .or_else(|| self.shared.logs.get(service))
             .unwrap_or_else(|| EMPTY.get_or_init(VecDeque::new))
     }
 
@@ -246,27 +317,44 @@ impl TuiState {
         let Some(inst) = self.current_instance() else {
             return 0;
         };
-        match inst.selected_service.and_then(|idx| inst.services.get(idx)) {
-            Some(s) => inst.log_scroll.get(&s.name).copied().unwrap_or(0),
-            None => 0,
+        let Some(idx) = inst.selected_service else {
+            return 0;
+        };
+        let Some(svc) = self.resolve_service_index(idx) else {
+            return 0;
+        };
+        if self.is_shared_service_index(idx) {
+            self.shared.log_scroll.get(&svc.name).copied().unwrap_or(0)
+        } else {
+            inst.log_scroll.get(&svc.name).copied().unwrap_or(0)
         }
     }
 
     fn set_scroll_for_selected(&mut self, value: usize) {
-        let Some(inst) = self.current_instance_mut() else {
+        let Some(inst) = self.current_instance() else {
             return;
         };
-        let Some(name) = inst
-            .selected_service
-            .and_then(|idx| inst.services.get(idx))
-            .map(|s| s.name.clone())
-        else {
+        let Some(idx) = inst.selected_service else {
             return;
         };
-        if value == 0 {
-            inst.log_scroll.remove(&name);
+        let Some(svc) = self.resolve_service_index(idx) else {
+            return;
+        };
+        let name = svc.name.clone();
+        let is_shared = self.is_shared_service_index(idx);
+        if is_shared {
+            if value == 0 {
+                self.shared.log_scroll.remove(&name);
+            } else {
+                self.shared.log_scroll.insert(name, value);
+            }
         } else {
-            inst.log_scroll.insert(name, value);
+            let inst = self.current_instance_mut().unwrap();
+            if value == 0 {
+                inst.log_scroll.remove(&name);
+            } else {
+                inst.log_scroll.insert(name, value);
+            }
         }
     }
 
@@ -303,28 +391,72 @@ impl TuiState {
         self.set_scroll_for_selected(0);
     }
 
+    /// The visible log lines for the selected service (what's currently in
+    /// the viewport). Returns an empty vec if nothing is selected.
+    pub fn visible_log_lines(&self) -> Vec<&str> {
+        let Some(svc) = self.selected_service() else {
+            return Vec::new();
+        };
+        let logs = self.service_logs(&svc.name);
+        if logs.is_empty() {
+            return Vec::new();
+        }
+        let viewport = self.viewport_height;
+        let offset = self.log_scroll_offset();
+        let end = logs.len().saturating_sub(offset);
+        let start = end.saturating_sub(viewport);
+        logs.iter().skip(start).take(end - start).map(|s| s.as_str()).collect()
+    }
+
+    /// All log lines for the selected service.
+    pub fn all_log_lines(&self) -> Vec<&str> {
+        let Some(svc) = self.selected_service() else {
+            return Vec::new();
+        };
+        self.service_logs(&svc.name).iter().map(|s| s.as_str()).collect()
+    }
+
+    /// Update the viewport height from the last render pass. Called by the
+    /// renderer so scroll clamping stays in sync with the actual terminal size.
+    pub fn set_viewport_height(&mut self, h: usize) {
+        self.viewport_height = h.max(1);
+    }
+
     fn max_scroll_for_selected(&self) -> usize {
         let Some(inst) = self.current_instance() else {
             return 0;
         };
-        match inst.selected_service.and_then(|idx| inst.services.get(idx)) {
-            Some(s) => inst.logs.get(&s.name).map(|l| l.len()).unwrap_or(0),
-            None => 0,
-        }
+        let Some(idx) = inst.selected_service else {
+            return 0;
+        };
+        let Some(svc) = self.resolve_service_index(idx) else {
+            return 0;
+        };
+        let total = if self.is_shared_service_index(idx) {
+            self.shared.logs.get(&svc.name).map(|l| l.len()).unwrap_or(0)
+        } else {
+            inst.logs.get(&svc.name).map(|l| l.len()).unwrap_or(0)
+        };
+        total.saturating_sub(self.viewport_height)
     }
 
     /// Absorb a [`ServerMessage`] tagged with the id of the daemon that
-    /// sent it. Routes the update to the matching [`InstanceData`] rather
-    /// than the currently-selected one, so multiplexed input from the
-    /// discovery layer doesn't cross-pollute stacks.
+    /// sent it. Messages from the shared daemon (`shared::*`) are routed to
+    /// [`SharedData`]; everything else goes to the matching [`InstanceData`].
     pub fn apply_from(&mut self, source_id: &str, msg: ServerMessage) {
+        if is_shared_id(source_id) {
+            self.apply_shared(source_id, msg);
+            return;
+        }
         match msg {
             ServerMessage::Subscribed { services, steps, instance } => {
                 let idx = self.upsert_instance(instance);
                 let inst = &mut self.instances[idx];
                 inst.services = services;
                 inst.steps = steps;
-                inst.selected_service = if inst.services.is_empty() { None } else { Some(0) };
+                if inst.selected_service.is_none() && !inst.services.is_empty() {
+                    inst.selected_service = Some(0);
+                }
             }
             ServerMessage::StatusUpdate { service, state, .. } => {
                 if let Some(idx) = self.find_instance(source_id)
@@ -344,6 +476,29 @@ impl TuiState {
                 }
             }
             ServerMessage::LogChunk { service, bytes, .. } => {
+                Self::apply_log_chunk_to(
+                    self.find_instance(source_id)
+                        .and_then(|idx| Some(&mut self.instances[idx])),
+                    &service,
+                    &bytes,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_shared(&mut self, _source_id: &str, msg: ServerMessage) {
+        match msg {
+            ServerMessage::Subscribed { services, instance, .. } => {
+                self.shared.id = Some(instance.id);
+                self.shared.services = services;
+            }
+            ServerMessage::StatusUpdate { service, state, .. } => {
+                if let Some(s) = self.shared.services.iter_mut().find(|s| s.name == service) {
+                    s.state = state;
+                }
+            }
+            ServerMessage::LogChunk { service, bytes, .. } => {
                 let decoded = base64::engine::general_purpose::STANDARD
                     .decode(bytes.as_bytes())
                     .ok()
@@ -351,11 +506,7 @@ impl TuiState {
                 let Some(text) = decoded else {
                     return;
                 };
-                let Some(idx) = self.find_instance(source_id) else {
-                    return;
-                };
-                let inst = &mut self.instances[idx];
-                let buf = inst
+                let buf = self.shared
                     .logs
                     .entry(service.clone())
                     .or_insert_with(|| VecDeque::with_capacity(TUI_LOG_CAP.min(64)));
@@ -373,20 +524,55 @@ impl TuiState {
                     pushed += 1;
                 }
                 let len_after = buf.len();
-                // Stable viewport while paused: bump scroll offset by net
-                // growth so the visible window keeps pointing at the same
-                // absolute lines. See render_log_viewport for the geometry.
                 let net_growth = len_after.saturating_sub(len_before);
                 if pushed > 0
                     && net_growth > 0
-                    && let Some(off) = inst.log_scroll.get_mut(&service)
+                    && let Some(off) = self.shared.log_scroll.get_mut(&service)
                     && *off > 0
                 {
                     *off = off.saturating_add(net_growth).min(len_after);
                 }
             }
-            // Notice, Error, Goodbye don't yet move the model.
             _ => {}
+        }
+    }
+
+    fn apply_log_chunk_to(inst: Option<&mut InstanceData>, service: &str, bytes: &str) {
+        let Some(inst) = inst else {
+            return;
+        };
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(bytes.as_bytes())
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok());
+        let Some(text) = decoded else {
+            return;
+        };
+        let buf = inst
+            .logs
+            .entry(service.to_string())
+            .or_insert_with(|| VecDeque::with_capacity(TUI_LOG_CAP.min(64)));
+        let len_before = buf.len();
+        let mut pushed = 0usize;
+        for line in text.split('\n') {
+            let line = line.trim_end_matches('\r');
+            if line.is_empty() {
+                continue;
+            }
+            if buf.len() == TUI_LOG_CAP {
+                buf.pop_front();
+            }
+            buf.push_back(line.to_string());
+            pushed += 1;
+        }
+        let len_after = buf.len();
+        let net_growth = len_after.saturating_sub(len_before);
+        if pushed > 0
+            && net_growth > 0
+            && let Some(off) = inst.log_scroll.get_mut(service)
+            && *off > 0
+        {
+            *off = off.saturating_add(net_growth).min(len_after);
         }
     }
 
@@ -412,13 +598,19 @@ impl TuiState {
     /// Ids of instances that have at least one service — i.e. whose
     /// daemon has responded with a `Subscribed`. The caller uses this to
     /// drive "send Start once" semantics; placeholders (no daemon yet)
-    /// are skipped.
+    /// are skipped. Includes the shared daemon if it has services.
     pub fn attached_instance_ids(&self) -> Vec<String> {
-        self.instances
+        let mut ids: Vec<String> = self.instances
             .iter()
             .filter(|i| !i.services.is_empty())
             .map(|i| i.info.id.clone())
-            .collect()
+            .collect();
+        if !self.shared.services.is_empty() {
+            if let Some(id) = &self.shared.id {
+                ids.push(id.clone());
+            }
+        }
+        ids
     }
 
     /// Move selection to the instance with this id, if it exists.
@@ -429,37 +621,47 @@ impl TuiState {
     }
 
     /// `(instance_id, service_name)` of the currently-selected service, for
-    /// routing commands back to the right daemon.
+    /// routing commands back to the right daemon. Returns the shared daemon's
+    /// id when the selected service is repo-scoped.
     pub fn selected_instance_and_service(&self) -> Option<(String, String)> {
         let inst = self.current_instance()?;
-        let svc = inst.selected_service.and_then(|i| inst.services.get(i))?;
-        Some((inst.info.id.clone(), svc.name.clone()))
+        let idx = inst.selected_service?;
+        let svc = self.resolve_service_index(idx)?;
+        let id = if self.is_shared_service_index(idx) {
+            self.shared.id.clone()?
+        } else {
+            inst.info.id.clone()
+        };
+        Some((id, svc.name.clone()))
     }
 
     /// Horizontal navigation across service tabs (`h`/`l` / `←`/`→`).
+    /// Navigates across both instance and shared services.
     pub fn select_next_service(&mut self) {
+        let total = self.combined_service_count();
+        if total == 0 {
+            return;
+        }
         let Some(inst) = self.current_instance_mut() else {
             return;
         };
-        if inst.services.is_empty() {
-            return;
-        }
         let next = match inst.selected_service {
-            Some(i) => (i + 1) % inst.services.len(),
+            Some(i) => (i + 1) % total,
             None => 0,
         };
         inst.selected_service = Some(next);
     }
 
     pub fn select_prev_service(&mut self) {
+        let total = self.combined_service_count();
+        if total == 0 {
+            return;
+        }
         let Some(inst) = self.current_instance_mut() else {
             return;
         };
-        if inst.services.is_empty() {
-            return;
-        }
         let prev = match inst.selected_service {
-            Some(0) | None => inst.services.len() - 1,
+            Some(0) | None => total - 1,
             Some(i) => i - 1,
         };
         inst.selected_service = Some(prev);
@@ -640,7 +842,8 @@ mod tests {
         s.log_page_down(15);
         assert_eq!(s.log_scroll_offset(), 5);
         s.log_scroll_top();
-        assert_eq!(s.log_scroll_offset(), 50);
+        // Default viewport_height is 20, so max scroll = 50 - 20 = 30.
+        assert_eq!(s.log_scroll_offset(), 30);
         s.log_scroll_bottom();
         assert_eq!(s.log_scroll_offset(), 0);
     }
@@ -719,15 +922,17 @@ mod tests {
             });
         }
         s.log_page_up(100);
-        assert_eq!(s.log_scroll_offset(), 5, "should clamp to buffer length");
+        // 5 lines, viewport 20 → all lines fit, max scroll = 0.
+        assert_eq!(s.log_scroll_offset(), 0, "should clamp: all lines fit viewport");
     }
 
     #[test]
     fn log_scroll_is_independent_per_service() {
         let mut s = TuiState::default();
+        s.set_viewport_height(10);
         s.apply(snapshot_msg(&["a", "b"]));
         let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
-        for n in 0..20 {
+        for n in 0..30 {
             s.apply(ServerMessage::LogChunk {
                 service: "a".into(),
                 bytes: enc(&format!("a-{n}")),

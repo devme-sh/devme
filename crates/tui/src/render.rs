@@ -37,8 +37,14 @@ use crate::state::TuiState;
 use devme_core::{ServiceState, StepState};
 
 /// Render `state` into `frame`'s full area.
-pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
+pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     let area = frame.area();
+
+    if state.copy_mode() {
+        render_copy_mode(frame, area, state);
+        return;
+    }
+
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -53,10 +59,81 @@ pub fn render(frame: &mut Frame<'_>, state: &TuiState) {
     render_main(frame, outer[1], state);
     render_footer(frame, vertical[1], state);
 
-    // Help overlay renders last so it sits on top of every other widget.
     if state.help_visible() {
         render_help_overlay(frame, area);
     }
+}
+
+/// Full-screen log view for copy mode. No borders, sidebar, or tabs —
+/// just the log text so terminal-native text selection works cleanly.
+fn render_copy_mode(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
+    let svc_name = state.selected_service().map(|s| s.name.clone());
+    let title = svc_name.as_deref().unwrap_or("logs");
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
+        .split(area);
+    let header_area = layout[0];
+    let log_area = layout[1];
+    let footer_area = layout[2];
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(
+            " COPY MODE ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {title} "),
+            Style::default().fg(Color::White),
+        ),
+        Span::styled(
+            "— select text with mouse ",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    frame.render_widget(header, header_area);
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let key = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled(" y ", key),
+        Span::styled("copy visible  ", dim),
+        Span::styled("Y ", key),
+        Span::styled("copy all  ", dim),
+        Span::styled("jk ", key),
+        Span::styled("scroll  ", dim),
+        Span::styled("g/G ", key),
+        Span::styled("top/bottom  ", dim),
+        Span::styled("Esc ", key),
+        Span::styled("exit", dim),
+    ]));
+    frame.render_widget(footer, footer_area);
+
+    let Some(name) = &svc_name else {
+        return;
+    };
+    let viewport = log_area.height as usize;
+    state.set_viewport_height(viewport);
+    let offset = state.log_scroll_offset();
+    let logs = state.service_logs(name);
+    let end = logs.len().saturating_sub(offset);
+    let start = end.saturating_sub(viewport);
+
+    let mut text = Text::default();
+    for line in logs.iter().skip(start).take(end - start) {
+        let parsed = line
+            .as_bytes()
+            .into_text()
+            .unwrap_or_else(|_| Text::raw(line.clone()));
+        for parsed_line in parsed.lines {
+            text.lines.push(parsed_line);
+        }
+    }
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), log_area);
 }
 
 // ── footer / sidebar ────────────────────────────────────────────────────────
@@ -140,7 +217,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
     // to read at a glance, narrow enough that the underlying layout is
     // still partly visible around it.
     let w = 56u16.min(area.width.saturating_sub(4));
-    let h = 22u16.min(area.height.saturating_sub(4));
+    let h = 24u16.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let modal = Rect { x, y, width: w, height: h };
@@ -188,7 +265,9 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
         Line::from(vec![key("b / space"), desc("page up / down")]),
         Line::from(vec![key("J / K"), desc("scroll one line")]),
         Line::from(vec![key("g / G"), desc("top / live tail")]),
-        Line::from(vec![key("wheel"), desc("scroll (Option to copy)")]),
+        Line::from(vec![key("y / Y"), desc("copy visible / all logs")]),
+        Line::from(vec![key("v"), desc("copy mode (select text)")]),
+        Line::from(vec![key("wheel"), desc("scroll")]),
         Line::default(),
         section("service actions"),
         Line::from(vec![key("S"), desc("start selected")]),
@@ -300,7 +379,7 @@ fn render_tools_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
 // ── main pane: tabs + viewport + meta ──────────────────────────────────────
 
-fn render_main(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+fn render_main(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
     let header = format_main_title(state);
     let main_block = Block::default()
         .title(header)
@@ -421,9 +500,9 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(tabs, area);
 }
 
-fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let svc = match state.selected_service() {
-        Some(s) => s,
+fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
+    let (svc_name, svc_state) = match state.selected_service() {
+        Some(s) => (s.name.clone(), s.state.clone()),
         None => {
             let msg = Paragraph::new(Line::from(Span::styled(
                 "no service selected",
@@ -433,9 +512,8 @@ fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             return;
         }
     };
-    let logs = state.service_logs(&svc.name);
-    if logs.is_empty() {
-        let placeholder = match &svc.state {
+    if state.service_logs(&svc_name).is_empty() {
+        let placeholder = match &svc_state {
             ServiceState::Stopped => "stopped — press S to start",
             ServiceState::Starting => "starting…",
             _ => "no output yet",
@@ -448,13 +526,6 @@ fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         return;
     }
 
-    // Horizontal layout of the log pane:
-    //   1 col left padding   • text breathes from the sidebar border
-    //   N cols log text
-    //   1 col right padding  • text breathes from the scrollbar
-    //   1 col scrollbar gutter
-    // The padding makes log lines easier to read at a glance; without it
-    // characters kissed the border on both sides.
     let (text_area, sb_area) = if area.width >= 5 {
         let split = Layout::default()
             .direction(Direction::Horizontal)
@@ -467,7 +538,6 @@ fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             .split(area);
         (split[1], Some(split[3]))
     } else if area.width >= 3 {
-        // Narrow fallback: no padding, just text + scrollbar.
         let split = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -477,12 +547,10 @@ fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         (area, None)
     };
 
-    // The viewport is anchored to the tail by default. When the user
-    // scrolls up, `offset` shifts the window earlier in the buffer; new
-    // lines arrive into `logs` and the state model bumps `offset` to match
-    // so the visible window stays still — see TuiState::apply.
     let viewport = (text_area.height as usize).max(1);
+    state.set_viewport_height(viewport);
     let offset = state.log_scroll_offset();
+    let logs = state.service_logs(&svc_name);
     let end = logs.len().saturating_sub(offset);
     let start = end.saturating_sub(viewport);
     let mut text = Text::default();
@@ -495,7 +563,7 @@ fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             text.lines.push(parsed_line);
         }
     }
-    frame.render_widget(Paragraph::new(text), text_area);
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), text_area);
 
     // Scrollbar: track length = full log buffer, thumb position = top of
     // the visible window (i.e., `start`). Ratatui sizes the thumb from the
@@ -682,7 +750,7 @@ mod tests {
         s
     }
 
-    fn render_to_text(state: &TuiState, w: u16, h: u16) -> String {
+    fn render_to_text(state: &mut TuiState, w: u16, h: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal.draw(|f| render(f, state)).unwrap();
         buffer_to_text(terminal.backend().buffer())
@@ -709,7 +777,7 @@ mod tests {
             ],
             steps: vec![],
         });
-        let text = render_to_text(&state, 80, 12);
+        let text = render_to_text(&mut state, 80, 12);
         assert!(
             text.contains("│"),
             "expected tab divider somewhere:\n{text}"
@@ -729,7 +797,7 @@ mod tests {
             steps: vec![],
         });
 
-        let text = render_to_text(&state, 100, 14);
+        let text = render_to_text(&mut state, 100, 14);
         // All three names must appear on the same row.
         let lines: Vec<&str> = text.lines().collect();
         let tab_line = lines
@@ -763,7 +831,7 @@ mod tests {
                 },
             ],
         });
-        let text = render_to_text(&state, 80, 14);
+        let text = render_to_text(&mut state, 80, 14);
         assert!(text.contains("✓"), "passed glyph missing:\n{text}");
         assert!(text.contains("✗"), "failed glyph missing:\n{text}");
         assert!(text.contains("·"), "unknown glyph missing:\n{text}");
@@ -772,9 +840,9 @@ mod tests {
 
     #[test]
     fn footer_lists_basic_key_bindings() {
-        let state = TuiState::default();
+        let mut state = TuiState::default();
         // 140 wide so the centre hints all fit without truncation.
-        let text = render_to_text(&state, 140, 12);
+        let text = render_to_text(&mut state, 140, 12);
         let last = text.lines().last().unwrap_or("");
         assert!(last.contains("help"), "footer missing 'help' (was: {last})");
         assert!(last.contains("stack"), "footer missing stack nav (was: {last})");
@@ -795,7 +863,7 @@ mod tests {
             ],
             steps: vec![],
         });
-        let text = render_to_text(&state, 140, 14);
+        let text = render_to_text(&mut state, 140, 14);
         let last = text.lines().last().unwrap_or("");
         assert!(last.contains("●2"), "expected 2 running in footer: {last}");
         assert!(last.contains("○1"), "expected 1 stopped in footer: {last}");
@@ -805,13 +873,13 @@ mod tests {
     #[test]
     fn help_overlay_renders_when_toggled() {
         let mut state = TuiState::default();
-        let text = render_to_text(&state, 100, 30);
+        let text = render_to_text(&mut state, 100, 30);
         assert!(!text.contains("toggle this overlay"), "overlay leaked when hidden");
         state.toggle_help();
-        let text = render_to_text(&state, 100, 30);
+        let text = render_to_text(&mut state, 100, 30);
         assert!(text.contains("toggle this overlay"), "overlay help text missing");
         state.toggle_help();
-        let text = render_to_text(&state, 100, 30);
+        let text = render_to_text(&mut state, 100, 30);
         assert!(!text.contains("toggle this overlay"), "overlay should hide again");
     }
 
@@ -833,7 +901,7 @@ mod tests {
             steps: vec![],
         });
 
-        let text = render_to_text(&state, 80, 14);
+        let text = render_to_text(&mut state, 80, 14);
         assert!(text.contains("running"), "expected 'running':\n{text}");
         assert!(text.contains("1234"), "pid missing:\n{text}");
         assert!(text.contains("5432"), "port missing:\n{text}");
@@ -859,7 +927,7 @@ mod tests {
             ts: 2,
         });
 
-        let text = render_to_text(&state, 100, 20);
+        let text = render_to_text(&mut state, 100, 20);
         assert!(text.contains("listening on :8080"), "missing first log line:\n{text}");
         assert!(text.contains("GET /health 200"), "missing second log line:\n{text}");
     }
@@ -881,7 +949,7 @@ mod tests {
             ],
             steps: vec![],
         });
-        let text = render_to_text(&state, 100, 14);
+        let text = render_to_text(&mut state, 100, 14);
         assert!(text.contains("1/2 running"), "header count missing:\n{text}");
     }
 
@@ -902,12 +970,12 @@ mod tests {
             });
         }
         // At tail — no PAUSED.
-        let text = render_to_text(&state, 100, 14);
+        let text = render_to_text(&mut state, 100, 14);
         assert!(!text.contains("PAUSED"), "PAUSED visible at tail:\n{text}");
 
         // Scroll up; pill must appear.
         state.log_page_up(10);
-        let text = render_to_text(&state, 100, 14);
+        let text = render_to_text(&mut state, 100, 14);
         assert!(text.contains("PAUSED"), "PAUSED missing while scrolled:\n{text}");
         assert!(text.contains("G to follow"), "hint missing:\n{text}");
     }
@@ -923,7 +991,7 @@ mod tests {
             ],
             steps: vec![],
         });
-        let text = render_to_text(&state, 100, 14);
+        let text = render_to_text(&mut state, 100, 14);
         assert!(text.contains("1 failed"), "failed count missing:\n{text}");
     }
 }

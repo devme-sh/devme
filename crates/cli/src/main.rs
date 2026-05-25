@@ -755,6 +755,14 @@ async fn ensure_daemon(sock: &std::path::Path) -> anyhow::Result<bool> {
             }
             // Re-parse since we moved `stack.env` above
             if let Ok(stack) = Stack::parse(&toml_str) {
+                // Preflight: check dependencies that don't need services
+                let interactive = std::io::stdin().is_terminal();
+                let mut stdin = std::io::BufReader::new(std::io::stdin());
+                let mut stderr = std::io::stderr();
+                let _ = devme_supervisor::preflight::run_preflight(
+                    &stack, &cwd, &mut stdin, &mut stderr, interactive,
+                );
+
                 ensure_docker_if_needed(&stack)?;
             }
         }

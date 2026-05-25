@@ -9,9 +9,11 @@
 //! `devme.toml`, finds repo-scoped services, spawns each via
 //! [`devme_supervisor::process::ChildProcess`], and broadcasts every
 //! line of output as a `LogChunk` to all subscribers. Shutdown kills
-//! children and exits. Ref-counted teardown (auto-exit when the last
-//! subscriber disconnects) is a follow-up; users currently quit
-//! explicitly via the TUI's `q`.
+//! children and exits.
+//!
+//! Lifecycle: the daemon exits when its last subscriber disconnects and
+//! no new subscriber arrives within a 30-second grace window. An
+//! explicit `Shutdown` message also triggers immediate teardown.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -138,6 +140,12 @@ struct RunningService {
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
 }
 
+/// Grace period after the last subscriber disconnects before the shared
+/// daemon tears itself down. Long enough that a cargo-watch restart of the
+/// TUI doesn't flap the daemon; short enough that genuinely-orphaned daemons
+/// don't linger forever.
+const IDLE_GRACE_SECS: u64 = 30;
+
 /// Live state shared between the accept loop and connection handlers.
 struct SharedState {
     /// Service name → running handle. `Mutex` because Shutdown reaches in
@@ -148,6 +156,11 @@ struct SharedState {
     events: broadcast::Sender<ServerMessage>,
     /// Set to true on Shutdown so the accept loop exits.
     shutdown: Arc<Mutex<bool>>,
+    /// Active subscriber count. When this drops to 0, the idle grace timer
+    /// starts; if it's still 0 when the timer fires, the daemon exits.
+    subscribers: Arc<std::sync::atomic::AtomicUsize>,
+    /// Notifies the serve loop when subscriber count changes.
+    sub_notify: Arc<tokio::sync::Notify>,
 }
 
 impl SharedState {
@@ -193,6 +206,8 @@ impl SharedState {
             services: services_map,
             events,
             shutdown,
+            subscribers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            sub_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -270,15 +285,38 @@ async fn serve(
     info: InstanceInfo,
     state: Arc<SharedState>,
 ) -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+
+    // Idle teardown task: when subscriber count drops to 0, wait the grace
+    // period then signal shutdown — unless a new subscriber arrives first.
+    let idle_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            idle_state.sub_notify.notified().await;
+            if idle_state.subscribers.load(Ordering::SeqCst) == 0 {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(IDLE_GRACE_SECS)) => {
+                        if idle_state.subscribers.load(Ordering::SeqCst) == 0 {
+                            tracing::info!("no subscribers for {IDLE_GRACE_SECS}s — shutting down");
+                            *idle_state.shutdown.lock().await = true;
+                            return;
+                        }
+                    }
+                    _ = idle_state.sub_notify.notified() => {
+                        // A subscriber arrived during the grace window — cancel.
+                    }
+                }
+            }
+        }
+    });
+
     loop {
         if *state.shutdown.lock().await {
             state.shutdown_services().await;
             return Ok(());
         }
         let accept = listener.accept();
-        // Wake periodically to check the shutdown flag — a long-idle daemon
-        // with no inbound traffic would otherwise block here forever.
-        let res = tokio::time::timeout(std::time::Duration::from_secs(60), accept).await;
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), accept).await;
         match res {
             Ok(Ok((stream, _))) => {
                 let info = info.clone();
@@ -303,62 +341,78 @@ async fn handle(
     info: InstanceInfo,
     state: Arc<SharedState>,
 ) -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+
     let mut framed = Framed::new(stream, FrameCodec);
     let mut events = state.events.subscribe();
+    let mut subscribed = false;
 
-    loop {
-        tokio::select! {
-            incoming = framed.next() => {
-                let Some(item) = incoming else { break };
-                let bytes = item?;
-                let env: Envelope<ClientMessage> = serde_json::from_slice(&bytes)?;
-                match env.payload {
-                    ClientMessage::Subscribe { .. } => {
-                        let services = state.current_snapshot().await;
-                        let reply = ServerMessage::Subscribed {
-                            instance: info.clone(),
-                            services,
-                            steps: vec![],
-                        };
-                        send_msg(&mut framed, reply).await?;
-                    }
-                    ClientMessage::Unsubscribe => {}
-                    ClientMessage::Shutdown => {
-                        let _ = send_msg(
-                            &mut framed,
-                            ServerMessage::Goodbye { reason: "shutdown requested".into() },
-                        )
-                        .await;
-                        *state.shutdown.lock().await = true;
-                        return Ok(());
-                    }
-                    // Restart/Stop/Start of repo-scoped services arrives
-                    // here once instance daemons learn to route them.
-                    // Today: acknowledge with a Notice so the client sees
-                    // we received it but didn't act.
-                    _ => {
-                        let _ = send_msg(
-                            &mut framed,
-                            ServerMessage::Notice {
-                                level: devme_core::NoticeLevel::Warn,
-                                message: "shared supervisor: per-service control not yet routed"
-                                    .into(),
-                            },
-                        )
-                        .await;
+    let result: anyhow::Result<()> = async {
+        loop {
+            tokio::select! {
+                incoming = framed.next() => {
+                    let Some(item) = incoming else { break };
+                    let bytes = item?;
+                    let env: Envelope<ClientMessage> = serde_json::from_slice(&bytes)?;
+                    match env.payload {
+                        ClientMessage::Subscribe { .. } => {
+                            if !subscribed {
+                                subscribed = true;
+                                state.subscribers.fetch_add(1, Ordering::SeqCst);
+                                state.sub_notify.notify_one();
+                            }
+                            let services = state.current_snapshot().await;
+                            let reply = ServerMessage::Subscribed {
+                                instance: info.clone(),
+                                services,
+                                steps: vec![],
+                            };
+                            send_msg(&mut framed, reply).await?;
+                        }
+                        ClientMessage::Unsubscribe => {
+                            if subscribed {
+                                subscribed = false;
+                                state.subscribers.fetch_sub(1, Ordering::SeqCst);
+                                state.sub_notify.notify_one();
+                            }
+                        }
+                        ClientMessage::Shutdown => {
+                            let _ = send_msg(
+                                &mut framed,
+                                ServerMessage::Goodbye { reason: "shutdown requested".into() },
+                            )
+                            .await;
+                            *state.shutdown.lock().await = true;
+                            return Ok(());
+                        }
+                        _ => {
+                            let _ = send_msg(
+                                &mut framed,
+                                ServerMessage::Notice {
+                                    level: devme_core::NoticeLevel::Warn,
+                                    message: "shared supervisor: per-service control not yet routed"
+                                        .into(),
+                                },
+                            )
+                            .await;
+                        }
                     }
                 }
-            }
-            broadcast = events.recv() => match broadcast {
-                Ok(msg) => send_msg(&mut framed, msg).await?,
-                // Lagged means the broadcast buffer dropped some messages;
-                // forward what's still available rather than disconnecting.
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
+                broadcast = events.recv() => match broadcast {
+                    Ok(msg) => send_msg(&mut framed, msg).await?,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
             }
         }
+        Ok(())
+    }.await;
+
+    if subscribed {
+        state.subscribers.fetch_sub(1, Ordering::SeqCst);
+        state.sub_notify.notify_one();
     }
-    Ok(())
+    result
 }
 
 async fn send_msg(

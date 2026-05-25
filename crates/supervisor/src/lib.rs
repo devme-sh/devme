@@ -7,5 +7,6 @@
 pub mod daemon;
 pub mod env_resolve;
 pub mod health;
+pub mod preflight;
 pub mod process;
 pub mod spawn;

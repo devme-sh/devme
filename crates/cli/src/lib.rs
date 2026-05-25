@@ -85,6 +85,34 @@ pub enum Command {
         /// Target shell.
         shell: Shell,
     },
+    /// Diagnostic snapshot: service states + recent error logs. Designed for
+    /// agents — outputs structured JSON with everything needed to diagnose
+    /// failures without multiple round-trips.
+    Doctor {
+        /// Maximum log lines per service (default 50).
+        #[arg(long, default_value_t = 50)]
+        tail: usize,
+    },
+    /// View or change devme global settings.
+    ///
+    /// `devme config` — list all settings.
+    /// `devme config get <key>` — print the value of a setting.
+    /// `devme config set <key> <value>` — set a value.
+    /// `devme config unset <key>` — remove a value.
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum ConfigAction {
+    /// Print the value of a setting.
+    Get { key: String },
+    /// Set a value.
+    Set { key: String, value: String },
+    /// Remove a value (reset to default).
+    Unset { key: String },
 }
 
 /// Format a status snapshot for human consumption — one row per node,
@@ -325,6 +353,39 @@ mod tests {
                 service: "api".into(),
                 follow: true,
                 tail: 200,
+            })
+        );
+    }
+
+    #[test]
+    fn config_list_parses() {
+        let cli = Cli::parse_from(["devme", "config"]);
+        assert_eq!(cli.command, Some(Command::Config { action: None }));
+    }
+
+    #[test]
+    fn config_set_parses() {
+        let cli = Cli::parse_from(["devme", "config", "set", "docker.daemon", "orbstack"]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Config {
+                action: Some(ConfigAction::Set {
+                    key: "docker.daemon".into(),
+                    value: "orbstack".into(),
+                })
+            })
+        );
+    }
+
+    #[test]
+    fn config_get_parses() {
+        let cli = Cli::parse_from(["devme", "config", "get", "docker.daemon"]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Config {
+                action: Some(ConfigAction::Get {
+                    key: "docker.daemon".into(),
+                })
             })
         );
     }

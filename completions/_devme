@@ -1,0 +1,545 @@
+#compdef devme
+
+autoload -U is-at-least
+
+_devme() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'--json[Emit machine-readable JSON instead of human-friendly output. Honored by every subcommand that prints data]' \
+'--no-input[Disable interactive prompts. Required for non-tty contexts (CI, agents). Fails closed\: any prompt aborts with exit code 2]' \
+'-q[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--quiet[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--no-color[Strip ANSI color codes from all output. Also honored\: the \`NO_COLOR\` environment variable (see https\://no-color.org) and a non-TTY stdout]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_devme_commands" \
+"*::: :->devme" \
+&& ret=0
+    case $state in
+    (devme)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:devme-command-$line[1]:"
+        case $line[1] in
+            (up)
+_arguments "${_arguments_options[@]}" : \
+'--timeout=[Seconds to wait for \`--wait\`. 0 means "no timeout" (docker convention). Default 30s, only consulted with \`--wait\`]:TIMEOUT:_default' \
+'-d[Start services then exit without tailing logs. The daemon keeps running in the background; use \`devme down\` to stop it]' \
+'--detach[Start services then exit without tailing logs. The daemon keeps running in the background; use \`devme down\` to stop it]' \
+'--wait[With \`-d\`, block until every service is healthy (or has Started) before exiting. Pairs with \`--timeout\` to cap the wait]' \
+'--json[Emit machine-readable JSON instead of human-friendly output. Honored by every subcommand that prints data]' \
+'--no-input[Disable interactive prompts. Required for non-tty contexts (CI, agents). Fails closed\: any prompt aborts with exit code 2]' \
+'-q[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--quiet[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--no-color[Strip ANSI color codes from all output. Also honored\: the \`NO_COLOR\` environment variable (see https\://no-color.org) and a non-TTY stdout]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'*::services -- Restrict to a subset of services. Empty = all:_default' \
+&& ret=0
+;;
+(down)
+_arguments "${_arguments_options[@]}" : \
+'-t+[Seconds to wait for graceful service stops before SIGKILL. Matches \`docker compose down -t\`]:TIMEOUT:_default' \
+'--timeout=[Seconds to wait for graceful service stops before SIGKILL. Matches \`docker compose down -t\`]:TIMEOUT:_default' \
+'--json[Emit machine-readable JSON instead of human-friendly output. Honored by every subcommand that prints data]' \
+'--no-input[Disable interactive prompts. Required for non-tty contexts (CI, agents). Fails closed\: any prompt aborts with exit code 2]' \
+'-q[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--quiet[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--no-color[Strip ANSI color codes from all output. Also honored\: the \`NO_COLOR\` environment variable (see https\://no-color.org) and a non-TTY stdout]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit machine-readable JSON instead of human-friendly output. Honored by every subcommand that prints data]' \
+'--no-input[Disable interactive prompts. Required for non-tty contexts (CI, agents). Fails closed\: any prompt aborts with exit code 2]' \
+'-q[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--quiet[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--no-color[Strip ANSI color codes from all output. Also honored\: the \`NO_COLOR\` environment variable (see https\://no-color.org) and a non-TTY stdout]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(restart)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit machine-readable JSON instead of human-friendly output. Honored by every subcommand that prints data]' \
+'--no-input[Disable interactive prompts. Required for non-tty contexts (CI, agents). Fails closed\: any prompt aborts with exit code 2]' \
+'-q[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--quiet[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--no-color[Strip ANSI color codes from all output. Also honored\: the \`NO_COLOR\` environment variable (see https\://no-color.org) and a non-TTY stdout]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':service:_default' \
+&& ret=0
+;;
+(stop)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit machine-readable JSON instead of human-friendly output. Honored by every subcommand that prints data]' \
+'--no-input[Disable interactive prompts. Required for non-tty contexts (CI, agents). Fails closed\: any prompt aborts with exit code 2]' \
+'-q[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--quiet[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--no-color[Strip ANSI color codes from all output. Also honored\: the \`NO_COLOR\` environment variable (see https\://no-color.org) and a non-TTY stdout]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':service:_default' \
+&& ret=0
+;;
+(start)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit machine-readable JSON instead of human-friendly output. Honored by every subcommand that prints data]' \
+'--no-input[Disable interactive prompts. Required for non-tty contexts (CI, agents). Fails closed\: any prompt aborts with exit code 2]' \
+'-q[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--quiet[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--no-color[Strip ANSI color codes from all output. Also honored\: the \`NO_COLOR\` environment variable (see https\://no-color.org) and a non-TTY stdout]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':service:_default' \
+&& ret=0
+;;
+(logs)
+_arguments "${_arguments_options[@]}" : \
+'--tail=[Show only the last N lines of buffered output before following. 0 means "all" (the daemon'\''s full ring). Default 200 — a \`docker compose logs\` of a long-running service is a wall of text]:TAIL:_default' \
+'-f[]' \
+'--follow[]' \
+'--json[Emit machine-readable JSON instead of human-friendly output. Honored by every subcommand that prints data]' \
+'--no-input[Disable interactive prompts. Required for non-tty contexts (CI, agents). Fails closed\: any prompt aborts with exit code 2]' \
+'-q[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--quiet[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--no-color[Strip ANSI color codes from all output. Also honored\: the \`NO_COLOR\` environment variable (see https\://no-color.org) and a non-TTY stdout]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':service:_default' \
+&& ret=0
+;;
+(completions)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit machine-readable JSON instead of human-friendly output. Honored by every subcommand that prints data]' \
+'--no-input[Disable interactive prompts. Required for non-tty contexts (CI, agents). Fails closed\: any prompt aborts with exit code 2]' \
+'-q[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--quiet[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--no-color[Strip ANSI color codes from all output. Also honored\: the \`NO_COLOR\` environment variable (see https\://no-color.org) and a non-TTY stdout]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':shell -- Target shell:(bash elvish fish powershell zsh)' \
+&& ret=0
+;;
+(doctor)
+_arguments "${_arguments_options[@]}" : \
+'--tail=[Maximum log lines per service (default 50)]:TAIL:_default' \
+'--json[Emit machine-readable JSON instead of human-friendly output. Honored by every subcommand that prints data]' \
+'--no-input[Disable interactive prompts. Required for non-tty contexts (CI, agents). Fails closed\: any prompt aborts with exit code 2]' \
+'-q[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--quiet[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--no-color[Strip ANSI color codes from all output. Also honored\: the \`NO_COLOR\` environment variable (see https\://no-color.org) and a non-TTY stdout]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(config)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit machine-readable JSON instead of human-friendly output. Honored by every subcommand that prints data]' \
+'--no-input[Disable interactive prompts. Required for non-tty contexts (CI, agents). Fails closed\: any prompt aborts with exit code 2]' \
+'-q[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--quiet[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--no-color[Strip ANSI color codes from all output. Also honored\: the \`NO_COLOR\` environment variable (see https\://no-color.org) and a non-TTY stdout]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+":: :_devme__subcmd__config_commands" \
+"*::: :->config" \
+&& ret=0
+
+    case $state in
+    (config)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:devme-config-command-$line[1]:"
+        case $line[1] in
+            (get)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit machine-readable JSON instead of human-friendly output. Honored by every subcommand that prints data]' \
+'--no-input[Disable interactive prompts. Required for non-tty contexts (CI, agents). Fails closed\: any prompt aborts with exit code 2]' \
+'-q[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--quiet[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--no-color[Strip ANSI color codes from all output. Also honored\: the \`NO_COLOR\` environment variable (see https\://no-color.org) and a non-TTY stdout]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':key:_default' \
+&& ret=0
+;;
+(set)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit machine-readable JSON instead of human-friendly output. Honored by every subcommand that prints data]' \
+'--no-input[Disable interactive prompts. Required for non-tty contexts (CI, agents). Fails closed\: any prompt aborts with exit code 2]' \
+'-q[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--quiet[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--no-color[Strip ANSI color codes from all output. Also honored\: the \`NO_COLOR\` environment variable (see https\://no-color.org) and a non-TTY stdout]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':key:_default' \
+':value:_default' \
+&& ret=0
+;;
+(unset)
+_arguments "${_arguments_options[@]}" : \
+'--json[Emit machine-readable JSON instead of human-friendly output. Honored by every subcommand that prints data]' \
+'--no-input[Disable interactive prompts. Required for non-tty contexts (CI, agents). Fails closed\: any prompt aborts with exit code 2]' \
+'-q[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--quiet[Suppress informational/progress output on stderr. Errors still print. Combines with \`NO_COLOR=1\` and \`--no-color\` for fully-quiet pipes]' \
+'--no-color[Strip ANSI color codes from all output. Also honored\: the \`NO_COLOR\` environment variable (see https\://no-color.org) and a non-TTY stdout]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':key:_default' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_devme__subcmd__config__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:devme-config-help-command-$line[1]:"
+        case $line[1] in
+            (get)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(set)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(unset)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_devme__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:devme-help-command-$line[1]:"
+        case $line[1] in
+            (up)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(down)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(restart)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(stop)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(start)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(logs)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(completions)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(doctor)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(config)
+_arguments "${_arguments_options[@]}" : \
+":: :_devme__subcmd__help__subcmd__config_commands" \
+"*::: :->config" \
+&& ret=0
+
+    case $state in
+    (config)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:devme-help-config-command-$line[1]:"
+        case $line[1] in
+            (get)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(set)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(unset)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_devme_commands] )) ||
+_devme_commands() {
+    local commands; commands=(
+'up:Start the supervisor (or attach to a running one) and bring services up' \
+'down:Shut down this instance'\''s supervisor' \
+'status:Print a snapshot of current service status' \
+'restart:Restart a service' \
+'stop:Stop a single service (keep the daemon running)' \
+'start:Start a single service' \
+'logs:Tail logs for a service' \
+'completions:Print a shell completion script. Pipe into your shell'\''s completion directory\: \`devme completions fish > ~/.config/fish/completions/devme.fish\`' \
+'doctor:Diagnostic snapshot\: service states + recent error logs. Designed for agents — outputs structured JSON with everything needed to diagnose failures without multiple round-trips' \
+'config:View or change devme global settings' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'devme commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__completions_commands] )) ||
+_devme__subcmd__completions_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme completions commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__config_commands] )) ||
+_devme__subcmd__config_commands() {
+    local commands; commands=(
+'get:Print the value of a setting' \
+'set:Set a value' \
+'unset:Remove a value (reset to default)' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'devme config commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__config__subcmd__get_commands] )) ||
+_devme__subcmd__config__subcmd__get_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme config get commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__config__subcmd__help_commands] )) ||
+_devme__subcmd__config__subcmd__help_commands() {
+    local commands; commands=(
+'get:Print the value of a setting' \
+'set:Set a value' \
+'unset:Remove a value (reset to default)' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'devme config help commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__config__subcmd__help__subcmd__get_commands] )) ||
+_devme__subcmd__config__subcmd__help__subcmd__get_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme config help get commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__config__subcmd__help__subcmd__help_commands] )) ||
+_devme__subcmd__config__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme config help help commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__config__subcmd__help__subcmd__set_commands] )) ||
+_devme__subcmd__config__subcmd__help__subcmd__set_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme config help set commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__config__subcmd__help__subcmd__unset_commands] )) ||
+_devme__subcmd__config__subcmd__help__subcmd__unset_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme config help unset commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__config__subcmd__set_commands] )) ||
+_devme__subcmd__config__subcmd__set_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme config set commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__config__subcmd__unset_commands] )) ||
+_devme__subcmd__config__subcmd__unset_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme config unset commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__doctor_commands] )) ||
+_devme__subcmd__doctor_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme doctor commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__down_commands] )) ||
+_devme__subcmd__down_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme down commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__help_commands] )) ||
+_devme__subcmd__help_commands() {
+    local commands; commands=(
+'up:Start the supervisor (or attach to a running one) and bring services up' \
+'down:Shut down this instance'\''s supervisor' \
+'status:Print a snapshot of current service status' \
+'restart:Restart a service' \
+'stop:Stop a single service (keep the daemon running)' \
+'start:Start a single service' \
+'logs:Tail logs for a service' \
+'completions:Print a shell completion script. Pipe into your shell'\''s completion directory\: \`devme completions fish > ~/.config/fish/completions/devme.fish\`' \
+'doctor:Diagnostic snapshot\: service states + recent error logs. Designed for agents — outputs structured JSON with everything needed to diagnose failures without multiple round-trips' \
+'config:View or change devme global settings' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'devme help commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__help__subcmd__completions_commands] )) ||
+_devme__subcmd__help__subcmd__completions_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme help completions commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__help__subcmd__config_commands] )) ||
+_devme__subcmd__help__subcmd__config_commands() {
+    local commands; commands=(
+'get:Print the value of a setting' \
+'set:Set a value' \
+'unset:Remove a value (reset to default)' \
+    )
+    _describe -t commands 'devme help config commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__help__subcmd__config__subcmd__get_commands] )) ||
+_devme__subcmd__help__subcmd__config__subcmd__get_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme help config get commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__help__subcmd__config__subcmd__set_commands] )) ||
+_devme__subcmd__help__subcmd__config__subcmd__set_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme help config set commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__help__subcmd__config__subcmd__unset_commands] )) ||
+_devme__subcmd__help__subcmd__config__subcmd__unset_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme help config unset commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__help__subcmd__doctor_commands] )) ||
+_devme__subcmd__help__subcmd__doctor_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme help doctor commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__help__subcmd__down_commands] )) ||
+_devme__subcmd__help__subcmd__down_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme help down commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__help__subcmd__help_commands] )) ||
+_devme__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme help help commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__help__subcmd__logs_commands] )) ||
+_devme__subcmd__help__subcmd__logs_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme help logs commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__help__subcmd__restart_commands] )) ||
+_devme__subcmd__help__subcmd__restart_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme help restart commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__help__subcmd__start_commands] )) ||
+_devme__subcmd__help__subcmd__start_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme help start commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__help__subcmd__status_commands] )) ||
+_devme__subcmd__help__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme help status commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__help__subcmd__stop_commands] )) ||
+_devme__subcmd__help__subcmd__stop_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme help stop commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__help__subcmd__up_commands] )) ||
+_devme__subcmd__help__subcmd__up_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme help up commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__logs_commands] )) ||
+_devme__subcmd__logs_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme logs commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__restart_commands] )) ||
+_devme__subcmd__restart_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme restart commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__start_commands] )) ||
+_devme__subcmd__start_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme start commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__status_commands] )) ||
+_devme__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme status commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__stop_commands] )) ||
+_devme__subcmd__stop_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme stop commands' commands "$@"
+}
+(( $+functions[_devme__subcmd__up_commands] )) ||
+_devme__subcmd__up_commands() {
+    local commands; commands=()
+    _describe -t commands 'devme up commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_devme" ]; then
+    _devme "$@"
+else
+    compdef _devme devme
+fi
