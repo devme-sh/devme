@@ -722,6 +722,7 @@ async fn launch_tui() -> anyhow::Result<i32> {
     let config_path = cwd.join("devme.toml");
     if let Ok(toml_str) = std::fs::read_to_string(&config_path) {
         if let Ok(stack) = Stack::parse(&toml_str) {
+            // Env resolution only prompts when vars are missing — silent otherwise.
             if !stack.env.is_empty() {
                 let env_file = devme_supervisor::env_resolve::default_env_file(&cwd);
                 let env_pairs: Vec<(String, devme_config::EnvVar)> =
@@ -733,13 +734,16 @@ async fn launch_tui() -> anyhow::Result<i32> {
                     &env_pairs, &env_file, &cwd, &mut stdin, &mut stderr, interactive,
                 );
             }
+            // Only show preflight output when something needs provisioning.
             if let Ok(stack) = Stack::parse(&toml_str) {
-                let interactive = std::io::stdin().is_terminal();
-                let mut stdin = std::io::BufReader::new(std::io::stdin());
-                let mut stderr = std::io::stderr();
-                let _ = devme_supervisor::preflight::run_preflight(
-                    &stack, &cwd, &mut stdin, &mut stderr, interactive,
-                );
+                if !devme_supervisor::preflight::all_checks_pass(&stack, &cwd) {
+                    let interactive = std::io::stdin().is_terminal();
+                    let mut stdin = std::io::BufReader::new(std::io::stdin());
+                    let mut stderr = std::io::stderr();
+                    let _ = devme_supervisor::preflight::run_preflight(
+                        &stack, &cwd, &mut stdin, &mut stderr, interactive,
+                    );
+                }
                 ensure_docker_if_needed(&stack)?;
             }
         }

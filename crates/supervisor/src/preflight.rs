@@ -112,6 +112,15 @@ fn run_provision(cmd: &str, cwd: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// True if every preflight step's `check` command passes. Runs silently.
+pub fn all_checks_pass(stack: &Stack, cwd: &Path) -> bool {
+    let steps = preflight_steps(stack);
+    steps.iter().all(|name| {
+        let step = &stack.step[name];
+        run_check(&step.check, cwd)
+    })
+}
+
 /// Run preflight step checks and render results.
 /// Returns the check results so the caller can decide whether to proceed.
 pub fn run_preflight<R: BufRead, W: Write>(
