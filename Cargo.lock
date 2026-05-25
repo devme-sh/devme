@@ -354,6 +354,7 @@ dependencies = [
  "devme-config",
  "devme-core",
  "devme-supervisor",
+ "devme-tui",
  "serde",
  "serde_json",
  "tokio",

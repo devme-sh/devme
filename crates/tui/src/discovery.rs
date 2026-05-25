@@ -171,7 +171,6 @@ async fn attach_one(
     let mut client = match Client::connect(&path).await {
         Ok(c) => c,
         Err(_) => {
-            // Let a future event re-try; remove from seen.
             seen.lock().await.remove(&path);
             return;
         }

@@ -146,7 +146,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let dim = Style::default().fg(Color::DarkGray);
     let key = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 
-    let stack = state.instance_label();
+    let stack = if state.shared_selected() { "shared" } else { state.instance_label() };
     let svc = state.selected_service().map(|s| s.name.as_str()).unwrap_or("—");
     let breadcrumb = format!(" {stack} › {svc} ");
     let left = Paragraph::new(Line::from(vec![
@@ -329,8 +329,9 @@ fn render_stacks_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
     let mut lines: Vec<Line> = Vec::new();
     let selected = state.selected_instance_index();
+    let shared_active = state.shared_selected();
     for (i, label) in state.instances().iter().enumerate() {
-        let is_selected = selected == Some(i);
+        let is_selected = !shared_active && selected == Some(i);
         if is_selected {
             lines.push(Line::from(vec![
                 Span::styled("▸ ", Style::default().fg(Color::Cyan)),
@@ -348,6 +349,32 @@ fn render_stacks_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             ]));
         }
     }
+
+    // Shared (repo-level) services row
+    if !state.shared_services().is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        let svc_names: Vec<&str> = state.shared_services().iter().map(|s| s.name.as_str()).collect();
+        let label = format!("shared ({})", svc_names.join(", "));
+        if shared_active {
+            lines.push(Line::from(vec![
+                Span::styled("▸ ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    label,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(label, Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
+
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
@@ -422,8 +449,9 @@ fn format_main_title(state: &TuiState) -> Line<'_> {
         })
         .count();
 
+    let version = env!("CARGO_PKG_VERSION");
     let mut spans = vec![Span::styled(
-        " devme ",
+        format!(" devme v{version} "),
         Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
     )];
     spans.push(Span::styled(

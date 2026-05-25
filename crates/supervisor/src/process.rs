@@ -105,7 +105,11 @@ impl ChildProcess {
                     Ok(0) => break,
                     Ok(_) => {
                         let trimmed = line.trim_end_matches(['\n', '\r']).to_string();
-                        if lines_tx.send(trimmed).is_err() {
+                        let cleaned = strip_cursor_escapes(&trimmed);
+                        if cleaned.is_empty() {
+                            continue;
+                        }
+                        if lines_tx.send(cleaned).is_err() {
                             break;
                         }
                     }
@@ -158,6 +162,49 @@ impl ChildProcess {
             .kill()
             .map_err(|e| std::io::Error::other(e.to_string()))
     }
+}
+
+/// Strip CSI escape sequences used for cursor positioning (up/down/column,
+/// erase, save/restore, show/hide cursor) while keeping SGR color sequences
+/// (those ending in `m`). Programs like `docker compose` use cursor movement
+/// for in-place progress rendering which looks like garbage in a log buffer.
+fn strip_cursor_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, ch)) = chars.next() {
+        if ch == '\x1b' {
+            if let Some(&(_, '[')) = chars.peek() {
+                // CSI sequence: \x1b[ params final_byte
+                let start = i;
+                chars.next(); // consume '['
+                // skip parameter bytes (0x20-0x3F range in ASCII)
+                while let Some(&(_, c)) = chars.peek() {
+                    if c >= '\x20' && c <= '\x3F' {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(&(end_i, final_ch)) = chars.peek() {
+                    chars.next();
+                    if final_ch == 'm' {
+                        // SGR (color/style) — keep it
+                        let seq_end = end_i + final_ch.len_utf8();
+                        out.push_str(&s[start..seq_end]);
+                    }
+                    // else: cursor movement, erase, etc — drop
+                }
+            } else {
+                // Non-CSI escape (e.g. \x1b7, \x1b8) — drop both bytes
+                chars.next();
+            }
+        } else if ch == '\r' {
+            // Carriage return without newline — skip
+        } else {
+            out.push(ch);
+        }
+    }
+    out.trim().to_string()
 }
 
 #[cfg(test)]
@@ -239,5 +286,29 @@ mod tests {
             .await
             .expect("wait timed out — kill didn't work");
         assert_ne!(exit, 0, "killed child should not report exit 0");
+    }
+
+    #[test]
+    fn strip_cursor_escapes_keeps_sgr_colors() {
+        let input = "\x1b[32m✔\x1b[0m Container created";
+        assert_eq!(strip_cursor_escapes(input), "\x1b[32m✔\x1b[0m Container created");
+    }
+
+    #[test]
+    fn strip_cursor_escapes_removes_cursor_movement() {
+        let input = "\x1b[?25l\x1b[0G[+] up 0/1\r";
+        assert_eq!(strip_cursor_escapes(input), "[+] up 0/1");
+    }
+
+    #[test]
+    fn strip_cursor_escapes_removes_cursor_up_and_erase() {
+        let input = "\x1b[2A\x1b[0G\x1b[0KSpinner text";
+        assert_eq!(strip_cursor_escapes(input), "Spinner text");
+    }
+
+    #[test]
+    fn strip_cursor_escapes_handles_empty_and_noise() {
+        assert_eq!(strip_cursor_escapes("\x1b[?25h"), "");
+        assert_eq!(strip_cursor_escapes("\x1b[2A\x1b[0G\x1b[0K"), "");
     }
 }

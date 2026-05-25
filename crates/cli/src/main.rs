@@ -44,10 +44,13 @@ fn main() {
     NO_COLOR.store(no_color, Ordering::Relaxed);
     QUIET.store(cli.quiet, Ordering::Relaxed);
 
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
+    let is_tui = cli.command.is_none();
+    let mut builder = if is_tui {
+        tokio::runtime::Builder::new_multi_thread()
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+    };
+    let runtime = match builder.enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("devme: tokio init failed: {e}");
@@ -712,19 +715,42 @@ fn print_completions(shell: Shell) {
     generate(shell, &mut cmd, "devme", &mut std::io::stdout());
 }
 
-/// Launch the TUI by exec'ing devme-tui — keeps the CLI binary small and
-/// avoids pulling crossterm/ratatui into it. Daemon is auto-spawned first.
+/// Launch the TUI directly. Runs preflight checks first, then hands off
+/// to the TUI event loop which manages all daemon spawning.
 async fn launch_tui() -> anyhow::Result<i32> {
-    let sock = socket_path();
-    ensure_daemon(&sock).await?;
+    let cwd = std::env::current_dir()?;
+    let config_path = cwd.join("devme.toml");
+    if let Ok(toml_str) = std::fs::read_to_string(&config_path) {
+        if let Ok(stack) = Stack::parse(&toml_str) {
+            if !stack.env.is_empty() {
+                let env_file = devme_supervisor::env_resolve::default_env_file(&cwd);
+                let env_pairs: Vec<(String, devme_config::EnvVar)> =
+                    stack.env.into_iter().collect();
+                let interactive = std::io::stdin().is_terminal();
+                let mut stdin = std::io::BufReader::new(std::io::stdin());
+                let mut stderr = std::io::stderr();
+                let _ = devme_supervisor::env_resolve::resolve_env_vars(
+                    &env_pairs, &env_file, &cwd, &mut stdin, &mut stderr, interactive,
+                );
+            }
+            if let Ok(stack) = Stack::parse(&toml_str) {
+                let interactive = std::io::stdin().is_terminal();
+                let mut stdin = std::io::BufReader::new(std::io::stdin());
+                let mut stderr = std::io::stderr();
+                let _ = devme_supervisor::preflight::run_preflight(
+                    &stack, &cwd, &mut stdin, &mut stderr, interactive,
+                );
+                ensure_docker_if_needed(&stack)?;
+            }
+        }
+    }
 
-    let tui_path = find_sibling_binary("devme-tui")?;
-    let status = std::process::Command::new(&tui_path).status()?;
-    Ok(status.code().unwrap_or(0))
+    devme_tui::launch(false).await?;
+    Ok(0)
 }
 
 use devme_supervisor::spawn::{
-    ensure_daemon as ensure_daemon_inner, find_sibling_binary,
+    ensure_daemon as ensure_daemon_inner,
 };
 
 /// Make sure a daemon is listening on `sock` for the current cwd. Thin

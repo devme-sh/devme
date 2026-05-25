@@ -9,3 +9,6 @@ pub mod discovery;
 pub mod render;
 pub mod state;
 pub mod worktree;
+mod event_loop;
+
+pub use event_loop::launch;

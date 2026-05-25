@@ -56,8 +56,7 @@ impl InstanceData {
     }
 }
 
-/// Repo-scoped shared daemon state. These services are merged into every
-/// instance's tab row rather than appearing as a separate sidebar entry.
+/// Repo-scoped shared daemon state. Shows as a separate sidebar entry.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct SharedData {
     /// Instance id of the shared daemon (e.g. `shared::<repo_id>`).
@@ -65,14 +64,18 @@ struct SharedData {
     services: Vec<ServiceSnapshot>,
     logs: HashMap<String, VecDeque<String>>,
     log_scroll: HashMap<String, usize>,
+    selected_service: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiState {
     instances: Vec<InstanceData>,
     selected_instance: Option<usize>,
-    /// Shared (repo-scoped) daemon state, merged into every instance view.
+    /// Shared (repo-scoped) daemon state with its own sidebar row.
     shared: SharedData,
+    /// When true, the sidebar focus is on the "shared" row and the main pane
+    /// shows repo-scoped services.
+    shared_selected: bool,
     focus: Focus,
     help_visible: bool,
     /// Last-known log viewport height (rows). Updated each render pass so
@@ -89,6 +92,7 @@ impl Default for TuiState {
             instances: Vec::new(),
             selected_instance: None,
             shared: SharedData::default(),
+            shared_selected: false,
             focus: Focus::Tabs,
             help_visible: false,
             viewport_height: 20,
@@ -147,6 +151,16 @@ impl TuiState {
 
     pub fn copy_mode(&self) -> bool {
         self.copy_mode
+    }
+
+    /// True when the sidebar "shared" row is focused.
+    pub fn shared_selected(&self) -> bool {
+        self.shared_selected
+    }
+
+    /// The repo-scoped services (from the shared supervisor).
+    pub fn shared_services(&self) -> &[ServiceSnapshot] {
+        &self.shared.services
     }
 
     pub fn enter_copy_mode(&mut self) {
@@ -245,8 +259,11 @@ impl TuiState {
     /// uses this to show a friendlier "waiting for devme.toml" message
     /// instead of an empty tab row.
     pub fn current_instance_is_placeholder(&self) -> bool {
+        if self.shared_selected {
+            return self.shared.services.is_empty();
+        }
         self.current_instance()
-            .map(|i| i.services.is_empty() && i.steps.is_empty() && self.shared.services.is_empty())
+            .map(|i| i.services.is_empty() && i.steps.is_empty())
             .unwrap_or(false)
     }
 
@@ -259,38 +276,50 @@ impl TuiState {
 
     // ── proxies to the selected instance ────────────────────────────────
 
-    /// Combined service count: instance services + shared (repo-scoped) services.
-    fn combined_service_count(&self) -> usize {
-        let inst = self.current_instance().map(|i| i.services.len()).unwrap_or(0);
-        inst + self.shared.services.len()
+    /// Instance services excluding external stubs for repo-scoped services.
+    fn instance_only_services(&self) -> Vec<&ServiceSnapshot> {
+        let Some(inst) = self.current_instance() else {
+            return Vec::new();
+        };
+        inst.services
+            .iter()
+            .filter(|s| !self.shared.services.iter().any(|sh| sh.name == s.name))
+            .collect()
     }
 
-    /// Resolve a combined index into either an instance or shared service.
-    fn resolve_service_index(&self, idx: usize) -> Option<&ServiceSnapshot> {
-        let inst = self.current_instance()?;
-        if idx < inst.services.len() {
-            inst.services.get(idx)
+    /// Services visible in the main pane tabs. When the shared row is
+    /// selected, returns only repo-scoped services. Otherwise returns only
+    /// instance-local services (repo-scoped stubs filtered out).
+    pub fn services(&self) -> Vec<ServiceSnapshot> {
+        if self.shared_selected {
+            self.shared.services.clone()
         } else {
-            self.shared.services.get(idx - inst.services.len())
+            self.instance_only_services().into_iter().cloned().collect()
         }
     }
 
-    /// True if the given combined index refers to a shared service.
-    fn is_shared_service_index(&self, idx: usize) -> bool {
-        self.current_instance()
-            .map(|i| idx >= i.services.len())
-            .unwrap_or(false)
+    fn active_service_count(&self) -> usize {
+        if self.shared_selected {
+            self.shared.services.len()
+        } else {
+            self.instance_only_services().len()
+        }
     }
 
-    /// All services visible in the current instance's tab row: instance-
-    /// scoped services first, then repo-scoped (shared) services.
-    pub fn services(&self) -> Vec<ServiceSnapshot> {
-        let mut out: Vec<ServiceSnapshot> = self
-            .current_instance()
-            .map(|i| i.services.clone())
-            .unwrap_or_default();
-        out.extend(self.shared.services.iter().cloned());
-        out
+    fn active_selected_service_idx(&self) -> Option<usize> {
+        if self.shared_selected {
+            self.shared.selected_service
+        } else {
+            self.current_instance()?.selected_service
+        }
+    }
+
+    fn set_active_selected_service(&mut self, idx: Option<usize>) {
+        if self.shared_selected {
+            self.shared.selected_service = idx;
+        } else if let Some(inst) = self.current_instance_mut() {
+            inst.selected_service = idx;
+        }
     }
 
     pub fn steps(&self) -> &[StepSnapshot] {
@@ -298,51 +327,55 @@ impl TuiState {
     }
 
     pub fn selected_service(&self) -> Option<&ServiceSnapshot> {
-        let inst = self.current_instance()?;
-        let idx = inst.selected_service?;
-        self.resolve_service_index(idx)
+        let idx = self.active_selected_service_idx()?;
+        let svcs = self.services();
+        if idx < svcs.len() {
+            if self.shared_selected {
+                self.shared.services.get(idx)
+            } else {
+                let inst_only = self.instance_only_services();
+                inst_only.get(idx).copied()
+            }
+        } else {
+            None
+        }
     }
 
     /// Buffered log lines for `service` — checks both instance and shared logs.
     pub fn service_logs(&self, service: &str) -> &VecDeque<String> {
         static EMPTY: std::sync::OnceLock<VecDeque<String>> = std::sync::OnceLock::new();
-        self.current_instance()
-            .and_then(|i| i.logs.get(service))
-            .or_else(|| self.shared.logs.get(service))
-            .unwrap_or_else(|| EMPTY.get_or_init(VecDeque::new))
+        if self.shared_selected {
+            self.shared.logs.get(service)
+        } else {
+            self.current_instance()
+                .and_then(|i| i.logs.get(service))
+                .or_else(|| self.shared.logs.get(service))
+        }
+        .unwrap_or_else(|| EMPTY.get_or_init(VecDeque::new))
     }
 
     /// Lines-from-bottom scroll offset for the selected service. 0 = tail.
     pub fn log_scroll_offset(&self) -> usize {
-        let Some(inst) = self.current_instance() else {
+        let Some(svc) = self.selected_service() else {
             return 0;
         };
-        let Some(idx) = inst.selected_service else {
-            return 0;
-        };
-        let Some(svc) = self.resolve_service_index(idx) else {
-            return 0;
-        };
-        if self.is_shared_service_index(idx) {
-            self.shared.log_scroll.get(&svc.name).copied().unwrap_or(0)
+        let name = &svc.name;
+        if self.shared_selected {
+            self.shared.log_scroll.get(name).copied().unwrap_or(0)
         } else {
-            inst.log_scroll.get(&svc.name).copied().unwrap_or(0)
+            self.current_instance()
+                .and_then(|i| i.log_scroll.get(name))
+                .copied()
+                .unwrap_or(0)
         }
     }
 
     fn set_scroll_for_selected(&mut self, value: usize) {
-        let Some(inst) = self.current_instance() else {
-            return;
-        };
-        let Some(idx) = inst.selected_service else {
-            return;
-        };
-        let Some(svc) = self.resolve_service_index(idx) else {
+        let Some(svc) = self.selected_service() else {
             return;
         };
         let name = svc.name.clone();
-        let is_shared = self.is_shared_service_index(idx);
-        if is_shared {
+        if self.shared_selected {
             if value == 0 {
                 self.shared.log_scroll.remove(&name);
             } else {
@@ -423,19 +456,17 @@ impl TuiState {
     }
 
     fn max_scroll_for_selected(&self) -> usize {
-        let Some(inst) = self.current_instance() else {
+        let Some(svc) = self.selected_service() else {
             return 0;
         };
-        let Some(idx) = inst.selected_service else {
-            return 0;
-        };
-        let Some(svc) = self.resolve_service_index(idx) else {
-            return 0;
-        };
-        let total = if self.is_shared_service_index(idx) {
-            self.shared.logs.get(&svc.name).map(|l| l.len()).unwrap_or(0)
+        let name = &svc.name;
+        let total = if self.shared_selected {
+            self.shared.logs.get(name).map(|l| l.len()).unwrap_or(0)
         } else {
-            inst.logs.get(&svc.name).map(|l| l.len()).unwrap_or(0)
+            self.current_instance()
+                .and_then(|i| i.logs.get(name))
+                .map(|l| l.len())
+                .unwrap_or(0)
         };
         total.saturating_sub(self.viewport_height)
     }
@@ -492,6 +523,9 @@ impl TuiState {
             ServerMessage::Subscribed { services, instance, .. } => {
                 self.shared.id = Some(instance.id);
                 self.shared.services = services;
+                if self.shared.selected_service.is_none() && !self.shared.services.is_empty() {
+                    self.shared.selected_service = Some(0);
+                }
             }
             ServerMessage::StatusUpdate { service, state, .. } => {
                 if let Some(s) = self.shared.services.iter_mut().find(|s| s.name == service) {
@@ -622,73 +656,94 @@ impl TuiState {
 
     /// `(instance_id, service_name)` of the currently-selected service, for
     /// routing commands back to the right daemon. Returns the shared daemon's
-    /// id when the selected service is repo-scoped.
+    /// id when viewing repo-scoped services.
     pub fn selected_instance_and_service(&self) -> Option<(String, String)> {
-        let inst = self.current_instance()?;
-        let idx = inst.selected_service?;
-        let svc = self.resolve_service_index(idx)?;
-        let id = if self.is_shared_service_index(idx) {
-            self.shared.id.clone()?
+        let svc = self.selected_service()?;
+        let name = svc.name.clone();
+        if self.shared_selected {
+            let id = self.shared.id.clone()?;
+            Some((id, name))
         } else {
-            inst.info.id.clone()
-        };
-        Some((id, svc.name.clone()))
+            let inst = self.current_instance()?;
+            Some((inst.info.id.clone(), name))
+        }
     }
 
     /// Horizontal navigation across service tabs (`h`/`l` / `←`/`→`).
-    /// Navigates across both instance and shared services.
     pub fn select_next_service(&mut self) {
-        let total = self.combined_service_count();
+        let total = self.active_service_count();
         if total == 0 {
             return;
         }
-        let Some(inst) = self.current_instance_mut() else {
-            return;
-        };
-        let next = match inst.selected_service {
+        let next = match self.active_selected_service_idx() {
             Some(i) => (i + 1) % total,
             None => 0,
         };
-        inst.selected_service = Some(next);
+        self.set_active_selected_service(Some(next));
     }
 
     pub fn select_prev_service(&mut self) {
-        let total = self.combined_service_count();
+        let total = self.active_service_count();
         if total == 0 {
             return;
         }
-        let Some(inst) = self.current_instance_mut() else {
-            return;
-        };
-        let prev = match inst.selected_service {
+        let prev = match self.active_selected_service_idx() {
             Some(0) | None => total - 1,
             Some(i) => i - 1,
         };
-        inst.selected_service = Some(prev);
+        self.set_active_selected_service(Some(prev));
     }
 
-    /// Vertical navigation through the sidebar's instance list
-    /// (`j`/`k` / `↑`/`↓`).
+    /// Vertical navigation through the sidebar. The "shared" row (if present)
+    /// appears after all instances. Wraps around.
     pub fn select_next_instance(&mut self) {
-        if self.instances.is_empty() {
+        let has_shared = !self.shared.services.is_empty();
+        let inst_count = self.instances.len();
+        if inst_count == 0 && !has_shared {
             return;
         }
-        let next = match self.selected_instance {
-            Some(i) => (i + 1) % self.instances.len(),
-            None => 0,
-        };
-        self.selected_instance = Some(next);
+        if self.shared_selected {
+            // Wrap from shared → first instance (or stay if no instances)
+            if inst_count > 0 {
+                self.shared_selected = false;
+                self.selected_instance = Some(0);
+            }
+        } else {
+            let cur = self.selected_instance.unwrap_or(0);
+            if cur + 1 < inst_count {
+                self.selected_instance = Some(cur + 1);
+            } else if has_shared {
+                self.shared_selected = true;
+            } else {
+                // Wrap to first instance
+                self.selected_instance = Some(0);
+            }
+        }
     }
 
     pub fn select_prev_instance(&mut self) {
-        if self.instances.is_empty() {
+        let has_shared = !self.shared.services.is_empty();
+        let inst_count = self.instances.len();
+        if inst_count == 0 && !has_shared {
             return;
         }
-        let prev = match self.selected_instance {
-            Some(0) | None => self.instances.len() - 1,
-            Some(i) => i - 1,
-        };
-        self.selected_instance = Some(prev);
+        if self.shared_selected {
+            // Move up to last instance
+            if inst_count > 0 {
+                self.shared_selected = false;
+                self.selected_instance = Some(inst_count - 1);
+            }
+        } else {
+            let cur = self.selected_instance.unwrap_or(0);
+            if cur > 0 {
+                self.selected_instance = Some(cur - 1);
+            } else if has_shared {
+                self.shared_selected = true;
+            } else {
+                // Wrap to last instance
+                self.selected_instance = Some(inst_count - 1);
+            }
+        }
     }
 }
 

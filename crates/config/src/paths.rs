@@ -102,11 +102,11 @@ pub fn runtime_dir() -> std::io::Result<PathBuf> {
     runtime_dir_inner()
 }
 
-/// `~/.local/share/devme/` or platform equivalent, created if missing.
+/// Socket/runtime directory. Uses `/tmp/devme` on Unix (TMPDIR is too long
+/// on macOS — the per-user temp path pushes socket paths past SUN_LEN).
+/// XDG_RUNTIME_DIR is honored when set (short-lived Linux runtime dirs).
 fn runtime_dir_inner() -> std::io::Result<PathBuf> {
     let dir = if let Some(d) = std::env::var_os("XDG_RUNTIME_DIR") {
-        PathBuf::from(d).join("devme")
-    } else if let Some(d) = std::env::var_os("TMPDIR") {
         PathBuf::from(d).join("devme")
     } else {
         PathBuf::from("/tmp/devme")

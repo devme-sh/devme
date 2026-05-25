@@ -1,9 +1,11 @@
 default:
     @just --list
 
-# Release-build the three binaries (cli, supervisor, tui).
+# Build and install all binaries to ~/.cargo/bin.
 build:
-    cargo build --release -p devme -p devme-supervisor -p devme-tui
+    cargo install --path crates/cli
+    cargo install --path crates/supervisor
+    cargo install --path crates/shared-supervisor
 
 # Run the full workspace test suite.
 test:
