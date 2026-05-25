@@ -261,6 +261,7 @@ async fn up(
              devme down             stop everything",
             if n == 1 { "" } else { "s" }
         );
+        maybe_show_skills_hint();
         return Ok(());
     }
 
@@ -750,6 +751,7 @@ async fn launch_tui() -> anyhow::Result<i32> {
     }
 
     devme_tui::launch(false).await?;
+    maybe_show_skills_hint();
     Ok(0)
 }
 
@@ -868,6 +870,26 @@ fn ensure_docker_if_needed(stack: &Stack) -> anyhow::Result<()> {
     docker::start_daemon(&daemon_id).map_err(|e| anyhow::anyhow!("{e}"))?;
     info!("devme: Docker is ready");
     Ok(())
+}
+
+fn maybe_show_skills_hint() {
+    let config_dir = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        std::path::PathBuf::from(xdg).join("devme")
+    } else if let Some(home) = std::env::var_os("HOME") {
+        std::path::PathBuf::from(home).join(".config").join("devme")
+    } else {
+        return;
+    };
+    let flag = config_dir.join("skills-hint-shown");
+    if flag.exists() {
+        return;
+    }
+    eprintln!(
+        "\n  Tip: Using an AI coding agent? Add the devme skill:\n\
+         \n       npx skills add devme-sh/skills\n"
+    );
+    let _ = std::fs::create_dir_all(&config_dir);
+    let _ = std::fs::write(&flag, "");
 }
 
 fn socket_path() -> std::path::PathBuf {
