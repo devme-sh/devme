@@ -4,7 +4,7 @@ Steps:
 1. Read the current version from `Cargo.toml` (`workspace.package.version`)
 2. Ask the user what the new version should be (suggest patch bump as default)
 3. Update `version` in the root `Cargo.toml` under `[workspace.package]`
-4. Run `cargo check` to update `Cargo.lock`
+4. Run `cargo generate-lockfile` then `cargo check --locked` to verify
 5. Commit: `release: v{version}`
 6. Create annotated tag: `v{version}`
 7. Push commit and tag to `origin main`
