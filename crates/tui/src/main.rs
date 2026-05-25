@@ -15,13 +15,22 @@ use std::io::Stdout;
 
 use base64::Engine;
 
-use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseEventKind,
-};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 
 /// Lines per PgUp / PgDn step. A "screen" worth of scroll.
 const LOG_PAGE: usize = 20;
+
+/// Enable mouse tracking in normal mode (1000) + SGR encoding (1006).
+/// Normal mode reports button press/release and scroll, but NOT motion.
+/// This is less aggressive than crossterm's EnableMouseCapture (mode 1003)
+/// and lets terminals like Ghostty handle Cmd-click on URLs natively.
+fn enable_mouse(w: &mut impl std::io::Write) -> std::io::Result<()> {
+    w.write_all(b"\x1b[?1000h\x1b[?1006h")
+}
+
+fn disable_mouse(w: &mut impl std::io::Write) -> std::io::Result<()> {
+    w.write_all(b"\x1b[?1000l\x1b[?1006l")
+}
 const MOUSE_SCROLL_LINES: usize = 3;
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
@@ -49,7 +58,8 @@ fn main() {
         Ok(()) => 0,
         Err(e) => {
             let _ = disable_raw_mode();
-            let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+            let _ = disable_mouse(&mut std::io::stdout());
+            let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
             eprintln!("devme-tui: {e}");
             1
         }
@@ -74,14 +84,16 @@ async fn real_main() -> anyhow::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
+    enable_mouse(&mut stdout)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = run(&mut terminal, &mut state, &mut registry, wt_rx, &home_id, no_shutdown).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
+    disable_mouse(terminal.backend_mut())?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     result
@@ -147,11 +159,11 @@ async fn run(
                         // disabled for native text selection.
                         KeyCode::Esc if state.copy_mode() => {
                             state.exit_copy_mode();
-                            execute!(terminal.backend_mut(), EnableMouseCapture)?;
+                            enable_mouse(terminal.backend_mut())?;
                         }
                         KeyCode::Char('v') if !state.copy_mode() => {
                             state.enter_copy_mode();
-                            execute!(terminal.backend_mut(), DisableMouseCapture)?;
+                            disable_mouse(terminal.backend_mut())?;
                         }
                         // Scrolling still works in copy mode.
                         _ if state.copy_mode() => match k.code {
@@ -164,16 +176,16 @@ async fn run(
                             KeyCode::Char('y') => {
                                 copy_to_clipboard(&state.visible_log_lines());
                                 state.exit_copy_mode();
-                                execute!(terminal.backend_mut(), EnableMouseCapture)?;
+                                enable_mouse(terminal.backend_mut())?;
                             }
                             KeyCode::Char('Y') => {
                                 copy_to_clipboard(&state.all_log_lines());
                                 state.exit_copy_mode();
-                                execute!(terminal.backend_mut(), EnableMouseCapture)?;
+                                enable_mouse(terminal.backend_mut())?;
                             }
                             KeyCode::Char('q') => {
                                 state.exit_copy_mode();
-                                execute!(terminal.backend_mut(), EnableMouseCapture)?;
+                                enable_mouse(terminal.backend_mut())?;
                             }
                             _ => {}
                         }
@@ -238,10 +250,7 @@ async fn run(
                             copy_to_clipboard(&state.all_log_lines());
                         }
                         KeyCode::Char('p') => {
-                            let prompt = build_debug_prompt(state);
-                            if !prompt.is_empty() {
-                                copy_to_clipboard(&[&prompt]);
-                            }
+                            copy_to_clipboard(&[&build_debug_prompt(state)]);
                         }
                         _ => {}
                     }
@@ -286,41 +295,78 @@ fn copy_to_clipboard(lines: &[&str]) {
 }
 
 fn build_debug_prompt(state: &TuiState) -> String {
-    let Some(svc) = state.selected_service() else {
-        return String::new();
-    };
-    let name = svc.name.clone();
-    let state_str = format!("{:?}", svc.state);
-    let logs = state.all_log_lines();
-    let tail: Vec<&str> = if logs.len() > 50 {
-        logs[logs.len() - 50..].to_vec()
-    } else {
-        logs
-    };
-
     let cwd = state.current_instance_cwd();
+    let label = state.instance_label();
+    let services = state.services();
 
-    let mut prompt = format!(
-        "The `{name}` service in my devme dev environment is {state_str}.\n\n\
-         Working directory: {cwd}\n\n\
-         Here are the last {} log lines:\n\n```\n",
-        tail.len()
-    );
-    for line in &tail {
-        prompt.push_str(line);
+    let mut prompt = format!("My devme dev environment ({label}).\n\nWorking directory: {cwd}\n\n");
+
+    if services.is_empty() {
+        if state.current_instance_is_placeholder() {
+            prompt.push_str("No devme.toml found in this directory.\n\n");
+        } else {
+            prompt.push_str("No services declared.\n\n");
+        }
+    } else {
+        prompt.push_str("## Service states\n\n");
+        for svc in &services {
+            prompt.push_str(&format!("- **{}**: {:?}", svc.name, svc.state));
+            if let Some(pid) = svc.pid {
+                prompt.push_str(&format!(" (pid {})", pid));
+            }
+            if let Some(port) = svc.port {
+                prompt.push_str(&format!(" (port {})", port));
+            }
+            if svc.restart_count > 0 {
+                prompt.push_str(&format!(" ({} restarts)", svc.restart_count));
+            }
+            prompt.push('\n');
+        }
         prompt.push('\n');
+
+        for svc in &services {
+            let logs = state.service_logs(&svc.name);
+            if logs.is_empty() {
+                continue;
+            }
+            let tail: Vec<&str> = if logs.len() > 30 {
+                logs.iter().skip(logs.len() - 30).map(|s| s.as_str()).collect()
+            } else {
+                logs.iter().map(|s| s.as_str()).collect()
+            };
+            prompt.push_str(&format!("## {} logs (last {})\n\n```\n", svc.name, tail.len()));
+            for line in &tail {
+                prompt.push_str(line);
+                prompt.push('\n');
+            }
+            prompt.push_str("```\n\n");
+        }
     }
-    prompt.push_str("```\n\n");
+
+    for step in state.steps() {
+        if matches!(step.state, devme_core::StepState::Failed | devme_core::StepState::ProvisionFailed) {
+            prompt.push_str(&format!("Step `{}` is {:?}.\n", step.name, step.state));
+            let logs = state.service_logs(&step.name);
+            if !logs.is_empty() {
+                prompt.push_str("\n```\n");
+                for line in logs.iter() {
+                    prompt.push_str(line);
+                    prompt.push('\n');
+                }
+                prompt.push_str("```\n\n");
+            }
+        }
+    }
 
     if let Ok(toml) = std::fs::read_to_string(
         std::path::Path::new(cwd).join("devme.toml"),
     ) {
-        prompt.push_str("Here is the relevant devme.toml config:\n\n```toml\n");
+        prompt.push_str("## devme.toml\n\n```toml\n");
         prompt.push_str(&toml);
         prompt.push_str("```\n\n");
     }
 
-    prompt.push_str("Diagnose the issue and suggest a fix.");
+    prompt.push_str("Inspect the environment and help me diagnose any issues.");
     prompt
 }
 
