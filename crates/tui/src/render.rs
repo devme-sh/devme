@@ -217,7 +217,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
     // to read at a glance, narrow enough that the underlying layout is
     // still partly visible around it.
     let w = 56u16.min(area.width.saturating_sub(4));
-    let h = 24u16.min(area.height.saturating_sub(4));
+    let h = 26u16.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let modal = Rect { x, y, width: w, height: h };
@@ -266,6 +266,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
         Line::from(vec![key("J / K"), desc("scroll one line")]),
         Line::from(vec![key("g / G"), desc("top / live tail")]),
         Line::from(vec![key("y / Y"), desc("copy visible / all logs")]),
+        Line::from(vec![key("p"), desc("copy debug prompt to clipboard")]),
         Line::from(vec![key("v"), desc("copy mode (select text)")]),
         Line::from(vec![key("wheel"), desc("scroll")]),
         Line::default(),
@@ -570,8 +571,13 @@ fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) 
     // ratio of `viewport / content_length` implicitly through its render.
     if let Some(sb_area) = sb_area {
         let content_length = logs.len();
+        let sb_position = if offset == 0 {
+            content_length
+        } else {
+            start
+        };
         let mut sb_state = ScrollbarState::new(content_length)
-            .position(start)
+            .position(sb_position)
             .viewport_content_length(viewport);
         let sb = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .style(Style::default().fg(Color::DarkGray))

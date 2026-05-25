@@ -237,6 +237,12 @@ async fn run(
                         KeyCode::Char('Y') => {
                             copy_to_clipboard(&state.all_log_lines());
                         }
+                        KeyCode::Char('p') => {
+                            let prompt = build_debug_prompt(state);
+                            if !prompt.is_empty() {
+                                copy_to_clipboard(&[&prompt]);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -277,5 +283,44 @@ fn copy_to_clipboard(lines: &[&str]) {
         &mut std::io::stdout(),
         format!("\x1b]52;c;{encoded}\x07").as_bytes(),
     );
+}
+
+fn build_debug_prompt(state: &TuiState) -> String {
+    let Some(svc) = state.selected_service() else {
+        return String::new();
+    };
+    let name = svc.name.clone();
+    let state_str = format!("{:?}", svc.state);
+    let logs = state.all_log_lines();
+    let tail: Vec<&str> = if logs.len() > 50 {
+        logs[logs.len() - 50..].to_vec()
+    } else {
+        logs
+    };
+
+    let cwd = state.current_instance_cwd();
+
+    let mut prompt = format!(
+        "The `{name}` service in my devme dev environment is {state_str}.\n\n\
+         Working directory: {cwd}\n\n\
+         Here are the last {} log lines:\n\n```\n",
+        tail.len()
+    );
+    for line in &tail {
+        prompt.push_str(line);
+        prompt.push('\n');
+    }
+    prompt.push_str("```\n\n");
+
+    if let Ok(toml) = std::fs::read_to_string(
+        std::path::Path::new(cwd).join("devme.toml"),
+    ) {
+        prompt.push_str("Here is the relevant devme.toml config:\n\n```toml\n");
+        prompt.push_str(&toml);
+        prompt.push_str("```\n\n");
+    }
+
+    prompt.push_str("Diagnose the issue and suggest a fix.");
+    prompt
 }
 
