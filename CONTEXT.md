@@ -103,3 +103,21 @@ The TUI modal shown when a [[Step]]'s check fails. Actions: `Enter` (install —
 ### Supervisor tab
 
 The first tab inside every [[Stack instance]]'s pane. Synthetic — not a real [[Service]]. Shows the graph traversal status, every [[Step]]'s state, output from the daemon itself, and shared-service status. The "what's happening at the meta level for this instance" view.
+
+## Cloud terms
+
+### Cloud relay
+
+The continuous sync link between a local machine and a remote host (VPS). Comprises bidirectional file sync (Mutagen) for the worktree, JSONL session sync for Claude Code conversations, and a WebSocket heartbeat for presence detection. Starts automatically with `devme up` when `[cloud]` is configured.
+
+### Watchdog
+
+A lightweight devme process running on the remote host in warm standby. Maintains the WebSocket heartbeat with the local machine, monitors sync health. On heartbeat loss (laptop offline for >2 minutes), triggers [[Takeover]].
+
+### Takeover
+
+The automatic transfer of an agent session from local to remote. Triggered by the [[Watchdog]] when the local machine has been offline for the configured delay (default 2 minutes) and the Claude session was idle. The watchdog runs `devme up` on the remote to start the dev stack, then `claude --resume` to continue the session.
+
+### Pull-back
+
+The reverse of [[Takeover]] — transferring a session from the remote back to local. Triggered explicitly by the user via a tmux keybinding or `devme cloud pull`. Stops the remote agent, syncs files and JSONL, resumes Claude Code locally.
