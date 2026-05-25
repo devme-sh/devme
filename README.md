@@ -65,14 +65,14 @@ Ports automatically offset per worktree slot — slot 0 keeps defaults, slot 1 g
 ## How It Compares
 
 | | devme | docker-compose | process-compose | Procfile (foreman) |
-|---|---|---|---|---|
-| Worktree-aware ports | Yes | No | No | No |
-| Dependency graph | Yes | Yes | Yes | No |
-| Health checks | Yes | Yes | Yes | No |
-| TUI | Yes | No | Yes | No |
-| Agent/AI interface | Yes | No | No | No |
-| Requires Docker | No | Yes | No | No |
-| Setup step provisioning | Yes | No | No | No |
+|---|:---:|:---:|:---:|:---:|
+| Worktree-aware ports | :white_check_mark: | :x: | :x: | :x: |
+| Dependency graph | :white_check_mark: | :white_check_mark: | :white_check_mark: | :x: |
+| Health checks | :white_check_mark: | :white_check_mark: | :white_check_mark: | :x: |
+| TUI dashboard | :white_check_mark: | :x: | :white_check_mark: | :x: |
+| Agent/AI interface | :white_check_mark: | :x: | :x: | :x: |
+| Docker-free | :white_check_mark: | :x: | :white_check_mark: | :white_check_mark: |
+| Setup step provisioning | :white_check_mark: | :x: | :x: | :x: |
 
 ## Architecture
 
