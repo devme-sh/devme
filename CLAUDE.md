@@ -37,3 +37,16 @@ macOS Intel is not built separately — Rosetta 2 runs the ARM binary.
 - Source: `install.sh` in repo root
 - Formula: `devme-sh/homebrew-tap`
 - CI secret: `HOMEBREW_TAP_TOKEN` (fine-grained PAT scoped to homebrew-tap repo)
+
+## Agent skill
+
+The `devme` agent skill lives in the sibling repo `devme-sh/skills` (local
+checkout: `../skills`, installed by users via `npx skills add devme-sh/skills`;
+Vercel skills CLI — `github.com/vercel-labs/skills`). Its `SKILL.md` documents
+the CLI surface (commands, flags, output) that agents drive.
+
+**Whenever you change CLI mechanics — add/rename/remove a command or flag, or
+change a command's output shape — update `../skills/skills/devme/SKILL.md` in
+the same change** (the CLI reference table, the action sections, and the
+gotchas). The skill is the executable contract agents rely on; letting it drift
+from the binary breaks them silently.
