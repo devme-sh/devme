@@ -829,8 +829,8 @@ fn print_completions(shell: Shell) {
 async fn launch_tui() -> anyhow::Result<i32> {
     let cwd = std::env::current_dir()?;
     let config_path = cwd.join("devme.toml");
-    if let Ok(toml_str) = std::fs::read_to_string(&config_path) {
-        if let Ok(stack) = Stack::parse(&toml_str) {
+    if let Ok(toml_str) = std::fs::read_to_string(&config_path)
+        && let Ok(stack) = Stack::parse(&toml_str) {
             // Env resolution only prompts when vars are missing — silent otherwise.
             if !stack.env.is_empty() {
                 // Honour `[stack] env_file` (ADR-0014) — compute the target
@@ -858,7 +858,6 @@ async fn launch_tui() -> anyhow::Result<i32> {
                 ensure_docker_if_needed(&stack)?;
             }
         }
-    }
 
     devme_tui::launch(false).await?;
     maybe_show_skills_hint();
@@ -880,8 +879,8 @@ async fn ensure_daemon(sock: &std::path::Path) -> anyhow::Result<bool> {
     let cwd = std::env::current_dir()?;
 
     let config_path = cwd.join("devme.toml");
-    if let Ok(toml_str) = std::fs::read_to_string(&config_path) {
-        if let Ok(stack) = Stack::parse(&toml_str) {
+    if let Ok(toml_str) = std::fs::read_to_string(&config_path)
+        && let Ok(stack) = Stack::parse(&toml_str) {
             if !stack.env.is_empty() {
                 // Honour `[stack] env_file` (ADR-0014) — compute the target
                 // path before moving `stack.env` out below.
@@ -910,7 +909,6 @@ async fn ensure_daemon(sock: &std::path::Path) -> anyhow::Result<bool> {
                 ensure_docker_if_needed(&stack)?;
             }
         }
-    }
 
     ensure_daemon_inner(sock, &cwd).await
 }

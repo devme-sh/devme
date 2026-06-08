@@ -179,7 +179,7 @@ fn strip_cursor_escapes(s: &str) -> String {
                 chars.next(); // consume '['
                 // skip parameter bytes (0x20-0x3F range in ASCII)
                 while let Some(&(_, c)) = chars.peek() {
-                    if c >= '\x20' && c <= '\x3F' {
+                    if ('\x20'..='\x3F').contains(&c) {
                         chars.next();
                     } else {
                         break;

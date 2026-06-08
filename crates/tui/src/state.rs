@@ -554,8 +554,7 @@ impl TuiState {
             }
             ServerMessage::LogChunk { service, bytes, .. } => {
                 Self::apply_log_chunk_to(
-                    self.find_instance(source_id)
-                        .and_then(|idx| Some(&mut self.instances[idx])),
+                    self.find_instance(source_id).map(|idx| &mut self.instances[idx]),
                     &service,
                     &bytes,
                 );
@@ -685,11 +684,10 @@ impl TuiState {
             .filter(|i| !i.services.is_empty())
             .map(|i| i.info.id.clone())
             .collect();
-        if !self.shared.services.is_empty() {
-            if let Some(id) = &self.shared.id {
+        if !self.shared.services.is_empty()
+            && let Some(id) = &self.shared.id {
                 ids.push(id.clone());
             }
-        }
         ids
     }
 

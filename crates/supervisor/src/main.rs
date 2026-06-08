@@ -33,14 +33,13 @@ fn real_main() -> anyhow::Result<()> {
     for svc in stack.service.values_mut() {
         if svc.scope == devme_core::Scope::Repo {
             svc.external = true;
-            if svc.health.is_none() {
-                if let Some(port) = svc.port {
+            if svc.health.is_none()
+                && let Some(port) = svc.port {
                     let resolved = port.resolve(0);
                     svc.health = Some(devme_core::HealthCheck::Tcp {
                         tcp: format!("localhost:{resolved}"),
                     });
                 }
-            }
         }
     }
 

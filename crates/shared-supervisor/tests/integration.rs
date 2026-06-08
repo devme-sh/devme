@@ -211,20 +211,17 @@ cmd = "while true; do echo INSTANCE-MARKER; sleep 0.2; done"
     let mut saw_marker = false;
     while std::time::Instant::now() < deadline && !saw_marker {
         let next = tokio::time::timeout(Duration::from_millis(200), client.next_event()).await;
-        match next {
-            Ok(Ok(Some(ServerMessage::LogChunk { service, bytes, .. }))) => {
-                if service != "cache" {
-                    continue;
-                }
-                let decoded = base64::engine::general_purpose::STANDARD
-                    .decode(bytes.as_bytes())
-                    .unwrap();
-                let line = String::from_utf8_lossy(&decoded);
-                if line.contains("SHARED-MARKER") {
-                    saw_marker = true;
-                }
+        if let Ok(Ok(Some(ServerMessage::LogChunk { service, bytes, .. }))) = next {
+            if service != "cache" {
+                continue;
             }
-            Ok(_) | Err(_) => {}
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(bytes.as_bytes())
+                .unwrap();
+            let line = String::from_utf8_lossy(&decoded);
+            if line.contains("SHARED-MARKER") {
+                saw_marker = true;
+            }
         }
     }
     assert!(
