@@ -50,7 +50,7 @@ fn checkable_port(svc: &Service) -> Option<u16> {
 }
 
 /// True if `port` can be bound right now (i.e. nothing is listening on it).
-fn is_port_free(port: u16) -> bool {
+pub fn is_port_free(port: u16) -> bool {
     TcpListener::bind(("0.0.0.0", port)).is_ok()
 }
 
@@ -85,8 +85,10 @@ fn process_name(pid: u32) -> Option<String> {
     if short.is_empty() { None } else { Some(short) }
 }
 
-/// What's holding a port, and how we can free it.
-enum Holder {
+/// What's holding a port, and how we can free it. Public so the TUI's
+/// reactive port-conflict modal can reuse the same detection + remediation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Holder {
     /// A Docker container, with its Compose project (if any).
     Container { name: String, project: Option<String> },
     /// One or more host processes (pid, name).
@@ -95,7 +97,9 @@ enum Holder {
     Unknown,
 }
 
-fn identify_holder(port: u16) -> Holder {
+/// Attribute `port` to whatever is currently holding it — a Docker container
+/// (preferred, with its Compose project) or one or more host processes.
+pub fn identify_holder(port: u16) -> Holder {
     if let Some(name) = docker::container_publishing_port(port) {
         let project = docker::container_compose_project(&name);
         return Holder::Container { name, project };
@@ -107,7 +111,8 @@ fn identify_holder(port: u16) -> Holder {
     Holder::Unknown
 }
 
-fn kill_pid(pid: u32) -> Result<(), String> {
+/// `kill <pid>` (SIGTERM). Frees a port held by a plain host process.
+pub fn kill_pid(pid: u32) -> Result<(), String> {
     let status = std::process::Command::new("kill")
         .arg(pid.to_string())
         .status()

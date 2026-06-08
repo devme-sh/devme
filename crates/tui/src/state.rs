@@ -196,6 +196,124 @@ pub struct SkillDialog {
     pub count: usize,
 }
 
+/// What the user can do about a port-conflict crash. Carries the data the
+/// event loop needs to carry the action out off-thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortConflictAction {
+    /// `docker stop <name>` — graceful, restartable.
+    StopContainer(String),
+    /// `docker compose -p <project> down` — tear down the whole project.
+    ComposeDown(String),
+    /// `kill <pids>` — SIGTERM the listening host process(es).
+    KillProcess(Vec<u32>),
+    /// Leave it; just close the modal.
+    Skip,
+}
+
+/// One selectable remediation row in the port-conflict modal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortConflictOption {
+    pub label: String,
+    pub action: PortConflictAction,
+}
+
+/// A reactive port-conflict modal: a running service crash-looped on
+/// `address already in use`. Mirrors the pre-launch picker, but in-session
+/// and ratatui-rendered — same Stop / Compose-down / Kill / Skip choices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortConflictDialog {
+    /// The instance (daemon) that reported the crash — where Restart is sent.
+    pub instance_id: String,
+    /// The crashing service.
+    pub service: String,
+    /// The port it couldn't bind.
+    pub port: u16,
+    /// One-line description of who's holding the port.
+    pub holder_desc: String,
+    /// Remediation rows; "Skip" is always last.
+    pub options: Vec<PortConflictOption>,
+    /// Currently-highlighted row.
+    pub selected: usize,
+}
+
+impl PortConflictDialog {
+    /// Build the modal from an identified port holder, deriving the relevant
+    /// remediation rows (Stop / Compose-down for a container, Kill for a
+    /// process) with "Skip" always last.
+    fn from_holder(
+        instance_id: String,
+        service: String,
+        port: u16,
+        holder: devme_supervisor::port_preflight::Holder,
+    ) -> Self {
+        use devme_supervisor::port_preflight::Holder;
+
+        let mut options = Vec::new();
+        let holder_desc = match &holder {
+            Holder::Container { name, project } => match project {
+                Some(p) => format!("container {name} (compose: {p})"),
+                None => format!("container {name}"),
+            },
+            Holder::Process(pids) => pids
+                .iter()
+                .map(|(pid, n)| match n {
+                    Some(n) => format!("{n} ({pid})"),
+                    None => format!("pid {pid}"),
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            Holder::Unknown => "an unknown process".to_string(),
+        };
+
+        match holder {
+            Holder::Container { name, project } => {
+                options.push(PortConflictOption {
+                    label: format!("Stop container {name}"),
+                    action: PortConflictAction::StopContainer(name),
+                });
+                if let Some(p) = project {
+                    options.push(PortConflictOption {
+                        label: format!("Compose down {p} (stops the whole project)"),
+                        action: PortConflictAction::ComposeDown(p),
+                    });
+                }
+            }
+            Holder::Process(pids) => {
+                let label = pids
+                    .iter()
+                    .map(|(pid, n)| match n {
+                        Some(n) => format!("{n} ({pid})"),
+                        None => format!("pid {pid}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let ids = pids.into_iter().map(|(p, _)| p).collect();
+                options.push(PortConflictOption {
+                    label: format!("Kill {label}"),
+                    action: PortConflictAction::KillProcess(ids),
+                });
+            }
+            Holder::Unknown => {}
+        }
+        options.push(PortConflictOption {
+            label: "Skip".into(),
+            action: PortConflictAction::Skip,
+        });
+
+        Self { instance_id, service, port, holder_desc, options, selected: 0 }
+    }
+}
+
+/// True if any of the last few log lines look like a port-already-in-use
+/// error. Covers Node (`EADDRINUSE`), Python/Go/Rust/Postgres
+/// (`address already in use`).
+fn logs_show_addr_in_use(logs: &VecDeque<String>) -> bool {
+    logs.iter().rev().take(40).any(|l| {
+        let low = l.to_ascii_lowercase();
+        low.contains("address already in use") || low.contains("eaddrinuse")
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiState {
     instances: Vec<InstanceData>,
@@ -237,6 +355,12 @@ pub struct TuiState {
     config: GlobalConfig,
     /// The settings overlay, when open. Modal like the help/skill dialogs.
     settings: Option<SettingsState>,
+    /// A reactive port-conflict crash detected during ingest, awaiting holder
+    /// identification (a blocking docker/lsof probe) in the event loop.
+    /// `(instance_id, service, port)`.
+    pending_port_conflict: Option<(String, String, u16)>,
+    /// The active port-conflict modal, once the holder is known.
+    port_conflict: Option<PortConflictDialog>,
 }
 
 impl Default for TuiState {
@@ -260,6 +384,8 @@ impl Default for TuiState {
             sidebar_collapsed: false,
             config: GlobalConfig::default(),
             settings: None,
+            pending_port_conflict: None,
+            port_conflict: None,
         }
     }
 }
@@ -829,6 +955,109 @@ impl TuiState {
         }
     }
 
+    // ── reactive port-conflict modal ────────────────────────────────────
+
+    /// On a fresh crash into Failed/CrashLoop, if the service's recent logs
+    /// look like an `address already in use` error and we know its port,
+    /// queue a port-conflict probe. Crash-loops re-enter the failure edge
+    /// (Restarting→Failed) repeatedly, so a log line that arrived late still
+    /// gets caught on a later cycle. Never stacks a second prompt.
+    fn flag_port_conflict_if_addr_in_use(
+        &mut self,
+        instance_id: &str,
+        service: &str,
+        old: &ServiceState,
+        new: &ServiceState,
+        port: Option<u16>,
+        shared: bool,
+    ) {
+        use ServiceState as S;
+        let was_failed = matches!(old, S::Failed { .. } | S::CrashLoop { .. });
+        let now_failed = matches!(new, S::Failed { .. } | S::CrashLoop { .. });
+        // Only the fresh edge into failure — not repeated failed states.
+        if !now_failed || was_failed {
+            return;
+        }
+        if self.port_conflict.is_some() || self.pending_port_conflict.is_some() {
+            return;
+        }
+        let Some(port) = port else { return };
+        let hit = if shared {
+            self.shared.logs.get(service)
+        } else {
+            self.find_instance(instance_id).and_then(|i| self.instances[i].logs.get(service))
+        }
+        .map(logs_show_addr_in_use)
+        .unwrap_or(false);
+        if hit {
+            self.pending_port_conflict =
+                Some((instance_id.to_string(), service.to_string(), port));
+        }
+    }
+
+    /// Take the queued port-conflict probe, if any, so the event loop can
+    /// identify the holder (a blocking docker/lsof call) off the UI thread.
+    pub fn take_pending_port_conflict(&mut self) -> Option<(String, String, u16)> {
+        self.pending_port_conflict.take()
+    }
+
+    /// Open the modal once the holder is known. Won't replace an open one.
+    pub fn open_port_conflict(
+        &mut self,
+        instance_id: String,
+        service: String,
+        port: u16,
+        holder: devme_supervisor::port_preflight::Holder,
+    ) {
+        if self.port_conflict.is_some() {
+            return;
+        }
+        self.port_conflict =
+            Some(PortConflictDialog::from_holder(instance_id, service, port, holder));
+    }
+
+    pub fn port_conflict(&self) -> Option<&PortConflictDialog> {
+        self.port_conflict.as_ref()
+    }
+
+    pub fn port_conflict_visible(&self) -> bool {
+        self.port_conflict.is_some()
+    }
+
+    /// Move the highlighted option by `delta`, wrapping.
+    pub fn port_conflict_move(&mut self, delta: i32) {
+        if let Some(d) = &mut self.port_conflict {
+            let n = d.options.len() as i32;
+            if n > 0 {
+                d.selected = (((d.selected as i32 + delta) % n + n) % n) as usize;
+            }
+        }
+    }
+
+    pub fn dismiss_port_conflict(&mut self) {
+        self.port_conflict = None;
+    }
+
+    /// Take the highlighted choice and close the modal. Returns
+    /// `(instance_id, service, action)` for the event loop to carry out.
+    pub fn take_port_conflict_choice(
+        &mut self,
+    ) -> Option<(String, String, PortConflictAction)> {
+        let d = self.port_conflict.take()?;
+        let action = d
+            .options
+            .get(d.selected)
+            .map(|o| o.action.clone())
+            .unwrap_or(PortConflictAction::Skip);
+        Some((d.instance_id, d.service, action))
+    }
+
+    /// Surface the outcome of a remediation as a corner toast.
+    pub fn push_port_conflict_result(&mut self, ok: bool, detail: impl Into<String>) {
+        let kind = if ok { ToastKind::Info } else { ToastKind::Failed };
+        self.push_toast(kind, "port", detail);
+    }
+
     // ── sidebar layout (scroll + collapse) ──────────────────────────────
 
     pub fn sidebar_collapsed(&self) -> bool {
@@ -1107,8 +1336,9 @@ impl TuiState {
                     inst.selected_service = Some(0);
                 }
             }
-            ServerMessage::StatusUpdate { service, state, .. } => {
+            ServerMessage::StatusUpdate { service, state, port: msg_port, .. } => {
                 let mut transition = None;
+                let mut port = msg_port;
                 if let Some(idx) = self.find_instance(source_id)
                     && let Some(s) = self.instances[idx]
                         .services
@@ -1116,10 +1346,14 @@ impl TuiState {
                         .find(|s| s.name == service)
                 {
                     transition = Some(s.state.clone());
+                    port = port.or(s.port);
                     s.state = state.clone();
                 }
                 if let Some(old) = transition {
                     self.toast_for_transition(&service, &old, &state);
+                    self.flag_port_conflict_if_addr_in_use(
+                        source_id, &service, &old, &state, port, false,
+                    );
                 }
             }
             ServerMessage::StepStatusUpdate { step, state } => {
@@ -1140,7 +1374,7 @@ impl TuiState {
         }
     }
 
-    fn apply_shared(&mut self, _source_id: &str, msg: ServerMessage) {
+    fn apply_shared(&mut self, source_id: &str, msg: ServerMessage) {
         match msg {
             ServerMessage::Subscribed { services, instance, .. } => {
                 self.shared.id = Some(instance.id);
@@ -1149,14 +1383,19 @@ impl TuiState {
                     self.shared.selected_service = Some(0);
                 }
             }
-            ServerMessage::StatusUpdate { service, state, .. } => {
+            ServerMessage::StatusUpdate { service, state, port: msg_port, .. } => {
                 let mut transition = None;
+                let mut port = msg_port;
                 if let Some(s) = self.shared.services.iter_mut().find(|s| s.name == service) {
                     transition = Some(s.state.clone());
+                    port = port.or(s.port);
                     s.state = state.clone();
                 }
                 if let Some(old) = transition {
                     self.toast_for_transition(&service, &old, &state);
+                    self.flag_port_conflict_if_addr_in_use(
+                        source_id, &service, &old, &state, port, true,
+                    );
                 }
             }
             ServerMessage::LogChunk { service, bytes, .. } => {
@@ -1939,4 +2178,116 @@ mod tests {
         assert_eq!(buf.last().unwrap(), &format!("line {}", super::TUI_LOG_CAP + 4));
     }
 
+    // ── reactive port-conflict modal ────────────────────────────────────
+
+    use devme_supervisor::port_preflight::Holder;
+
+    #[test]
+    fn addr_in_use_detected_in_logs() {
+        let mut logs = VecDeque::new();
+        logs.push_back("Error: listen EADDRINUSE: address already in use :::3000".to_string());
+        assert!(logs_show_addr_in_use(&logs));
+
+        let mut pg = VecDeque::new();
+        pg.push_back("FATAL: could not create lock file: Address already in use".to_string());
+        assert!(logs_show_addr_in_use(&pg));
+
+        let mut clean = VecDeque::new();
+        clean.push_back("server listening on 3000".to_string());
+        assert!(!logs_show_addr_in_use(&clean));
+    }
+
+    #[test]
+    fn options_from_container_with_project() {
+        let h = Holder::Container { name: "pg-1".into(), project: Some("proj".into()) };
+        let d = PortConflictDialog::from_holder("id".into(), "db".into(), 5432, h);
+        assert_eq!(d.options.len(), 3);
+        assert!(d.options[0].label.contains("Stop container pg-1"));
+        assert!(d.options[1].label.contains("Compose down proj"));
+        assert_eq!(d.options[2].action, PortConflictAction::Skip);
+        assert_eq!(d.holder_desc, "container pg-1 (compose: proj)");
+    }
+
+    #[test]
+    fn options_from_process_offer_kill_then_skip() {
+        let h = Holder::Process(vec![(123, Some("node".into()))]);
+        let d = PortConflictDialog::from_holder("id".into(), "web".into(), 3000, h);
+        assert_eq!(d.options.len(), 2);
+        assert!(d.options[0].label.contains("Kill node (123)"));
+        assert_eq!(d.options[0].action, PortConflictAction::KillProcess(vec![123]));
+        assert_eq!(d.options[1].action, PortConflictAction::Skip);
+    }
+
+    #[test]
+    fn port_conflict_move_wraps_both_ways() {
+        let mut s = TuiState::default();
+        s.open_port_conflict(
+            "id".into(),
+            "db".into(),
+            5432,
+            Holder::Container { name: "c".into(), project: None },
+        );
+        // options: [Stop, Skip]
+        assert_eq!(s.port_conflict().unwrap().selected, 0);
+        s.port_conflict_move(-1);
+        assert_eq!(s.port_conflict().unwrap().selected, 1);
+        s.port_conflict_move(1);
+        assert_eq!(s.port_conflict().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn take_choice_returns_selection_and_closes() {
+        let mut s = TuiState::default();
+        s.open_port_conflict("inst".into(), "db".into(), 5432, Holder::Process(vec![(9, None)]));
+        let (id, svc, action) = s.take_port_conflict_choice().unwrap();
+        assert_eq!(id, "inst");
+        assert_eq!(svc, "db");
+        assert_eq!(action, PortConflictAction::KillProcess(vec![9]));
+        assert!(!s.port_conflict_visible());
+    }
+
+    #[test]
+    fn crash_with_addr_in_use_log_queues_a_probe() {
+        let mut s = TuiState::default();
+        s.apply(snapshot_msg(&["db"]));
+        // A log line showing the bind failure arrives first…
+        let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
+        s.apply(ServerMessage::LogChunk {
+            service: "db".into(),
+            bytes: enc("Error: bind: address already in use"),
+            ts: 1,
+        });
+        // …then the daemon marks the service Failed, carrying the port.
+        s.apply(ServerMessage::StatusUpdate {
+            service: "db".into(),
+            state: ServiceState::Failed { exit_code: Some(1) },
+            pid: None,
+            port: Some(5432),
+            restart_count: 0,
+        });
+        assert_eq!(
+            s.take_pending_port_conflict(),
+            Some((test_instance().id, "db".to_string(), 5432)),
+        );
+    }
+
+    #[test]
+    fn crash_without_addr_in_use_does_not_queue() {
+        let mut s = TuiState::default();
+        s.apply(snapshot_msg(&["db"]));
+        let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
+        s.apply(ServerMessage::LogChunk {
+            service: "db".into(),
+            bytes: enc("panic: nil pointer dereference"),
+            ts: 1,
+        });
+        s.apply(ServerMessage::StatusUpdate {
+            service: "db".into(),
+            state: ServiceState::Failed { exit_code: Some(2) },
+            pid: None,
+            port: Some(5432),
+            restart_count: 0,
+        });
+        assert_eq!(s.take_pending_port_conflict(), None);
+    }
 }

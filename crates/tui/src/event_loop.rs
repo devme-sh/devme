@@ -167,6 +167,51 @@ async fn run(
                             }
                             _ => {}
                         }
+                        // Port-conflict modal takes top priority — a service
+                        // crashed on bind. ↑↓/jk move, Enter runs the chosen
+                        // remediation off-thread then restarts the service,
+                        // Esc/n skips.
+                        _ if state.port_conflict_visible() => match k.code {
+                            KeyCode::Up | KeyCode::Char('k') => state.port_conflict_move(-1),
+                            KeyCode::Down | KeyCode::Char('j') => state.port_conflict_move(1),
+                            KeyCode::Enter => {
+                                if let Some((id, service, action)) =
+                                    state.take_port_conflict_choice()
+                                {
+                                    use crate::state::PortConflictAction as A;
+                                    if !matches!(action, A::Skip) {
+                                        let svc = service.clone();
+                                        let outcome = tokio::task::spawn_blocking(move || {
+                                            run_port_remediation(&action)
+                                        })
+                                        .await;
+                                        match outcome {
+                                            Ok(Ok(label)) => {
+                                                state.push_port_conflict_result(
+                                                    true,
+                                                    format!("{label} — restarting {svc}"),
+                                                );
+                                                registry
+                                                    .send_to(
+                                                        &id,
+                                                        ClientMessage::Restart { service },
+                                                    )
+                                                    .await;
+                                            }
+                                            Ok(Err(e)) => {
+                                                state.push_port_conflict_result(false, e)
+                                            }
+                                            Err(_) => state.push_port_conflict_result(
+                                                false,
+                                                "remediation failed to run".to_string(),
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char('n') | KeyCode::Esc => state.dismiss_port_conflict(),
+                            _ => {}
+                        },
                         // Skill prompt is modal: capture its keys, swallow the
                         // rest so the choice is deliberate. Install offers
                         // i/g/n; update offers u/a/n.
@@ -289,7 +334,19 @@ async fn run(
                 None => return Ok(()),
             },
             tagged = registry.recv() => match tagged {
-                Some(t) => state.apply_from(&t.instance_id, t.message),
+                Some(t) => {
+                    state.apply_from(&t.instance_id, t.message);
+                    // A crash-on-bind queued a probe — identify the holder
+                    // off-thread (docker/lsof) and raise the modal.
+                    if let Some((id, service, port)) = state.take_pending_port_conflict() {
+                        let holder = tokio::task::spawn_blocking(move || {
+                            devme_supervisor::port_preflight::identify_holder(port)
+                        })
+                        .await
+                        .unwrap_or(devme_supervisor::port_preflight::Holder::Unknown);
+                        state.open_port_conflict(id, service, port, holder);
+                    }
+                }
                 None => return Ok(()),
             },
             wt = wt_rx.recv() => match wt {
@@ -328,6 +385,30 @@ fn persist_setting(state: &mut TuiState, dir: i32) {
         && let Err(err) = devme_config::GlobalConfig::persist(key, &value)
     {
         state.push_config_warning(format!("couldn't save {key}: {err}"));
+    }
+}
+
+/// Carry out a port-conflict remediation off the UI thread. Returns a short
+/// success label (for the toast) or an error string. Reuses the same
+/// container/process helpers as the pre-launch picker.
+fn run_port_remediation(action: &crate::state::PortConflictAction) -> Result<String, String> {
+    use crate::state::PortConflictAction as A;
+    use devme_config::docker;
+    use devme_supervisor::port_preflight::kill_pid;
+    match action {
+        A::StopContainer(name) => docker::stop_container(name).map(|_| format!("stopped {name}")),
+        A::ComposeDown(project) => {
+            docker::compose_down(project).map(|_| format!("composed down {project}"))
+        }
+        A::KillProcess(pids) => {
+            let errs: Vec<String> = pids.iter().filter_map(|p| kill_pid(*p).err()).collect();
+            if errs.is_empty() {
+                Ok("killed process".to_string())
+            } else {
+                Err(errs.join("; "))
+            }
+        }
+        A::Skip => Ok("skipped".to_string()),
     }
 }
 

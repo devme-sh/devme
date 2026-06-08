@@ -70,8 +70,11 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     // Transient corner notifications, above the main pane.
     render_toasts(frame, main_area, state);
 
-    // Modal priority: skill prompt > settings > help.
-    if let Some(dlg) = state.skill_dialog() {
+    // Modal priority: port conflict > skill prompt > settings > help. A
+    // crash-on-bind needs the user's attention before anything else.
+    if let Some(dlg) = state.port_conflict() {
+        render_port_conflict_dialog(frame, area, dlg);
+    } else if let Some(dlg) = state.skill_dialog() {
         render_skill_dialog(frame, area, dlg);
     } else if state.settings_visible() {
         render_settings_overlay(frame, area, state);
@@ -197,6 +200,79 @@ fn render_skill_dialog(frame: &mut Frame<'_>, area: Rect, dlg: &crate::state::Sk
             ]
         }
     };
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Modal shown when a running service crash-loops on `address already in
+/// use`. Mirrors the pre-launch picker: a radio list of remediations
+/// (Stop / Compose-down / Kill / Skip), navigated with ↑↓ / j,k and Enter.
+fn render_port_conflict_dialog(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    dlg: &crate::state::PortConflictDialog,
+) {
+    let n = dlg.options.len() as u16;
+    let w = 60u16.min(area.width.saturating_sub(4));
+    let h = (7 + n).min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let modal = Rect { x, y, width: w, height: h };
+
+    frame.render_widget(Clear, modal);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Port conflict ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Red));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let desc = |d: String| Span::styled(d, Style::default().fg(Color::Gray));
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            desc(format!("{} couldn't bind port ", dlg.service)),
+            Span::styled(
+                dlg.port.to_string(),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(desc(format!("held by {}", dlg.holder_desc))),
+        Line::default(),
+    ];
+    for (i, opt) in dlg.options.iter().enumerate() {
+        let selected = i == dlg.selected;
+        let (glyph, glyph_style, label_style) = if selected {
+            (
+                "●",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (
+                "○",
+                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
+            )
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {glyph} "), glyph_style),
+            Span::styled(opt.label.clone(), label_style),
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        " ↑↓ move · enter choose · esc skip",
+        Style::default().fg(Color::DarkGray),
+    )));
+
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -1268,6 +1344,48 @@ mod tests {
         let text = render_to_text(&mut state, 80, 20);
         assert!(text.contains("out of date"), "missing update prompt:\n{text}");
         assert!(text.contains("auto-update"), "missing always option:\n{text}");
+    }
+
+    #[test]
+    fn port_conflict_modal_lists_remediations() {
+        use devme_supervisor::port_preflight::Holder;
+        let mut state = TuiState::default();
+        state.open_port_conflict(
+            "inst".into(),
+            "postgres".into(),
+            5432,
+            Holder::Container {
+                name: "kpi-shared-db-1".into(),
+                project: Some("kpi-shared".into()),
+            },
+        );
+        let text = render_to_text(&mut state, 80, 20);
+        assert!(text.contains("Port conflict"), "missing title:\n{text}");
+        assert!(text.contains("postgres"), "missing service:\n{text}");
+        assert!(text.contains("5432"), "missing port:\n{text}");
+        assert!(text.contains("kpi-shared-db-1"), "missing holder:\n{text}");
+        assert!(text.contains("Stop container"), "missing stop option:\n{text}");
+        assert!(text.contains("Compose down"), "missing compose option:\n{text}");
+        assert!(text.contains("Skip"), "missing skip option:\n{text}");
+    }
+
+    #[test]
+    fn port_conflict_modal_outranks_skill_dialog() {
+        use crate::state::SkillPrompt;
+        use devme_supervisor::port_preflight::Holder;
+        let mut state = TuiState::default();
+        state.set_skill_dialog_for_test(SkillPrompt::Install);
+        state.open_port_conflict(
+            "inst".into(),
+            "web".into(),
+            3000,
+            Holder::Process(vec![(123, Some("node".into()))]),
+        );
+        let text = render_to_text(&mut state, 80, 20);
+        // The port-conflict modal wins; the skill prompt is suppressed.
+        assert!(text.contains("Port conflict"), "port modal not on top:\n{text}");
+        assert!(text.contains("Kill node (123)"), "missing kill option:\n{text}");
+        assert!(!text.contains("Install it"), "skill prompt leaked through:\n{text}");
     }
 
     #[test]
