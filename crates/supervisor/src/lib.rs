@@ -10,4 +10,5 @@ pub mod health;
 pub mod port_preflight;
 pub mod preflight;
 pub mod process;
+pub mod prompt;
 pub mod spawn;

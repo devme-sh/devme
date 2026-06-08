@@ -6,7 +6,7 @@
 //! automatically prompted on the next `devme` run.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -18,8 +18,6 @@ const S_BAR_END: &str = "└";
 const S_STEP_ACTIVE: &str = "◆";
 const S_STEP_SUBMIT: &str = "◇";
 const S_STEP_SKIP: &str = "◇";
-const S_RADIO_ACTIVE: &str = "●";
-const S_RADIO_INACTIVE: &str = "○";
 
 // Colors
 const C_RESET: &str = "\x1b[0m";
@@ -141,133 +139,6 @@ fn read_line_safe<R: BufRead>(input: &mut R) -> Result<Option<String>, std::io::
         Ok(0) => Ok(None),
         Ok(_) => Ok(Some(line)),
         Err(e) => Err(e),
-    }
-}
-
-/// Render N choice lines into a string for the picker.
-fn format_choices(choices: &[String], selected: usize, default_idx: usize) -> String {
-    let mut buf = String::new();
-    for (i, choice) in choices.iter().enumerate() {
-        if i == selected {
-            buf.push_str(&format!(
-                "  {C_DIM}{S_BAR}{C_RESET}  {C_CYAN}{S_RADIO_ACTIVE}{C_RESET} {choice}"
-            ));
-        } else {
-            buf.push_str(&format!(
-                "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}{S_RADIO_INACTIVE} {choice}{C_RESET}"
-            ));
-        }
-        if i == default_idx {
-            buf.push_str(&format!(" {C_DIM}(default){C_RESET}"));
-        }
-        buf.push_str("\r\n");
-    }
-    buf
-}
-
-/// Interactive arrow-key picker using crossterm raw mode.
-/// Uses Clack's rendering strategy: track line count, move up, erase down, redraw.
-/// Returns the index of the selected choice, or None on Ctrl+C / Esc.
-fn pick_choice<W: Write>(
-    output: &mut W,
-    choices: &[String],
-    default_idx: usize,
-) -> Result<Option<usize>, std::io::Error> {
-    use crossterm::{
-        event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
-        terminal,
-    };
-
-    let mut selected = default_idx;
-    let num_choices = choices.len();
-
-    // Hide cursor, render initial frame
-    write!(output, "\x1b[?25l")?;
-    let frame = format_choices(choices, selected, default_idx);
-    write!(output, "{frame}")?;
-    output.flush()?;
-    let prev_lines = num_choices;
-
-    terminal::enable_raw_mode()?;
-    let result = loop {
-        if let Ok(Event::Key(KeyEvent { code, modifiers, .. })) = event::read() {
-            match code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    selected = if selected == 0 { num_choices - 1 } else { selected - 1 };
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    selected = (selected + 1) % num_choices;
-                }
-                KeyCode::Enter => break Ok(Some(selected)),
-                KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    break Ok(None);
-                }
-                KeyCode::Esc => break Ok(None),
-                _ => continue,
-            };
-
-            // Redraw: move to col 0, up N lines, erase down, write new frame
-            write!(output, "\r\x1b[{prev_lines}A\x1b[J")?;
-            let frame = format_choices(choices, selected, default_idx);
-            write!(output, "{frame}")?;
-            output.flush()?;
-        }
-    };
-
-    terminal::disable_raw_mode()?;
-    // Erase the picker: move up, erase down, show cursor
-    write!(output, "\r\x1b[{prev_lines}A\x1b[J\x1b[?25h")?;
-    output.flush()?;
-    result
-}
-
-/// Numbered-list fallback for choice selection when no controlling terminal
-/// is available (piped stdin, CI, tests) — [`pick_choice`]'s crossterm raw
-/// mode needs a real TTY and `event::read()` ignores any injected reader.
-/// Prints a numbered list and reads a 1-based selection from `input`; an
-/// empty line takes the default. Returns `None` on EOF.
-fn pick_choice_numbered<R: BufRead, W: Write>(
-    input: &mut R,
-    output: &mut W,
-    choices: &[String],
-    default_idx: usize,
-) -> Result<Option<usize>, std::io::Error> {
-    for (i, choice) in choices.iter().enumerate() {
-        let marker = if i == default_idx { " (default)" } else { "" };
-        writeln!(
-            output,
-            "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}{}){C_RESET} {choice}{C_DIM}{marker}{C_RESET}",
-            i + 1
-        )?;
-    }
-    write!(
-        output,
-        "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}Enter a number (1-{}), or Enter for default ›{C_RESET} ",
-        choices.len()
-    )?;
-    output.flush()?;
-
-    loop {
-        match read_line_safe(input)? {
-            None => break Ok(None),
-            Some(line) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    break Ok(Some(default_idx));
-                }
-                match trimmed.parse::<usize>() {
-                    Ok(n) if (1..=choices.len()).contains(&n) => break Ok(Some(n - 1)),
-                    _ => {
-                        write!(
-                            output,
-                            "  {C_DIM}{S_BAR}{C_RESET}  {C_YELLOW}▲{C_RESET} {C_DIM}Enter 1-{} ›{C_RESET} ",
-                            choices.len()
-                        )?;
-                        output.flush()?;
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -418,15 +289,9 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
                 .unwrap_or(0);
 
             if interactive {
-                // The arrow-key picker needs a real controlling terminal
-                // (crossterm raw mode + `event::read()`); without one — piped
-                // stdin, CI, tests — fall back to a numbered prompt that reads
-                // the injected `input`.
-                let picked = if std::io::stdin().is_terminal() {
-                    pick_choice(output, &var.choices, default_idx)?
-                } else {
-                    pick_choice_numbered(input, output, &var.choices, default_idx)?
-                };
+                // Shared single-select prompt: arrow-key picker on a TTY,
+                // numbered fallback when stdin is piped (CI, tests).
+                let picked = crate::prompt::select_one(input, output, &var.choices, default_idx)?;
                 match picked {
                     Some(idx) => {
                         let value = var.choices[idx].clone();

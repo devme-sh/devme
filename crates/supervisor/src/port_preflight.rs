@@ -204,64 +204,81 @@ pub fn check_ports<R: BufRead, W: Write>(
             continue;
         }
 
-        // Build the prompt offer based on what we can do about it.
-        let freed = match holder {
+        // A port we can't attribute gets no menu — there's nothing to act on.
+        if let Holder::Unknown = holder {
+            writeln!(
+                output,
+                "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}can't attribute this port — free it manually{C_RESET}"
+            )?;
+            unresolved += 1;
+            continue;
+        }
+
+        // Offer the remediations as a single-select menu — arrow keys / j,k
+        // on a TTY, numbered fallback otherwise. The primary action is
+        // pre-selected; "Skip" is always last. `Esc`/`Ctrl-C` reads as Skip.
+        enum Act<'a> {
+            Stop(&'a str),
+            Down(&'a str),
+            Kill(&'a [(u32, Option<String>)]),
+            Skip,
+        }
+
+        let mut choices: Vec<String> = Vec::new();
+        let mut actions: Vec<Act> = Vec::new();
+        match holder {
             Holder::Container { name, project } => {
-                let prompt = match project {
-                    Some(_) => "[s] stop container, [d] compose down, [n] skip",
-                    None => "[s] stop container, [n] skip",
-                };
-                write!(
-                    output,
-                    "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}Free it? {prompt} ›{C_RESET} "
-                )?;
-                output.flush()?;
-                let choice = read_choice(input)?;
-                match choice.as_str() {
-                    "s" => act(output, "docker stop", docker::stop_container(name)),
-                    "d" => match project {
-                        Some(p) => act(output, "docker compose down", docker::compose_down(p)),
-                        None => skip(output)?,
-                    },
-                    _ => skip(output)?,
+                choices.push(format!("Stop container {name}"));
+                actions.push(Act::Stop(name));
+                if let Some(p) = project {
+                    choices.push(format!("Compose down {p} (stops the whole project)"));
+                    actions.push(Act::Down(p));
                 }
             }
             Holder::Process(pids) => {
-                write!(
-                    output,
-                    "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}Free it? [k] kill, [n] skip ›{C_RESET} "
-                )?;
-                output.flush()?;
-                let choice = read_choice(input)?;
-                match choice.as_str() {
-                    "k" => {
-                        let mut ok = true;
-                        for (pid, _) in pids {
-                            if let Err(e) = kill_pid(*pid) {
-                                ok = false;
-                                writeln!(
-                                    output,
-                                    "  {C_DIM}{S_BAR}{C_RESET}    {C_RED}▲ {e}{C_RESET}"
-                                )?;
-                            }
-                        }
-                        if ok {
-                            act_ok(output, "Killed")?;
-                            true
-                        } else {
-                            false
-                        }
+                let label = pids
+                    .iter()
+                    .map(|(pid, n)| match n {
+                        Some(n) => format!("{n} ({pid})"),
+                        None => format!("pid {pid}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                choices.push(format!("Kill {label}"));
+                actions.push(Act::Kill(pids));
+            }
+            Holder::Unknown => unreachable!("handled above"),
+        }
+        choices.push("Skip".to_string());
+        actions.push(Act::Skip);
+
+        let picked = crate::prompt::select_one(input, output, &choices, 0)?
+            .unwrap_or(actions.len() - 1); // aborted → Skip (always last)
+
+        let freed = match &actions[picked] {
+            Act::Stop(name) => act(output, "docker stop", docker::stop_container(name)),
+            Act::Down(project) => {
+                act(output, "docker compose down", docker::compose_down(project))
+            }
+            Act::Kill(pids) => {
+                let mut ok = true;
+                for (pid, _) in pids.iter() {
+                    if let Err(e) = kill_pid(*pid) {
+                        ok = false;
+                        writeln!(
+                            output,
+                            "  {C_DIM}{S_BAR}{C_RESET}    {C_RED}▲ {e}{C_RESET}"
+                        )?;
                     }
-                    _ => skip(output)?,
+                }
+                if ok {
+                    act_ok(output, "Killed")?;
+                    true
+                } else {
+                    false
                 }
             }
-            Holder::Unknown => {
-                writeln!(
-                    output,
-                    "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}can't attribute this port — free it manually{C_RESET}"
-                )?;
-                false
-            }
+            Act::Skip => skip(output)?,
         };
 
         // Re-probe: confirm the action actually freed the port.
@@ -299,17 +316,6 @@ pub fn check_ports<R: BufRead, W: Write>(
     writeln!(output)?;
 
     Ok(())
-}
-
-/// Read a single trimmed, lowercased choice token. Empty line (EOF or bare
-/// Enter) reads as "n" — the safe default is to leave things alone.
-fn read_choice<R: BufRead>(input: &mut R) -> std::io::Result<String> {
-    let mut line = String::new();
-    if input.read_line(&mut line)? == 0 {
-        return Ok("n".to_string());
-    }
-    let t = line.trim().to_lowercase();
-    Ok(if t.is_empty() { "n".to_string() } else { t })
 }
 
 /// Run a remediation, render the outcome, and report whether it succeeded.
@@ -459,5 +465,37 @@ port = {{ fixed = {port} }}
         assert!(text.contains("Port conflicts"), "got: {text}");
         assert!(text.contains(&port.to_string()));
         assert!(text.contains("unresolved"));
+    }
+
+    #[test]
+    fn occupied_port_interactive_skip_leaves_it() {
+        // Hold the port with this test process so it's detected as a host
+        // process. Tests aren't a TTY, so the menu uses the numbered
+        // fallback reading from `input` — pick the last option (Skip) so we
+        // never kill our own test runner.
+        let listener = TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stack = parse_stack(&format!(
+            r#"
+schema_version = 1
+
+[service.db]
+cmd = "echo db"
+port = {{ fixed = {port} }}
+"#,
+        ));
+        // "2" = Skip for a host-process holder (choices are [Kill, Skip]).
+        let mut input = Cursor::new(b"2\n");
+        let mut output = Vec::new();
+        check_ports(&stack, &mut input, &mut output, true).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        // The interactive menu fired (either a Kill option, or — if the port
+        // couldn't be attributed — the manual-free hint), and nothing was
+        // freed, so the conflict stays unresolved.
+        assert!(
+            text.contains("Kill") || text.contains("can't attribute"),
+            "expected an interactive remediation path, got: {text}"
+        );
+        assert!(text.contains("unresolved"), "got: {text}");
     }
 }
