@@ -6,7 +6,7 @@
 //! automatically prompted on the next `devme` run.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -97,11 +97,10 @@ pub fn append_to_env_file(
         .append(true)
         .open(path)?;
 
-    if let Ok(existing) = std::fs::read_to_string(path) {
-        if !existing.is_empty() && !existing.ends_with('\n') {
+    if let Ok(existing) = std::fs::read_to_string(path)
+        && !existing.is_empty() && !existing.ends_with('\n') {
             writeln!(file)?;
         }
-    }
 
     for (key, value) in vars {
         if value.contains(' ') || value.contains('"') || value.contains('#') {
@@ -222,6 +221,56 @@ fn pick_choice<W: Write>(
     result
 }
 
+/// Numbered-list fallback for choice selection when no controlling terminal
+/// is available (piped stdin, CI, tests) — [`pick_choice`]'s crossterm raw
+/// mode needs a real TTY and `event::read()` ignores any injected reader.
+/// Prints a numbered list and reads a 1-based selection from `input`; an
+/// empty line takes the default. Returns `None` on EOF.
+fn pick_choice_numbered<R: BufRead, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    choices: &[String],
+    default_idx: usize,
+) -> Result<Option<usize>, std::io::Error> {
+    for (i, choice) in choices.iter().enumerate() {
+        let marker = if i == default_idx { " (default)" } else { "" };
+        writeln!(
+            output,
+            "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}{}){C_RESET} {choice}{C_DIM}{marker}{C_RESET}",
+            i + 1
+        )?;
+    }
+    write!(
+        output,
+        "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}Enter a number (1-{}), or Enter for default ›{C_RESET} ",
+        choices.len()
+    )?;
+    output.flush()?;
+
+    loop {
+        match read_line_safe(input)? {
+            None => break Ok(None),
+            Some(line) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    break Ok(Some(default_idx));
+                }
+                match trimmed.parse::<usize>() {
+                    Ok(n) if (1..=choices.len()).contains(&n) => break Ok(Some(n - 1)),
+                    _ => {
+                        write!(
+                            output,
+                            "  {C_DIM}{S_BAR}{C_RESET}  {C_YELLOW}▲{C_RESET} {C_DIM}Enter 1-{} ›{C_RESET} ",
+                            choices.len()
+                        )?;
+                        output.flush()?;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Resolve missing env vars with Clack-style interactive prompts.
 pub fn resolve_env_vars<R: BufRead, W: Write>(
     declared: &[(String, EnvVar)],
@@ -266,8 +315,8 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
         writeln!(output, "  {C_DIM}{S_BAR}{C_RESET}")?;
 
         // --- Generate vars: prompt with Enter-to-generate ---
-        if let Some(gen_cmd) = &var.generate {
-            if var.choices.is_empty() {
+        if let Some(gen_cmd) = &var.generate
+            && var.choices.is_empty() {
                 if interactive {
                     writeln!(
                         output,
@@ -333,7 +382,6 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
                     continue;
                 }
             }
-        }
 
         // --- Non-interactive fallback ---
         if !interactive {
@@ -370,7 +418,16 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
                 .unwrap_or(0);
 
             if interactive {
-                match pick_choice(output, &var.choices, default_idx)? {
+                // The arrow-key picker needs a real controlling terminal
+                // (crossterm raw mode + `event::read()`); without one — piped
+                // stdin, CI, tests — fall back to a numbered prompt that reads
+                // the injected `input`.
+                let picked = if std::io::stdin().is_terminal() {
+                    pick_choice(output, &var.choices, default_idx)?
+                } else {
+                    pick_choice_numbered(input, output, &var.choices, default_idx)?
+                };
+                match picked {
                     Some(idx) => {
                         let value = var.choices[idx].clone();
                         writeln!(
