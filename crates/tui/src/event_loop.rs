@@ -167,6 +167,51 @@ async fn run(
                             }
                             _ => {}
                         }
+                        // Port-conflict modal takes top priority — a service
+                        // crashed on bind. ↑↓/jk move, Enter runs the chosen
+                        // remediation off-thread then restarts the service,
+                        // Esc/n skips.
+                        _ if state.port_conflict_visible() => match k.code {
+                            KeyCode::Up | KeyCode::Char('k') => state.port_conflict_move(-1),
+                            KeyCode::Down | KeyCode::Char('j') => state.port_conflict_move(1),
+                            KeyCode::Enter => {
+                                if let Some((id, service, action)) =
+                                    state.take_port_conflict_choice()
+                                {
+                                    use crate::state::PortConflictAction as A;
+                                    if !matches!(action, A::Skip) {
+                                        let svc = service.clone();
+                                        let outcome = tokio::task::spawn_blocking(move || {
+                                            run_port_remediation(&action)
+                                        })
+                                        .await;
+                                        match outcome {
+                                            Ok(Ok(label)) => {
+                                                state.push_port_conflict_result(
+                                                    true,
+                                                    format!("{label} — restarting {svc}"),
+                                                );
+                                                registry
+                                                    .send_to(
+                                                        &id,
+                                                        ClientMessage::Restart { service },
+                                                    )
+                                                    .await;
+                                            }
+                                            Ok(Err(e)) => {
+                                                state.push_port_conflict_result(false, e)
+                                            }
+                                            Err(_) => state.push_port_conflict_result(
+                                                false,
+                                                "remediation failed to run".to_string(),
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Char('n') | KeyCode::Esc => state.dismiss_port_conflict(),
+                            _ => {}
+                        },
                         // Zoom (fullscreen logs) captures navigation so the
                         // hidden sidebar/tabs don't move invisibly. `z`/Esc/q
                         // leave it; h/l still switch service.
@@ -188,12 +233,15 @@ async fn run(
                             KeyCode::Char('Y') => copy_to_clipboard(&state.all_log_lines()),
                             _ => {}
                         }
-                        // Quit confirmation is modal: y/Enter commits the quit,
-                        // anything else cancels.
+                        // Quit confirmation is modal: y/Enter commits the quit
+                        // (sibling-safe shutdown, like `devme down`), anything
+                        // else cancels.
                         _ if state.quit_confirm_visible() => match k.code {
                             KeyCode::Char('y') | KeyCode::Enter => {
-                                if !no_shutdown {
-                                    registry.broadcast(ClientMessage::Shutdown).await;
+                                if !no_shutdown
+                                    && let Ok(cwd) = std::env::current_dir()
+                                {
+                                    crate::worktree::shutdown_current_and_shared(&cwd).await;
                                 }
                                 return Ok(());
                             }
@@ -248,8 +296,12 @@ async fn run(
                             if state.confirm_quit_enabled() && !no_shutdown {
                                 state.open_quit_confirm();
                             } else {
-                                if !no_shutdown {
-                                    registry.broadcast(ClientMessage::Shutdown).await;
+                                if !no_shutdown
+                                    && let Ok(cwd) = std::env::current_dir()
+                                {
+                                    // Stop this stack + the shared services
+                                    // (sibling-safe), exactly like `devme down`.
+                                    crate::worktree::shutdown_current_and_shared(&cwd).await;
                                 }
                                 return Ok(());
                             }
@@ -258,12 +310,16 @@ async fn run(
                             if state.confirm_quit_enabled() && !no_shutdown {
                                 state.open_quit_confirm();
                             } else {
-                                if !no_shutdown {
-                                    registry.broadcast(ClientMessage::Shutdown).await;
+                                if !no_shutdown
+                                    && let Ok(cwd) = std::env::current_dir()
+                                {
+                                    crate::worktree::shutdown_current_and_shared(&cwd).await;
                                 }
                                 return Ok(());
                             }
                         }
+                        // Detach: leave every daemon running in the background
+                        // (use `devme up -d` to start that way deliberately).
                         KeyCode::Char('D') => return Ok(()),
                         KeyCode::Char('`') => state.toggle_sidebar(),
                         KeyCode::Char('z') => state.toggle_zoom(),
@@ -332,7 +388,19 @@ async fn run(
                 None => return Ok(()),
             },
             tagged = registry.recv() => match tagged {
-                Some(t) => state.apply_from(&t.instance_id, t.message),
+                Some(t) => {
+                    state.apply_from(&t.instance_id, t.message);
+                    // A crash-on-bind queued a probe — identify the holder
+                    // off-thread (docker/lsof) and raise the modal.
+                    if let Some((id, service, port)) = state.take_pending_port_conflict() {
+                        let holder = tokio::task::spawn_blocking(move || {
+                            devme_supervisor::port_preflight::identify_holder(port)
+                        })
+                        .await
+                        .unwrap_or(devme_supervisor::port_preflight::Holder::Unknown);
+                        state.open_port_conflict(id, service, port, holder);
+                    }
+                }
                 None => return Ok(()),
             },
             wt = wt_rx.recv() => match wt {
@@ -378,6 +446,30 @@ fn persist_setting(state: &mut TuiState, dir: i32) {
     };
     if let Err(err) = result {
         state.push_config_warning(format!("couldn't save {}: {err}", write.key()));
+    }
+}
+
+/// Carry out a port-conflict remediation off the UI thread. Returns a short
+/// success label (for the toast) or an error string. Reuses the same
+/// container/process helpers as the pre-launch picker.
+fn run_port_remediation(action: &crate::state::PortConflictAction) -> Result<String, String> {
+    use crate::state::PortConflictAction as A;
+    use devme_config::docker;
+    use devme_supervisor::port_preflight::kill_pid;
+    match action {
+        A::StopContainer(name) => docker::stop_container(name).map(|_| format!("stopped {name}")),
+        A::ComposeDown(project) => {
+            docker::compose_down(project).map(|_| format!("composed down {project}"))
+        }
+        A::KillProcess(pids) => {
+            let errs: Vec<String> = pids.iter().filter_map(|p| kill_pid(*p).err()).collect();
+            if errs.is_empty() {
+                Ok("killed process".to_string())
+            } else {
+                Err(errs.join("; "))
+            }
+        }
+        A::Skip => Ok("skipped".to_string()),
     }
 }
 

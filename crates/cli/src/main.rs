@@ -196,19 +196,12 @@ async fn down(timeout_secs: u64) -> anyhow::Result<()> {
     // shared supervisor, which other worktrees may be using. Tear it down too
     // only when no other worktree still has a running daemon, so `devme down`
     // is a complete stop in the common single-worktree case but doesn't yank
-    // a shared Postgres out from under a sibling worktree.
-    if let Ok(cwd) = std::env::current_dir() {
-        let reports = devme_tui::worktree::gather_worktree_reports(&cwd).await;
-        let others_live = reports
-            .iter()
-            .any(|r| !r.is_cwd && r.services.is_some());
-        if !others_live
-            && let Ok(shared_sock) = devme_config::paths::shared_socket(&cwd)
-            && let Ok(mut shared) = devme_client::Client::connect(&shared_sock).await
-        {
-            let _ = shared.send(ClientMessage::Shutdown).await;
-            println!(" ✔ Shared services            Stopped");
-        }
+    // a shared Postgres out from under a sibling worktree. The same helper
+    // backs the TUI's `q`.
+    if let Ok(cwd) = std::env::current_dir()
+        && devme_tui::worktree::shutdown_shared_if_last(&cwd).await
+    {
+        println!(" ✔ Shared services            Stopped");
     }
     Ok(())
 }
