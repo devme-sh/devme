@@ -256,17 +256,25 @@ async fn run(
                         KeyCode::Char('?') => state.toggle_help(),
                         KeyCode::Esc if state.help_visible() => state.hide_help(),
                         KeyCode::Char('q') | KeyCode::Esc => {
-                            if !no_shutdown {
-                                registry.broadcast(ClientMessage::Shutdown).await;
+                            if !no_shutdown
+                                && let Ok(cwd) = std::env::current_dir()
+                            {
+                                // Stop this stack + the shared services
+                                // (sibling-safe), exactly like `devme down`.
+                                crate::worktree::shutdown_current_and_shared(&cwd).await;
                             }
                             return Ok(());
                         }
                         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if !no_shutdown {
-                                registry.broadcast(ClientMessage::Shutdown).await;
+                            if !no_shutdown
+                                && let Ok(cwd) = std::env::current_dir()
+                            {
+                                crate::worktree::shutdown_current_and_shared(&cwd).await;
                             }
                             return Ok(());
                         }
+                        // Detach: leave every daemon running in the background
+                        // (use `devme up -d` to start that way deliberately).
                         KeyCode::Char('D') => return Ok(()),
                         KeyCode::Char('`') => state.toggle_sidebar(),
                         KeyCode::Down | KeyCode::Char('j') => state.select_next_instance(),

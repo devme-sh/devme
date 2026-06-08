@@ -543,6 +543,42 @@ pub async fn gather_worktree_reports(cwd: &Path) -> Vec<WorktreeReport> {
     reports
 }
 
+/// Shut down the repo-shared supervisor for `cwd`, but only when no *other*
+/// worktree of the repo still has a live daemon — so a sibling's shared
+/// Postgres isn't yanked out from under it. Returns `true` if a `Shutdown`
+/// was sent. Best-effort; never errors.
+///
+/// Shared by `devme down` and the TUI's `q` so both have identical
+/// sibling-safe teardown semantics.
+pub async fn shutdown_shared_if_last(cwd: &Path) -> bool {
+    let reports = gather_worktree_reports(cwd).await;
+    let others_live = reports.iter().any(|r| !r.is_cwd && r.services.is_some());
+    if others_live {
+        return false;
+    }
+    if let Ok(shared_sock) = devme_config::paths::shared_socket(cwd)
+        && let Ok(mut shared) = Client::connect(&shared_sock).await
+    {
+        let _ = shared.send(ClientMessage::Shutdown).await;
+        return true;
+    }
+    false
+}
+
+/// Graceful "quit this stack" used by the TUI's `q`: stop the current
+/// worktree's own services, then — sibling-safe — the repo-shared services
+/// too. Mirrors `devme down`. Each `Shutdown` is sent over a fresh awaited
+/// connection (not the discovery channel, which the writer task would drop on
+/// process exit), so delivery is guaranteed before the TUI returns.
+pub async fn shutdown_current_and_shared(cwd: &Path) {
+    if let Ok(sock) = devme_config::paths::supervisor_socket(cwd)
+        && let Ok(mut client) = Client::connect(&sock).await
+    {
+        let _ = client.send(ClientMessage::Shutdown).await;
+    }
+    shutdown_shared_if_last(cwd).await;
+}
+
 /// One-shot snapshot of a worktree's instance daemon. `None` if no daemon is
 /// listening (connect fails) — we never spawn one here.
 async fn snapshot_instance(path: &Path) -> Option<Vec<ServiceSnapshot>> {
