@@ -887,6 +887,15 @@ async fn launch_tui() -> anyhow::Result<i32> {
                     );
                 }
                 ensure_docker_if_needed(&stack)?;
+
+                // Catch ports already taken by a stray container/process and
+                // offer to free them before the daemon tries to bind.
+                let interactive = std::io::stdin().is_terminal();
+                let mut stdin = std::io::BufReader::new(std::io::stdin());
+                let mut stderr = std::io::stderr();
+                let _ = devme_supervisor::port_preflight::check_ports(
+                    &stack, &mut stdin, &mut stderr, interactive,
+                );
             }
         }
 
@@ -938,6 +947,15 @@ async fn ensure_daemon(sock: &std::path::Path) -> anyhow::Result<bool> {
                 );
 
                 ensure_docker_if_needed(&stack)?;
+
+                // Catch ports already taken by a stray container/process and
+                // offer to free them before the daemon tries to bind.
+                let interactive = std::io::stdin().is_terminal();
+                let mut stdin = std::io::BufReader::new(std::io::stdin());
+                let mut stderr = std::io::stderr();
+                let _ = devme_supervisor::port_preflight::check_ports(
+                    &stack, &mut stdin, &mut stderr, interactive,
+                );
             }
         }
 

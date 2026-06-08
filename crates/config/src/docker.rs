@@ -138,6 +138,81 @@ pub fn start_command_for(id: &str) -> Option<String> {
         .map(|d| d.start_cmd.join(" "))
 }
 
+// ── Port-conflict helpers (see `supervisor::port_preflight`) ────────────────
+
+/// Name of the running container publishing `host_port`, if any.
+///
+/// `docker ps --filter publish=<port>` matches containers that publish that
+/// host port. Returns `None` when Docker isn't reachable or nothing matches —
+/// the caller then falls back to host-process detection.
+pub fn container_publishing_port(host_port: u16) -> Option<String> {
+    let out = std::process::Command::new("docker")
+        .args(["ps", "--filter", &format!("publish={host_port}"), "--format", "{{.Names}}"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
+/// The Compose project a container belongs to (its
+/// `com.docker.compose.project` label), if it was started by Compose.
+pub fn container_compose_project(container: &str) -> Option<String> {
+    let out = std::process::Command::new("docker")
+        .args([
+            "inspect",
+            "-f",
+            "{{ index .Config.Labels \"com.docker.compose.project\" }}",
+            container,
+        ])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let proj = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // `docker inspect` prints `<no value>` for a missing label.
+    if proj.is_empty() || proj == "<no value>" {
+        None
+    } else {
+        Some(proj)
+    }
+}
+
+/// `docker stop <container>` — graceful stop of a single container. Keeps the
+/// container (restartable with `docker start`); just frees its ports.
+pub fn stop_container(container: &str) -> Result<(), String> {
+    run_docker(["stop", container], &format!("docker stop {container}"))
+}
+
+/// `docker compose -p <project> down` — stop and remove a whole Compose
+/// project (the bigger hammer; volumes survive). Works by project name without
+/// the compose file present, since Compose locates containers by label.
+pub fn compose_down(project: &str) -> Result<(), String> {
+    run_docker(["compose", "-p", project, "down"], &format!("docker compose -p {project} down"))
+}
+
+fn run_docker<const N: usize>(args: [&str; N], label: &str) -> Result<(), String> {
+    let status = std::process::Command::new("docker")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("{label}: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{label} exited with {status}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
