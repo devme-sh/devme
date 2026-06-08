@@ -22,6 +22,19 @@ cargo build --release        # all binaries
 cargo install --path crates/cli  # install devme to ~/.cargo/bin
 ```
 
+## Testing the TUI
+
+Unit render tests (ratatui `TestBackend`) cover frame *shape*; they don't
+exercise the event loop or input. For end-to-end TUI behavior (keybindings,
+modals, scroll), drive it headlessly in **tmux** and assert on the captured
+grid — `tmux new-session -d -x W -y H '…devme'`, `send-keys`, `capture-pane -p`,
+`grep -F`. The `verify-tui` skill documents the pattern and its pitfalls
+(startup races, fixed width, daemon cleanup on EXIT).
+
+- `scripts/tui-smoke.sh` — general TUI smoke (sidebar, pause/scroll, quit).
+- `scripts/skill-modal-smoke.sh` — the `devme skill` startup modals
+  (install / update / silent auto-update) under an isolated `HOME`.
+
 ## Releasing
 
 Use `/release` to create a new release. This bumps the version, tags, and pushes.
