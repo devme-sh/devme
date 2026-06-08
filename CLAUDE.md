@@ -40,13 +40,26 @@ macOS Intel is not built separately — Rosetta 2 runs the ARM binary.
 
 ## Agent skill
 
-The `devme` agent skill lives in the sibling repo `devme-sh/skills` (local
-checkout: `../skills`, installed by users via `npx skills add devme-sh/skills`;
-Vercel skills CLI — `github.com/vercel-labs/skills`). Its `SKILL.md` documents
-the CLI surface (commands, flags, output) that agents drive.
+The `devme` agent skill is a `SKILL.md` that teaches coding agents how to drive
+the CLI. **The canonical copy lives in this repo at
+`crates/config/skill/SKILL.md` and is embedded into the binary at build time**
+(`include_str!` in `crates/config/src/skill.rs`), so `devme skill install`
+always writes the version matching the running binary — no skill-vs-binary
+drift. Users install it either way:
+
+- `devme skill install` (`--global`) — the embedded copy, version-locked to
+  their binary, offline, no Node.
+- `npx skills add devme-sh/skills` — the published mirror (Vercel skills CLI,
+  `github.com/vercel-labs/skills`).
+
+The sibling repo `devme-sh/skills` (local checkout `../skills`,
+`skills/devme/SKILL.md`) is a **CI-generated mirror** of the canonical file —
+do not edit it by hand; it is overwritten from `crates/config/skill/SKILL.md`
+on release.
 
 **Whenever you change CLI mechanics — add/rename/remove a command or flag, or
-change a command's output shape — update `../skills/skills/devme/SKILL.md` in
-the same change** (the CLI reference table, the action sections, and the
-gotchas). The skill is the executable contract agents rely on; letting it drift
-from the binary breaks them silently.
+change a command's output shape — update `crates/config/skill/SKILL.md` in the
+same change** (the CLI reference table, the action sections, and the gotchas).
+The embedded skill is the executable contract agents rely on; letting it drift
+from the binary breaks them silently. The mirror in `../skills` syncs
+automatically, so don't touch it directly.

@@ -67,6 +67,29 @@ struct SharedData {
     selected_service: Option<usize>,
 }
 
+/// Which flavour of skill prompt the startup modal is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillPrompt {
+    /// No devme-managed skill is installed yet — offer to install it.
+    Install,
+    /// A devme-managed install is out of date — offer to refresh it.
+    Update,
+}
+
+/// A pending skill prompt, shown as a modal when the TUI starts. For
+/// `Install`, no skill is present and the human picks install / global /
+/// not-now. For `Update`, a devme-managed install is stale (and
+/// `skill.auto_update` is off) and the human picks update / always / not-now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillDialog {
+    pub kind: SkillPrompt,
+    /// Versions for the Update case (`from` → `to`). Empty for Install.
+    pub from: String,
+    pub to: String,
+    /// How many devme-managed installs are stale (Update case).
+    pub count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiState {
     instances: Vec<InstanceData>,
@@ -78,6 +101,8 @@ pub struct TuiState {
     shared_selected: bool,
     focus: Focus,
     help_visible: bool,
+    /// Pending stale-skill prompt, if any. Takes modal priority over help.
+    skill_dialog: Option<SkillDialog>,
     /// Last-known log viewport height (rows). Updated each render pass so
     /// scroll clamping accounts for how many lines the user can see at once.
     viewport_height: usize,
@@ -100,6 +125,7 @@ impl Default for TuiState {
             shared_selected: false,
             focus: Focus::Tabs,
             help_visible: false,
+            skill_dialog: None,
             viewport_height: 20,
             copy_mode: false,
             skill_hint_eligible: check_skill_hint_eligible(),
@@ -128,6 +154,44 @@ fn check_skill_hint_eligible() -> bool {
         }
         Err(_) => true,
     }
+}
+
+/// The devme config dir (`$XDG_CONFIG_HOME/devme` or `~/.config/devme`).
+fn config_dir() -> Option<std::path::PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        Some(std::path::PathBuf::from(xdg).join("devme"))
+    } else {
+        std::env::var_os("HOME")
+            .map(|h| std::path::PathBuf::from(h).join(".config").join("devme"))
+    }
+}
+
+/// Advance the skills-hint backoff counter (mirrors the CLI's hint writer), so
+/// the install modal doesn't reappear on every launch.
+fn record_skill_hint_shown() {
+    let Some(dir) = config_dir() else { return };
+    let state_file = dir.join("skills-hint-state");
+    let count: u32 = std::fs::read_to_string(&state_file)
+        .ok()
+        .and_then(|c| c.lines().next().and_then(|s| s.parse().ok()))
+        .unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(&state_file, format!("{}\n{now}", count + 1));
+}
+
+/// True if a skill is already installed at either default Claude Code
+/// location (project or global) — devme-managed or not. Used so we don't
+/// pester someone who installed via `npx skills`.
+fn skill_present_anywhere() -> bool {
+    use devme_config::skill::{InstallStatus, skill_file, status_at};
+    [skill_file(false), skill_file(true)]
+        .into_iter()
+        .flatten()
+        .any(|p| status_at(&p, None) != InstallStatus::Missing)
 }
 
 /// Returns true if the instance id belongs to the shared supervisor.
@@ -209,6 +273,16 @@ impl TuiState {
         self.skill_hint_eligible = false;
     }
 
+    #[cfg(test)]
+    pub fn set_skill_dialog_for_test(&mut self, kind: SkillPrompt) {
+        self.skill_dialog = Some(SkillDialog {
+            kind,
+            from: "0.1.2".into(),
+            to: "0.1.3".into(),
+            count: 1,
+        });
+    }
+
     /// True when the footer should show the skill hint instead of keybindings.
     /// Alternates: 8s hint, 30s keybindings, repeating.
     pub fn show_skill_hint(&self) -> bool {
@@ -227,6 +301,90 @@ impl TuiState {
 
     pub fn hide_help(&mut self) {
         self.help_visible = false;
+    }
+
+    // ── stale-skill prompt ──────────────────────────────────────────────
+
+    /// Decide, once at startup, whether to show a skill modal:
+    ///
+    /// - devme-managed install present + `skill.auto_update`: silently refresh,
+    ///   show nothing.
+    /// - devme-managed install present + stale: `Update` modal.
+    /// - nothing installed at all (and the install hint is still eligible):
+    ///   `Install` modal — same prompt, for first-time setup.
+    ///
+    /// The `Install` ask reuses the footer-hint backoff so it isn't naggy: it
+    /// appears at most a handful of times, and showing it both suppresses the
+    /// footer hint for this session and advances the persisted backoff.
+    pub fn check_skill_prompt(&mut self) {
+        let mut cfg = devme_config::GlobalConfig::load();
+
+        if !cfg.skill_installs().is_empty() {
+            if cfg.skill_auto_update() {
+                devme_config::skill::auto_update(&mut cfg);
+                return;
+            }
+            let stale = devme_config::skill::stale_installs(&cfg);
+            if let Some(first) = stale.first() {
+                self.skill_dialog = Some(SkillDialog {
+                    kind: SkillPrompt::Update,
+                    from: first.from.clone(),
+                    to: first.to.clone(),
+                    count: stale.len(),
+                });
+            }
+            return;
+        }
+
+        // Nothing devme-managed. Offer to install — but only if the skill
+        // isn't already present some other way (e.g. `npx skills`) and the
+        // backoff still allows it.
+        if !self.skill_hint_eligible || skill_present_anywhere() {
+            return;
+        }
+        self.skill_dialog = Some(SkillDialog {
+            kind: SkillPrompt::Install,
+            from: String::new(),
+            to: String::new(),
+            count: 0,
+        });
+        // Don't double up: hide the footer hint this session and back off so
+        // we don't pop the modal every launch.
+        self.skill_hint_eligible = false;
+        record_skill_hint_shown();
+    }
+
+    pub fn skill_dialog(&self) -> Option<&SkillDialog> {
+        self.skill_dialog.as_ref()
+    }
+
+    pub fn skill_dialog_visible(&self) -> bool {
+        self.skill_dialog.is_some()
+    }
+
+    pub fn dismiss_skill_dialog(&mut self) {
+        self.skill_dialog = None;
+    }
+
+    /// Apply the stale-skill update: regenerate every stale, devme-managed,
+    /// unmodified install. With `always`, also flips on `skill.auto_update`
+    /// so future updates happen silently. Closes the dialog either way.
+    pub fn apply_skill_update(&mut self, always: bool) {
+        let mut cfg = devme_config::GlobalConfig::load();
+        if always {
+            let _ = cfg.set("skill.auto_update", "true");
+            let _ = cfg.save();
+        }
+        devme_config::skill::auto_update(&mut cfg);
+        self.skill_dialog = None;
+    }
+
+    /// Apply the install prompt: write the embedded skill into the chosen
+    /// scope (project by default, `~/.claude/...` with `global`). Closes the
+    /// dialog regardless of outcome (a failure just means it stays uninstalled).
+    pub fn apply_skill_install(&mut self, global: bool) {
+        let _ = devme_config::skill::install(global, false);
+        self.skill_dialog = None;
     }
 
     // ── sidebar labels (back-compat with single-stack callers) ──────────

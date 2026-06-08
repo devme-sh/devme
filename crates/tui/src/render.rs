@@ -59,9 +59,85 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     render_main(frame, outer[1], state);
     render_footer(frame, vertical[1], state);
 
-    if state.help_visible() {
+    // The stale-skill prompt takes modal priority over help.
+    if let Some(dlg) = state.skill_dialog() {
+        render_skill_dialog(frame, area, dlg);
+    } else if state.help_visible() {
         render_help_overlay(frame, area);
     }
+}
+
+/// Modal asking the human to install the AI skill, or to refresh an
+/// out-of-date one. Both flavours share the framing and styling.
+fn render_skill_dialog(frame: &mut Frame<'_>, area: Rect, dlg: &crate::state::SkillDialog) {
+    use crate::state::SkillPrompt;
+
+    let w = 56u16.min(area.width.saturating_sub(4));
+    let h = 9u16.min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let modal = Rect { x, y, width: w, height: h };
+
+    frame.render_widget(Clear, modal);
+
+    let title = match dlg.kind {
+        SkillPrompt::Install => " AI skill ",
+        SkillPrompt::Update => " AI skill update ",
+    };
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let key = |k: &'static str| {
+        Span::styled(
+            format!(" {k} "),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )
+    };
+    let desc = |d: String| Span::styled(d, Style::default().fg(Color::Gray));
+    let dim = |d: &'static str| Span::styled(d, Style::default().fg(Color::DarkGray));
+
+    let lines: Vec<Line> = match dlg.kind {
+        SkillPrompt::Install => vec![
+            Line::from(desc(
+                "devme ships an AI coding skill that teaches agents".into(),
+            )),
+            Line::from(desc("to drive it. Install it for this repo?".into())),
+            Line::default(),
+            Line::from(vec![key("i"), desc(" install (.claude/skills/devme)".into())]),
+            Line::from(vec![key("g"), desc(" install globally (~/.claude/...)".into())]),
+            Line::from(vec![key("n"), dim(" not now")]),
+        ],
+        SkillPrompt::Update => {
+            let where_ = if dlg.count > 1 {
+                format!("{} installs", dlg.count)
+            } else {
+                "this project".to_string()
+            };
+            vec![
+                Line::from(desc(format!(
+                    "devme's AI skill is out of date (v{} \u{2192} v{}).",
+                    dlg.from, dlg.to
+                ))),
+                Line::from(desc(format!("Refresh {where_} from this binary?"))),
+                Line::default(),
+                Line::from(vec![key("u"), desc(" update now".into())]),
+                Line::from(vec![key("a"), desc(" always (auto-update from now on)".into())]),
+                Line::from(vec![key("n"), dim(" not now")]),
+            ]
+        }
+    };
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Full-screen log view for copy mode. No borders, sidebar, or tabs —
@@ -156,7 +232,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let centre_line = if state.show_skill_hint() {
         Line::from(vec![
             Span::styled("hint: ", Style::default().fg(Color::DarkGray)),
-            Span::styled("npx skills add devme-sh/skills", Style::default().fg(Color::Yellow)),
+            Span::styled("devme skill install", Style::default().fg(Color::Yellow)),
             Span::styled("  (suppress: ", Style::default().fg(Color::DarkGray)),
             Span::styled("devme config set hints.skills false", Style::default().fg(Color::DarkGray)),
             Span::styled(")", Style::default().fg(Color::DarkGray)),
@@ -883,6 +959,27 @@ mod tests {
         assert!(text.contains("✗"), "failed glyph missing:\n{text}");
         assert!(text.contains("·"), "unknown glyph missing:\n{text}");
         assert!(text.contains("gcloud"), "step name missing:\n{text}");
+    }
+
+    #[test]
+    fn install_modal_offers_install_keys() {
+        use crate::state::SkillPrompt;
+        let mut state = TuiState::default();
+        state.set_skill_dialog_for_test(SkillPrompt::Install);
+        let text = render_to_text(&mut state, 80, 20);
+        assert!(text.contains("Install it"), "missing install prompt:\n{text}");
+        assert!(text.contains("install globally"), "missing global option:\n{text}");
+        assert!(text.contains("not now"), "missing dismiss option:\n{text}");
+    }
+
+    #[test]
+    fn update_modal_offers_update_keys() {
+        use crate::state::SkillPrompt;
+        let mut state = TuiState::default();
+        state.set_skill_dialog_for_test(SkillPrompt::Update);
+        let text = render_to_text(&mut state, 80, 20);
+        assert!(text.contains("out of date"), "missing update prompt:\n{text}");
+        assert!(text.contains("auto-update"), "missing always option:\n{text}");
     }
 
     #[test]

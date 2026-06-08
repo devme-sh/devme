@@ -13,13 +13,14 @@ mod interpolate;
 pub mod paths;
 mod provision;
 mod service;
+pub mod skill;
 mod stack;
 mod step;
 mod validate;
 
 pub use env_var::EnvVar;
 pub use error::ConfigError;
-pub use global::GlobalConfig;
+pub use global::{GlobalConfig, SkillConfig, SkillInstall};
 pub use graph::{DepStatus, Graph, GraphError, NodeKind, SatisfactionOutcome};
 pub use interpolate::{InterpContext, InterpError, interpolate};
 pub use provision::Provision;

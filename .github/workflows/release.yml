@@ -120,6 +120,56 @@ jobs:
             devme-*.tar.gz
             devme-*.tar.gz.sha256
 
+  mirror-skill:
+    name: Mirror SKILL.md to devme-sh/skills
+    needs: release
+    runs-on: ubuntu-latest
+
+    steps:
+      # The canonical skill is embedded in the binary from
+      # crates/config/skill/SKILL.md; the devme-sh/skills repo is a mirror that
+      # `npx skills add` serves. Overwrite it on every release so the two can
+      # never describe different binaries.
+      - name: Check for sync token
+        id: token
+        run: |
+          if [ -n "${{ secrets.SKILLS_SYNC_TOKEN }}" ]; then
+            echo "have=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::SKILLS_SYNC_TOKEN not set — skipping SKILL.md mirror."
+          fi
+
+      - name: Checkout devme (canonical skill)
+        if: steps.token.outputs.have == 'true'
+        uses: actions/checkout@v4
+
+      - name: Checkout skills mirror
+        if: steps.token.outputs.have == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: devme-sh/skills
+          token: ${{ secrets.SKILLS_SYNC_TOKEN }}
+          path: skills-repo
+
+      - name: Sync and push if changed
+        if: steps.token.outputs.have == 'true'
+        run: |
+          src="crates/config/skill/SKILL.md"
+          dst="skills-repo/skills/devme/SKILL.md"
+          mkdir -p "$(dirname "$dst")"
+          cp "$src" "$dst"
+          cd skills-repo
+          if git diff --quiet -- skills/devme/SKILL.md; then
+            echo "SKILL.md already in sync — nothing to push."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add skills/devme/SKILL.md
+          git commit -m "Sync SKILL.md from devme ${GITHUB_REF_NAME}"
+          git push
+
   update-homebrew:
     name: Update Homebrew formula
     needs: release

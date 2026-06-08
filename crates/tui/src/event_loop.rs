@@ -38,6 +38,10 @@ pub async fn launch(no_shutdown: bool) -> anyhow::Result<()> {
     let (wt_tx, wt_rx) = mpsc::unbounded_channel::<WorktreeEvent>();
     let _spawner = AutoSpawner::bind(&cwd, wt_tx).await?;
     let mut state = TuiState::default();
+    // Queue a skill prompt before entering the alt-screen loop: offer to
+    // install when nothing's there, or to refresh a stale devme-managed copy
+    // (or silently refresh when auto-update is on).
+    state.check_skill_prompt();
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -142,6 +146,31 @@ async fn run(
                                 enable_mouse(terminal.backend_mut())?;
                             }
                             _ => {}
+                        }
+                        // Skill prompt is modal: capture its keys, swallow the
+                        // rest so the choice is deliberate. Install offers
+                        // i/g/n; update offers u/a/n.
+                        _ if state.skill_dialog_visible() => {
+                            use crate::state::SkillPrompt;
+                            let kind = state.skill_dialog().map(|d| d.kind);
+                            match (kind, k.code) {
+                                (Some(SkillPrompt::Install), KeyCode::Char('i')) => {
+                                    state.apply_skill_install(false)
+                                }
+                                (Some(SkillPrompt::Install), KeyCode::Char('g')) => {
+                                    state.apply_skill_install(true)
+                                }
+                                (Some(SkillPrompt::Update), KeyCode::Char('u')) => {
+                                    state.apply_skill_update(false)
+                                }
+                                (Some(SkillPrompt::Update), KeyCode::Char('a')) => {
+                                    state.apply_skill_update(true)
+                                }
+                                (_, KeyCode::Char('n') | KeyCode::Esc) => {
+                                    state.dismiss_skill_dialog()
+                                }
+                                _ => {}
+                            }
                         }
                         KeyCode::Char('?') => state.toggle_help(),
                         KeyCode::Esc if state.help_visible() => state.hide_help(),

@@ -8,8 +8,8 @@ use base64::Engine;
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
 use devme_cli::{
-    Cli, Command, ConfigAction, WorktreeAction, format_status_all, format_status_json,
-    format_status_text,
+    Cli, Command, ConfigAction, SkillAction, WorktreeAction, format_status_all,
+    format_status_json, format_status_text,
 };
 use devme_config::Stack;
 use devme_core::{ClientMessage, ServerMessage, ServiceState};
@@ -95,6 +95,7 @@ async fn run(cli: Cli) -> i32 {
         Some(Command::Doctor { tail }) => doctor(tail).await,
         Some(Command::Config { action }) => config_cmd(action),
         Some(Command::Worktree { action }) => worktree_cmd(action, cli.json).await,
+        Some(Command::Skill { action }) => skill_cmd(action, cli.json),
     };
     match result {
         Ok(()) => 0,
@@ -188,6 +189,25 @@ async fn down(timeout_secs: u64) -> anyhow::Result<()> {
         if !stopped.contains(name) {
             let elapsed = started.elapsed().as_secs_f32();
             println!(" ✔ Service {name:<20}  Stopped   {elapsed:>5.1}s");
+        }
+    }
+
+    // Shared (`scope = "repo"`) services — postgres, proxy — live in the
+    // shared supervisor, which other worktrees may be using. Tear it down too
+    // only when no other worktree still has a running daemon, so `devme down`
+    // is a complete stop in the common single-worktree case but doesn't yank
+    // a shared Postgres out from under a sibling worktree.
+    if let Ok(cwd) = std::env::current_dir() {
+        let reports = devme_tui::worktree::gather_worktree_reports(&cwd).await;
+        let others_live = reports
+            .iter()
+            .any(|r| !r.is_cwd && r.services.is_some());
+        if !others_live
+            && let Ok(shared_sock) = devme_config::paths::shared_socket(&cwd)
+            && let Ok(mut shared) = devme_client::Client::connect(&shared_sock).await
+        {
+            let _ = shared.send(ClientMessage::Shutdown).await;
+            println!(" ✔ Shared services            Stopped");
         }
     }
     Ok(())
@@ -330,6 +350,7 @@ async fn up(
              devme down             stop everything",
             if n == 1 { "" } else { "s" }
         );
+        maybe_skill_update();
         maybe_show_skills_hint();
         return Ok(());
     }
@@ -819,6 +840,16 @@ async fn worktree_cmd(action: WorktreeAction, json: bool) -> anyhow::Result<()> 
     }
 }
 
+/// `devme skill …` — manage the embedded AI agent skill. Pure filesystem
+/// work, so it's synchronous (no daemon involved).
+fn skill_cmd(action: SkillAction, json: bool) -> anyhow::Result<()> {
+    match action {
+        SkillAction::Install { global, force } => devme_cli::skill::install(global, force, json),
+        SkillAction::Uninstall { global } => devme_cli::skill::uninstall(global, json),
+        SkillAction::Status => devme_cli::skill::status(json),
+    }
+}
+
 fn print_completions(shell: Shell) {
     let mut cmd = Cli::command();
     generate(shell, &mut cmd, "devme", &mut std::io::stdout());
@@ -982,6 +1013,60 @@ fn ensure_docker_if_needed(stack: &Stack) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Keep a devme-managed skill install in step with this binary. Two modes:
+///
+/// - `skill.auto_update = true`: silently regenerate any stale, unmodified,
+///   devme-written install. No prompt, no nag.
+/// - otherwise: on an interactive terminal only, print a one-line nudge —
+///   throttled to once per binary version — pointing at `devme skill install`.
+///
+/// Either way we only ever touch installs devme recorded writing and that the
+/// user hasn't edited since; foreign/modified copies are left alone. Agents
+/// and pipes (no tty) get nothing but the silent auto-update path.
+fn maybe_skill_update() {
+    if QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut cfg = devme_config::GlobalConfig::load();
+    if cfg.skill_installs().is_empty() {
+        return;
+    }
+
+    if cfg.skill_auto_update() {
+        let updated = devme_config::skill::auto_update(&mut cfg);
+        if !updated.is_empty() {
+            info!(
+                "devme: refreshed AI skill to v{} in {} location(s)",
+                devme_config::skill::embedded_version(),
+                updated.len()
+            );
+        }
+        return;
+    }
+
+    // Nudge only a human at a keyboard — never an agent or a pipe.
+    if !std::io::stdin().is_terminal() {
+        return;
+    }
+    if cfg.get("hints.skills").as_deref() == Some("false") {
+        return;
+    }
+    let stale = devme_config::skill::stale_installs(&cfg);
+    let Some(first) = stale.first() else {
+        return;
+    };
+    let embedded = devme_config::skill::embedded_version();
+    if cfg.skill_last_nudge() == Some(embedded.as_str()) {
+        return;
+    }
+    eprintln!(
+        "hint: devme's AI skill is out of date (v{} → v{}). Update: devme skill install",
+        first.from, first.to
+    );
+    cfg.set_skill_last_nudge(&embedded);
+    let _ = cfg.save();
+}
+
 fn maybe_show_skills_hint() {
     if QUIET.load(std::sync::atomic::Ordering::Relaxed) {
         return;
@@ -989,6 +1074,11 @@ fn maybe_show_skills_hint() {
 
     let cfg = devme_config::GlobalConfig::load();
     if cfg.get("hints.skills") == Some("false".into()) {
+        return;
+    }
+    // Don't nag to install a skill devme already manages — `maybe_skill_update`
+    // owns keeping it current.
+    if !cfg.skill_installs().is_empty() {
         return;
     }
 
@@ -1034,7 +1124,8 @@ fn maybe_show_skills_hint() {
     }
 
     eprintln!(
-        "hint: devme has an AI coding skill. Run: npx skills add devme-sh/skills"
+        "hint: devme has an AI coding skill. Install it: devme skill install \
+         (or: npx skills add devme-sh/skills)"
     );
     if count == 0 {
         eprintln!("hint: suppress with: devme config set hints.skills false");

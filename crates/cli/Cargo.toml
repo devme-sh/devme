@@ -29,3 +29,6 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
 devme-tui = { path = "../tui" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

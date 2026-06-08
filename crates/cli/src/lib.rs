@@ -7,6 +7,8 @@ use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 use devme_core::{ServiceSnapshot, StepSnapshot};
 
+pub mod skill;
+
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(name = "devme", version, about = "Multi-service dev environment supervisor")]
 pub struct Cli {
@@ -127,6 +129,20 @@ pub enum Command {
         #[command(subcommand)]
         action: WorktreeAction,
     },
+    /// Install or update the devme AI agent skill — a `SKILL.md` that teaches
+    /// coding agents (Claude Code et al.) how to drive devme.
+    ///
+    /// The skill is embedded in this binary, so `devme skill install` always
+    /// writes the version matching the devme you're running — no drift.
+    ///
+    /// `devme skill install` — into this project's `.claude/skills/devme/`.
+    /// `devme skill install --global` — into `~/.claude/skills/devme/`.
+    /// `devme skill status` — show where it's installed and if it's current.
+    /// `devme skill uninstall` — remove a devme-managed install.
+    Skill {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -145,6 +161,28 @@ pub enum WorktreeAction {
         #[arg(long, short = 'f')]
         force: bool,
     },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum SkillAction {
+    /// Write the embedded `SKILL.md` into a Claude Code skills directory.
+    Install {
+        /// Install into `~/.claude/skills/devme/` instead of this project's
+        /// `.claude/skills/devme/`.
+        #[arg(long, short = 'g')]
+        global: bool,
+        /// Overwrite even a hand-edited install or one placed by another tool.
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
+    /// Remove a devme-managed skill install (refuses to touch a foreign one).
+    Uninstall {
+        /// Target the global `~/.claude/skills/devme/` install.
+        #[arg(long, short = 'g')]
+        global: bool,
+    },
+    /// Show where the skill is installed and whether each copy is current.
+    Status,
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
