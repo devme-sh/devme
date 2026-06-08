@@ -150,6 +150,14 @@ struct DaemonState {
     /// Slot assigned by the cross-worktree allocator. Drives the `{slot}`
     /// and `{port}` interpolation for every service.
     slot: Slot,
+    /// Absolute worktree path, exposed as `{worktree}` in interpolation.
+    /// Derived from the daemon's [`InstanceInfo::cwd`].
+    worktree: String,
+    /// Current git branch of the worktree, exposed as `{branch}`. Empty
+    /// when the worktree isn't a git checkout (the var is still present so
+    /// configs referencing `{branch}` validate; a typo like `{branchh}`
+    /// still errors).
+    branch: String,
     children: HashMap<String, ChildRecord>,
     logs: HashMap<String, RingBuffer>,
     clients: HashMap<ClientId, ClientTx>,
@@ -180,11 +188,15 @@ struct DaemonState {
 impl DaemonState {
     fn new(stack: Arc<Stack>, slot: Slot, instance: InstanceInfo) -> Self {
         let graph = Graph::from_stack(&stack);
+        let worktree = instance.cwd.clone();
+        let branch = current_git_branch(Path::new(&worktree)).unwrap_or_default();
         Self {
             stack,
             executor: Executor::new(graph),
             instance,
             slot,
+            worktree,
+            branch,
             children: HashMap::new(),
             logs: HashMap::new(),
             clients: HashMap::new(),
@@ -250,6 +262,46 @@ impl DaemonState {
             })
             .collect();
         (services, steps)
+    }
+
+    /// Resolved port for every service that declares a port spec, keyed by
+    /// service name. Computed from the stack + slot, so it's stable for the
+    /// daemon's lifetime and identical for every node that reads it.
+    fn service_ports(&self) -> HashMap<&str, u16> {
+        self.stack
+            .service
+            .iter()
+            .filter_map(|(name, svc)| {
+                svc.port
+                    .map(|spec| (name.as_str(), spec.resolve(self.slot.as_u8())))
+            })
+            .collect()
+    }
+
+    /// The interpolation context shared by every node: `{slot}`,
+    /// `{worktree}`, `{branch}`, and `{port.<service>}` for each sibling
+    /// service that declares a port. A node's own `{port}` is layered on
+    /// top by [`node_ctx`](Self::node_ctx).
+    fn base_ctx(&self) -> InterpContext {
+        let mut ctx = InterpContext::new()
+            .set("slot", self.slot.to_string())
+            .set("worktree", self.worktree.clone())
+            .set("branch", self.branch.clone());
+        for (name, port) in self.service_ports() {
+            ctx.insert(format!("port.{name}"), port.to_string());
+        }
+        ctx
+    }
+
+    /// Context for a specific node: the shared [`base_ctx`](Self::base_ctx)
+    /// plus the node's own `{port}` when it has one. Steps pass `None`;
+    /// they still see every sibling's `{port.<service>}`.
+    fn node_ctx(&self, own_port: Option<u16>) -> InterpContext {
+        let mut ctx = self.base_ctx();
+        if let Some(p) = own_port {
+            ctx.insert("port", p.to_string());
+        }
+        ctx
     }
 
     /// Send `msg` to every connected client whose subscription matches `svc`.
@@ -905,10 +957,11 @@ fn enact_actions(
                 let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
 
                 // Resolve the service's port (if it declared one), then build
-                // an interpolation context with {slot} and {port} so cmd /
-                // env / health all see the same numbers.
+                // an interpolation context with {slot}, {port}, {worktree},
+                // {branch}, and {port.<sibling>} so cmd / env / health all see
+                // the same numbers — including every other service's port.
                 let port = svc.port.map(|spec| spec.resolve(state.slot.as_u8()));
-                let ctx = interp_ctx(state.slot, port);
+                let ctx = state.node_ctx(port);
 
                 let cmd = match interpolate(&svc.cmd, &ctx) {
                     Ok(s) => s,
@@ -923,14 +976,30 @@ fn enact_actions(
                         continue;
                     }
                 };
-                let env: Vec<(String, String)> = svc
-                    .env
-                    .iter()
-                    .map(|(k, v)| {
-                        let v_resolved = interpolate(v, &ctx).unwrap_or_else(|_| v.clone());
-                        (k.clone(), v_resolved)
-                    })
-                    .collect();
+                // Resolve env values the same way. A bad `{var}` here (e.g. a
+                // typo'd `{port.backed}`) fails the spawn loudly rather than
+                // leaking a literal `{...}` into the child's environment.
+                let mut env: Vec<(String, String)> = Vec::with_capacity(svc.env.len());
+                let mut env_error: Option<String> = None;
+                for (k, v) in &svc.env {
+                    match interpolate(v, &ctx) {
+                        Ok(resolved) => env.push((k.clone(), resolved)),
+                        Err(e) => {
+                            env_error = Some(format!("service {name}: env {k}: {e}"));
+                            break;
+                        }
+                    }
+                }
+                if let Some(message) = env_error {
+                    state.broadcast(
+                        None,
+                        ServerMessage::Notice {
+                            level: NoticeLevel::Error,
+                            message,
+                        },
+                    );
+                    continue;
+                }
                 let env_slice: Vec<(&str, &str)> =
                     env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
@@ -1052,7 +1121,7 @@ fn enact_actions(
                     .get(&name)
                     .map(|s| s.check.clone());
                 let Some(cmd) = cmd else { continue };
-                let ctx = interp_ctx(state.slot, None);
+                let ctx = state.node_ctx(None);
                 let cmd = interpolate(&cmd, &ctx).unwrap_or(cmd);
                 let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
                 let check_tx = tx.clone();
@@ -1073,7 +1142,7 @@ fn enact_actions(
                     .get(&name)
                     .and_then(|s| s.provision.clone());
                 let Some(provision) = provision else { continue };
-                let ctx = interp_ctx(state.slot, None);
+                let ctx = state.node_ctx(None);
                 let cmd = match provision {
                     devme_config::Provision::Shell(c) => interpolate(&c, &ctx).unwrap_or(c),
                     devme_config::Provision::Wizard { wizard } => {
@@ -1114,14 +1183,25 @@ fn encode_line(line: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(line.as_bytes())
 }
 
-/// Build the interpolation context for a service spawn. `{slot}` is always
-/// available; `{port}` is set only if the service declared a port spec.
-fn interp_ctx(slot: Slot, port: Option<u16>) -> InterpContext {
-    let mut ctx = InterpContext::new().set("slot", slot.to_string());
-    if let Some(p) = port {
-        ctx.insert("port", p.to_string());
+/// Current git branch for `cwd`, used to populate `{branch}`. Returns
+/// `None` outside a git checkout or in detached-HEAD state, in which case
+/// `{branch}` resolves to an empty string.
+fn current_git_branch(cwd: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
     }
-    ctx
+    let branch = String::from_utf8(out.stdout).ok()?;
+    let trimmed = branch.trim();
+    if trimmed.is_empty() || trimmed == "HEAD" {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 /// Interpolate `{port}` / `{slot}` inside a health-check target. Falls back
@@ -1542,6 +1622,134 @@ port = {{ base = 9000, slot_offset = 10 }}
             }
         }
         assert!(saw_port_in_status, "Running status didn't carry port 9030");
+
+        send_msg(&mut conn, ClientMessage::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn sibling_port_worktree_and_branch_resolve_in_service() {
+        // A frontend service references the backend's resolved port via
+        // {port.backend}, plus {worktree} and {branch}. All three must
+        // resolve before spawn — proving the shared per-service port map
+        // and the {worktree}/{branch} context are wired through.
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("d.sock");
+        let marker = dir.path().join("ctx-seen");
+        let marker_path = marker.to_string_lossy().to_string();
+        // {worktree} resolves to "." here (bind_with_stack_and_slot sets
+        // InstanceInfo::cwd = "."). {branch} resolves to whatever git
+        // reports for the test's cwd (possibly empty); we only assert it
+        // didn't error out the spawn, so we don't pin its value.
+        // Single-quote the echo payload so the shell treats `|` literally
+        // (devme has already substituted the {vars} by spawn time, so the
+        // quotes don't suppress anything we need).
+        let cmd =
+            format!("echo '{{port.backend}}|{{worktree}}' > {marker_path}; echo {{branch}}; sleep 30");
+        let toml = format!(
+            r#"
+schema_version = 1
+
+[service.backend]
+cmd = "sleep 30"
+port = {{ base = 8080, slot_offset = 10 }}
+
+[service.frontend]
+cmd = "{cmd}"
+port = {{ base = 5173, slot_offset = 10 }}
+env = {{ VITE_API_BASE_URL = "http://localhost:{{port.backend}}" }}
+"#,
+        );
+
+        let stack = make_stack(&toml);
+        // Slot 2 → backend = 8080 + 2*10 = 8100.
+        let server = DaemonServer::bind_with_stack_and_slot(
+            &sock,
+            stack,
+            devme_core::Slot::new(2).unwrap(),
+        )
+        .unwrap();
+        let task = tokio::spawn(server.serve());
+
+        let mut conn = connect(&sock).await;
+        send_msg(&mut conn, ClientMessage::Subscribe { services: vec![] }).await;
+        let _ = recv_msg(&mut conn).await;
+        send_msg(
+            &mut conn,
+            ClientMessage::Start {
+                service: "frontend".into(),
+                skip_deps: false,
+            },
+        )
+        .await;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut got: Option<String> = None;
+        while std::time::Instant::now() < deadline && got.is_none() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Ok(s) = std::fs::read_to_string(&marker) {
+                got = Some(s.trim().to_string());
+            }
+        }
+        // Backend's resolved port is visible to the frontend, and {worktree}
+        // resolved to the daemon's cwd (".").
+        assert_eq!(
+            got.as_deref(),
+            Some("8100|."),
+            "expected sibling backend port 8100 and worktree '.' in marker"
+        );
+
+        send_msg(&mut conn, ClientMessage::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn unknown_sibling_port_var_fails_spawn_with_notice() {
+        // A typo'd {port.backed} (missing 'n') must surface as an error
+        // Notice, not leak a literal "{port.backed}" into the child.
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("d.sock");
+        let toml = r#"
+schema_version = 1
+
+[service.backend]
+cmd = "sleep 30"
+port = { base = 8080, slot_offset = 10 }
+
+[service.frontend]
+cmd = "echo {port.backed}; sleep 30"
+"#;
+        let server =
+            DaemonServer::bind_with_stack(&sock, make_stack(toml)).unwrap();
+        let task = tokio::spawn(server.serve());
+
+        let mut conn = connect(&sock).await;
+        send_msg(&mut conn, ClientMessage::Subscribe { services: vec![] }).await;
+        let _ = recv_msg(&mut conn).await;
+        send_msg(
+            &mut conn,
+            ClientMessage::Start {
+                service: "frontend".into(),
+                skip_deps: false,
+            },
+        )
+        .await;
+
+        let mut saw_error = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline && !saw_error {
+            match tokio::time::timeout(Duration::from_millis(500), recv_msg(&mut conn)).await {
+                Ok(ServerMessage::Notice {
+                    level: NoticeLevel::Error,
+                    message,
+                }) if message.contains("port.backed") => {
+                    saw_error = true;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(saw_error, "expected an error Notice naming the unknown var");
 
         send_msg(&mut conn, ClientMessage::Shutdown).await;
         let _ = tokio::time::timeout(Duration::from_secs(3), task).await;

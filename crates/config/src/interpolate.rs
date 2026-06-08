@@ -264,4 +264,31 @@ mod tests {
         c.insert("port", "9090");
         assert_eq!(c.get("port"), Some("9090"));
     }
+
+    #[test]
+    fn dotted_sibling_port_keys_resolve() {
+        // The supervisor exposes each sibling service's port as
+        // `{port.<name>}`. The dot is just part of the key name — the
+        // generic resolver handles it with no special casing.
+        let c = InterpContext::new()
+            .set("port", "5173")
+            .set("port.backend", "8100")
+            .set("port.proxy", "15432");
+        let out = interpolate(
+            "VITE_API_BASE_URL=http://localhost:{port.backend} self={port}",
+            &c,
+        )
+        .unwrap();
+        assert_eq!(out, "VITE_API_BASE_URL=http://localhost:8100 self=5173");
+        assert_eq!(c.get("port.proxy"), Some("15432"));
+    }
+
+    #[test]
+    fn typo_in_sibling_port_key_still_errors() {
+        let c = InterpContext::new().set("port.backend", "8100");
+        let err = interpolate("{port.backed}", &c).unwrap_err();
+        assert!(
+            matches!(err, InterpError::UnknownVariable { ref name, .. } if name == "port.backed")
+        );
+    }
 }

@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use devme_config::Stack;
+use devme_config::{InterpContext, Stack, interpolate};
 use devme_core::{
     ClientMessage, Envelope, InstanceInfo, ServerMessage, ServiceSnapshot, ServiceState,
     Scope,
@@ -90,15 +90,9 @@ async fn real_main() -> anyhow::Result<()> {
     // missing the daemon still runs (responding to Subscribe with an
     // empty snapshot), so instance daemons can attach harmlessly.
     let stack = read_stack(&cwd).ok();
-    let repo_services: Vec<(String, String)> = stack
+    let repo_services: Vec<ResolvedService> = stack
         .as_ref()
-        .map(|s| {
-            s.service
-                .iter()
-                .filter(|(_, svc)| svc.scope == Scope::Repo)
-                .map(|(name, svc)| (name.clone(), svc.cmd.clone()))
-                .collect()
-        })
+        .map(|s| resolve_repo_services(s, &cwd))
         .unwrap_or_default();
 
     tracing::info!(
@@ -121,6 +115,93 @@ async fn try_bind(path: &std::path::Path) -> anyhow::Result<Option<UnixListener>
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
     Ok(Some(listener))
+}
+
+/// A repo-scoped service with its `cmd` and `env` already interpolated and
+/// ready to spawn. Repo services have no per-instance slot, so they resolve
+/// against slot 0 — fixed ports stay fixed and `{port.<name>}` references
+/// resolve to those fixed ports.
+struct ResolvedService {
+    name: String,
+    cmd: String,
+    env: Vec<(String, String)>,
+}
+
+/// Resolve every `scope = "repo"` service into a spawnable form. Builds one
+/// shared interpolation context — `{slot}` = 0, `{worktree}`, `{branch}`,
+/// and `{port.<service>}` for each repo service that declares a port — then
+/// interpolates each service's `cmd` and `env` against it (layering the
+/// service's own `{port}` on top). A service whose `cmd` fails to
+/// interpolate is dropped with a log line rather than aborting the daemon.
+fn resolve_repo_services(stack: &Stack, cwd: &std::path::Path) -> Vec<ResolvedService> {
+    // Sibling port map: {port.<name>} for every repo service with a port.
+    let worktree = cwd.display().to_string();
+    let branch = current_git_branch(cwd).unwrap_or_default();
+    let mut base = InterpContext::new()
+        .set("slot", "0")
+        .set("worktree", worktree)
+        .set("branch", branch);
+    for (name, svc) in &stack.service {
+        if svc.scope == Scope::Repo {
+            if let Some(spec) = svc.port {
+                base.insert(format!("port.{name}"), spec.resolve(0).to_string());
+            }
+        }
+    }
+
+    let mut resolved = Vec::new();
+    for (name, svc) in &stack.service {
+        if svc.scope != Scope::Repo {
+            continue;
+        }
+        let mut ctx = base.clone();
+        if let Some(spec) = svc.port {
+            ctx.insert("port", spec.resolve(0).to_string());
+        }
+        let cmd = match interpolate(&svc.cmd, &ctx) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(service = %name, error = %e, "cmd interpolation failed; skipping");
+                continue;
+            }
+        };
+        let mut env = Vec::with_capacity(svc.env.len());
+        for (k, v) in &svc.env {
+            match interpolate(v, &ctx) {
+                Ok(resolved_val) => env.push((k.clone(), resolved_val)),
+                Err(e) => {
+                    tracing::warn!(service = %name, var = %k, error = %e, "env interpolation failed; passing through literally");
+                    env.push((k.clone(), v.clone()));
+                }
+            }
+        }
+        resolved.push(ResolvedService {
+            name: name.clone(),
+            cmd,
+            env,
+        });
+    }
+    resolved
+}
+
+/// Current git branch for `cwd` (populates `{branch}`); `None` outside a
+/// git checkout or in detached-HEAD state.
+fn current_git_branch(cwd: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8(out.stdout).ok()?;
+    let trimmed = branch.trim();
+    if trimmed.is_empty() || trimmed == "HEAD" {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 fn read_stack(cwd: &std::path::Path) -> anyhow::Result<Stack> {
@@ -164,7 +245,7 @@ struct SharedState {
 }
 
 impl SharedState {
-    async fn spawn_all(cwd: &std::path::Path, services: &[(String, String)]) -> Arc<Self> {
+    async fn spawn_all(cwd: &std::path::Path, services: &[ResolvedService]) -> Arc<Self> {
         let (events, _) = broadcast::channel(1024);
         let services_map: Arc<Mutex<HashMap<String, RunningService>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -173,8 +254,10 @@ impl SharedState {
         // Spawn each repo-scoped service. Failures are surfaced as Failed
         // snapshots rather than killing the whole daemon, because partial
         // availability is more useful than nothing at all.
-        for (name, cmd) in services {
-            match ChildProcess::spawn_parts::<&str>(cmd, cwd, &[]) {
+        for ResolvedService { name, cmd, env } in services {
+            let env_slice: Vec<(&str, &str)> =
+                env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            match ChildProcess::spawn_parts::<&str>(cmd, cwd, &env_slice) {
                 Ok(parts) => {
                     let pid = parts.pid;
                     spawn_log_forwarder(name.clone(), parts.lines, events.clone());
