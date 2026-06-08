@@ -36,7 +36,7 @@ use ratatui::widgets::{
 };
 
 use crate::state::TuiState;
-use crate::theme;
+use crate::theme::{self, Palette};
 use devme_core::{ServiceState, StepState};
 
 /// Render `state` into `frame`'s full area.
@@ -53,20 +53,75 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(area);
 
-    let outer = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(22), Constraint::Min(0)])
-        .split(vertical[0]);
-
-    render_sidebar(frame, outer[0], state);
-    render_main(frame, outer[1], state);
+    // The sidebar can be collapsed (`\``) to give the log pane full width.
+    let main_area = if state.sidebar_collapsed() {
+        vertical[0]
+    } else {
+        let outer = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(22), Constraint::Min(0)])
+            .split(vertical[0]);
+        render_sidebar(frame, outer[0], state);
+        outer[1]
+    };
+    render_main(frame, main_area, state);
     render_footer(frame, vertical[1], state);
+
+    // Transient corner notifications, above the main pane.
+    render_toasts(frame, main_area, state);
 
     // The stale-skill prompt takes modal priority over help.
     if let Some(dlg) = state.skill_dialog() {
         render_skill_dialog(frame, area, dlg);
     } else if state.help_visible() {
         render_help_overlay(frame, area);
+    }
+}
+
+/// Stack of auto-expiring toasts in the top-right of the main pane.
+fn render_toasts(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    use crate::state::ToastKind;
+    let p = *state.palette();
+    let toasts = state.toasts();
+    if toasts.is_empty() || area.width < 24 || area.height < 4 {
+        return;
+    }
+
+    let width = 36u16.min(area.width.saturating_sub(4));
+    let x = area.x + area.width.saturating_sub(width + 2);
+    // Anchor to the bottom-right (clear of the tab row), newest at the bottom
+    // and older ones stacked upward.
+    let mut y = area.y + area.height.saturating_sub(2);
+    for toast in toasts.iter().rev() {
+        if y < area.y + 3 {
+            break;
+        }
+        y -= 3;
+        let rect = Rect { x, y, width, height: 3 };
+        let dot_color = match toast.kind {
+            ToastKind::Failed => p.red,
+            ToastKind::Ready => p.green,
+            ToastKind::Info => p.accent,
+        };
+        frame.render_widget(Clear, rect);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(p.surface1))
+            .style(Style::default().bg(p.panel_bg));
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        let title = theme::truncate(&toast.title, 14);
+        let body_budget = (inner.width as usize).saturating_sub(title.chars().count() + 3);
+        let line = Line::from(vec![
+            Span::styled("● ", Style::default().fg(dot_color)),
+            Span::styled(title, Style::default().fg(p.text).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" {}", theme::truncate(&toast.body, body_budget)),
+                Style::default().fg(p.subtext0),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), inner);
     }
 }
 
@@ -222,14 +277,15 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     //   left  — focus breadcrumb (stack > service)
     //   centre — terse key hints (only the most-used)
     //   right — aggregate health summary (counts of each state)
-    let dim = Style::default().fg(theme::OVERLAY0);
-    let key = Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD);
+    let p = *state.palette();
+    let dim = Style::default().fg(p.overlay0);
+    let key = Style::default().fg(p.accent).add_modifier(Modifier::BOLD);
 
     let stack = if state.shared_selected() { "shared" } else { state.instance_label() };
     let svc = state.selected_service().map(|s| s.name.as_str()).unwrap_or("—");
     let breadcrumb = format!(" {stack} › {svc} ");
     let left = Paragraph::new(Line::from(vec![
-        Span::styled(breadcrumb, Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)),
+        Span::styled(breadcrumb, Style::default().fg(p.text).add_modifier(Modifier::BOLD)),
     ]));
 
     let centre_line = if state.show_skill_hint() {
@@ -261,10 +317,10 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
     let (running, starting, stopped, failed) = aggregate_states(state);
     let right_spans = vec![
-        Span::styled(format!(" ●{running} "), Style::default().fg(theme::GREEN)),
-        Span::styled(format!("◌{starting} "), Style::default().fg(theme::YELLOW)),
-        Span::styled(format!("○{stopped} "), Style::default().fg(theme::OVERLAY0)),
-        Span::styled(format!("✗{failed}"), Style::default().fg(theme::RED)),
+        Span::styled(format!(" ●{running} "), Style::default().fg(p.green)),
+        Span::styled(format!("◌{starting} "), Style::default().fg(p.yellow)),
+        Span::styled(format!("○{stopped} "), Style::default().fg(p.overlay0)),
+        Span::styled(format!("✗{failed}"), Style::default().fg(p.red)),
         // Right-edge margin so the glyphs don't kiss the terminal border.
         Span::raw("  "),
     ];
@@ -352,6 +408,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
         section("navigation"),
         Line::from(vec![key("←→ / hl"), desc("service tab")]),
         Line::from(vec![key("↑↓ / jk"), desc("stack")]),
+        Line::from(vec![key("`"), desc("collapse / expand sidebar")]),
         Line::default(),
         section("log viewport"),
         Line::from(vec![key("b / space"), desc("page up / down")]),
@@ -375,7 +432,8 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
+    let p = *state.palette();
     // Borderless, herdr-style: no boxes. The two sections (stacks + tools)
     // are set off by a dim header label and a horizontal divider, and
     // selection is a filled row rather than an arrow. The main pane's own
@@ -406,123 +464,200 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .constraints([Constraint::Min(2), Constraint::Length(tools_height)])
         .split(content);
 
-    render_stacks_pane(frame, chunks[0], state);
+    render_stacks_pane(&p, frame, chunks[0], state);
     if tools_height > 0 {
-        render_tools_pane(frame, chunks[1], state);
+        render_tools_pane(&p, frame, chunks[1], state);
     }
 }
 
 /// A single status dot (glyph + colour) summarising a stack's health.
-fn health_dot(health: crate::state::StackHealth) -> (&'static str, Color) {
+fn health_dot(p: &Palette, health: crate::state::StackHealth) -> (&'static str, Color) {
     use crate::state::StackHealth as H;
     match health {
-        H::AllRunning => ("●", theme::GREEN),
-        H::SomeRunning => ("◐", theme::YELLOW),
-        H::Idle => ("○", theme::OVERLAY0),
-        H::Failed => ("✗", theme::RED),
-        H::Placeholder => ("○", theme::SURFACE1),
+        H::AllRunning => ("●", p.green),
+        H::SomeRunning => ("◐", p.yellow),
+        H::Idle => ("○", p.overlay0),
+        H::Failed => ("✗", p.red),
+        H::Placeholder => ("○", p.surface1),
     }
 }
 
 /// Header label for a sidebar section — a quiet lowercase tag, herdr-style.
-fn section_header(frame: &mut Frame<'_>, area: Rect, label: &str) {
+fn section_header(p: &Palette, frame: &mut Frame<'_>, area: Rect, label: &str) {
     if area.height == 0 {
         return;
     }
     frame.render_widget(
         Paragraph::new(Span::styled(
             format!(" {label}"),
-            Style::default().fg(theme::OVERLAY0).add_modifier(Modifier::BOLD),
+            Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
         )),
         Rect { height: 1, ..area },
     );
 }
 
-/// Render one sidebar row: a status dot, then a name, optionally filled with
-/// a selection background across the full width.
-fn render_row(
+/// Render a paragraph, optionally filling its row with a selection bg.
+fn render_filled(frame: &mut Frame<'_>, area: Rect, line: Line<'static>, fill: Option<Style>) {
+    let para = match fill {
+        Some(s) => Paragraph::new(line).style(s),
+        None => Paragraph::new(line),
+    };
+    frame.render_widget(para, area);
+}
+
+/// Render a sidebar stack/shared row: a status dot + name on the first line,
+/// and a dim secondary line (service summary, git ahead/behind) on the
+/// second. The whole row fills with a highlight when selected.
+fn render_stack_row(
+    p: &Palette,
     frame: &mut Frame<'_>,
     area: Rect,
     dot: (&'static str, Color),
     name: &str,
+    secondary: Vec<Span<'static>>,
     selected: bool,
 ) {
     if area.height == 0 {
         return;
     }
-    let row = Rect { height: 1, ..area };
     let name_style = if selected {
-        Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(theme::SUBTEXT0)
+        Style::default().fg(p.subtext0)
     };
-    // Two leading columns (" ● "), one trailing for breathing room.
-    let max_name = (row.width as usize).saturating_sub(4);
-    let line = Line::from(vec![
+    let max_name = (area.width as usize).saturating_sub(4);
+    let name_line = Line::from(vec![
         Span::raw(" "),
         Span::styled(dot.0, Style::default().fg(dot.1)),
         Span::raw(" "),
         Span::styled(theme::truncate(name, max_name), name_style),
     ]);
-    let para = if selected {
-        Paragraph::new(line).style(Style::default().bg(theme::SURFACE0))
-    } else {
-        Paragraph::new(line)
-    };
-    frame.render_widget(para, row);
+    let fill = selected.then(|| Style::default().bg(p.surface0));
+    render_filled(frame, Rect { y: area.y, height: 1, ..area }, name_line, fill);
+    if area.height > 1 && !secondary.is_empty() {
+        render_filled(
+            frame,
+            Rect { y: area.y + 1, height: 1, ..area },
+            Line::from(secondary),
+            fill,
+        );
+    }
 }
 
-fn render_stacks_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+/// The dim secondary line for stack `i`: "2/3 up" plus git ↑ahead ↓behind.
+fn stack_secondary(p: &Palette, state: &TuiState, i: usize) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::raw("   ")];
+    match state.instance_service_summary(i) {
+        Some((up, total)) => {
+            let color = if up == total {
+                p.green
+            } else if up > 0 {
+                p.yellow
+            } else {
+                p.overlay0
+            };
+            spans.push(Span::styled(format!("{up}/{total} up"), Style::default().fg(color)));
+        }
+        None => spans.push(Span::styled("no daemon", Style::default().fg(p.surface1))),
+    }
+    if let Some((ahead, behind)) = state.instance_ahead_behind(i) {
+        if ahead > 0 {
+            spans.push(Span::styled(format!(" ↑{ahead}"), Style::default().fg(p.green)));
+        }
+        if behind > 0 {
+            spans.push(Span::styled(format!(" ↓{behind}"), Style::default().fg(p.peach)));
+        }
+    }
+    spans
+}
+
+fn render_stacks_pane(p: &Palette, frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
     if area.height == 0 {
         return;
     }
-    section_header(frame, area, "stacks");
+    section_header(p, frame, area, "stacks");
 
     let selected = state.selected_instance_index();
     let shared_active = state.shared_selected();
-    let bottom = area.y + area.height;
-    let mut y = area.y + 1;
+    let total = state.instances().len();
+    let has_shared = !state.shared_services().is_empty();
 
-    for (i, label) in state.instances().iter().enumerate() {
-        if y >= bottom {
-            return;
+    let content_top = area.y + 1;
+    let content_h = area.height.saturating_sub(1);
+    // Reserve the bottom for the shared row (blank + 2 lines) when present.
+    let shared_reserve: u16 = if has_shared { 3 } else { 0 };
+    let stack_h = content_h.saturating_sub(shared_reserve);
+    let visible = ((stack_h / 2) as usize).max(1);
+
+    state.ensure_stack_visible(visible);
+    let scroll = state.sidebar_scroll();
+
+    let labels = state.instances();
+    let mut y = content_top;
+    let stack_bottom = content_top + stack_h;
+    for (i, label) in labels.iter().enumerate().skip(scroll) {
+        if y + 2 > stack_bottom {
+            break;
         }
         let is_selected = !shared_active && selected == Some(i);
-        let dot = health_dot(state.instance_health(i));
-        render_row(
-            frame,
-            Rect { y, height: 1, ..area },
-            dot,
-            label,
-            is_selected,
-        );
-        y += 1;
+        let dot = health_dot(p, state.instance_health(i));
+        let label = label.to_string();
+        let secondary = stack_secondary(p, state, i);
+        render_stack_row(p, frame, Rect { y, height: 2, ..area }, dot, &label, secondary, is_selected);
+        y += 2;
     }
 
-    // Shared (repo-level) services row, set off by a blank line.
-    if !state.shared_services().is_empty() {
-        y += 1;
-        if y >= bottom {
-            return;
-        }
+    // "▾ N more" hint when the list overflows the pane.
+    let shown = (scroll..total).take(((stack_bottom - content_top) / 2) as usize).count();
+    if scroll + shown < total && y < stack_bottom {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!("  ▾ {} more", total - scroll - shown),
+                Style::default().fg(p.overlay0),
+            )),
+            Rect { y, height: 1, ..area },
+        );
+    }
+
+    if has_shared {
+        let sy = area.y + area.height - 2;
         let svc_names: Vec<&str> = state.shared_services().iter().map(|s| s.name.as_str()).collect();
         let label = format!("shared ({})", svc_names.join(", "));
-        let dot = health_dot(state.shared_health());
-        render_row(frame, Rect { y, height: 1, ..area }, dot, &label, shared_active);
+        let dot = health_dot(p, state.shared_health());
+        let svcs = state.shared_services();
+        let up = svcs
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.state,
+                    ServiceState::Running { .. } | ServiceState::External { healthy: true }
+                )
+            })
+            .count();
+        let color = if up == svcs.len() && !svcs.is_empty() {
+            p.green
+        } else {
+            p.overlay0
+        };
+        let secondary = vec![Span::styled(
+            format!("   {up}/{} up", svcs.len()),
+            Style::default().fg(color),
+        )];
+        render_stack_row(p, frame, Rect { y: sy, height: 2, ..area }, dot, &label, secondary, shared_active);
     }
 }
 
-fn render_tools_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+fn render_tools_pane(p: &Palette, frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     if area.height < 2 {
         return;
     }
     // Divider rule across the top, then a dim header, then the steps.
     let divider = "─".repeat(area.width as usize);
     frame.render_widget(
-        Paragraph::new(Span::styled(divider, Style::default().fg(theme::SURFACE1))),
+        Paragraph::new(Span::styled(divider, Style::default().fg(p.surface1))),
         Rect { height: 1, ..area },
     );
-    section_header(frame, Rect { y: area.y + 1, height: 1, ..area }, "tools");
+    section_header(p, frame, Rect { y: area.y + 1, height: 1, ..area }, "tools");
 
     let bottom = area.y + area.height;
     let mut y = area.y + 2;
@@ -535,10 +670,10 @@ fn render_tools_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             Span::raw(" "),
             Span::styled(
                 step_glyph(s.state).to_string(),
-                Style::default().fg(step_color(s.state)),
+                Style::default().fg(step_color(p, s.state)),
             ),
             Span::raw(" "),
-            Span::styled(theme::truncate(s.name.as_str(), max_name), step_text_style(s.state)),
+            Span::styled(theme::truncate(s.name.as_str(), max_name), step_text_style(p, s.state)),
         ]);
         frame.render_widget(Paragraph::new(line), Rect { y, height: 1, ..area });
         y += 1;
@@ -548,12 +683,13 @@ fn render_tools_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 // ── main pane: tabs + viewport + meta ──────────────────────────────────────
 
 fn render_main(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
+    let p = *state.palette();
     let header = format_main_title(state);
     let main_block = Block::default()
         .title(header)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme::SURFACE1));
+        .border_style(Style::default().fg(p.surface1));
     let inner = main_block.inner(area);
     frame.render_widget(main_block, area);
 
@@ -572,6 +708,7 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
 }
 
 fn format_main_title(state: &TuiState) -> Line<'_> {
+    let p = *state.palette();
     let count = state.services().len();
     let running = state
         .services()
@@ -592,23 +729,23 @@ fn format_main_title(state: &TuiState) -> Line<'_> {
     let version = env!("CARGO_PKG_VERSION");
     let mut spans = vec![Span::styled(
         format!(" devme v{version} "),
-        Style::default().fg(theme::MAUVE).add_modifier(Modifier::BOLD),
+        Style::default().fg(p.mauve).add_modifier(Modifier::BOLD),
     )];
     spans.push(Span::styled(
         format!("• {running}/{count} running"),
         Style::default().fg(if running == count && count > 0 {
-            theme::GREEN
+            p.green
         } else if running > 0 {
-            theme::YELLOW
+            p.yellow
         } else {
-            theme::OVERLAY0
+            p.overlay0
         }),
     ));
     if failed > 0 {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             format!("• {failed} failed"),
-            Style::default().fg(theme::RED),
+            Style::default().fg(p.red),
         ));
     }
     spans.push(Span::raw(" "));
@@ -616,6 +753,7 @@ fn format_main_title(state: &TuiState) -> Line<'_> {
 }
 
 fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let p = *state.palette();
     if state.services().is_empty() {
         let text = if state.current_instance_is_placeholder() {
             format!(
@@ -627,19 +765,20 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         };
         let msg = Paragraph::new(Line::from(Span::styled(
             text,
-            Style::default().fg(Color::DarkGray).italic(),
+            Style::default().fg(p.overlay0).italic(),
         )));
         frame.render_widget(msg, area);
         return;
     }
+    let spinner = state.spinner_frame();
     let titles: Vec<Line> = state
         .services()
         .iter()
         .map(|s| {
             Line::from(vec![
                 Span::styled(
-                    service_dot(&s.state).to_string(),
-                    Style::default().fg(service_color(&s.state)),
+                    service_dot(&s.state, spinner).to_string(),
+                    Style::default().fg(service_color(&p, &s.state)),
                 ),
                 Span::raw(" "),
                 Span::styled(s.name.clone(), Style::default()),
@@ -660,11 +799,11 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .select(selected)
         .highlight_style(
             Style::default()
-                .fg(theme::TEXT)
-                .bg(theme::SURFACE0)
+                .fg(p.text)
+                .bg(p.surface0)
                 .add_modifier(Modifier::BOLD),
         )
-        .divider(Span::styled(" │ ", Style::default().fg(theme::SURFACE1)))
+        .divider(Span::styled(" │ ", Style::default().fg(p.surface1)))
         .padding(" ", " ");
     frame.render_widget(tabs, area);
 }
@@ -788,40 +927,35 @@ fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) 
 }
 
 fn render_service_meta(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let p = *state.palette();
     let svc = match state.selected_service() {
         Some(s) => s,
         None => return,
     };
     let mut spans = vec![Span::styled(
         " ".to_string() + &svc.name,
-        Style::default().add_modifier(Modifier::BOLD),
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     )];
     spans.push(Span::raw("  "));
     spans.push(Span::styled(
         state_label(&svc.state),
         Style::default()
-            .fg(service_color(&svc.state))
+            .fg(service_color(&p, &svc.state))
             .add_modifier(Modifier::BOLD),
     ));
     if let Some(pid) = svc.pid {
-        spans.push(Span::styled("  · pid ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled("  · pid ", Style::default().fg(p.overlay0)));
         spans.push(Span::raw(pid.to_string()));
     }
     if let Some(port) = svc.port {
-        spans.push(Span::styled(
-            "  · port ",
-            Style::default().fg(Color::DarkGray),
-        ));
+        spans.push(Span::styled("  · port ", Style::default().fg(p.overlay0)));
         spans.push(Span::raw(port.to_string()));
     }
     if svc.restart_count > 0 {
-        spans.push(Span::styled(
-            "  · restarts ",
-            Style::default().fg(Color::DarkGray),
-        ));
+        spans.push(Span::styled("  · restarts ", Style::default().fg(p.overlay0)));
         spans.push(Span::styled(
             svc.restart_count.to_string(),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(p.yellow),
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -829,19 +963,19 @@ fn render_service_meta(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
 // ── style helpers ──────────────────────────────────────────────────────────
 
-fn step_color(state: StepState) -> Color {
+fn step_color(p: &Palette, state: StepState) -> Color {
     match state {
-        StepState::Passed | StepState::SkippedThisRun => theme::GREEN,
-        StepState::Overridden => theme::YELLOW,
-        StepState::Failed | StepState::ProvisionFailed => theme::RED,
-        StepState::Unknown => theme::OVERLAY0,
+        StepState::Passed | StepState::SkippedThisRun => p.green,
+        StepState::Overridden => p.yellow,
+        StepState::Failed | StepState::ProvisionFailed => p.red,
+        StepState::Unknown => p.overlay0,
     }
 }
 
-fn step_text_style(state: StepState) -> Style {
+fn step_text_style(p: &Palette, state: StepState) -> Style {
     match state {
-        StepState::Unknown => Style::default().fg(theme::OVERLAY0),
-        _ => Style::default().fg(theme::SUBTEXT0),
+        StepState::Unknown => Style::default().fg(p.overlay0),
+        _ => Style::default().fg(p.subtext0),
     }
 }
 
@@ -854,29 +988,31 @@ fn step_glyph(state: StepState) -> &'static str {
     }
 }
 
-fn service_dot(state: &ServiceState) -> &'static str {
+/// Status glyph for a service. Starting/restarting services animate with the
+/// braille `spinner` frame so the row reads as live.
+fn service_dot(state: &ServiceState, spinner: char) -> String {
     use ServiceState as S;
     match state {
-        S::Running { degraded: false, .. } => "●",
-        S::Running { degraded: true, .. } => "◐",
-        S::Starting | S::Restarting { .. } => "◌",
-        S::Failed { .. } | S::CrashLoop { .. } => "✗",
-        S::External { healthy: true } => "◇",
-        S::External { healthy: false } => "✗",
-        S::Stopped | S::WaitingOnDependency { .. } => "○",
+        S::Running { degraded: false, .. } => "●".to_string(),
+        S::Running { degraded: true, .. } => "◐".to_string(),
+        S::Starting | S::Restarting { .. } => spinner.to_string(),
+        S::Failed { .. } | S::CrashLoop { .. } => "✗".to_string(),
+        S::External { healthy: true } => "◇".to_string(),
+        S::External { healthy: false } => "✗".to_string(),
+        S::Stopped | S::WaitingOnDependency { .. } => "○".to_string(),
     }
 }
 
-fn service_color(state: &ServiceState) -> Color {
+fn service_color(p: &Palette, state: &ServiceState) -> Color {
     use ServiceState as S;
     match state {
-        S::Running { degraded: false, .. } => theme::GREEN,
-        S::Running { degraded: true, .. } => theme::YELLOW,
-        S::Starting | S::Restarting { .. } => theme::YELLOW,
-        S::Failed { .. } | S::CrashLoop { .. } => theme::RED,
-        S::External { healthy: true } => theme::TEAL,
-        S::External { healthy: false } => theme::RED,
-        S::Stopped | S::WaitingOnDependency { .. } => theme::OVERLAY0,
+        S::Running { degraded: false, .. } => p.green,
+        S::Running { degraded: true, .. } => p.yellow,
+        S::Starting | S::Restarting { .. } => p.yellow,
+        S::Failed { .. } | S::CrashLoop { .. } => p.red,
+        S::External { healthy: true } => p.teal,
+        S::External { healthy: false } => p.red,
+        S::Stopped | S::WaitingOnDependency { .. } => p.overlay0,
     }
 }
 

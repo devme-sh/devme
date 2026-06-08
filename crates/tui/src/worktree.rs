@@ -207,6 +207,28 @@ fn git_branch_name(cwd: &Path) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+/// Commits the worktree's branch is ahead/behind its upstream, as
+/// `(ahead, behind)`. `None` when there's no upstream, the dir isn't a git
+/// repo, or git fails. Run off the render thread (it shells out to git).
+pub async fn git_ahead_behind(cwd: &str) -> Option<(usize, usize)> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-list", "--left-right", "--count", "@{upstream}...HEAD"])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // `--left-right` over `@{u}...HEAD` prints "<behind>\t<ahead>".
+    let text = String::from_utf8(out.stdout).ok()?;
+    let mut parts = text.split_whitespace();
+    let behind: usize = parts.next()?.parse().ok()?;
+    let ahead: usize = parts.next()?.parse().ok()?;
+    Some((ahead, behind))
+}
+
 /// Watch a single worktree's root non-recursively. When `devme.toml`
 /// appears, re-run `ensure_for(path)` — that's the moment a
 /// previously-empty worktree becomes runnable.
