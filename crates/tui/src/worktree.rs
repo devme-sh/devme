@@ -351,6 +351,40 @@ fn run_on_create_if_needed(path: &Path) {
     }
 }
 
+/// Run a `[stack] on_destroy` script when a worktree is being torn down —
+/// the symmetric counterpart of [`run_on_create_if_needed`]. Intended for
+/// dropping per-worktree resources (e.g. a cloned database).
+///
+/// `cmd` must already be interpolated by the caller, because by the time a
+/// worktree is removed its directory — and the slot/`{branch}` context the
+/// command needs — is gone, so resolution has to happen *before* removal.
+/// `run_dir` is where the command executes; the worktree path itself no
+/// longer exists, so callers pass a still-present directory (typically the
+/// repo's main worktree or `git-common-dir`).
+///
+/// ## Why this isn't auto-wired yet
+///
+/// devme has no always-on per-repo daemon observing `git worktree remove`.
+/// The shared supervisor is the closest thing, but it can exit when the
+/// last instance detaches, so it can't be relied on to witness every
+/// removal. Reliably firing `on_destroy` needs one of: (a) a `devme
+/// worktree rm` subcommand that resolves context and calls this before
+/// running `git worktree remove`, or (b) the shared supervisor diffing the
+/// worktree set on each scan and invoking this for vanished worktrees.
+/// Both are tracked as follow-ups; this function is the tested execution
+/// primitive they will share.
+pub fn run_on_destroy(cmd: &str, run_dir: &Path) -> std::io::Result<std::process::ExitStatus> {
+    tracing::info!(run_dir = %run_dir.display(), "running on_destroy script");
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(run_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+}
+
 /// `git rev-parse --git-common-dir` for `cwd`, canonicalized. None if
 /// `cwd` is not inside a git repo.
 fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
@@ -419,6 +453,19 @@ mod tests {
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn run_on_destroy_executes_interpolated_command() {
+        // The execution primitive for the on_destroy hook: it runs an
+        // already-interpolated shell command in the given directory. Here
+        // we stand in for `dropdb optoscale_slot3` with a marker write.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("destroyed-slot3");
+        let cmd = format!("touch {}", marker.to_string_lossy());
+        let status = run_on_destroy(&cmd, dir.path()).unwrap();
+        assert!(status.success());
+        assert!(marker.exists(), "on_destroy command did not run");
     }
 
     #[test]
