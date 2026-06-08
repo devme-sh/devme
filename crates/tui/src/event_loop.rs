@@ -43,6 +43,14 @@ pub async fn launch(no_shutdown: bool) -> anyhow::Result<()> {
     // (or silently refresh when auto-update is on).
     state.check_skill_prompt();
 
+    // Resolve the colour theme from config before raw mode is on. `auto`
+    // queries the terminal's background (OSC 11), which needs to happen while
+    // we own stdin and before the alt-screen swallows the reply.
+    let theme_name = devme_config::GlobalConfig::load()
+        .get("tui.theme")
+        .unwrap_or_else(|| "mocha".into());
+    state.set_palette(crate::theme::Palette::resolve(&theme_name));
+
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -87,6 +95,14 @@ async fn run(
 
     let mut started: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut home_selected = false;
+
+    // Animation/expiry tick — drives the service spinner and toast timeout.
+    let mut anim = tokio::time::interval(std::time::Duration::from_millis(120));
+    anim.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Background git ahead/behind refresh, fanned out to a detached task so a
+    // slow `git` never stalls the UI; results flow back over this channel.
+    let (git_tx, mut git_rx) = mpsc::unbounded_channel::<(String, usize, usize)>();
+    let mut git_refresh = tokio::time::interval(std::time::Duration::from_secs(5));
 
     loop {
         terminal.draw(|f| render(f, state))?;
@@ -187,6 +203,7 @@ async fn run(
                             return Ok(());
                         }
                         KeyCode::Char('D') => return Ok(()),
+                        KeyCode::Char('`') => state.toggle_sidebar(),
                         KeyCode::Down | KeyCode::Char('j') => state.select_next_instance(),
                         KeyCode::Up | KeyCode::Char('k') => state.select_prev_instance(),
                         KeyCode::Right | KeyCode::Char('l') => state.select_next_service(),
@@ -261,6 +278,25 @@ async fn run(
                 }
                 None => {}
             },
+            _ = anim.tick() => {
+                state.tick();
+            }
+            _ = git_refresh.tick() => {
+                let pairs = state.instance_id_cwd_pairs();
+                let tx = git_tx.clone();
+                tokio::spawn(async move {
+                    for (id, cwd) in pairs {
+                        if let Some((ahead, behind)) = crate::worktree::git_ahead_behind(&cwd).await {
+                            let _ = tx.send((id, ahead, behind));
+                        }
+                    }
+                });
+            }
+            git = git_rx.recv() => {
+                if let Some((id, ahead, behind)) = git {
+                    state.set_git_ahead_behind(&id, ahead, behind);
+                }
+            }
         }
     }
 }

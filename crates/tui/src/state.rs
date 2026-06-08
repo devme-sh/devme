@@ -8,9 +8,12 @@
 //! handle which stack is in focus.
 
 use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 
 use base64::Engine;
-use devme_core::{InstanceInfo, ServerMessage, ServiceSnapshot, StepSnapshot};
+use devme_core::{InstanceInfo, ServerMessage, ServiceSnapshot, ServiceState, StepSnapshot};
+
+use crate::theme::Palette;
 
 /// Per-service log cap inside the TUI. The daemon's ring is the source of
 /// truth (~2000 lines); the TUI keeps a smaller working buffer so even on a
@@ -41,6 +44,10 @@ pub struct InstanceData {
     /// 0 = pinned to tail; non-zero freezes the viewport so new lines
     /// accumulate behind the user without disturbing what's on screen.
     pub log_scroll: HashMap<String, usize>,
+    /// Commits this worktree's branch is ahead/behind its upstream, refreshed
+    /// in the background. `None` until the first git query lands (or when the
+    /// branch has no upstream).
+    pub git_ahead_behind: Option<(usize, usize)>,
 }
 
 impl InstanceData {
@@ -52,9 +59,35 @@ impl InstanceData {
             selected_service: None,
             logs: HashMap::new(),
             log_scroll: HashMap::new(),
+            git_ahead_behind: None,
         }
     }
 }
+
+/// A transient corner notification — service crashed, came up, etc. Auto-
+/// expires after [`TOAST_TTL`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Toast {
+    pub kind: ToastKind,
+    pub title: String,
+    pub body: String,
+    born: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastKind {
+    /// A service failed or entered a crash loop.
+    Failed,
+    /// A service became healthy.
+    Ready,
+    /// Neutral information.
+    Info,
+}
+
+/// How long a toast stays on screen before the tick loop drops it.
+const TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+/// Cap on simultaneously-visible toasts (oldest evicted first).
+const MAX_TOASTS: usize = 4;
 
 /// Repo-scoped shared daemon state. Shows as a separate sidebar entry.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -131,6 +164,18 @@ pub struct TuiState {
     skill_hint_eligible: bool,
     /// Instant when the TUI started, used to time hint rotation.
     started_at: std::time::Instant,
+    /// Active colour palette (mocha / latte / terminal-detected).
+    palette: Palette,
+    /// Monotonic animation counter, bumped each tick. Drives the spinner on
+    /// starting/restarting services.
+    spinner_tick: u64,
+    /// Live corner notifications, newest last. Expired on tick.
+    toasts: Vec<Toast>,
+    /// Index of the first stack row painted in the sidebar (vertical scroll
+    /// when the list is taller than the pane).
+    sidebar_scroll: usize,
+    /// When true the sidebar is hidden, giving the log pane full width.
+    sidebar_collapsed: bool,
 }
 
 impl Default for TuiState {
@@ -147,6 +192,11 @@ impl Default for TuiState {
             copy_mode: false,
             skill_hint_eligible: check_skill_hint_eligible(),
             started_at: std::time::Instant::now(),
+            palette: Palette::default(),
+            spinner_tick: 0,
+            toasts: Vec::new(),
+            sidebar_scroll: 0,
+            sidebar_collapsed: false,
         }
     }
 }
@@ -614,6 +664,157 @@ impl TuiState {
         }
     }
 
+    /// Running / total service counts for the stack at `idx` — the secondary
+    /// sidebar line ("2/3 up").
+    pub fn instance_service_summary(&self, idx: usize) -> Option<(usize, usize)> {
+        let inst = self.instances.get(idx)?;
+        if inst.services.is_empty() {
+            return None;
+        }
+        let total = inst.services.len();
+        let up = inst
+            .services
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.state,
+                    ServiceState::Running { .. } | ServiceState::External { healthy: true }
+                )
+            })
+            .count();
+        Some((up, total))
+    }
+
+    /// Ahead/behind commit counts for the stack at `idx`, if known.
+    pub fn instance_ahead_behind(&self, idx: usize) -> Option<(usize, usize)> {
+        self.instances.get(idx)?.git_ahead_behind
+    }
+
+    // ── theme ───────────────────────────────────────────────────────────
+
+    pub fn palette(&self) -> &Palette {
+        &self.palette
+    }
+
+    pub fn set_palette(&mut self, palette: Palette) {
+        self.palette = palette;
+    }
+
+    // ── animation + toasts ──────────────────────────────────────────────
+
+    /// Current spinner frame for animated (starting/restarting) glyphs.
+    pub fn spinner_frame(&self) -> char {
+        const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        FRAMES[(self.spinner_tick % FRAMES.len() as u64) as usize]
+    }
+
+    /// Advance one animation tick: bump the spinner and drop expired toasts.
+    /// Returns true if anything visible changed (so the loop can avoid a
+    /// redraw when nothing did — though a redraw is cheap either way).
+    pub fn tick(&mut self) -> bool {
+        self.spinner_tick = self.spinner_tick.wrapping_add(1);
+        let before = self.toasts.len();
+        self.toasts.retain(|t| t.born.elapsed() < TOAST_TTL);
+        // Always redraw while a spinner is live so the animation runs.
+        self.toasts.len() != before || self.has_animated_service()
+    }
+
+    fn has_animated_service(&self) -> bool {
+        let animated = |svcs: &[ServiceSnapshot]| {
+            svcs.iter().any(|s| {
+                matches!(s.state, ServiceState::Starting | ServiceState::Restarting { .. })
+            })
+        };
+        self.instances.iter().any(|i| animated(&i.services)) || animated(&self.shared.services)
+    }
+
+    pub fn toasts(&self) -> &[Toast] {
+        &self.toasts
+    }
+
+    fn push_toast(&mut self, kind: ToastKind, title: impl Into<String>, body: impl Into<String>) {
+        self.toasts.push(Toast {
+            kind,
+            title: title.into(),
+            body: body.into(),
+            born: Instant::now(),
+        });
+        if self.toasts.len() > MAX_TOASTS {
+            self.toasts.remove(0);
+        }
+    }
+
+    /// Emit a toast for a noteworthy service transition (`old` → `new`).
+    /// Quiet about routine moves (e.g. stopped→starting); only crashes and
+    /// recoveries get surfaced.
+    fn toast_for_transition(&mut self, service: &str, old: &ServiceState, new: &ServiceState) {
+        use ServiceState as S;
+        let was_failed = matches!(old, S::Failed { .. } | S::CrashLoop { .. });
+        let now_failed = matches!(new, S::Failed { .. } | S::CrashLoop { .. });
+        let now_running = matches!(new, S::Running { degraded: false, .. });
+        let was_up = matches!(old, S::Running { .. } | S::External { healthy: true });
+
+        if now_failed && !was_failed {
+            let detail = match new {
+                S::Failed { exit_code: Some(c) } => format!("crashed (exit {c})"),
+                S::CrashLoop { .. } => "crash-looping".to_string(),
+                _ => "crashed".to_string(),
+            };
+            self.push_toast(ToastKind::Failed, service.to_string(), detail);
+        } else if now_running && (was_failed || !was_up) {
+            self.push_toast(ToastKind::Ready, service.to_string(), "ready");
+        }
+    }
+
+    // ── sidebar layout (scroll + collapse) ──────────────────────────────
+
+    pub fn sidebar_collapsed(&self) -> bool {
+        self.sidebar_collapsed
+    }
+
+    pub fn toggle_sidebar(&mut self) {
+        self.sidebar_collapsed = !self.sidebar_collapsed;
+    }
+
+    pub fn sidebar_scroll(&self) -> usize {
+        self.sidebar_scroll
+    }
+
+    /// Keep the selected stack within a `visible_rows`-tall window by nudging
+    /// the scroll offset. Called from the renderer once it knows the height.
+    pub fn ensure_stack_visible(&mut self, visible_rows: usize) {
+        let total = self.instances.len();
+        if visible_rows == 0 || total <= visible_rows {
+            self.sidebar_scroll = 0;
+            return;
+        }
+        let sel = self.selected_instance.unwrap_or(0);
+        if sel < self.sidebar_scroll {
+            self.sidebar_scroll = sel;
+        } else if sel >= self.sidebar_scroll + visible_rows {
+            self.sidebar_scroll = sel + 1 - visible_rows;
+        }
+        self.sidebar_scroll = self.sidebar_scroll.min(total.saturating_sub(visible_rows));
+    }
+
+    // ── git status ──────────────────────────────────────────────────────
+
+    /// Record a background git refresh for the instance with `id`.
+    pub fn set_git_ahead_behind(&mut self, id: &str, ahead: usize, behind: usize) {
+        if let Some(idx) = self.find_instance(id) {
+            self.instances[idx].git_ahead_behind = Some((ahead, behind));
+        }
+    }
+
+    /// (id, cwd) pairs for every instance — the background git refresher
+    /// iterates these.
+    pub fn instance_id_cwd_pairs(&self) -> Vec<(String, String)> {
+        self.instances
+            .iter()
+            .map(|i| (i.info.id.clone(), i.info.cwd.clone()))
+            .collect()
+    }
+
     pub fn selected_service(&self) -> Option<&ServiceSnapshot> {
         let idx = self.active_selected_service_idx()?;
         let svcs = self.services();
@@ -778,13 +979,18 @@ impl TuiState {
                 }
             }
             ServerMessage::StatusUpdate { service, state, .. } => {
+                let mut transition = None;
                 if let Some(idx) = self.find_instance(source_id)
                     && let Some(s) = self.instances[idx]
                         .services
                         .iter_mut()
                         .find(|s| s.name == service)
                 {
-                    s.state = state;
+                    transition = Some(s.state.clone());
+                    s.state = state.clone();
+                }
+                if let Some(old) = transition {
+                    self.toast_for_transition(&service, &old, &state);
                 }
             }
             ServerMessage::StepStatusUpdate { step, state } => {
@@ -815,8 +1021,13 @@ impl TuiState {
                 }
             }
             ServerMessage::StatusUpdate { service, state, .. } => {
+                let mut transition = None;
                 if let Some(s) = self.shared.services.iter_mut().find(|s| s.name == service) {
-                    s.state = state;
+                    transition = Some(s.state.clone());
+                    s.state = state.clone();
+                }
+                if let Some(old) = transition {
+                    self.toast_for_transition(&service, &old, &state);
                 }
             }
             ServerMessage::LogChunk { service, bytes, .. } => {
@@ -1098,6 +1309,74 @@ mod tests {
         // The placeholder reports as such for its status dot.
         let place_idx = s.find_instance("place").unwrap();
         assert_eq!(s.instance_health(place_idx), StackHealth::Placeholder);
+    }
+
+    #[test]
+    fn crash_and_recovery_raise_toasts() {
+        let running = || ServiceState::Running { degraded: false, started_without: vec![] };
+        let status = |state: ServiceState| ServerMessage::StatusUpdate {
+            service: "api".into(),
+            state,
+            pid: None,
+            port: None,
+            restart_count: 0,
+        };
+        let mut s = TuiState::default();
+        // Start the service already up so the first transition is a crash.
+        s.apply(ServerMessage::Subscribed {
+            instance: test_instance(),
+            services: vec![ServiceSnapshot { state: running(), ..svc("api") }],
+            steps: vec![],
+        });
+        assert!(s.toasts().is_empty());
+
+        // Running → Failed surfaces a crash toast…
+        s.apply(status(ServiceState::Failed { exit_code: Some(2) }));
+        assert_eq!(s.toasts().last().map(|t| t.kind), Some(ToastKind::Failed));
+        // …and Failed → Running a recovery toast.
+        s.apply(status(running()));
+        assert_eq!(s.toasts().last().map(|t| t.kind), Some(ToastKind::Ready));
+        assert_eq!(s.toasts().len(), 2);
+        // A routine stopped→starting move stays quiet.
+        let before = s.toasts().len();
+        s.apply(status(ServiceState::Starting));
+        assert_eq!(s.toasts().len(), before);
+    }
+
+    #[test]
+    fn sidebar_scroll_keeps_selection_in_view() {
+        let mut s = TuiState::default();
+        for i in 0..6 {
+            s.add_instance(format!("stack-{i}"));
+        }
+        // A 3-row window: selecting the last stack scrolls it into view.
+        s.select_instance_by_id("local::stack-5");
+        s.ensure_stack_visible(3);
+        assert_eq!(s.sidebar_scroll(), 3); // shows 3,4,5
+        // Selecting the first scrolls back to the top.
+        s.select_instance_by_id("local::stack-0");
+        s.ensure_stack_visible(3);
+        assert_eq!(s.sidebar_scroll(), 0);
+    }
+
+    #[test]
+    fn toggle_sidebar_flips_collapsed() {
+        let mut s = TuiState::default();
+        assert!(!s.sidebar_collapsed());
+        s.toggle_sidebar();
+        assert!(s.sidebar_collapsed());
+        s.toggle_sidebar();
+        assert!(!s.sidebar_collapsed());
+    }
+
+    #[test]
+    fn git_ahead_behind_attaches_to_instance() {
+        let mut s = TuiState::default();
+        s.apply(snapshot_msg(&["api"]));
+        let idx = s.find_instance("test-id").unwrap();
+        assert_eq!(s.instance_ahead_behind(idx), None);
+        s.set_git_ahead_behind("test-id", 3, 1);
+        assert_eq!(s.instance_ahead_behind(idx), Some((3, 1)));
     }
 
     #[test]

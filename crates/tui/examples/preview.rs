@@ -95,6 +95,18 @@ fn main() {
     // Select the second tab so the preview shows the busier service.
     state.select_next_service();
 
+    // Background git status for the secondary sidebar line.
+    state.set_git_ahead_behind("local::kpi-dashboard", 2, 1);
+
+    // A state transition spawns a toast (frontend Stopped → Failed).
+    state.apply(ServerMessage::StatusUpdate {
+        service: "frontend".into(),
+        state: ServiceState::Failed { exit_code: Some(1) },
+        pid: None,
+        port: None,
+        restart_count: 1,
+    });
+
     let (w, h) = (110, 30);
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
     terminal.draw(|f| render(f, &mut state)).unwrap();

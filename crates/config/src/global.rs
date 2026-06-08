@@ -16,6 +16,22 @@ pub struct GlobalConfig {
     pub hints: HintsConfig,
     #[serde(default, skip_serializing_if = "SkillConfig::is_empty")]
     pub skill: SkillConfig,
+    #[serde(default, skip_serializing_if = "TuiConfig::is_empty")]
+    pub tui: TuiConfig,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuiConfig {
+    /// Colour theme for the TUI: "mocha" (dark, default), "latte" (light),
+    /// or "auto" (match the terminal's background).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+}
+
+impl TuiConfig {
+    fn is_empty(&self) -> bool {
+        self.theme.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +123,7 @@ impl GlobalConfig {
             "docker.daemon" => self.docker.daemon.clone(),
             "hints.skills" => self.hints.skills.clone(),
             "skill.auto_update" => self.skill.auto_update.map(|b| b.to_string()),
+            "tui.theme" => self.tui.theme.clone(),
             _ => None,
         }
     }
@@ -127,6 +144,13 @@ impl GlobalConfig {
                 self.skill.auto_update = Some(b);
                 Ok(())
             }
+            "tui.theme" => match value {
+                "mocha" | "latte" | "auto" => {
+                    self.tui.theme = Some(value.to_string());
+                    Ok(())
+                }
+                _ => Err(format!("tui.theme expects mocha/latte/auto, got: {value}")),
+            },
             _ => Err(format!("unknown config key: {key}")),
         }
     }
@@ -145,6 +169,10 @@ impl GlobalConfig {
                 self.skill.auto_update = None;
                 Ok(())
             }
+            "tui.theme" => {
+                self.tui.theme = None;
+                Ok(())
+            }
             _ => Err(format!("unknown config key: {key}")),
         }
     }
@@ -154,6 +182,7 @@ impl GlobalConfig {
             ("docker.daemon", "Docker daemon to start (orbstack, docker-desktop, colima, rancher-desktop)"),
             ("hints.skills", "Show AI skill install hint (true/false)"),
             ("skill.auto_update", "Auto-update the embedded AI skill when devme updates (true/false)"),
+            ("tui.theme", "TUI colour theme (mocha/latte/auto)"),
         ]
     }
 
