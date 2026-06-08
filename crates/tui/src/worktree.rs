@@ -84,11 +84,28 @@ impl AutoSpawner {
                 watchers.push(w);
             }
         }
-        let initial_paths: Vec<PathBuf> = initial.iter().map(|w| w.path.clone()).collect();
+        // Sort: home worktree (cwd) first so it claims slot 0, then
+        // remaining worktrees sorted by path for deterministic port assignment.
+        let canon_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        let mut initial_paths: Vec<PathBuf> = initial.iter().map(|w| w.path.clone()).collect();
+        initial_paths.sort_by(|a, b| {
+            let a_home = a == &canon_cwd;
+            let b_home = b == &canon_cwd;
+            match (a_home, b_home) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.cmp(b),
+            }
+        });
+
+        // Sweep stale slot claims so the first worktree gets slot 0.
+        if let Ok(registry_path) = devme_config::paths::slot_registry() {
+            let allocator = devme_slot_allocator::SlotAllocator::open(&registry_path);
+            let _ = allocator.list(); // triggers sweep_stale
+        }
+
         let cwd_for_shared = cwd.to_path_buf();
         tokio::spawn(async move {
-            // Spawn the repo-scoped shared supervisor first — it owns
-            // scope=repo services that instance supervisors have filtered out.
             if let Err(e) = ensure_shared_daemon(&cwd_for_shared).await {
                 tracing::debug!(error = %e, "shared supervisor not started (may have no repo-scoped services)");
             }
