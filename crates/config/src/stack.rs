@@ -66,6 +66,28 @@ pub struct StackMeta {
     /// A `.devme-initialized` marker file prevents re-running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_create: Option<String>,
+
+    /// Env file that declarative `[env.*]` resolution reads and writes
+    /// (ADR-0014). Relative to the worktree root. Defaults to `.env.local`
+    /// when unset; set to `.env` for projects whose framework loads that
+    /// file directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_file: Option<String>,
+
+    /// Shell command to run once when a worktree is being removed. The
+    /// symmetric counterpart of [`on_create`](Self::on_create) — intended
+    /// for tearing down per-worktree resources (e.g. dropping a cloned
+    /// database).
+    ///
+    /// NOTE: parsed and surfaced via [`crate::Stack`], but devme does not
+    /// yet invoke it automatically. devme has no always-on per-repo daemon
+    /// that observes `git worktree remove`, and by the time a worktree
+    /// directory disappears its `devme.toml` (and the slot/cwd context the
+    /// command needs) is already gone. See `crates/tui/src/worktree.rs`
+    /// (`run_on_destroy`) for the tested execution path and the wiring
+    /// that's deferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_destroy: Option<String>,
 }
 
 #[cfg(test)]
@@ -197,6 +219,34 @@ unsupported_meta = true
     fn schema_version_constant_is_one() {
         // Guards against accidental edits — bumping requires a checklist.
         assert_eq!(SCHEMA_VERSION, 1);
+    }
+
+    #[test]
+    fn parse_stack_meta_env_file_and_on_destroy() {
+        let s = Stack::parse(r#"
+schema_version = 1
+
+[stack]
+name = "kpi"
+env_file = ".env"
+on_create = "uv sync"
+on_destroy = "dropdb optoscale_slot{slot}"
+"#).unwrap();
+        let meta = s.stack.as_ref().unwrap();
+        assert_eq!(meta.env_file.as_deref(), Some(".env"));
+        assert_eq!(meta.on_create.as_deref(), Some("uv sync"));
+        assert_eq!(meta.on_destroy.as_deref(), Some("dropdb optoscale_slot{slot}"));
+    }
+
+    #[test]
+    fn env_file_defaults_to_none_when_unset() {
+        let s = Stack::parse(r#"
+schema_version = 1
+
+[stack]
+name = "x"
+"#).unwrap();
+        assert!(s.stack.as_ref().unwrap().env_file.is_none());
     }
 
     #[test]

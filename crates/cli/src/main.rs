@@ -725,7 +725,9 @@ async fn launch_tui() -> anyhow::Result<i32> {
         if let Ok(stack) = Stack::parse(&toml_str) {
             // Env resolution only prompts when vars are missing — silent otherwise.
             if !stack.env.is_empty() {
-                let env_file = devme_supervisor::env_resolve::default_env_file(&cwd);
+                // Honour `[stack] env_file` (ADR-0014) — compute the target
+                // path before moving `stack.env` out below.
+                let env_file = devme_supervisor::env_resolve::env_file_path(&stack, &cwd);
                 let env_pairs: Vec<(String, devme_config::EnvVar)> =
                     stack.env.into_iter().collect();
                 let interactive = std::io::stdin().is_terminal();
@@ -773,7 +775,9 @@ async fn ensure_daemon(sock: &std::path::Path) -> anyhow::Result<bool> {
     if let Ok(toml_str) = std::fs::read_to_string(&config_path) {
         if let Ok(stack) = Stack::parse(&toml_str) {
             if !stack.env.is_empty() {
-                let env_file = devme_supervisor::env_resolve::default_env_file(&cwd);
+                // Honour `[stack] env_file` (ADR-0014) — compute the target
+                // path before moving `stack.env` out below.
+                let env_file = devme_supervisor::env_resolve::env_file_path(&stack, &cwd);
                 let env_pairs: Vec<(String, devme_config::EnvVar)> =
                     stack.env.into_iter().collect();
                 let interactive = std::io::stdin().is_terminal();

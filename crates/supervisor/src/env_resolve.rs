@@ -508,8 +508,26 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
     })
 }
 
+/// The default env file when a stack doesn't configure one.
+pub const DEFAULT_ENV_FILE: &str = ".env.local";
+
+/// Path to the env file declarative resolution reads and writes, ignoring
+/// any per-stack override. Prefer [`env_file_path`] when a [`Stack`] is in
+/// hand so the `[stack] env_file` setting is honoured.
 pub fn default_env_file(cwd: &Path) -> PathBuf {
-    cwd.join(".env.local")
+    cwd.join(DEFAULT_ENV_FILE)
+}
+
+/// Path to the env file for `stack`, honouring the optional
+/// `[stack] env_file` override (ADR-0014). Falls back to
+/// [`DEFAULT_ENV_FILE`] (`.env.local`) when unset.
+pub fn env_file_path(stack: &devme_config::Stack, cwd: &Path) -> PathBuf {
+    let name = stack
+        .stack
+        .as_ref()
+        .and_then(|m| m.env_file.as_deref())
+        .unwrap_or(DEFAULT_ENV_FILE);
+    cwd.join(name)
 }
 
 #[cfg(test)]
@@ -709,6 +727,53 @@ mod tests {
 
         assert!(result.resolved.is_empty());
         assert_eq!(result.skipped, vec!["OPTIONAL_KEY"]);
+    }
+
+    #[test]
+    fn env_file_path_defaults_to_env_local() {
+        let stack = devme_config::Stack::parse("schema_version = 1\n").unwrap();
+        let path = env_file_path(&stack, Path::new("/repo"));
+        assert_eq!(path, Path::new("/repo/.env.local"));
+    }
+
+    #[test]
+    fn env_file_path_honours_stack_override() {
+        let stack = devme_config::Stack::parse(
+            "schema_version = 1\n\n[stack]\nenv_file = \".env\"\n",
+        )
+        .unwrap();
+        let path = env_file_path(&stack, Path::new("/repo"));
+        assert_eq!(path, Path::new("/repo/.env"));
+    }
+
+    #[test]
+    fn resolution_targets_configured_env_file() {
+        // With env_file = ".env", a missing var is written to .env, not
+        // .env.local.
+        let dir = TempDir::new().unwrap();
+        let stack = devme_config::Stack::parse(
+            "schema_version = 1\n\n[stack]\nenv_file = \".env\"\n",
+        )
+        .unwrap();
+        let env_path = env_file_path(&stack, dir.path());
+
+        let declared = vec![(
+            "API_KEY".to_string(),
+            make_env_var(false, Some("from-default"), None, None, vec![]),
+        )];
+        let mut input = Cursor::new(b"\n");
+        let mut output = Vec::new();
+        let result =
+            resolve_env_vars(&declared, &env_path, dir.path(), &mut input, &mut output, true)
+                .unwrap();
+
+        assert_eq!(result.resolved.len(), 1);
+        let dot_env = std::fs::read_to_string(dir.path().join(".env")).unwrap();
+        assert!(dot_env.contains("API_KEY=from-default"), "got: {dot_env}");
+        assert!(
+            !dir.path().join(".env.local").exists(),
+            ".env.local should not have been written"
+        );
     }
 
     #[test]
