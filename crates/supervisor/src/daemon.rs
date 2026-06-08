@@ -954,7 +954,16 @@ fn enact_actions(
                     None => continue,
                 };
                 let generation = state.alloc_generation();
-                let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+                // Honor the service's `cwd` (joined to the worktree root). A
+                // relative value like `[service.ai] cwd = "ai-service"` would
+                // otherwise be ignored and the service would spawn from the
+                // repo root, failing to find its entrypoint. An absolute cwd
+                // replaces the base per `Path::join` semantics.
+                let base_cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+                let cwd = match &svc.cwd {
+                    Some(rel) => base_cwd.join(rel),
+                    None => base_cwd,
+                };
 
                 // Resolve the service's port (if it declared one), then build
                 // an interpolation context with {slot}, {port}, {worktree},
@@ -1622,6 +1631,58 @@ port = {{ base = 9000, slot_offset = 10 }}
             }
         }
         assert!(saw_port_in_status, "Running status didn't carry port 9030");
+
+        send_msg(&mut conn, ClientMessage::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn service_cwd_is_honored_when_spawning() {
+        // A service with `cwd` set must spawn in that directory. We point cwd
+        // at an absolute temp subdir and have the service write a *relative*
+        // file; it must land in the subdir (proving cwd was applied), not in
+        // the daemon's own working directory.
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let sock = dir.path().join("d.sock");
+        let cwd_str = sub.to_string_lossy().to_string();
+        // Relative marker — only resolves correctly if the child's cwd == sub.
+        let cmd = "echo here > cwd-seen; sleep 30";
+        let toml = format!(
+            r#"
+schema_version = 1
+
+[service.app]
+cmd = "{cmd}"
+cwd = "{cwd_str}"
+"#,
+        );
+
+        let stack = make_stack(&toml);
+        let server = DaemonServer::bind_with_stack(&sock, stack).unwrap();
+        let task = tokio::spawn(server.serve());
+
+        let mut conn = connect(&sock).await;
+        send_msg(&mut conn, ClientMessage::Subscribe { services: vec![] }).await;
+        let _ = recv_msg(&mut conn).await;
+        send_msg(
+            &mut conn,
+            ClientMessage::Start {
+                service: String::new(),
+                skip_deps: false,
+            },
+        )
+        .await;
+
+        let expected = sub.join("cwd-seen");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut found = false;
+        while std::time::Instant::now() < deadline && !found {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            found = expected.exists();
+        }
+        assert!(found, "service did not spawn in its configured cwd");
 
         send_msg(&mut conn, ClientMessage::Shutdown).await;
         let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
