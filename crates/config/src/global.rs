@@ -95,13 +95,69 @@ impl SkillConfig {
 
 impl GlobalConfig {
     pub fn load() -> Self {
-        let path = global_config_path();
-        Self::load_from(&path).unwrap_or_default()
+        Self::load_checked().0
     }
 
+    /// Load the config, surfacing a human-readable warning when the file
+    /// exists but doesn't parse. A typo in `global.toml` previously caused
+    /// every setting to be silently discarded; now we still fall back to
+    /// defaults but hand the caller a diagnostic to show.
+    pub fn load_checked() -> (Self, Option<String>) {
+        let path = global_config_path();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            // Missing file is the normal first-run case — not a warning.
+            Err(_) => return (Self::default(), None),
+        };
+        match toml::from_str(&text) {
+            Ok(cfg) => (cfg, None),
+            Err(e) => {
+                let first = e.to_string().lines().next().unwrap_or("parse error").to_string();
+                (
+                    Self::default(),
+                    Some(format!(
+                        "{} has an error ({first}); using defaults",
+                        path.display()
+                    )),
+                )
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn load_from(path: &Path) -> Option<Self> {
         let text = std::fs::read_to_string(path).ok()?;
         toml::from_str(&text).ok()
+    }
+
+    /// Surgically write `key = value` to `global.toml`, preserving the
+    /// user's comments and formatting. Validates the value first (same rules
+    /// as [`set`](Self::set)). Used by `devme config set` and the in-TUI
+    /// settings overlay so both paths agree and neither clobbers comments.
+    pub fn persist(key: &str, value: &str) -> Result<(), String> {
+        // Validate against a throwaway config so a bad key/value is rejected
+        // before we touch the file.
+        Self::default().set(key, value)?;
+        let (section, leaf) = key
+            .rsplit_once('.')
+            .ok_or_else(|| format!("config key must be `section.key`, got: {key}"))?;
+        let rendered = render_toml_value(key, value);
+        let path = global_config_path();
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let updated = crate::surgical::upsert_section_value(&content, section, leaf, &rendered);
+        write_atomic(&path, &updated).map_err(|e| e.to_string())
+    }
+
+    /// Surgically remove `key` from `global.toml`.
+    pub fn unset_persisted(key: &str) -> Result<(), String> {
+        Self::default().unset(key)?;
+        let (section, leaf) = key
+            .rsplit_once('.')
+            .ok_or_else(|| format!("config key must be `section.key`, got: {key}"))?;
+        let path = global_config_path();
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let updated = crate::surgical::remove_section_key(&content, section, leaf);
+        write_atomic(&path, &updated).map_err(|e| e.to_string())
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -225,6 +281,27 @@ fn parse_bool(value: &str) -> Option<bool> {
         "false" | "0" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+/// Render a config value as TOML for surgical writes. Bools become literal
+/// `true`/`false`; everything else (theme names, daemon names, the
+/// string-typed `hints.skills`) is quoted.
+fn render_toml_value(key: &str, value: &str) -> String {
+    match key {
+        "skill.auto_update" => value.to_string(),
+        _ => format!("\"{value}\""),
+    }
+}
+
+/// Write `content` to `path`, creating the parent dir. Uses a temp file +
+/// rename so a crash mid-write can't truncate the user's config.
+fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// `~/.config/devme/config.toml` or `$XDG_CONFIG_HOME/devme/config.toml`.

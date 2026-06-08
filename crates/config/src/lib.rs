@@ -16,6 +16,7 @@ mod service;
 pub mod skill;
 mod stack;
 mod step;
+mod surgical;
 mod validate;
 
 pub use env_var::EnvVar;

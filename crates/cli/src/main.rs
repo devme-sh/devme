@@ -764,7 +764,10 @@ fn config_cmd(action: Option<ConfigAction>) -> anyhow::Result<()> {
 
     match action {
         None => {
-            let cfg = GlobalConfig::load();
+            let (cfg, warning) = GlobalConfig::load_checked();
+            if let Some(w) = warning {
+                eprintln!("warning: {w}");
+            }
             for (key, desc) in GlobalConfig::keys() {
                 let value = cfg.get(key).unwrap_or_else(|| "(unset)".into());
                 println!("{key:<24} {value:<20} # {desc}");
@@ -772,29 +775,24 @@ fn config_cmd(action: Option<ConfigAction>) -> anyhow::Result<()> {
             Ok(())
         }
         Some(ConfigAction::Get { key }) => {
-            let cfg = GlobalConfig::load();
-            match cfg.get(&key) {
-                Some(v) => {
-                    println!("{v}");
-                    Ok(())
-                }
-                None => {
-                    println!("(unset)");
-                    Ok(())
-                }
+            let (cfg, warning) = GlobalConfig::load_checked();
+            if let Some(w) = warning {
+                eprintln!("warning: {w}");
             }
+            match cfg.get(&key) {
+                Some(v) => println!("{v}"),
+                None => println!("(unset)"),
+            }
+            Ok(())
         }
+        // Surgical writes preserve any comments/formatting in the file.
         Some(ConfigAction::Set { key, value }) => {
-            let mut cfg = GlobalConfig::load();
-            cfg.set(&key, &value).map_err(|e| anyhow::anyhow!("{e}"))?;
-            cfg.save()?;
+            GlobalConfig::persist(&key, &value).map_err(|e| anyhow::anyhow!("{e}"))?;
             info!("devme: {key} = {value}");
             Ok(())
         }
         Some(ConfigAction::Unset { key }) => {
-            let mut cfg = GlobalConfig::load();
-            cfg.unset(&key).map_err(|e| anyhow::anyhow!("{e}"))?;
-            cfg.save()?;
+            GlobalConfig::unset_persisted(&key).map_err(|e| anyhow::anyhow!("{e}"))?;
             info!("devme: unset {key}");
             Ok(())
         }
