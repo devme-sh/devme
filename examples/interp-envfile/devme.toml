@@ -16,8 +16,9 @@ schema_version = 1
 name = "interp-envfile-demo"
 # ADR-0014: write resolved [env.*] vars into .env, not .env.local.
 env_file = ".env"
-# Symmetric teardown hook (parsed + has a tested execution primitive in
-# crates/tui/src/worktree.rs::run_on_destroy; automatic firing is deferred).
+# Symmetric teardown hook, fired by `devme worktree rm <target>` (resolves
+# {slot}/{branch}/{worktree}, stops the stack, git-removes the worktree, then
+# runs this). A bare `git worktree remove` bypasses devme and skips it.
 on_destroy = "echo would drop db for slot {slot}"
 
 [env.API_TOKEN]

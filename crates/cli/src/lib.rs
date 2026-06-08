@@ -103,6 +103,32 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<ConfigAction>,
     },
+    /// Manage git worktrees in coordination with devme.
+    ///
+    /// `devme worktree rm <target>` — tear down a worktree's stack, run its
+    /// `[stack] on_destroy` hook, then `git worktree remove` it.
+    Worktree {
+        #[command(subcommand)]
+        action: WorktreeAction,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum WorktreeAction {
+    /// Remove a worktree: stop its instance stack, run the `[stack]
+    /// on_destroy` hook (resolved against its slot/branch while the worktree
+    /// still exists), then `git worktree remove` it. This is the
+    /// deterministic path that makes `on_destroy` fire — a bare `git
+    /// worktree remove` bypasses devme and runs no hook.
+    Rm {
+        /// Which worktree to remove: a path, its directory name, or its
+        /// branch name.
+        target: String,
+        /// Forward `--force` to `git worktree remove` (removes even with
+        /// uncommitted changes / untracked files).
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -375,6 +401,39 @@ mod tests {
                 })
             })
         );
+    }
+
+    #[test]
+    fn worktree_rm_parses_with_target() {
+        let cli = Cli::parse_from(["devme", "worktree", "rm", "IWP-86"]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Worktree {
+                action: WorktreeAction::Rm {
+                    target: "IWP-86".into(),
+                    force: false,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn worktree_rm_force_flag_parses() {
+        let cli = Cli::parse_from(["devme", "worktree", "rm", "-f", "../wt"]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Worktree {
+                action: WorktreeAction::Rm {
+                    target: "../wt".into(),
+                    force: true,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn worktree_rm_without_target_is_an_error() {
+        assert!(Cli::try_parse_from(["devme", "worktree", "rm"]).is_err());
     }
 
     #[test]

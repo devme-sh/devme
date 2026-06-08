@@ -74,18 +74,21 @@ pub struct StackMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_file: Option<String>,
 
-    /// Shell command to run once when a worktree is being removed. The
-    /// symmetric counterpart of [`on_create`](Self::on_create) — intended
-    /// for tearing down per-worktree resources (e.g. dropping a cloned
-    /// database).
+    /// Shell command to run when a worktree is being removed. The symmetric
+    /// counterpart of [`on_create`](Self::on_create) — intended for tearing
+    /// down per-worktree resources (e.g. dropping a cloned database).
+    /// Interpolated with `{slot}`, `{worktree}`, and `{branch}`.
     ///
-    /// NOTE: parsed and surfaced via [`crate::Stack`], but devme does not
-    /// yet invoke it automatically. devme has no always-on per-repo daemon
-    /// that observes `git worktree remove`, and by the time a worktree
-    /// directory disappears its `devme.toml` (and the slot/cwd context the
-    /// command needs) is already gone. See `crates/tui/src/worktree.rs`
-    /// (`run_on_destroy`) for the tested execution path and the wiring
-    /// that's deferred.
+    /// Invoked by `devme worktree rm <target>`, which resolves the command
+    /// against the worktree's slot/branch *before* removal (the context is
+    /// gone afterwards), stops the instance stack, runs `git worktree
+    /// remove`, then fires this hook from the main worktree. See
+    /// `crates/tui/src/worktree.rs` (`remove_worktree` / `run_on_destroy`).
+    ///
+    /// NOTE: a *bare* `git worktree remove` bypasses devme and runs no hook
+    /// — devme has no always-on per-repo daemon observing removals, so the
+    /// deterministic `devme worktree rm` path is the supported way to fire
+    /// `on_destroy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_destroy: Option<String>,
 }

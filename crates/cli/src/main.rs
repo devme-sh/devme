@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use base64::Engine;
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
-use devme_cli::{Cli, Command, ConfigAction, format_status_json, format_status_text};
+use devme_cli::{Cli, Command, ConfigAction, WorktreeAction, format_status_json, format_status_text};
 use devme_config::Stack;
 use devme_core::{ClientMessage, ServerMessage, ServiceState};
 
@@ -84,6 +84,7 @@ async fn run(cli: Cli) -> i32 {
         }
         Some(Command::Doctor { tail }) => doctor(tail).await,
         Some(Command::Config { action }) => config_cmd(action),
+        Some(Command::Worktree { action }) => worktree_cmd(action, cli.json).await,
     };
     match result {
         Ok(()) => 0,
@@ -706,6 +707,45 @@ fn config_cmd(action: Option<ConfigAction>) -> anyhow::Result<()> {
             cfg.unset(&key).map_err(|e| anyhow::anyhow!("{e}"))?;
             cfg.save()?;
             info!("devme: unset {key}");
+            Ok(())
+        }
+    }
+}
+
+/// `devme worktree …` — worktree lifecycle coordinated with devme.
+async fn worktree_cmd(action: WorktreeAction, json: bool) -> anyhow::Result<()> {
+    match action {
+        WorktreeAction::Rm { target, force } => {
+            let cwd = std::env::current_dir()?;
+            let report = devme_tui::worktree::remove_worktree(&cwd, &target, force).await?;
+            if json {
+                let value = serde_json::json!({
+                    "path": report.path.display().to_string(),
+                    "branch": report.branch,
+                    "slot": report.slot,
+                    "instance_stopped": report.instance_stopped,
+                    "on_destroy_ran": report.on_destroy_ran,
+                });
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                println!("Removed worktree {}", report.path.display());
+                if let Some(b) = &report.branch {
+                    info!("  branch: {b}");
+                }
+                if let Some(s) = report.slot {
+                    info!("  slot:   {s}");
+                }
+                if report.instance_stopped {
+                    info!("  stopped instance stack");
+                }
+                match report.on_destroy_ran {
+                    Some(true) => info!("  ran on_destroy hook"),
+                    Some(false) => {
+                        eprintln!("devme: on_destroy hook failed (worktree was still removed)")
+                    }
+                    None => {}
+                }
+            }
             Ok(())
         }
     }
