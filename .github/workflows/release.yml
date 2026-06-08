@@ -121,7 +121,7 @@ jobs:
             devme-*.tar.gz.sha256
 
   mirror-skill:
-    name: Mirror SKILL.md to devme-sh/skills
+    name: Mirror SKILL.md and trigger skill evals
     needs: release
     runs-on: ubuntu-latest
 
@@ -129,7 +129,8 @@ jobs:
       # The canonical skill is embedded in the binary from
       # crates/config/skill/SKILL.md; the devme-sh/skills repo is a mirror that
       # `npx skills add` serves. Overwrite it on every release so the two can
-      # never describe different binaries.
+      # never describe different binaries, then kick its eval suite so the
+      # skill is re-validated against the binary it now ships alongside.
       - name: Check for sync token
         id: token
         run: |
@@ -169,6 +170,17 @@ jobs:
           git add skills/devme/SKILL.md
           git commit -m "Sync SKILL.md from devme ${GITHUB_REF_NAME}"
           git push
+
+      - name: Trigger skill evals
+        if: steps.token.outputs.have == 'true'
+        run: |
+          # Fire devme-sh/skills' skill-evals workflow with this release tag, so
+          # the skill is exercised against the just-published binary.
+          curl -fsSL -X POST \
+            -H "Authorization: token ${{ secrets.SKILLS_SYNC_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/devme-sh/skills/dispatches \
+            -d "{\"event_type\":\"devme-release\",\"client_payload\":{\"version\":\"${GITHUB_REF_NAME}\"}}"
 
   update-homebrew:
     name: Update Homebrew formula
