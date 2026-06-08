@@ -1,0 +1,49 @@
+schema_version = 1
+
+# Exercises the two features added in
+# feat/dev-stack-interpolation-envfile:
+#
+#   1. Cross-service port interpolation — `frontend` embeds the backend's
+#      resolved port via `{port.backend}` in its `env`, something that was
+#      previously inexpressible (only `{port}` = own port and `{slot}`
+#      existed). Also shows `{worktree}` and `{branch}`.
+#   2. Configurable `env_file` — declarative `[env.*]` resolution reads and
+#      writes `.env` here instead of the default `.env.local`.
+#
+# Every command is a shell loop — no real binaries needed.
+
+[stack]
+name = "interp-envfile-demo"
+# ADR-0014: write resolved [env.*] vars into .env, not .env.local.
+env_file = ".env"
+# Symmetric teardown hook (parsed + has a tested execution primitive in
+# crates/tui/src/worktree.rs::run_on_destroy; automatic firing is deferred).
+on_destroy = "echo would drop db for slot {slot}"
+
+[env.API_TOKEN]
+help = "Any value — proves [env.*] resolution targets .env (not .env.local)."
+default = "demo-token"
+
+[step.tools]
+check = "command -v sh"
+
+# A scope = "repo" shared service with a FIXED port. One copy is started by
+# the shared supervisor across every worktree of this repo.
+[service.proxy]
+cmd = "echo shared proxy on :{port} worktree={worktree} branch={branch}; while true; do echo proxy tick; sleep 5; done"
+port = { fixed = 15432 }
+scope = "repo"
+depends_on = ["tools"]
+
+[service.backend]
+cmd = "echo backend on :{port}; while true; do echo GET /api 200; sleep 3; done"
+port = { base = 8080, slot_offset = 10 }
+depends_on = ["tools"]
+
+[service.frontend]
+# The whole point: VITE_API_BASE_URL references the BACKEND's resolved port
+# via {port.backend}, while {port} is the frontend's own port.
+cmd = "echo frontend dev server on :{port}; echo talking to backend at $VITE_API_BASE_URL; while true; do echo hmr ping; sleep 4; done"
+port = { base = 5173, slot_offset = 10 }
+depends_on = ["backend"]
+env = { VITE_API_BASE_URL = "http://localhost:{port.backend}" }
