@@ -26,11 +26,19 @@ pub struct TuiConfig {
     /// or "auto" (match the terminal's background).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    /// Ask for confirmation before quitting (which stops every service).
+    /// Off by default; `q` shuts down immediately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_quit: Option<bool>,
+    /// Show transient corner notifications when a service crashes or recovers.
+    /// On by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toasts: Option<bool>,
 }
 
 impl TuiConfig {
     fn is_empty(&self) -> bool {
-        self.theme.is_none()
+        self.theme.is_none() && self.confirm_quit.is_none() && self.toasts.is_none()
     }
 }
 
@@ -180,6 +188,8 @@ impl GlobalConfig {
             "hints.skills" => self.hints.skills.clone(),
             "skill.auto_update" => self.skill.auto_update.map(|b| b.to_string()),
             "tui.theme" => self.tui.theme.clone(),
+            "tui.confirm_quit" => self.tui.confirm_quit.map(|b| b.to_string()),
+            "tui.toasts" => self.tui.toasts.map(|b| b.to_string()),
             _ => None,
         }
     }
@@ -207,6 +217,18 @@ impl GlobalConfig {
                 }
                 _ => Err(format!("tui.theme expects mocha/latte/auto, got: {value}")),
             },
+            "tui.confirm_quit" => {
+                let b = parse_bool(value)
+                    .ok_or_else(|| format!("tui.confirm_quit expects true/false, got: {value}"))?;
+                self.tui.confirm_quit = Some(b);
+                Ok(())
+            }
+            "tui.toasts" => {
+                let b = parse_bool(value)
+                    .ok_or_else(|| format!("tui.toasts expects true/false, got: {value}"))?;
+                self.tui.toasts = Some(b);
+                Ok(())
+            }
             _ => Err(format!("unknown config key: {key}")),
         }
     }
@@ -229,6 +251,14 @@ impl GlobalConfig {
                 self.tui.theme = None;
                 Ok(())
             }
+            "tui.confirm_quit" => {
+                self.tui.confirm_quit = None;
+                Ok(())
+            }
+            "tui.toasts" => {
+                self.tui.toasts = None;
+                Ok(())
+            }
             _ => Err(format!("unknown config key: {key}")),
         }
     }
@@ -239,6 +269,8 @@ impl GlobalConfig {
             ("hints.skills", "Show AI skill install hint (true/false)"),
             ("skill.auto_update", "Auto-update the embedded AI skill when devme updates (true/false)"),
             ("tui.theme", "TUI colour theme (mocha/latte/auto)"),
+            ("tui.confirm_quit", "Confirm before quitting the TUI (true/false)"),
+            ("tui.toasts", "Show service crash/recovery notifications (true/false)"),
         ]
     }
 
@@ -288,7 +320,7 @@ fn parse_bool(value: &str) -> Option<bool> {
 /// string-typed `hints.skills`) is quoted.
 fn render_toml_value(key: &str, value: &str) -> String {
     match key {
-        "skill.auto_update" => value.to_string(),
+        "skill.auto_update" | "tui.confirm_quit" | "tui.toasts" => value.to_string(),
         _ => format!("\"{value}\""),
     }
 }
@@ -349,6 +381,21 @@ mod tests {
         assert_eq!(cfg.get("docker.daemon"), Some("orbstack".into()));
         cfg.unset("docker.daemon").unwrap();
         assert_eq!(cfg.get("docker.daemon"), None);
+    }
+
+    #[test]
+    fn tui_bool_keys_round_trip_and_render_as_literals() {
+        let mut cfg = GlobalConfig::default();
+        assert_eq!(cfg.get("tui.toasts"), None);
+        cfg.set("tui.confirm_quit", "true").unwrap();
+        cfg.set("tui.toasts", "false").unwrap();
+        assert_eq!(cfg.get("tui.confirm_quit"), Some("true".into()));
+        assert_eq!(cfg.get("tui.toasts"), Some("false".into()));
+        assert!(cfg.set("tui.toasts", "maybe").is_err());
+        // Bool keys are written as TOML literals, not quoted strings.
+        assert_eq!(render_toml_value("tui.confirm_quit", "true"), "true");
+        assert_eq!(render_toml_value("tui.toasts", "false"), "false");
+        assert_eq!(render_toml_value("tui.theme", "latte"), "\"latte\"");
     }
 
     #[test]

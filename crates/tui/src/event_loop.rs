@@ -167,6 +167,38 @@ async fn run(
                             }
                             _ => {}
                         }
+                        // Zoom (fullscreen logs) captures navigation so the
+                        // hidden sidebar/tabs don't move invisibly. `z`/Esc/q
+                        // leave it; h/l still switch service.
+                        _ if state.zoom() => match k.code {
+                            KeyCode::Char('z') | KeyCode::Esc | KeyCode::Char('q') => {
+                                state.exit_zoom()
+                            }
+                            KeyCode::Char('j') | KeyCode::Down => state.log_scroll_down(1),
+                            KeyCode::Char('k') | KeyCode::Up => state.log_scroll_up(1),
+                            KeyCode::Char('g') => state.log_scroll_top(),
+                            KeyCode::Char('G') => state.log_scroll_bottom(),
+                            KeyCode::PageUp | KeyCode::Char('b') => state.log_page_up(LOG_PAGE),
+                            KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('f') => {
+                                state.log_page_down(LOG_PAGE)
+                            }
+                            KeyCode::Char('h') | KeyCode::Left => state.select_prev_service(),
+                            KeyCode::Char('l') | KeyCode::Right => state.select_next_service(),
+                            KeyCode::Char('y') => copy_to_clipboard(&state.visible_log_lines()),
+                            KeyCode::Char('Y') => copy_to_clipboard(&state.all_log_lines()),
+                            _ => {}
+                        }
+                        // Quit confirmation is modal: y/Enter commits the quit,
+                        // anything else cancels.
+                        _ if state.quit_confirm_visible() => match k.code {
+                            KeyCode::Char('y') | KeyCode::Enter => {
+                                if !no_shutdown {
+                                    registry.broadcast(ClientMessage::Shutdown).await;
+                                }
+                                return Ok(());
+                            }
+                            _ => state.cancel_quit_confirm(),
+                        }
                         // Skill prompt is modal: capture its keys, swallow the
                         // rest so the choice is deliberate. Install offers
                         // i/g/n; update offers u/a/n.
@@ -211,19 +243,30 @@ async fn run(
                         KeyCode::Char('?') => state.toggle_help(),
                         KeyCode::Esc if state.help_visible() => state.hide_help(),
                         KeyCode::Char('q') | KeyCode::Esc => {
-                            if !no_shutdown {
-                                registry.broadcast(ClientMessage::Shutdown).await;
+                            // With `tui.confirm_quit`, ask first — but only when
+                            // quitting would actually stop services (not detach).
+                            if state.confirm_quit_enabled() && !no_shutdown {
+                                state.open_quit_confirm();
+                            } else {
+                                if !no_shutdown {
+                                    registry.broadcast(ClientMessage::Shutdown).await;
+                                }
+                                return Ok(());
                             }
-                            return Ok(());
                         }
                         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if !no_shutdown {
-                                registry.broadcast(ClientMessage::Shutdown).await;
+                            if state.confirm_quit_enabled() && !no_shutdown {
+                                state.open_quit_confirm();
+                            } else {
+                                if !no_shutdown {
+                                    registry.broadcast(ClientMessage::Shutdown).await;
+                                }
+                                return Ok(());
                             }
-                            return Ok(());
                         }
                         KeyCode::Char('D') => return Ok(()),
                         KeyCode::Char('`') => state.toggle_sidebar(),
+                        KeyCode::Char('z') => state.toggle_zoom(),
                         KeyCode::Down | KeyCode::Char('j') => state.select_next_instance(),
                         KeyCode::Up | KeyCode::Char('k') => state.select_prev_instance(),
                         KeyCode::Right | KeyCode::Char('l') => state.select_next_service(),
@@ -322,12 +365,19 @@ async fn run(
 }
 
 /// Apply a settings-overlay edit (`dir` = +1 next / -1 prev) and write it
-/// back to `global.toml`, surfacing a toast if the write fails.
+/// back to `global.toml`, surfacing a toast if the write fails. A change can
+/// either set a value or remove the key (the `(auto)` choice).
 fn persist_setting(state: &mut TuiState, dir: i32) {
-    if let Some((key, value)) = state.settings_change(dir)
-        && let Err(err) = devme_config::GlobalConfig::persist(key, &value)
-    {
-        state.push_config_warning(format!("couldn't save {key}: {err}"));
+    use crate::state::SettingWrite;
+    let Some(write) = state.settings_change(dir) else {
+        return;
+    };
+    let result = match &write {
+        SettingWrite::Set { key, value } => devme_config::GlobalConfig::persist(key, value),
+        SettingWrite::Unset { key } => devme_config::GlobalConfig::unset_persisted(key),
+    };
+    if let Err(err) = result {
+        state.push_config_warning(format!("couldn't save {}: {err}", write.key()));
     }
 }
 

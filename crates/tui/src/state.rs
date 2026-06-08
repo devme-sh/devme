@@ -129,6 +129,10 @@ pub struct SettingDef {
     pub control: SettingControl,
     /// Value shown when the key is unset.
     pub default: &'static str,
+    /// A choice value that means "leave the key unset" — selecting it removes
+    /// the key from `global.toml` rather than writing a literal. Used for the
+    /// `(auto)` option on keys whose absence triggers auto-detection.
+    pub unset_value: Option<&'static str>,
 }
 
 #[derive(Clone, Copy)]
@@ -139,8 +143,24 @@ pub enum SettingControl {
     Choice(&'static [&'static str]),
 }
 
-/// The settings the overlay exposes. A deliberately small set — the rest of
-/// `devme config`'s keys (e.g. `docker.daemon`) stay CLI-only.
+/// What an overlay edit should do to `global.toml`: write a value, or remove
+/// the key entirely (the `(auto)` / default case).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingWrite {
+    Set { key: &'static str, value: String },
+    Unset { key: &'static str },
+}
+
+impl SettingWrite {
+    pub fn key(&self) -> &'static str {
+        match self {
+            SettingWrite::Set { key, .. } | SettingWrite::Unset { key } => key,
+        }
+    }
+}
+
+/// The settings the overlay exposes — a thin front-end over the same
+/// `global.toml` keys `devme config set` writes.
 pub const SETTINGS: &[SettingDef] = &[
     SettingDef {
         key: "tui.theme",
@@ -148,6 +168,23 @@ pub const SETTINGS: &[SettingDef] = &[
         desc: "Colour palette for the TUI",
         control: SettingControl::Choice(&["mocha", "latte", "auto"]),
         default: "mocha",
+        unset_value: None,
+    },
+    SettingDef {
+        key: "tui.toasts",
+        label: "Notifications",
+        desc: "Pop a toast when a service crashes or recovers",
+        control: SettingControl::Toggle,
+        default: "true",
+        unset_value: None,
+    },
+    SettingDef {
+        key: "tui.confirm_quit",
+        label: "Confirm quit",
+        desc: "Ask before quitting (which stops every service)",
+        control: SettingControl::Toggle,
+        default: "false",
+        unset_value: None,
     },
     SettingDef {
         key: "hints.skills",
@@ -155,6 +192,7 @@ pub const SETTINGS: &[SettingDef] = &[
         desc: "Show the AI-skill install hint in the footer",
         control: SettingControl::Toggle,
         default: "true",
+        unset_value: None,
     },
     SettingDef {
         key: "skill.auto_update",
@@ -162,6 +200,23 @@ pub const SETTINGS: &[SettingDef] = &[
         desc: "Refresh the embedded AI skill when devme updates",
         control: SettingControl::Toggle,
         default: "false",
+        unset_value: None,
+    },
+    SettingDef {
+        key: "docker.daemon",
+        label: "Docker daemon",
+        desc: "Which daemon to start when Docker isn't running",
+        control: SettingControl::Choice(&[
+            "auto",
+            "orbstack",
+            "docker-desktop",
+            "colima",
+            "rancher-desktop",
+        ]),
+        default: "auto",
+        // `auto` is the absence of the key — selecting it unsets `docker.daemon`
+        // so devme falls back to auto-detection.
+        unset_value: Some("auto"),
     },
 ];
 
@@ -232,6 +287,13 @@ pub struct TuiState {
     sidebar_scroll: usize,
     /// When true the sidebar is hidden, giving the log pane full width.
     sidebar_collapsed: bool,
+    /// Fullscreen "zoom" mode: the selected service's logs fill the screen,
+    /// all chrome (sidebar, tabs, footer) hidden. Live tail + scroll stay
+    /// active (unlike copy mode, which is for native text selection).
+    zoom: bool,
+    /// When set, a "really quit?" confirmation modal is up (gated on
+    /// `tui.confirm_quit`).
+    quit_confirm: bool,
     /// User global config, loaded once at startup. The settings overlay reads
     /// and writes through this.
     config: GlobalConfig,
@@ -258,6 +320,8 @@ impl Default for TuiState {
             toasts: Vec::new(),
             sidebar_scroll: 0,
             sidebar_collapsed: false,
+            zoom: false,
+            quit_confirm: false,
             config: GlobalConfig::default(),
             settings: None,
         }
@@ -812,6 +876,11 @@ impl TuiState {
     /// recoveries get surfaced.
     fn toast_for_transition(&mut self, service: &str, old: &ServiceState, new: &ServiceState) {
         use ServiceState as S;
+        // Service crash/recovery toasts are opt-out (`tui.toasts`). Config-parse
+        // warnings bypass this — they go through `push_config_warning` directly.
+        if !self.toasts_enabled() {
+            return;
+        }
         let was_failed = matches!(old, S::Failed { .. } | S::CrashLoop { .. });
         let now_failed = matches!(new, S::Failed { .. } | S::CrashLoop { .. });
         let now_running = matches!(new, S::Running { degraded: false, .. });
@@ -837,6 +906,45 @@ impl TuiState {
 
     pub fn toggle_sidebar(&mut self) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
+    }
+
+    // ── fullscreen log zoom ─────────────────────────────────────────────
+
+    pub fn zoom(&self) -> bool {
+        self.zoom
+    }
+
+    pub fn toggle_zoom(&mut self) {
+        self.zoom = !self.zoom;
+    }
+
+    pub fn exit_zoom(&mut self) {
+        self.zoom = false;
+    }
+
+    // ── quit confirmation (gated on `tui.confirm_quit`) ──────────────────
+
+    /// Whether quitting should pop a confirmation first.
+    pub fn confirm_quit_enabled(&self) -> bool {
+        self.config.get("tui.confirm_quit").as_deref() == Some("true")
+    }
+
+    pub fn quit_confirm_visible(&self) -> bool {
+        self.quit_confirm
+    }
+
+    pub fn open_quit_confirm(&mut self) {
+        self.quit_confirm = true;
+    }
+
+    pub fn cancel_quit_confirm(&mut self) {
+        self.quit_confirm = false;
+    }
+
+    /// Whether service crash/recovery toasts are shown (opt-out via
+    /// `tui.toasts`). Defaults to on when the key is unset.
+    fn toasts_enabled(&self) -> bool {
+        self.config.get("tui.toasts").as_deref() != Some("false")
     }
 
     pub fn sidebar_scroll(&self) -> usize {
@@ -920,8 +1028,8 @@ impl TuiState {
 
     /// Change the focused setting. `dir` is +1 (right/next/activate), -1
     /// (left/prev). Updates the value, applies it live, and returns the
-    /// `(key, value)` to persist — or `None` if nothing is open.
-    pub fn settings_change(&mut self, dir: i32) -> Option<(&'static str, String)> {
+    /// [`SettingWrite`] to persist — or `None` if nothing is open.
+    pub fn settings_change(&mut self, dir: i32) -> Option<SettingWrite> {
         let s = self.settings.as_mut()?;
         let def = &SETTINGS[s.cursor];
         let current = &s.values[s.cursor];
@@ -936,12 +1044,22 @@ impl TuiState {
             }
         };
         s.values[s.cursor] = next.clone();
-        // Keep the in-memory config in sync and apply side effects live.
-        let _ = self.config.set(def.key, &next);
+        // A value equal to the setting's `unset_value` (e.g. docker `auto`)
+        // means "remove the key"; otherwise keep the in-memory config in sync.
+        let is_unset = def.unset_value == Some(next.as_str());
+        if is_unset {
+            let _ = self.config.unset(def.key);
+        } else {
+            let _ = self.config.set(def.key, &next);
+        }
         if def.key == "tui.theme" {
             self.palette = Palette::preview(&next);
         }
-        Some((def.key, next))
+        Some(if is_unset {
+            SettingWrite::Unset { key: def.key }
+        } else {
+            SettingWrite::Set { key: def.key, value: next }
+        })
     }
 
     pub fn selected_service(&self) -> Option<&ServiceSnapshot> {
@@ -1507,19 +1625,92 @@ mod tests {
         // Row 0 is the theme choice (mocha → latte → auto → mocha).
         assert_eq!(s.settings().unwrap().values[0], "mocha");
         let change = s.settings_change(1).unwrap();
-        assert_eq!(change, ("tui.theme", "latte".to_string()));
+        assert_eq!(change, SettingWrite::Set { key: "tui.theme", value: "latte".into() });
         assert_eq!(s.settings().unwrap().values[0], "latte");
         // Live application swaps the palette.
         assert_eq!(*s.palette(), crate::theme::Palette::latte());
 
-        // Move to the skill-hint toggle and flip it.
+        // Row 1 is the notifications toggle (default on → off).
         s.settings_move(1);
         assert_eq!(s.settings().unwrap().cursor, 1);
         let change = s.settings_change(1).unwrap();
-        assert_eq!(change, ("hints.skills", "false".to_string()));
+        assert_eq!(change, SettingWrite::Set { key: "tui.toasts", value: "false".into() });
 
         s.close_settings();
         assert!(!s.settings_visible());
+    }
+
+    #[test]
+    fn docker_daemon_auto_choice_unsets_the_key() {
+        let mut s = TuiState::default();
+        s.open_settings();
+        // Jump to the docker.daemon row (last setting).
+        s.settings_move(-1);
+        assert_eq!(s.settings().unwrap().cursor, SETTINGS.len() - 1);
+        // Defaults to `auto` (the unset sentinel).
+        let row = s.settings().unwrap().cursor;
+        assert_eq!(s.settings().unwrap().values[row], "auto");
+        // Forward to a real daemon → a Set.
+        let change = s.settings_change(1).unwrap();
+        assert_eq!(change, SettingWrite::Set { key: "docker.daemon", value: "orbstack".into() });
+        // Back to `auto` → an Unset.
+        let change = s.settings_change(-1).unwrap();
+        assert_eq!(change, SettingWrite::Unset { key: "docker.daemon" });
+    }
+
+    #[test]
+    fn disabling_toasts_suppresses_transition_notifications() {
+        let running = || ServiceState::Running { degraded: false, started_without: vec![] };
+        let mut s = TuiState::default();
+        s.set_config({
+            let mut c = GlobalConfig::default();
+            c.set("tui.toasts", "false").unwrap();
+            c
+        });
+        s.apply(ServerMessage::Subscribed {
+            instance: test_instance(),
+            services: vec![ServiceSnapshot { state: running(), ..svc("api") }],
+            steps: vec![],
+        });
+        // A crash that would normally raise a toast stays silent.
+        s.apply(ServerMessage::StatusUpdate {
+            service: "api".into(),
+            state: ServiceState::Failed { exit_code: Some(1) },
+            pid: None,
+            port: None,
+            restart_count: 0,
+        });
+        assert!(s.toasts().is_empty(), "toasts should be suppressed when disabled");
+        // But a config-parse warning still surfaces (it bypasses the gate).
+        s.push_config_warning("broken".into());
+        assert_eq!(s.toasts().len(), 1);
+    }
+
+    #[test]
+    fn confirm_quit_reads_config_and_toggles_modal() {
+        let mut s = TuiState::default();
+        assert!(!s.confirm_quit_enabled());
+        s.set_config({
+            let mut c = GlobalConfig::default();
+            c.set("tui.confirm_quit", "true").unwrap();
+            c
+        });
+        assert!(s.confirm_quit_enabled());
+        assert!(!s.quit_confirm_visible());
+        s.open_quit_confirm();
+        assert!(s.quit_confirm_visible());
+        s.cancel_quit_confirm();
+        assert!(!s.quit_confirm_visible());
+    }
+
+    #[test]
+    fn toggle_zoom_flips_fullscreen_logs() {
+        let mut s = TuiState::default();
+        assert!(!s.zoom());
+        s.toggle_zoom();
+        assert!(s.zoom());
+        s.exit_zoom();
+        assert!(!s.zoom());
     }
 
     #[test]

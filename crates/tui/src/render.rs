@@ -48,6 +48,11 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
         return;
     }
 
+    if state.zoom() {
+        render_zoom(frame, area, state);
+        return;
+    }
+
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -70,9 +75,11 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     // Transient corner notifications, above the main pane.
     render_toasts(frame, main_area, state);
 
-    // Modal priority: skill prompt > settings > help.
+    // Modal priority: skill prompt > quit confirm > settings > help.
     if let Some(dlg) = state.skill_dialog() {
         render_skill_dialog(frame, area, dlg);
+    } else if state.quit_confirm_visible() {
+        render_quit_confirm(frame, area, state);
     } else if state.settings_visible() {
         render_settings_overlay(frame, area, state);
     } else if state.help_visible() {
@@ -272,6 +279,93 @@ fn render_copy_mode(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), log_area);
 }
 
+/// Fullscreen "zoom" view: the selected service's logs fill the screen with
+/// just a thin header and footer. Unlike copy mode this keeps live tail,
+/// scrollback and the scrollbar — it's for *reading* one service closely, not
+/// for native text selection.
+fn render_zoom(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
+    let p = *state.palette();
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
+        .split(area);
+
+    let (name, svc_state) = match state.selected_service() {
+        Some(s) => (s.name.clone(), Some(s.state.clone())),
+        None => ("logs".to_string(), None),
+    };
+    let mut header = vec![
+        Span::styled(
+            " ⛶ zoom ",
+            Style::default().fg(p.panel_bg).bg(p.mauve).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" {name} "), Style::default().fg(p.text).add_modifier(Modifier::BOLD)),
+    ];
+    if let Some(st) = &svc_state {
+        header.push(Span::styled(
+            state_label(st),
+            Style::default().fg(service_color(&p, st)).add_modifier(Modifier::BOLD),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(header)), layout[0]);
+
+    // Reuse the standard log viewport (scroll, scrollbar, PAUSED pill).
+    render_log_viewport(frame, layout[1], state);
+
+    let dim = Style::default().fg(p.overlay0);
+    let key = Style::default().fg(p.accent).add_modifier(Modifier::BOLD);
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled(" jk ", key),
+        Span::styled("scroll  ", dim),
+        Span::styled("g/G ", key),
+        Span::styled("top/tail  ", dim),
+        Span::styled("hl ", key),
+        Span::styled("service  ", dim),
+        Span::styled("z/Esc ", key),
+        Span::styled("exit zoom", dim),
+    ]));
+    frame.render_widget(footer, layout[2]);
+}
+
+/// Small centred "really quit?" modal, shown when `tui.confirm_quit` is on and
+/// the user asks to quit (which would stop every service).
+fn render_quit_confirm(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let p = *state.palette();
+    let w = 44u16.min(area.width.saturating_sub(4));
+    let h = 6u16.min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let modal = Rect { x, y, width: w, height: h };
+
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .title(Span::styled(
+            " quit ",
+            Style::default().fg(p.panel_bg).bg(p.red).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(p.red))
+        .style(Style::default().bg(p.panel_bg));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "Quit devme and stop every service?",
+            Style::default().fg(p.text),
+        )),
+        Line::default(),
+        Line::from(vec![
+            Span::styled(" y ", Style::default().fg(p.red).add_modifier(Modifier::BOLD)),
+            Span::styled("quit   ", Style::default().fg(p.overlay0)),
+            Span::styled("n/Esc ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(p.overlay0)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 // ── footer / sidebar ────────────────────────────────────────────────────────
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -367,7 +461,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
     // to read at a glance, narrow enough that the underlying layout is
     // still partly visible around it.
     let w = 56u16.min(area.width.saturating_sub(4));
-    let h = 26u16.min(area.height.saturating_sub(4));
+    let h = 28u16.min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let modal = Rect { x, y, width: w, height: h };
@@ -419,6 +513,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
         Line::from(vec![key("y / Y"), desc("copy visible / all logs")]),
         Line::from(vec![key("p"), desc("copy debug prompt to clipboard")]),
         Line::from(vec![key("v"), desc("copy mode (select text)")]),
+        Line::from(vec![key("z"), desc("zoom logs (fullscreen)")]),
         Line::from(vec![key("wheel"), desc("scroll")]),
         Line::default(),
         section("service actions"),
