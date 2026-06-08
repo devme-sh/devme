@@ -17,10 +17,13 @@ fn main() {
     state.add_instance("kpi-dashboard");
     state.add_instance("internal-portal");
     state.add_instance("ingest-worker");
+    // Subscribe the *first* stack so its services/steps land on the selected
+    // row; the other two stay placeholders (dim dots), which shows off the
+    // sidebar's per-stack health dots.
     state.apply(ServerMessage::Subscribed {
         instance: devme_core::InstanceInfo {
-            id: "preview".into(),
-            label: "preview".into(),
+            id: "local::kpi-dashboard".into(),
+            label: "kpi-dashboard".into(),
             cwd: "/tmp/preview".into(),
         },
         services: vec![
@@ -103,15 +106,19 @@ fn print_buffer(buf: &Buffer) {
 
     fn ansi_for(style: Style) -> String {
         let mut codes = vec!["0".to_string()];
-        if let Some(c) = style.fg
-            && let Some(n) = fg_code(c)
-        {
-            codes.push(n.to_string());
+        if let Some(c) = style.fg {
+            if let Color::Rgb(r, g, b) = c {
+                codes.push(format!("38;2;{r};{g};{b}"));
+            } else if let Some(n) = fg_code(c) {
+                codes.push(n.to_string());
+            }
         }
-        if let Some(c) = style.bg
-            && let Some(n) = bg_code(c)
-        {
-            codes.push(n.to_string());
+        if let Some(c) = style.bg {
+            if let Color::Rgb(r, g, b) = c {
+                codes.push(format!("48;2;{r};{g};{b}"));
+            } else if let Some(n) = bg_code(c) {
+                codes.push(n.to_string());
+            }
         }
         if style.add_modifier.contains(Modifier::BOLD) {
             codes.push("1".into());

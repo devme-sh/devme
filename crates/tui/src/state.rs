@@ -67,6 +67,23 @@ struct SharedData {
     selected_service: Option<usize>,
 }
 
+/// Aggregate health of a stack, summarised into a single sidebar status
+/// dot. Mirrors the per-service states but collapses them: any failure
+/// dominates, then a mix, then all-up, then idle, then "no daemon yet".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackHealth {
+    /// Discovered worktree with no daemon bound yet (no services).
+    Placeholder,
+    /// Every service is up and healthy.
+    AllRunning,
+    /// Some services up, some not.
+    SomeRunning,
+    /// Services exist but none are running.
+    Idle,
+    /// At least one service has failed or is crash-looping.
+    Failed,
+}
+
 /// Which flavour of skill prompt the startup modal is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillPrompt {
@@ -137,6 +154,12 @@ impl Default for TuiState {
 fn check_skill_hint_eligible() -> bool {
     let cfg = devme_config::GlobalConfig::load();
     if cfg.get("hints.skills") == Some("false".into()) {
+        return false;
+    }
+    // Don't hint to *install* a skill that's already here — whether devme
+    // installed it or it arrived via `npx skills`. (Staleness is handled by
+    // the update modal / auto-update, not this hint.)
+    if !cfg.skill_installs().is_empty() || skill_present_anywhere() {
         return false;
     }
     let config_dir = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
@@ -526,8 +549,69 @@ impl TuiState {
         }
     }
 
+    /// Dependency checks ("tools") to show in the sidebar.
+    ///
+    /// Steps are host/repo-level: every worktree of a repo shares the same
+    /// `devme.toml`, so its `[step.*]` checks (uv, gcloud, redis…) are the
+    /// same regardless of which worktree you're viewing. A placeholder
+    /// worktree — discovered but with no daemon bound yet — has an empty
+    /// `steps` list of its own. Rather than let the tools pane blink out of
+    /// existence when you switch onto such a stack, we fall back to the
+    /// checks reported by any subscribed sibling.
     pub fn steps(&self) -> &[StepSnapshot] {
-        self.current_instance().map(|i| i.steps.as_slice()).unwrap_or(&[])
+        let own = self.current_instance().map(|i| i.steps.as_slice()).unwrap_or(&[]);
+        if !own.is_empty() {
+            return own;
+        }
+        self.instances
+            .iter()
+            .map(|i| i.steps.as_slice())
+            .find(|s| !s.is_empty())
+            .unwrap_or(&[])
+    }
+
+    /// Aggregate health of the stack at `idx`, for its sidebar status dot.
+    /// A stack with no services of its own is a [`StackHealth::Placeholder`]
+    /// (discovered worktree, no daemon yet).
+    pub fn instance_health(&self, idx: usize) -> StackHealth {
+        let Some(inst) = self.instances.get(idx) else {
+            return StackHealth::Placeholder;
+        };
+        Self::aggregate_health(&inst.services)
+    }
+
+    /// Aggregate health of the shared (repo-scoped) services.
+    pub fn shared_health(&self) -> StackHealth {
+        Self::aggregate_health(&self.shared.services)
+    }
+
+    fn aggregate_health(services: &[ServiceSnapshot]) -> StackHealth {
+        use devme_core::ServiceState as S;
+        if services.is_empty() {
+            return StackHealth::Placeholder;
+        }
+        if services
+            .iter()
+            .any(|s| matches!(s.state, S::Failed { .. } | S::CrashLoop { .. }))
+        {
+            return StackHealth::Failed;
+        }
+        let healthy = services
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.state,
+                    S::Running { .. } | S::External { healthy: true }
+                )
+            })
+            .count();
+        if healthy == 0 {
+            StackHealth::Idle
+        } else if healthy == services.len() {
+            StackHealth::AllRunning
+        } else {
+            StackHealth::SomeRunning
+        }
     }
 
     pub fn selected_service(&self) -> Option<&ServiceSnapshot> {
@@ -985,6 +1069,35 @@ mod tests {
         let s = TuiState::default();
         assert!(s.services().is_empty());
         assert!(s.selected_service().is_none());
+    }
+
+    #[test]
+    fn steps_persist_when_switching_onto_a_placeholder_stack() {
+        // A subscribed stack with dependency checks, plus a placeholder
+        // worktree (discovered, no daemon yet → no steps of its own).
+        let mut s = TuiState::default();
+        s.apply(ServerMessage::Subscribed {
+            instance: InstanceInfo {
+                id: "real".into(),
+                label: "feature/a".into(),
+                cwd: "/tmp/a".into(),
+            },
+            services: vec![svc("db")],
+            steps: vec![StepSnapshot { name: "uv".into(), state: StepState::Passed }],
+        });
+        s.add_placeholder_instance("place", "feature/b", "/tmp/b");
+
+        // Switch onto the placeholder. Its own steps are empty…
+        s.select_instance_by_id("place");
+        assert!(s.current_instance().unwrap().steps.is_empty());
+        // …but the tools pane still shows the repo's checks (the sibling's),
+        // rather than blinking out of existence.
+        assert_eq!(s.steps().len(), 1);
+        assert_eq!(s.steps()[0].name, "uv");
+
+        // The placeholder reports as such for its status dot.
+        let place_idx = s.find_instance("place").unwrap();
+        assert_eq!(s.instance_health(place_idx), StackHealth::Placeholder);
     }
 
     #[test]

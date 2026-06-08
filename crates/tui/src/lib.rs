@@ -8,6 +8,7 @@
 pub mod discovery;
 pub mod render;
 pub mod state;
+pub mod theme;
 pub mod worktree;
 mod event_loop;
 

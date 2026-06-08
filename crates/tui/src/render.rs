@@ -5,23 +5,25 @@
 //! Layout (lazygit-inspired, see ADR-0010):
 //!
 //! ```text
-//! ╭─ stacks ────╮╭─ header: stack name • [tab1 │ tab2 │ tab3] • selected meta ─╮
-//! │ ▸ kpi-...   ││╭─ logs ──────────────────────────────────────────────────╮ │
-//! │   smoke     │││ 12:34:01 listening on :8080                              │ │
-//! │             │││ 12:34:02 GET /api/health 200                             │ │
-//! │             │││ ...                                                       │ │
-//! ├─ tools ─────┤││                                                           │ │
-//! │ ✓ gcloud    │││                                                           │ │
-//! │ · uv        │││                                                           │ │
-//! ╰─────────────╯│╰───────────────────────────────────────────────────────────╯ │
-//!                ╰── status: tick • running • pid 12345 • 0 restarts ───────────╯
-//!  q quit  ↑↓/jk stack  ←→/hl service  s stop  r restart  S start  o open  ? help
+//!  stacks        ╭─ devme v0.1 • 2/3 running ─────────────────────────────╮
+//!  ✗ kpi-dash    │  ● db │ ◌ backend │ ✗ proxy                            │
+//!  ○ portal      │ ╭─ logs ──────────────────────────────────────────╮   │
+//!  ○ worker      │ │ 12:34:01 listening on :8080                      │   │
+//!                │ │ 12:34:02 GET /api/health 200                     │   │
+//!  ─────────     │ │ ...                                              │   │
+//!  tools         │ ╰──────────────────────────────────────────────────╯   │
+//!  ✓ gcloud      │  backend · starting · pid 12345 · 0 restarts          │
+//!  · uv          ╰────────────────────────────────────────────────────────╯
+//!  ? help  hl svc  jk stack  S/s/r start/stop/restart  o open  q quit
 //! ```
 //!
-//! Services live in the tabs row at the top of the main pane, not in the
-//! sidebar (which would duplicate them). The sidebar's top half is stacks,
-//! the bottom half is the dependency checks ("tools" — uv, gcloud, etc.)
-//! that gate startup.
+//! The sidebar is borderless, herdr-style: a dim section header and a filled
+//! highlight for the selected row, with the main pane's own left border
+//! acting as the divider. Each stack carries an aggregate status dot. The top
+//! section is stacks (worktrees), the bottom the dependency checks ("tools" —
+//! uv, gcloud, …) that gate startup; those are repo-level, so they persist
+//! across stack switches. Services live in the tabs row of the main pane, not
+//! the sidebar (which would duplicate them).
 
 use ansi_to_tui::IntoText;
 use ratatui::Frame;
@@ -34,6 +36,7 @@ use ratatui::widgets::{
 };
 
 use crate::state::TuiState;
+use crate::theme;
 use devme_core::{ServiceState, StepState};
 
 /// Render `state` into `frame`'s full area.
@@ -219,14 +222,14 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     //   left  — focus breadcrumb (stack > service)
     //   centre — terse key hints (only the most-used)
     //   right — aggregate health summary (counts of each state)
-    let dim = Style::default().fg(Color::DarkGray);
-    let key = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(theme::OVERLAY0);
+    let key = Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD);
 
     let stack = if state.shared_selected() { "shared" } else { state.instance_label() };
     let svc = state.selected_service().map(|s| s.name.as_str()).unwrap_or("—");
     let breadcrumb = format!(" {stack} › {svc} ");
     let left = Paragraph::new(Line::from(vec![
-        Span::styled(breadcrumb, Style::default().fg(Color::White)),
+        Span::styled(breadcrumb, Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)),
     ]));
 
     let centre_line = if state.show_skill_hint() {
@@ -258,10 +261,10 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
     let (running, starting, stopped, failed) = aggregate_states(state);
     let right_spans = vec![
-        Span::styled(format!(" ●{running} "), Style::default().fg(Color::Green)),
-        Span::styled(format!("◌{starting} "), Style::default().fg(Color::Yellow)),
-        Span::styled(format!("○{stopped} "), Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("✗{failed}"), Style::default().fg(Color::Red)),
+        Span::styled(format!(" ●{running} "), Style::default().fg(theme::GREEN)),
+        Span::styled(format!("◌{starting} "), Style::default().fg(theme::YELLOW)),
+        Span::styled(format!("○{stopped} "), Style::default().fg(theme::OVERLAY0)),
+        Span::styled(format!("✗{failed}"), Style::default().fg(theme::RED)),
         // Right-edge margin so the glyphs don't kiss the terminal border.
         Span::raw("  "),
     ];
@@ -373,30 +376,35 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
 }
 
 fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    // Sidebar is split into two boxes stacked vertically. The top box lists
-    // running stacks (multi-stack scaffolding — for now usually one entry).
-    // The bottom box shows the dependency checks declared as `[step.*]`,
-    // which are the tools/services we rely on (uv, gcloud, redis…).
+    // Borderless, herdr-style: no boxes. The two sections (stacks + tools)
+    // are set off by a dim header label and a horizontal divider, and
+    // selection is a filled row rather than an arrow. The main pane's own
+    // left border serves as the divider between sidebar and main, so we keep
+    // a one-column blank gutter on the right instead of drawing a second
+    // rule (which would read as a doubled border).
     //
     // Services are deliberately NOT listed here — they live in the tabs row
-    // of the main pane. Putting them in both places would just waste real
-    // estate.
-    //
-    // The tools pane gets a fixed height proportional to the count, so a
-    // tall instance list doesn't crowd it out. We cap the stack pane at a
-    // sensible minimum height too.
+    // of the main pane. The sidebar's top section is stacks (worktrees), the
+    // bottom is the dependency checks ("tools" — uv, gcloud, …) that gate
+    // startup. Steps are repo-level, so they persist across stack switches
+    // (see `TuiState::steps`).
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let content = Rect { width: area.width - 1, ..area };
+
+    // Tools section = divider row + header row + one row per step. It claims
+    // a fixed slice off the bottom; stacks take the rest.
     let step_count = state.steps().len() as u16;
-    // Tools pane = header + steps + a little padding (rounded box borders).
-    let tools_height = if step_count == 0 { 0 } else { (step_count + 2).min(area.height / 2) };
-    let stacks_constraint = if tools_height == 0 {
-        [Constraint::Min(0), Constraint::Length(0)]
+    let tools_height = if step_count == 0 {
+        0
     } else {
-        [Constraint::Min(3), Constraint::Length(tools_height)]
+        (step_count + 2).min(content.height.saturating_sub(2))
     };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(stacks_constraint)
-        .split(area);
+        .constraints([Constraint::Min(2), Constraint::Length(tools_height)])
+        .split(content);
 
     render_stacks_pane(frame, chunks[0], state);
     if tools_height > 0 {
@@ -404,94 +412,137 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     }
 }
 
-fn render_stacks_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let block = Block::default()
-        .title(Span::styled(
-            " stacks ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+/// A single status dot (glyph + colour) summarising a stack's health.
+fn health_dot(health: crate::state::StackHealth) -> (&'static str, Color) {
+    use crate::state::StackHealth as H;
+    match health {
+        H::AllRunning => ("●", theme::GREEN),
+        H::SomeRunning => ("◐", theme::YELLOW),
+        H::Idle => ("○", theme::OVERLAY0),
+        H::Failed => ("✗", theme::RED),
+        H::Placeholder => ("○", theme::SURFACE1),
+    }
+}
 
-    let mut lines: Vec<Line> = Vec::new();
+/// Header label for a sidebar section — a quiet lowercase tag, herdr-style.
+fn section_header(frame: &mut Frame<'_>, area: Rect, label: &str) {
+    if area.height == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!(" {label}"),
+            Style::default().fg(theme::OVERLAY0).add_modifier(Modifier::BOLD),
+        )),
+        Rect { height: 1, ..area },
+    );
+}
+
+/// Render one sidebar row: a status dot, then a name, optionally filled with
+/// a selection background across the full width.
+fn render_row(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    dot: (&'static str, Color),
+    name: &str,
+    selected: bool,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let row = Rect { height: 1, ..area };
+    let name_style = if selected {
+        Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::SUBTEXT0)
+    };
+    // Two leading columns (" ● "), one trailing for breathing room.
+    let max_name = (row.width as usize).saturating_sub(4);
+    let line = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(dot.0, Style::default().fg(dot.1)),
+        Span::raw(" "),
+        Span::styled(theme::truncate(name, max_name), name_style),
+    ]);
+    let para = if selected {
+        Paragraph::new(line).style(Style::default().bg(theme::SURFACE0))
+    } else {
+        Paragraph::new(line)
+    };
+    frame.render_widget(para, row);
+}
+
+fn render_stacks_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    if area.height == 0 {
+        return;
+    }
+    section_header(frame, area, "stacks");
+
     let selected = state.selected_instance_index();
     let shared_active = state.shared_selected();
+    let bottom = area.y + area.height;
+    let mut y = area.y + 1;
+
     for (i, label) in state.instances().iter().enumerate() {
-        let is_selected = !shared_active && selected == Some(i);
-        if is_selected {
-            lines.push(Line::from(vec![
-                Span::styled("▸ ", Style::default().fg(Color::Cyan)),
-                Span::styled(
-                    label.to_string(),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]));
-        } else {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(label.to_string(), Style::default().fg(Color::Gray)),
-            ]));
+        if y >= bottom {
+            return;
         }
+        let is_selected = !shared_active && selected == Some(i);
+        let dot = health_dot(state.instance_health(i));
+        render_row(
+            frame,
+            Rect { y, height: 1, ..area },
+            dot,
+            label,
+            is_selected,
+        );
+        y += 1;
     }
 
-    // Shared (repo-level) services row
+    // Shared (repo-level) services row, set off by a blank line.
     if !state.shared_services().is_empty() {
-        if !lines.is_empty() {
-            lines.push(Line::from(""));
+        y += 1;
+        if y >= bottom {
+            return;
         }
         let svc_names: Vec<&str> = state.shared_services().iter().map(|s| s.name.as_str()).collect();
         let label = format!("shared ({})", svc_names.join(", "));
-        if shared_active {
-            lines.push(Line::from(vec![
-                Span::styled("▸ ", Style::default().fg(Color::Yellow)),
-                Span::styled(
-                    label,
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]));
-        } else {
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(label, Style::default().fg(Color::DarkGray)),
-            ]));
-        }
+        let dot = health_dot(state.shared_health());
+        render_row(frame, Rect { y, height: 1, ..area }, dot, &label, shared_active);
     }
-
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn render_tools_pane(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let block = Block::default()
-        .title(Span::styled(
-            " tools ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    if area.height < 2 {
+        return;
+    }
+    // Divider rule across the top, then a dim header, then the steps.
+    let divider = "─".repeat(area.width as usize);
+    frame.render_widget(
+        Paragraph::new(Span::styled(divider, Style::default().fg(theme::SURFACE1))),
+        Rect { height: 1, ..area },
+    );
+    section_header(frame, Rect { y: area.y + 1, height: 1, ..area }, "tools");
 
-    let mut lines: Vec<Line> = Vec::new();
+    let bottom = area.y + area.height;
+    let mut y = area.y + 2;
     for s in state.steps() {
-        lines.push(Line::from(vec![
+        if y >= bottom {
+            return;
+        }
+        let max_name = (area.width as usize).saturating_sub(4);
+        let line = Line::from(vec![
             Span::raw(" "),
             Span::styled(
                 step_glyph(s.state).to_string(),
                 Style::default().fg(step_color(s.state)),
             ),
             Span::raw(" "),
-            Span::styled(s.name.as_str().to_string(), step_text_style(s.state)),
-        ]));
+            Span::styled(theme::truncate(s.name.as_str(), max_name), step_text_style(s.state)),
+        ]);
+        frame.render_widget(Paragraph::new(line), Rect { y, height: 1, ..area });
+        y += 1;
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 // ── main pane: tabs + viewport + meta ──────────────────────────────────────
@@ -502,7 +553,7 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
         .title(header)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(theme::SURFACE1));
     let inner = main_block.inner(area);
     frame.render_widget(main_block, area);
 
@@ -541,23 +592,23 @@ fn format_main_title(state: &TuiState) -> Line<'_> {
     let version = env!("CARGO_PKG_VERSION");
     let mut spans = vec![Span::styled(
         format!(" devme v{version} "),
-        Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        Style::default().fg(theme::MAUVE).add_modifier(Modifier::BOLD),
     )];
     spans.push(Span::styled(
         format!("• {running}/{count} running"),
         Style::default().fg(if running == count && count > 0 {
-            Color::Green
+            theme::GREEN
         } else if running > 0 {
-            Color::Yellow
+            theme::YELLOW
         } else {
-            Color::DarkGray
+            theme::OVERLAY0
         }),
     ));
     if failed > 0 {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             format!("• {failed} failed"),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme::RED),
         ));
     }
     spans.push(Span::raw(" "));
@@ -609,11 +660,11 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .select(selected)
         .highlight_style(
             Style::default()
-                .fg(Color::White)
-                .bg(Color::Indexed(238))
+                .fg(theme::TEXT)
+                .bg(theme::SURFACE0)
                 .add_modifier(Modifier::BOLD),
         )
-        .divider(Span::styled(" │ ", Style::default().fg(Color::DarkGray)))
+        .divider(Span::styled(" │ ", Style::default().fg(theme::SURFACE1)))
         .padding(" ", " ");
     frame.render_widget(tabs, area);
 }
@@ -780,17 +831,17 @@ fn render_service_meta(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
 fn step_color(state: StepState) -> Color {
     match state {
-        StepState::Passed | StepState::SkippedThisRun => Color::Green,
-        StepState::Overridden => Color::Yellow,
-        StepState::Failed | StepState::ProvisionFailed => Color::Red,
-        StepState::Unknown => Color::DarkGray,
+        StepState::Passed | StepState::SkippedThisRun => theme::GREEN,
+        StepState::Overridden => theme::YELLOW,
+        StepState::Failed | StepState::ProvisionFailed => theme::RED,
+        StepState::Unknown => theme::OVERLAY0,
     }
 }
 
 fn step_text_style(state: StepState) -> Style {
     match state {
-        StepState::Unknown => Style::default().fg(Color::DarkGray),
-        _ => Style::default(),
+        StepState::Unknown => Style::default().fg(theme::OVERLAY0),
+        _ => Style::default().fg(theme::SUBTEXT0),
     }
 }
 
@@ -819,13 +870,13 @@ fn service_dot(state: &ServiceState) -> &'static str {
 fn service_color(state: &ServiceState) -> Color {
     use ServiceState as S;
     match state {
-        S::Running { degraded: false, .. } => Color::Green,
-        S::Running { degraded: true, .. } => Color::Yellow,
-        S::Starting | S::Restarting { .. } => Color::Yellow,
-        S::Failed { .. } | S::CrashLoop { .. } => Color::Red,
-        S::External { healthy: true } => Color::Cyan,
-        S::External { healthy: false } => Color::Red,
-        S::Stopped | S::WaitingOnDependency { .. } => Color::DarkGray,
+        S::Running { degraded: false, .. } => theme::GREEN,
+        S::Running { degraded: true, .. } => theme::YELLOW,
+        S::Starting | S::Restarting { .. } => theme::YELLOW,
+        S::Failed { .. } | S::CrashLoop { .. } => theme::RED,
+        S::External { healthy: true } => theme::TEAL,
+        S::External { healthy: false } => theme::RED,
+        S::Stopped | S::WaitingOnDependency { .. } => theme::OVERLAY0,
     }
 }
 
