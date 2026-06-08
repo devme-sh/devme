@@ -70,9 +70,11 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     // Transient corner notifications, above the main pane.
     render_toasts(frame, main_area, state);
 
-    // The stale-skill prompt takes modal priority over help.
+    // Modal priority: skill prompt > settings > help.
     if let Some(dlg) = state.skill_dialog() {
         render_skill_dialog(frame, area, dlg);
+    } else if state.settings_visible() {
+        render_settings_overlay(frame, area, state);
     } else if state.help_visible() {
         render_help_overlay(frame, area);
     }
@@ -425,11 +427,110 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
         Line::from(vec![key("r"), desc("restart selected")]),
         Line::default(),
         section("session"),
+        Line::from(vec![key(","), desc("settings")]),
         Line::from(vec![key("D"), desc("detach (keep services running)")]),
         Line::from(vec![key("q / Esc"), desc("quit (stops everything)")]),
         Line::from(vec![key("?"), desc("toggle this overlay")]),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// In-app settings overlay: a centered modal listing the editable config
+/// keys with their current values, each change persisted to `global.toml`
+/// and applied live. Mirrors herdr's settings screen, scaled to devme's
+/// handful of keys (so a flat list rather than tabbed sections).
+fn render_settings_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    use crate::state::{SettingControl, SETTINGS};
+    let Some(settings) = state.settings() else {
+        return;
+    };
+    let p = *state.palette();
+
+    let w = 60u16.min(area.width.saturating_sub(4));
+    // Two rows per setting (value + description) + title, divider, footer.
+    let h = (SETTINGS.len() as u16 * 2 + 5).min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let modal = Rect { x, y, width: w, height: h };
+
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .title(Span::styled(
+            " settings ",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(p.accent))
+        .style(Style::default().bg(p.panel_bg));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    if inner.height < 3 {
+        return;
+    }
+
+    let mut row = inner.y;
+    let bottom = inner.y + inner.height;
+    for (i, def) in SETTINGS.iter().enumerate() {
+        if row + 2 > bottom {
+            break;
+        }
+        let selected = i == settings.cursor;
+        let value = settings.values.get(i).map(String::as_str).unwrap_or(def.default);
+        let fill = selected.then(|| Style::default().bg(p.surface0));
+
+        // Row 1: label on the left, control value on the right.
+        let label_style = if selected {
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(p.subtext0)
+        };
+        let control = match def.control {
+            SettingControl::Toggle if value == "true" => {
+                vec![Span::styled("● on", Style::default().fg(p.green))]
+            }
+            SettingControl::Toggle => {
+                vec![Span::styled("○ off", Style::default().fg(p.overlay0))]
+            }
+            SettingControl::Choice(_) => vec![
+                Span::styled("‹ ", Style::default().fg(p.overlay0)),
+                Span::styled(value.to_string(), Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(" ›", Style::default().fg(p.overlay0)),
+            ],
+        };
+        let control_w: usize = control.iter().map(|s| s.content.chars().count()).sum();
+        let label = Span::styled(format!(" {}", def.label), label_style);
+        let pad = (inner.width as usize)
+            .saturating_sub(1 + def.label.chars().count() + control_w + 1);
+        let mut spans = vec![label, Span::raw(" ".repeat(pad))];
+        spans.extend(control);
+        render_filled(frame, Rect { x: inner.x, y: row, width: inner.width, height: 1 }, Line::from(spans), fill);
+        row += 1;
+
+        // Row 2: description.
+        let desc = Line::from(Span::styled(
+            format!("   {}", def.desc),
+            Style::default().fg(p.overlay0),
+        ));
+        render_filled(frame, Rect { x: inner.x, y: row, width: inner.width, height: 1 }, desc, fill);
+        row += 1;
+    }
+
+    // Footer hint, pinned to the last row.
+    if bottom > inner.y {
+        let hint = Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("move  ", Style::default().fg(p.overlay0)),
+            Span::styled("←→/space ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("change  ", Style::default().fg(p.overlay0)),
+            Span::styled("esc ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("close", Style::default().fg(p.overlay0)),
+        ]);
+        frame.render_widget(
+            Paragraph::new(hint),
+            Rect { x: inner.x, y: bottom - 1, width: inner.width, height: 1 },
+        );
+    }
 }
 
 fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {

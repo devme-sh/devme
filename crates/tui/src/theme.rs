@@ -101,6 +101,17 @@ impl Palette {
             _ => Self::mocha(),
         }
     }
+
+    /// Like [`resolve`](Self::resolve) but never queries the terminal — used
+    /// when applying a theme change live inside the alt-screen, where the
+    /// OSC-11 round-trip would fight the input reader. `auto` previews as
+    /// mocha and resolves for real on the next launch.
+    pub fn preview(name: &str) -> Self {
+        match name {
+            "latte" | "light" => Self::latte(),
+            _ => Self::mocha(),
+        }
+    }
 }
 
 /// Truncate `text` to `max` display columns, appending `…` when clipped.

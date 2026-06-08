@@ -43,13 +43,17 @@ pub async fn launch(no_shutdown: bool) -> anyhow::Result<()> {
     // (or silently refresh when auto-update is on).
     state.check_skill_prompt();
 
-    // Resolve the colour theme from config before raw mode is on. `auto`
-    // queries the terminal's background (OSC 11), which needs to happen while
-    // we own stdin and before the alt-screen swallows the reply.
-    let theme_name = devme_config::GlobalConfig::load()
-        .get("tui.theme")
-        .unwrap_or_else(|| "mocha".into());
+    // Load config (surfacing a warning if it failed to parse, rather than
+    // silently discarding it) and resolve the colour theme before raw mode
+    // is on. `auto` queries the terminal background (OSC 11), which needs to
+    // happen while we own stdin and before the alt-screen swallows the reply.
+    let (cfg, cfg_warning) = devme_config::GlobalConfig::load_checked();
+    let theme_name = cfg.get("tui.theme").unwrap_or_else(|| "mocha".into());
     state.set_palette(crate::theme::Palette::resolve(&theme_name));
+    state.set_config(cfg);
+    if let Some(warning) = cfg_warning {
+        state.push_config_warning(warning);
+    }
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -188,6 +192,22 @@ async fn run(
                                 _ => {}
                             }
                         }
+                        // Settings overlay is modal: route its keys here and
+                        // swallow the rest. Changes persist + apply live.
+                        _ if state.settings_visible() => match k.code {
+                            KeyCode::Up | KeyCode::Char('k') => state.settings_move(-1),
+                            KeyCode::Down | KeyCode::Char('j') => state.settings_move(1),
+                            KeyCode::Left | KeyCode::Char('h') => persist_setting(state, -1),
+                            KeyCode::Right
+                            | KeyCode::Char('l')
+                            | KeyCode::Char(' ')
+                            | KeyCode::Enter => persist_setting(state, 1),
+                            KeyCode::Esc | KeyCode::Char(',') | KeyCode::Char('q') => {
+                                state.close_settings()
+                            }
+                            _ => {}
+                        },
+                        KeyCode::Char(',') => state.open_settings(),
                         KeyCode::Char('?') => state.toggle_help(),
                         KeyCode::Esc if state.help_visible() => state.hide_help(),
                         KeyCode::Char('q') | KeyCode::Esc => {
@@ -298,6 +318,16 @@ async fn run(
                 }
             }
         }
+    }
+}
+
+/// Apply a settings-overlay edit (`dir` = +1 next / -1 prev) and write it
+/// back to `global.toml`, surfacing a toast if the write fails.
+fn persist_setting(state: &mut TuiState, dir: i32) {
+    if let Some((key, value)) = state.settings_change(dir)
+        && let Err(err) = devme_config::GlobalConfig::persist(key, &value)
+    {
+        state.push_config_warning(format!("couldn't save {key}: {err}"));
     }
 }
 

@@ -11,6 +11,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 use base64::Engine;
+use devme_config::GlobalConfig;
 use devme_core::{InstanceInfo, ServerMessage, ServiceSnapshot, ServiceState, StepSnapshot};
 
 use crate::theme::Palette;
@@ -117,6 +118,61 @@ pub enum StackHealth {
     Failed,
 }
 
+/// One editable row in the in-TUI settings overlay. The overlay is a thin
+/// front-end over the same `global.toml` keys `devme config set` writes, so
+/// nothing here is TUI-only state — changes persist to disk and apply live.
+pub struct SettingDef {
+    /// Config key, e.g. `tui.theme`.
+    pub key: &'static str,
+    pub label: &'static str,
+    pub desc: &'static str,
+    pub control: SettingControl,
+    /// Value shown when the key is unset.
+    pub default: &'static str,
+}
+
+#[derive(Clone, Copy)]
+pub enum SettingControl {
+    /// A boolean, stored as the strings "true"/"false".
+    Toggle,
+    /// One of a fixed set of values.
+    Choice(&'static [&'static str]),
+}
+
+/// The settings the overlay exposes. A deliberately small set — the rest of
+/// `devme config`'s keys (e.g. `docker.daemon`) stay CLI-only.
+pub const SETTINGS: &[SettingDef] = &[
+    SettingDef {
+        key: "tui.theme",
+        label: "Theme",
+        desc: "Colour palette for the TUI",
+        control: SettingControl::Choice(&["mocha", "latte", "auto"]),
+        default: "mocha",
+    },
+    SettingDef {
+        key: "hints.skills",
+        label: "Skill hint",
+        desc: "Show the AI-skill install hint in the footer",
+        control: SettingControl::Toggle,
+        default: "true",
+    },
+    SettingDef {
+        key: "skill.auto_update",
+        label: "Auto-update skill",
+        desc: "Refresh the embedded AI skill when devme updates",
+        control: SettingControl::Toggle,
+        default: "false",
+    },
+];
+
+/// Live state for the settings overlay: which row is focused and the current
+/// value of each setting (parallel to [`SETTINGS`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsState {
+    pub cursor: usize,
+    pub values: Vec<String>,
+}
+
 /// Which flavour of skill prompt the startup modal is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillPrompt {
@@ -176,6 +232,11 @@ pub struct TuiState {
     sidebar_scroll: usize,
     /// When true the sidebar is hidden, giving the log pane full width.
     sidebar_collapsed: bool,
+    /// User global config, loaded once at startup. The settings overlay reads
+    /// and writes through this.
+    config: GlobalConfig,
+    /// The settings overlay, when open. Modal like the help/skill dialogs.
+    settings: Option<SettingsState>,
 }
 
 impl Default for TuiState {
@@ -197,6 +258,8 @@ impl Default for TuiState {
             toasts: Vec::new(),
             sidebar_scroll: 0,
             sidebar_collapsed: false,
+            config: GlobalConfig::default(),
+            settings: None,
         }
     }
 }
@@ -815,6 +878,72 @@ impl TuiState {
             .collect()
     }
 
+    // ── settings overlay ────────────────────────────────────────────────
+
+    /// Seed the in-memory config (theme/hints/…) loaded at startup.
+    pub fn set_config(&mut self, config: GlobalConfig) {
+        self.config = config;
+    }
+
+    /// Surface a startup config-parse warning as a (longer-lived) toast.
+    pub fn push_config_warning(&mut self, message: String) {
+        self.push_toast(ToastKind::Failed, "config", message);
+    }
+
+    pub fn settings_visible(&self) -> bool {
+        self.settings.is_some()
+    }
+
+    pub fn settings(&self) -> Option<&SettingsState> {
+        self.settings.as_ref()
+    }
+
+    /// Open the settings overlay, snapshotting each key's current value.
+    pub fn open_settings(&mut self) {
+        let values = SETTINGS
+            .iter()
+            .map(|s| self.config.get(s.key).unwrap_or_else(|| s.default.to_string()))
+            .collect();
+        self.settings = Some(SettingsState { cursor: 0, values });
+    }
+
+    pub fn close_settings(&mut self) {
+        self.settings = None;
+    }
+
+    pub fn settings_move(&mut self, delta: i32) {
+        if let Some(s) = &mut self.settings {
+            let n = SETTINGS.len() as i32;
+            s.cursor = (((s.cursor as i32 + delta) % n + n) % n) as usize;
+        }
+    }
+
+    /// Change the focused setting. `dir` is +1 (right/next/activate), -1
+    /// (left/prev). Updates the value, applies it live, and returns the
+    /// `(key, value)` to persist — or `None` if nothing is open.
+    pub fn settings_change(&mut self, dir: i32) -> Option<(&'static str, String)> {
+        let s = self.settings.as_mut()?;
+        let def = &SETTINGS[s.cursor];
+        let current = &s.values[s.cursor];
+        let next = match def.control {
+            SettingControl::Toggle => {
+                if current == "true" { "false".to_string() } else { "true".to_string() }
+            }
+            SettingControl::Choice(opts) => {
+                let i = opts.iter().position(|o| *o == current).unwrap_or(0) as i32;
+                let n = opts.len() as i32;
+                opts[(((i + dir) % n + n) % n) as usize].to_string()
+            }
+        };
+        s.values[s.cursor] = next.clone();
+        // Keep the in-memory config in sync and apply side effects live.
+        let _ = self.config.set(def.key, &next);
+        if def.key == "tui.theme" {
+            self.palette = Palette::preview(&next);
+        }
+        Some((def.key, next))
+    }
+
     pub fn selected_service(&self) -> Option<&ServiceSnapshot> {
         let idx = self.active_selected_service_idx()?;
         let svcs = self.services();
@@ -1367,6 +1496,38 @@ mod tests {
         assert!(s.sidebar_collapsed());
         s.toggle_sidebar();
         assert!(!s.sidebar_collapsed());
+    }
+
+    #[test]
+    fn settings_overlay_cycles_and_toggles() {
+        let mut s = TuiState::default();
+        s.open_settings();
+        assert!(s.settings_visible());
+
+        // Row 0 is the theme choice (mocha → latte → auto → mocha).
+        assert_eq!(s.settings().unwrap().values[0], "mocha");
+        let change = s.settings_change(1).unwrap();
+        assert_eq!(change, ("tui.theme", "latte".to_string()));
+        assert_eq!(s.settings().unwrap().values[0], "latte");
+        // Live application swaps the palette.
+        assert_eq!(*s.palette(), crate::theme::Palette::latte());
+
+        // Move to the skill-hint toggle and flip it.
+        s.settings_move(1);
+        assert_eq!(s.settings().unwrap().cursor, 1);
+        let change = s.settings_change(1).unwrap();
+        assert_eq!(change, ("hints.skills", "false".to_string()));
+
+        s.close_settings();
+        assert!(!s.settings_visible());
+    }
+
+    #[test]
+    fn settings_move_wraps() {
+        let mut s = TuiState::default();
+        s.open_settings();
+        s.settings_move(-1);
+        assert_eq!(s.settings().unwrap().cursor, SETTINGS.len() - 1);
     }
 
     #[test]
