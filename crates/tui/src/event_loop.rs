@@ -193,6 +193,15 @@ async fn run(
                                 registry.send_to(&id, ClientMessage::Restart { service: name }).await;
                             }
                         }
+                        KeyCode::Char('o') => {
+                            // Open the focused service's local URL in the
+                            // browser. No-op for services without a port.
+                            if let Some(port) = state.selected_service().and_then(|s| s.port) {
+                                let _ = devme_config::browser::open_url(
+                                    &format!("http://localhost:{port}"),
+                                );
+                            }
+                        }
                         KeyCode::Char('y') => {
                             copy_to_clipboard(&state.visible_log_lines());
                         }

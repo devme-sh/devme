@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use devme_client::Client;
 use devme_config::{InterpContext, Stack, interpolate};
-use devme_core::ClientMessage;
+use devme_core::{ClientMessage, ServerMessage, ServiceSnapshot};
 use devme_slot_allocator::SlotAllocator;
 use devme_supervisor::spawn::{ensure_daemon, ensure_shared_daemon};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -474,6 +474,66 @@ pub async fn remove_worktree(
         instance_stopped,
         on_destroy_ran,
     })
+}
+
+/// One worktree's status for the cross-worktree `devme status --all` view.
+#[derive(Debug, Clone)]
+pub struct WorktreeReport {
+    /// Display label — branch name, else directory basename.
+    pub label: String,
+    /// Canonical worktree path.
+    pub path: PathBuf,
+    /// True for the worktree the command was run from.
+    pub is_cwd: bool,
+    /// Slot it currently holds (from the allocator registry), if any.
+    pub slot: Option<u8>,
+    /// Service snapshot from its daemon, or `None` if no daemon is running.
+    pub services: Option<Vec<ServiceSnapshot>>,
+}
+
+/// Gather a status report for every worktree of the repo containing `cwd`.
+/// Connects to each worktree's instance daemon (without spawning one) to read
+/// its live services + resolved ports; worktrees with no running daemon come
+/// back with `services: None`.
+pub async fn gather_worktree_reports(cwd: &Path) -> Vec<WorktreeReport> {
+    let canon_cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let worktrees = list_worktrees_detailed(cwd);
+    let mut reports = Vec::with_capacity(worktrees.len());
+    for wt in worktrees {
+        let label = wt.branch.clone().unwrap_or_else(|| {
+            wt.path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("worktree")
+                .to_string()
+        });
+        let is_cwd = wt.path == canon_cwd;
+        let slot = slot_for(&wt.path);
+        let services = snapshot_instance(&wt.path).await;
+        reports.push(WorktreeReport {
+            label,
+            path: wt.path,
+            is_cwd,
+            slot,
+            services,
+        });
+    }
+    reports
+}
+
+/// One-shot snapshot of a worktree's instance daemon. `None` if no daemon is
+/// listening (connect fails) — we never spawn one here.
+async fn snapshot_instance(path: &Path) -> Option<Vec<ServiceSnapshot>> {
+    let sock = devme_config::paths::supervisor_socket(path).ok()?;
+    let mut client = Client::connect(&sock).await.ok()?;
+    match client
+        .request(ClientMessage::Subscribe { services: vec![] })
+        .await
+        .ok()?
+    {
+        ServerMessage::Subscribed { services, .. } => Some(services),
+        _ => None,
+    }
 }
 
 /// Parse `git worktree list --porcelain` into one entry per worktree. The

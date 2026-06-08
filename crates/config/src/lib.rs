@@ -3,6 +3,7 @@
 //!
 //! See `CONTEXT.md` at the repo root and ADR-0001.
 
+pub mod browser;
 pub mod docker;
 mod env_var;
 mod error;

@@ -7,7 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use base64::Engine;
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
-use devme_cli::{Cli, Command, ConfigAction, WorktreeAction, format_status_json, format_status_text};
+use devme_cli::{
+    Cli, Command, ConfigAction, WorktreeAction, format_status_all, format_status_json,
+    format_status_text,
+};
 use devme_config::Stack;
 use devme_core::{ClientMessage, ServerMessage, ServiceState};
 
@@ -69,7 +72,13 @@ async fn run(cli: Cli) -> i32 {
                 1
             }
         },
-        Some(Command::Status) => status(cli.json).await,
+        Some(Command::Status { all }) => {
+            if all {
+                status_all(cli.json).await
+            } else {
+                status(cli.json).await
+            }
+        }
         Some(Command::Down { timeout }) => down(timeout).await,
         Some(Command::Up { services, detach, wait, timeout }) => {
             up(services, detach, wait, timeout).await
@@ -77,6 +86,7 @@ async fn run(cli: Cli) -> i32 {
         Some(Command::Start { service }) => start(service).await,
         Some(Command::Stop { service }) => stop(service).await,
         Some(Command::Restart { service }) => restart(service).await,
+        Some(Command::Url { service, open }) => url(service, open).await,
         Some(Command::Logs { service, follow, tail }) => logs(service, follow, tail).await,
         Some(Command::Completions { shell }) => {
             print_completions(shell);
@@ -179,6 +189,64 @@ async fn down(timeout_secs: u64) -> anyhow::Result<()> {
             let elapsed = started.elapsed().as_secs_f32();
             println!(" ✔ Service {name:<20}  Stopped   {elapsed:>5.1}s");
         }
+    }
+    Ok(())
+}
+
+/// Cross-worktree status (`--all`): every worktree of the repo with its slot
+/// and each service's resolved port. Connects to each worktree's daemon
+/// read-only — never spawns one — so a stopped worktree just shows as such.
+async fn status_all(as_json: bool) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let reports = devme_tui::worktree::gather_worktree_reports(&cwd).await;
+    if as_json {
+        let worktrees: Vec<serde_json::Value> = reports
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "label": r.label,
+                    "path": r.path.display().to_string(),
+                    "is_cwd": r.is_cwd,
+                    "slot": r.slot,
+                    "running": r.services.is_some(),
+                    "services": r.services,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::json!({ "worktrees": worktrees }));
+    } else {
+        print!("{}", format_status_all(&reports));
+    }
+    Ok(())
+}
+
+/// Print (and optionally open) a service's `http://localhost:<port>` URL,
+/// resolved from the current worktree's running daemon.
+async fn url(service: String, open: bool) -> anyhow::Result<()> {
+    let sock = socket_path();
+    ensure_daemon(&sock).await?;
+    let mut client = devme_client::Client::connect(&sock).await?;
+    let reply = client
+        .request(ClientMessage::Subscribe { services: vec![] })
+        .await?;
+    let services = match reply {
+        ServerMessage::Subscribed { services, .. } => services,
+        other => return Err(anyhow::anyhow!("daemon replied unexpectedly: {other:?}")),
+    };
+    let svc = services
+        .iter()
+        .find(|s| s.name == service)
+        .ok_or_else(|| anyhow::anyhow!("no service named {service:?} in devme.toml"))?;
+    let port = svc
+        .port
+        .ok_or_else(|| anyhow::anyhow!("service {service:?} has no port to build a URL from"))?;
+    let url = format!("http://localhost:{port}");
+    println!("{url}");
+    if !open {
+        return Ok(());
+    }
+    if let Err(e) = devme_config::browser::open_url(&url) {
+        eprintln!("devme: couldn't open browser: {e}");
     }
     Ok(())
 }

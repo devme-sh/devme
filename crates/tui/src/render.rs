@@ -15,7 +15,7 @@
 //! │ · uv        │││                                                           │ │
 //! ╰─────────────╯│╰───────────────────────────────────────────────────────────╯ │
 //!                ╰── status: tick • running • pid 12345 • 0 restarts ───────────╯
-//!  q quit  ↑↓/jk stack  ←→/hl service  s stop  r restart  S start  ? help
+//!  q quit  ↑↓/jk stack  ←→/hl service  s stop  r restart  S start  o open  ? help
 //! ```
 //!
 //! Services live in the tabs row at the top of the main pane, not in the
@@ -171,6 +171,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             Span::styled("stack  ", dim),
             Span::styled("S/s/r ", key),
             Span::styled("start/stop/restart  ", dim),
+            Span::styled("o ", key),
+            Span::styled("open  ", dim),
             Span::styled("q ", key),
             Span::styled("quit", dim),
         ])

@@ -61,13 +61,29 @@ pub enum Command {
         timeout: u64,
     },
     /// Print a snapshot of current service status.
-    Status,
+    Status {
+        /// Show every worktree of the repo — its slot and each service's
+        /// resolved port — not just the current one. The CLI form of the
+        /// TUI sidebar; handy for an agent coordinating across worktrees.
+        #[arg(long)]
+        all: bool,
+    },
     /// Restart a service.
     Restart { service: String },
     /// Stop a single service (keep the daemon running).
     Stop { service: String },
     /// Start a single service.
     Start { service: String },
+    /// Print a service's local URL (`http://localhost:<port>`) for the
+    /// current worktree. Resolves the port from the running daemon, so it
+    /// reflects this worktree's slot.
+    Url {
+        /// Service name.
+        service: String,
+        /// Also open the URL in the default browser.
+        #[arg(long, short = 'o')]
+        open: bool,
+    },
     /// Tail logs for a service.
     Logs {
         service: String,
@@ -141,16 +157,144 @@ pub enum ConfigAction {
     Unset { key: String },
 }
 
+/// Compact, human-friendly label for a service state — the noisy `Debug`
+/// form (`Running { degraded: false, started_without: [] }`) is useless in a
+/// status table.
+pub fn service_state_label(state: &devme_core::ServiceState) -> String {
+    use devme_core::ServiceState as S;
+    match state {
+        S::Stopped => "stopped".into(),
+        S::Starting => "starting".into(),
+        S::Running { degraded: false, .. } => "running".into(),
+        S::Running { degraded: true, .. } => "degraded".into(),
+        S::WaitingOnDependency { .. } => "waiting".into(),
+        S::Restarting { attempt } => format!("restarting({attempt})"),
+        S::CrashLoop { .. } => "crash-loop".into(),
+        S::Failed { exit_code: Some(c) } => format!("failed({c})"),
+        S::Failed { exit_code: None } => "failed".into(),
+        S::External { healthy: true } => "external".into(),
+        S::External { healthy: false } => "external(down)".into(),
+    }
+}
+
+/// Compact label for a step state.
+pub fn step_state_label(state: &devme_core::StepState) -> &'static str {
+    use devme_core::StepState as S;
+    match state {
+        S::Unknown => "pending",
+        S::Passed => "passed",
+        S::Failed => "failed",
+        S::SkippedThisRun => "skipped",
+        S::Overridden => "overridden",
+        S::ProvisionFailed => "provision-failed",
+    }
+}
+
 /// Format a status snapshot for human consumption — one row per node,
 /// declaration order preserved. Steps come first, then services, matching
-/// the TUI sidebar.
+/// the TUI sidebar. Services show their resolved `:PORT` so an agent sees
+/// the worktree's ports at a glance.
 pub fn format_status_text(services: &[ServiceSnapshot], steps: &[StepSnapshot]) -> String {
     let mut out = String::new();
     for s in steps {
-        out.push_str(&format!("step    {:<24} {:?}\n", s.name, s.state));
+        out.push_str(&format!("step    {:<20} {}\n", s.name, step_state_label(&s.state)));
     }
     for s in services {
-        out.push_str(&format!("service {:<24} {:?}\n", s.name, s.state));
+        let port = s.port.map(|p| format!(":{p}")).unwrap_or_default();
+        let line = format!(
+            "service {:<20} {:<14} {}",
+            s.name,
+            service_state_label(&s.state),
+            port
+        );
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+/// Format the cross-worktree status (`devme status --all`) as an aligned
+/// table: one row per worktree, one column per service (its resolved port),
+/// plus the slot. A leading `*` marks the current worktree; a worktree with
+/// no running daemon shows `(not running)`.
+pub fn format_status_all(reports: &[devme_tui::worktree::WorktreeReport]) -> String {
+    use devme_tui::worktree::WorktreeReport;
+    if reports.is_empty() {
+        return "no worktrees found\n".to_string();
+    }
+
+    // Column order = union of service names in first-seen order.
+    let mut svc_names: Vec<String> = Vec::new();
+    for r in reports {
+        if let Some(svcs) = &r.services {
+            for s in svcs {
+                if !svc_names.iter().any(|n| n == &s.name) {
+                    svc_names.push(s.name.clone());
+                }
+            }
+        }
+    }
+
+    let label_of = |r: &WorktreeReport| -> String {
+        let mark = if r.is_cwd { "* " } else { "  " };
+        format!("{mark}{}", r.label)
+    };
+    let cell = |r: &WorktreeReport, name: &str| -> String {
+        match &r.services {
+            None => "-".to_string(),
+            Some(svcs) => svcs
+                .iter()
+                .find(|s| s.name == name)
+                .and_then(|s| s.port)
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        }
+    };
+
+    let label_w = reports
+        .iter()
+        .map(|r| label_of(r).len())
+        .chain(std::iter::once("WORKTREE".len()))
+        .max()
+        .unwrap();
+    let slot_w = "SLOT".len();
+    let col_w: Vec<usize> = svc_names
+        .iter()
+        .map(|name| {
+            reports
+                .iter()
+                .map(|r| cell(r, name).len())
+                .max()
+                .unwrap_or(0)
+                .max(name.len())
+        })
+        .collect();
+
+    let mut rows: Vec<String> = Vec::new();
+    // Header.
+    let mut header = format!("{:<label_w$}  {:<slot_w$}", "WORKTREE", "SLOT");
+    for (name, w) in svc_names.iter().zip(&col_w) {
+        header.push_str(&format!("  {name:<w$}", w = *w));
+    }
+    rows.push(header);
+    // One row per worktree.
+    for r in reports {
+        let slot = r.slot.map(|s| s.to_string()).unwrap_or_else(|| "-".into());
+        let mut row = format!("{:<label_w$}  {:<slot_w$}", label_of(r), slot);
+        if r.services.is_none() {
+            row.push_str("  (not running)");
+        } else {
+            for (name, w) in svc_names.iter().zip(&col_w) {
+                row.push_str(&format!("  {:<w$}", cell(r, name), w = *w));
+            }
+        }
+        rows.push(row);
+    }
+
+    let mut out = String::new();
+    for row in rows {
+        out.push_str(row.trim_end());
+        out.push('\n');
     }
     out
 }
@@ -174,7 +318,7 @@ mod tests {
     #[test]
     fn parses_status_subcommand() {
         let cli = Cli::parse_from(["devme", "status"]);
-        assert_eq!(cli.command, Some(Command::Status));
+        assert_eq!(cli.command, Some(Command::Status { all: false }));
         assert!(!cli.json);
     }
 
@@ -259,7 +403,7 @@ mod tests {
     fn json_flag_is_global() {
         let cli = Cli::parse_from(["devme", "--json", "status"]);
         assert!(cli.json);
-        assert_eq!(cli.command, Some(Command::Status));
+        assert_eq!(cli.command, Some(Command::Status { all: false }));
     }
 
     #[test]
@@ -346,6 +490,94 @@ mod tests {
     #[test]
     fn empty_snapshot_formats_to_empty_text() {
         assert_eq!(format_status_text(&[], &[]), "");
+    }
+
+    #[test]
+    fn status_text_shows_port_and_clean_state() {
+        let mut s = svc(
+            "backend",
+            ServiceState::Running { degraded: false, started_without: vec![] },
+        );
+        s.port = Some(8090);
+        let out = format_status_text(&[s], &[step("tools", StepState::Passed)]);
+        assert!(out.contains("running"), "got: {out}");
+        assert!(out.contains(":8090"), "port missing: {out}");
+        // No raw Debug noise.
+        assert!(!out.contains("degraded:"), "leaked Debug: {out}");
+        assert!(out.contains("tools") && out.contains("passed"));
+    }
+
+    #[test]
+    fn url_parses_with_service_and_open_flag() {
+        let cli = Cli::parse_from(["devme", "url", "backend"]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Url { service: "backend".into(), open: false })
+        );
+        let cli = Cli::parse_from(["devme", "url", "-o", "backend"]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Url { service: "backend".into(), open: true })
+        );
+    }
+
+    #[test]
+    fn status_all_flag_parses() {
+        let cli = Cli::parse_from(["devme", "status", "--all"]);
+        assert_eq!(cli.command, Some(Command::Status { all: true }));
+    }
+
+    #[test]
+    fn format_status_all_builds_matrix_with_ports_and_cwd_marker() {
+        use devme_tui::worktree::WorktreeReport;
+        let mut backend = svc(
+            "backend",
+            ServiceState::Running { degraded: false, started_without: vec![] },
+        );
+        backend.port = Some(8090);
+        let reports = vec![
+            WorktreeReport {
+                label: "main".into(),
+                path: "/repo".into(),
+                is_cwd: false,
+                slot: Some(0),
+                services: Some(vec![{
+                    let mut b = backend.clone();
+                    b.port = Some(8080);
+                    b
+                }]),
+            },
+            WorktreeReport {
+                label: "feat/foo".into(),
+                path: "/repo-foo".into(),
+                is_cwd: true,
+                slot: Some(1),
+                services: Some(vec![backend]),
+            },
+            WorktreeReport {
+                label: "stale".into(),
+                path: "/repo-stale".into(),
+                is_cwd: false,
+                slot: None,
+                services: None,
+            },
+        ];
+        let out = format_status_all(&reports);
+        assert!(out.contains("WORKTREE") && out.contains("SLOT") && out.contains("backend"));
+        assert!(out.contains("8080") && out.contains("8090"), "ports missing: {out}");
+        assert!(out.contains("* feat/foo"), "cwd marker missing: {out}");
+        assert!(out.contains("(not running)"), "stopped worktree row missing: {out}");
+    }
+
+    #[test]
+    fn service_state_labels_are_compact() {
+        use devme_core::ServiceState as S;
+        assert_eq!(service_state_label(&S::Stopped), "stopped");
+        assert_eq!(
+            service_state_label(&S::Running { degraded: true, started_without: vec![] }),
+            "degraded"
+        );
+        assert_eq!(service_state_label(&S::Failed { exit_code: Some(2) }), "failed(2)");
     }
 
     #[test]
