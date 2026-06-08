@@ -33,6 +33,17 @@ pub struct Service {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
 
+    /// Optional teardown command run when the service is stopped (on
+    /// `devme down` or a single-service stop), before the process is
+    /// signalled. For services whose lifecycle outlives the supervised
+    /// process — e.g. a `docker compose up` whose container is owned by
+    /// `dockerd` — set this to the real teardown (`docker compose down`),
+    /// since SIGTERM/SIGKILL of the `up` client alone leaves the container
+    /// running. Interpolated with `{slot}`, `{port}`, `{worktree}`,
+    /// `{branch}`, and `{port.<service>}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<String>,
+
     /// Environment variables to add to the process's environment.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
@@ -109,6 +120,7 @@ cmd = "uv run manage.py runserver"
 [service.backend]
 cmd = "uv run manage.py runserver 0.0.0.0:{port}"
 cwd = "backend"
+stop = "docker compose down"
 env = { DATABASE_URL = "postgres://localhost/dev", DEBUG = "1" }
 port = { base = 8080, slot_offset = 10 }
 scope = "instance"
@@ -119,6 +131,7 @@ description = "Django dev server"
 "#);
         assert_eq!(s.cmd, "uv run manage.py runserver 0.0.0.0:{port}");
         assert_eq!(s.cwd.as_deref(), Some("backend"));
+        assert_eq!(s.stop.as_deref(), Some("docker compose down"));
         assert_eq!(s.env.get("DATABASE_URL").unwrap(), "postgres://localhost/dev");
         assert_eq!(s.env.get("DEBUG").unwrap(), "1");
         assert_eq!(s.port, Some(PortSpec::SlotOffset { base: 8080, slot_offset: 10 }));

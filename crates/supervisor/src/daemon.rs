@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 
 use crate::health::probe;
-use crate::process::ChildProcess;
+use crate::process::{ChildProcess, process_is_alive, send_sigkill, send_sigterm};
 
 /// Per-service log ring capacity. ~2000 lines is enough to scroll back a
 /// minute or two of moderately chatty output without unbounded memory.
@@ -38,6 +38,11 @@ const RING_CAPACITY: usize = 2000;
 /// flicker for instant-up commands; short enough that the user still sees
 /// the transition.
 const HEALTH_GRACE_MS: u64 = 150;
+
+/// Grace between a graceful SIGTERM and the SIGKILL fallback when a stopping
+/// service ignores SIGTERM. Under `devme down`'s default 10s client wait so it
+/// still observes the resulting Stopped events.
+const STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// How often the health probe re-runs while a service is in `Starting`.
 const PROBE_INTERVAL_MS: u64 = 1000;
@@ -113,7 +118,6 @@ struct ChildRecord {
     pid: u32,
     port: Option<u16>,
     restart_count: u32,
-    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
 }
 
 struct RingBuffer {
@@ -506,6 +510,14 @@ async fn run_event_loop(
     while let Some(event) = internal_rx.recv().await {
         process_event(&mut state, event, &internal_tx);
         if state.shutting_down && state.children.is_empty() {
+            // All children have drained — say goodbye now (not at Shutdown
+            // receipt) so clients render real Stopped events first.
+            state.broadcast(
+                None,
+                ServerMessage::Goodbye {
+                    reason: "shutdown complete".into(),
+                },
+            );
             break;
         }
     }
@@ -729,17 +741,16 @@ fn handle_client_message(
             // Stub for v1 — no probe loop running yet.
         }
         ClientMessage::Shutdown => {
-            // Reply to all clients, kill children. Loop exits once children
-            // map drains.
-            state.broadcast(
-                None,
-                ServerMessage::Goodbye {
-                    reason: "shutdown requested".into(),
-                },
-            );
-            for (name, mut rec) in state.children.drain() {
-                state.intentional_stops.insert(name);
-                let _ = rec.killer.kill();
+            // Gracefully stop every child (run `stop` hooks, then SIGTERM →
+            // SIGKILL). Children stay in the map and drain via ProcessExited;
+            // the loop broadcasts Goodbye and exits once the map empties, so
+            // clients see real per-service Stopped events with real timing.
+            let names: Vec<String> = state.children.keys().cloned().collect();
+            for name in &names {
+                state.intentional_stops.insert(name.clone());
+            }
+            for name in &names {
+                begin_stop(state, name, tx);
             }
             state.shutting_down = true;
         }
@@ -1034,7 +1045,6 @@ fn enact_actions(
                         pid: parts.pid,
                         port,
                         restart_count,
-                        killer: parts.killer,
                     },
                 );
                 state.broadcast(
@@ -1119,9 +1129,7 @@ fn enact_actions(
                 }
             }
             Action::StopService(name) => {
-                if let Some(mut rec) = state.children.remove(&name) {
-                    let _ = rec.killer.kill();
-                }
+                begin_stop(state, &name, tx);
             }
             Action::RunCheck(name) => {
                 let cmd = state
@@ -1225,6 +1233,61 @@ fn interpolate_health(check: &HealthCheck, ctx: &InterpContext) -> HealthCheck {
             shell: resolve(shell),
         },
     }
+}
+
+/// Begin stopping a running service: run its optional `stop` teardown command
+/// (e.g. `docker compose down`, which removes a dockerd-owned container that
+/// SIGKILL of the `up` client would leave running), then signal the process —
+/// SIGTERM, and SIGKILL after [`STOP_GRACE`] if it ignores it. The child is
+/// left in `state.children` and reaped by the normal `ProcessExited` path
+/// (which reports Stopped and, for a restart, relaunches), so a graceful
+/// shutdown keeps the daemon alive until the process actually exits.
+fn begin_stop(state: &DaemonState, name: &str, tx: &mpsc::UnboundedSender<InternalEvent>) {
+    let Some(rec) = state.children.get(name) else {
+        return;
+    };
+    let pid = rec.pid;
+    let port = rec.port;
+    let svc = state.stack.service.get(name);
+    let stop_cmd = svc.and_then(|s| s.stop.clone());
+    // Honor the service's cwd for the stop command, same as spawn.
+    let base_cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let cwd = match svc.and_then(|s| s.cwd.clone()) {
+        Some(rel) => base_cwd.join(rel),
+        None => base_cwd,
+    };
+
+    if let Some(stop_cmd) = stop_cmd {
+        let ctx = state.node_ctx(port);
+        let cmd = interpolate(&stop_cmd, &ctx).unwrap_or(stop_cmd);
+        let label = name.to_string();
+        let txc = tx.clone();
+        tokio::spawn(async move {
+            run_shell_streaming(&cmd, &cwd, &label, &txc).await;
+            graceful_signal(pid).await;
+        });
+    } else {
+        tokio::spawn(async move {
+            graceful_signal(pid).await;
+        });
+    }
+}
+
+/// SIGTERM, then SIGKILL after [`STOP_GRACE`] if the process is still alive.
+/// Polls so a clean exit returns near-instantly. No-op once the pid is gone.
+async fn graceful_signal(pid: u32) {
+    if !process_is_alive(pid) {
+        return;
+    }
+    send_sigterm(pid);
+    let deadline = tokio::time::Instant::now() + STOP_GRACE;
+    while tokio::time::Instant::now() < deadline {
+        if !process_is_alive(pid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    send_sigkill(pid);
 }
 
 /// Run `cmd` under `sh -c`, streaming both stdout and stderr back to the

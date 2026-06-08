@@ -243,6 +243,99 @@ cmd = "while true; do echo INSTANCE-MARKER; sleep 0.2; done"
 }
 
 #[tokio::test]
+async fn stop_hook_runs_on_shutdown_and_process_is_killed() {
+    // A repo service that never exits on its own (`sleep 1000`) with a `stop`
+    // teardown command. On Shutdown the supervisor must run the stop command
+    // (proven by a marker file) and then signal the process dead.
+    let tmp = ShortTmp::new();
+    let runtime = tmp.path().join("runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let cwd = tmp.path().join("repo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let marker = cwd.join("stop-ran");
+
+    std::fs::write(
+        cwd.join("devme.toml"),
+        format!(
+            r#"
+schema_version = 1
+
+[service.db]
+cmd = "sleep 1000"
+scope = "repo"
+stop = "touch {}"
+"#,
+            marker.display()
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(binary_path())
+        .current_dir(&cwd)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let sock = wait_for_shared_socket_or_diag(&runtime, &mut child).await;
+    let mut client = Client::connect(&sock).await.unwrap();
+
+    // Grab the spawned service's pid so we can assert it's gone afterwards.
+    let resp = client
+        .request(ClientMessage::Subscribe { services: vec![] })
+        .await
+        .unwrap();
+    let pid = match resp {
+        ServerMessage::Subscribed { services, .. } => services
+            .iter()
+            .find(|s| s.name == "db")
+            .and_then(|s| s.pid)
+            .expect("db service should have a pid"),
+        other => panic!("expected Subscribed, got {other:?}"),
+    };
+    assert!(!marker.exists(), "stop hook must not have run before shutdown");
+
+    let _ = client.send(ClientMessage::Shutdown).await;
+
+    // The daemon process should exit (its teardown awaits the stop command).
+    let exited = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Ok(Some(_)) = child.try_wait() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(exited.is_ok(), "shared-supervisor did not exit after Shutdown");
+
+    assert!(marker.exists(), "stop hook command did not run on shutdown");
+    // The `sleep 1000` must have been signalled dead, not orphaned.
+    assert!(
+        !pid_alive(pid),
+        "service process {pid} survived shutdown (was not signalled)"
+    );
+
+    let _ = child.kill();
+}
+
+/// Best-effort liveness check via `kill -0` (dependency-free) for the
+/// assertion above. Exit 0 = the process exists.
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[tokio::test]
 async fn second_instance_refuses_to_bind_when_one_is_running() {
     let tmp = ShortTmp::new();
     let runtime = tmp.path().join("runtime");

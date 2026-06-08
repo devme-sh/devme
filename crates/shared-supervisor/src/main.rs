@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use devme_config::{InterpContext, Stack, interpolate};
@@ -27,7 +27,7 @@ use devme_core::{
     Scope,
 };
 use devme_ipc::FrameCodec;
-use devme_supervisor::process::ChildProcess;
+use devme_supervisor::process::{ChildProcess, process_is_alive, send_sigkill, send_sigterm};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -125,6 +125,8 @@ struct ResolvedService {
     name: String,
     cmd: String,
     env: Vec<(String, String)>,
+    /// Interpolated teardown command run on shutdown before signalling.
+    stop: Option<String>,
 }
 
 /// Resolve every `scope = "repo"` service into a spawnable form. Builds one
@@ -173,10 +175,19 @@ fn resolve_repo_services(stack: &Stack, cwd: &std::path::Path) -> Vec<ResolvedSe
                 }
             }
         }
+        // Interpolate the optional teardown command against the same context.
+        let stop = svc.stop.as_ref().and_then(|s| match interpolate(s, &ctx) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(service = %name, error = %e, "stop interpolation failed; dropping stop hook");
+                None
+            }
+        });
         resolved.push(ResolvedService {
             name: name.clone(),
             cmd,
             env,
+            stop,
         });
     }
     resolved
@@ -215,9 +226,17 @@ fn repo_id_short(id: &str) -> &str {
 /// One spawned child + its derived snapshot.
 struct RunningService {
     snapshot: ServiceSnapshot,
-    /// Best-effort killer; held so we can stop the process on Shutdown.
-    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    /// OS pid — teardown signals it directly (SIGTERM then SIGKILL) so it can
+    /// stop gracefully; SIGKILL alone leaves a docker-compose container behind.
+    pid: u32,
+    /// Optional teardown command (e.g. `docker compose down`).
+    stop: Option<String>,
 }
+
+/// Grace period between a graceful SIGTERM and the SIGKILL fallback when a
+/// service ignores SIGTERM. Comfortably under `devme down`'s default 10s
+/// client-side wait so the client still sees the resulting Stopped events.
+const STOP_GRACE: Duration = Duration::from_secs(5);
 
 /// Grace period after the last subscriber disconnects before the shared
 /// daemon tears itself down. Long enough that a cargo-watch restart of the
@@ -240,6 +259,9 @@ struct SharedState {
     subscribers: Arc<std::sync::atomic::AtomicUsize>,
     /// Notifies the serve loop when subscriber count changes.
     sub_notify: Arc<tokio::sync::Notify>,
+    /// Repo root — the cwd used to spawn services and to run their `stop`
+    /// teardown commands on shutdown.
+    cwd: PathBuf,
 }
 
 impl SharedState {
@@ -252,7 +274,7 @@ impl SharedState {
         // Spawn each repo-scoped service. Failures are surfaced as Failed
         // snapshots rather than killing the whole daemon, because partial
         // availability is more useful than nothing at all.
-        for ResolvedService { name, cmd, env } in services {
+        for ResolvedService { name, cmd, env, stop } in services {
             let env_slice: Vec<(&str, &str)> =
                 env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
             match ChildProcess::spawn_parts::<&str>(cmd, cwd, &env_slice) {
@@ -274,7 +296,11 @@ impl SharedState {
                     };
                     services_map.lock().await.insert(
                         name.clone(),
-                        RunningService { snapshot: snapshot.clone(), killer: parts.killer },
+                        RunningService {
+                            snapshot: snapshot.clone(),
+                            pid,
+                            stop: stop.clone(),
+                        },
                     );
                 }
                 Err(e) => {
@@ -289,6 +315,7 @@ impl SharedState {
             shutdown,
             subscribers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             sub_notify: Arc::new(tokio::sync::Notify::new()),
+            cwd: cwd.to_path_buf(),
         })
     }
 
@@ -301,13 +328,66 @@ impl SharedState {
             .collect()
     }
 
+    /// Tear down every repo service. For each: run its `stop` command (e.g.
+    /// `docker compose down`) to completion — this is what actually removes a
+    /// container, since SIGKILL of the `docker compose up` client leaves the
+    /// dockerd-owned container running — then SIGTERM the process, and SIGKILL
+    /// it if it's still alive after a short grace. Services with no `stop`
+    /// command are simply SIGTERM'd (graceful) then SIGKILL'd.
     async fn shutdown_services(&self) {
-        let mut svcs = self.services.lock().await;
-        for (_, r) in svcs.iter_mut() {
-            let _ = r.killer.kill();
+        // Drain the map so each handle is owned here; spawn one teardown task
+        // per service and await them all (bounded by STOP_GRACE).
+        let drained: Vec<(String, RunningService)> = {
+            let mut svcs = self.services.lock().await;
+            svcs.drain().collect()
+        };
+        let cwd = self.cwd.clone();
+        let handles: Vec<_> = drained
+            .into_iter()
+            .map(|(name, rec)| {
+                let cwd = cwd.clone();
+                tokio::spawn(async move { teardown_one(&name, rec, &cwd).await })
+            })
+            .collect();
+        for h in handles {
+            let _ = h.await;
         }
-        svcs.clear();
     }
+}
+
+/// Stop a single repo service: optional `stop` command, then SIGTERM, then
+/// SIGKILL after [`STOP_GRACE`] if it survives.
+async fn teardown_one(name: &str, rec: RunningService, cwd: &std::path::Path) {
+    let pid = rec.pid;
+    if let Some(stop_cmd) = &rec.stop {
+        // Run the teardown command to completion. Its job (e.g. `docker
+        // compose down`) typically also causes the supervised `up` process to
+        // exit on its own.
+        let status = tokio::process::Command::new("sh")
+            .args(["-c", stop_cmd])
+            .current_dir(cwd)
+            .status()
+            .await;
+        if let Err(e) = status {
+            tracing::warn!(service = %name, error = %e, "stop command failed to run");
+        }
+    }
+    // Already gone (the stop command took it down)? Then we're done — no
+    // need to signal or wait out the grace period.
+    if !process_is_alive(pid) {
+        return;
+    }
+    // Graceful signal, then poll up to STOP_GRACE; hard-kill only if it
+    // ignored SIGTERM. Polling keeps a clean shutdown near-instant.
+    send_sigterm(pid);
+    let deadline = tokio::time::Instant::now() + STOP_GRACE;
+    while tokio::time::Instant::now() < deadline {
+        if !process_is_alive(pid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    send_sigkill(pid);
 }
 
 /// Per-spawn task: reads PTY lines and broadcasts them as `LogChunk`s.

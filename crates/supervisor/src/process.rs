@@ -164,6 +164,57 @@ impl ChildProcess {
     }
 }
 
+/// Send SIGTERM to `pid` — a *graceful* stop request the process can trap to
+/// shut down cleanly (flush, remove a docker container, etc.). Best-effort:
+/// signalling a dead pid (ESRCH) or pid 0 is a silent no-op. Unix only; on
+/// other platforms this does nothing and callers fall back to [`ChildProcess::kill`].
+pub fn send_sigterm(pid: u32) {
+    send_signal(pid, libc::SIGTERM);
+}
+
+/// Send SIGKILL to `pid` — the uncatchable hard stop, used as the fallback
+/// after a graceful SIGTERM grace period elapses. Best-effort (see
+/// [`send_sigterm`]).
+pub fn send_sigkill(pid: u32) {
+    send_signal(pid, libc::SIGKILL);
+}
+
+/// Best-effort liveness check for `pid` (unix: `kill(pid, 0)`). Lets a caller
+/// poll for a graceful exit before escalating to SIGKILL, so a clean shutdown
+/// doesn't always burn the full grace period.
+pub fn process_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        if pid == 0 {
+            return false;
+        }
+        // SAFETY: signal 0 performs only the existence/permission check, no
+        // delivery. Returns 0 if alive; EPERM also implies it's alive.
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+#[cfg(unix)]
+fn send_signal(pid: u32, sig: i32) {
+    if pid == 0 {
+        return;
+    }
+    // SAFETY: `kill(2)` with a plain pid and signal number has no memory
+    // effects; an invalid/dead pid just returns ESRCH which we ignore.
+    unsafe {
+        libc::kill(pid as libc::pid_t, sig);
+    }
+}
+
+#[cfg(not(unix))]
+fn send_signal(_pid: u32, _sig: i32) {}
+
 /// Strip CSI escape sequences used for cursor positioning (up/down/column,
 /// erase, save/restore, show/hide cursor) while keeping SGR color sequences
 /// (those ending in `m`). Programs like `docker compose` use cursor movement
