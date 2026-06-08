@@ -141,11 +141,9 @@ fn resolve_repo_services(stack: &Stack, cwd: &std::path::Path) -> Vec<ResolvedSe
         .set("slot", "0")
         .set("worktree", worktree)
         .set("branch", branch);
-    for (name, svc) in &stack.service {
-        if svc.scope == Scope::Repo {
-            if let Some(spec) = svc.port {
-                base.insert(format!("port.{name}"), spec.resolve(0).to_string());
-            }
+    for (name, svc) in stack.service.iter().filter(|(_, s)| s.scope == Scope::Repo) {
+        if let Some(spec) = svc.port {
+            base.insert(format!("port.{name}"), spec.resolve(0).to_string());
         }
     }
 
