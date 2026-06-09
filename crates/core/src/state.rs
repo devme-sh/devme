@@ -37,7 +37,10 @@ impl ServiceState {
     /// True if the process should be considered "up" by an observer.
     /// `Running` and healthy `External` count; everything else doesn't.
     pub fn is_up(&self) -> bool {
-        matches!(self, ServiceState::Running { .. } | ServiceState::External { healthy: true })
+        matches!(
+            self,
+            ServiceState::Running { .. } | ServiceState::External { healthy: true }
+        )
     }
 }
 
@@ -75,13 +78,19 @@ mod tests {
 
     #[test]
     fn service_running_is_up() {
-        let s = ServiceState::Running { degraded: false, started_without: vec![] };
+        let s = ServiceState::Running {
+            degraded: false,
+            started_without: vec![],
+        };
         assert!(s.is_up());
     }
 
     #[test]
     fn service_running_degraded_still_up() {
-        let s = ServiceState::Running { degraded: true, started_without: vec!["proxy".into()] };
+        let s = ServiceState::Running {
+            degraded: true,
+            started_without: vec!["proxy".into()],
+        };
         assert!(s.is_up());
     }
 
@@ -95,7 +104,12 @@ mod tests {
     fn stopped_and_failed_arent_up() {
         assert!(!ServiceState::Stopped.is_up());
         assert!(!ServiceState::Failed { exit_code: Some(1) }.is_up());
-        assert!(!ServiceState::WaitingOnDependency { blocked_by: "db".into() }.is_up());
+        assert!(
+            !ServiceState::WaitingOnDependency {
+                blocked_by: "db".into()
+            }
+            .is_up()
+        );
         assert!(!ServiceState::CrashLoop { restart_count: 5 }.is_up());
     }
 
@@ -118,12 +132,22 @@ mod tests {
         let cases = vec![
             ServiceState::Stopped,
             ServiceState::Starting,
-            ServiceState::Running { degraded: false, started_without: vec![] },
-            ServiceState::Running { degraded: true, started_without: vec!["proxy".into()] },
-            ServiceState::WaitingOnDependency { blocked_by: "db".into() },
+            ServiceState::Running {
+                degraded: false,
+                started_without: vec![],
+            },
+            ServiceState::Running {
+                degraded: true,
+                started_without: vec!["proxy".into()],
+            },
+            ServiceState::WaitingOnDependency {
+                blocked_by: "db".into(),
+            },
             ServiceState::Restarting { attempt: 3 },
             ServiceState::CrashLoop { restart_count: 5 },
-            ServiceState::Failed { exit_code: Some(137) },
+            ServiceState::Failed {
+                exit_code: Some(137),
+            },
             ServiceState::Failed { exit_code: None },
             ServiceState::External { healthy: true },
         ];
@@ -153,7 +177,10 @@ mod tests {
 
     #[test]
     fn service_state_running_serializes_without_empty_started_without() {
-        let s = ServiceState::Running { degraded: false, started_without: vec![] };
+        let s = ServiceState::Running {
+            degraded: false,
+            started_without: vec![],
+        };
         let json = serde_json::to_string(&s).unwrap();
         assert!(!json.contains("started_without"), "got: {json}");
     }

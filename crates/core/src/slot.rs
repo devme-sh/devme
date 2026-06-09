@@ -17,7 +17,11 @@ impl Slot {
 
     /// Construct a slot, returning `None` if the value exceeds `Slot::MAX`.
     pub fn new(value: u8) -> Option<Self> {
-        if value <= Self::MAX { Some(Self(value)) } else { None }
+        if value <= Self::MAX {
+            Some(Self(value))
+        } else {
+            None
+        }
     }
 
     /// The first slot (0). Used by single-worktree projects.

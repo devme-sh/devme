@@ -83,10 +83,17 @@ pub fn pick_choice<W: Write>(
 
     terminal::enable_raw_mode()?;
     let result = loop {
-        if let Ok(Event::Key(KeyEvent { code, modifiers, .. })) = event::read() {
+        if let Ok(Event::Key(KeyEvent {
+            code, modifiers, ..
+        })) = event::read()
+        {
             match code {
                 KeyCode::Up | KeyCode::Char('k') => {
-                    selected = if selected == 0 { num_choices - 1 } else { selected - 1 };
+                    selected = if selected == 0 {
+                        num_choices - 1
+                    } else {
+                        selected - 1
+                    };
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     selected = (selected + 1) % num_choices;

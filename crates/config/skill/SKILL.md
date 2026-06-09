@@ -90,7 +90,7 @@ Rules:
 | `devme worktree add <branch> [path]` | New worktree (+branch), runs `[stack] on_create`, ready for `devme up`. Default path `<repo>-<branch-leaf>` |
 | `devme worktree rm <target>` | Stop stack, run `on_destroy`, `git worktree remove`. Target by path/dir/branch; `-f` forces dirty |
 | `devme config [set <k> <v>] [check]` | Show / set global config; `check` lints `devme.toml` (`--json`, non-zero on errors) |
-| `devme remote [doctor\|status\|conflicts\|sync\|flush\|stop\|wake]` | Live-sync to `remote.host` and run the stack there — see remote note. `doctor` preflights; resolve `conflicts` before changes flow |
+| `devme remote [doctor\|status\|conflicts\|sync\|flush\|stop\|wake]` | Live-sync to `remote.host` and run the stack there — see remote note. `doctor` preflights; resolve `conflicts` before changes flow. `status --watch` (`-w`) refreshes a one-line sync state for a side pane |
 | `devme --local <cmd>` | Force a command against the local daemon, bypassing the remote proxy |
 | `devme skill install [-g]` | (Re)install this skill into `.claude/skills/devme/` (`-g` = `~/.claude/`); embedded, always matches the binary |
 
@@ -98,4 +98,4 @@ Rules:
 
 - **Worktree-aware.** Each git worktree runs its own supervisor, slot, and ports. `up`/`down`/`doctor`/`status`/`logs`/`url` act on the worktree you're in — just call them. `devme down --all` stops every worktree's stack (and the shared services); `devme status --all` shows every worktree's ports; `devme url <svc>` gives a ready link without guessing the slot.
 - **Restart cascades.** Services have dependency ordering; restarting a DB can cascade to dependents.
-- **Remote is remote-primary.** The supervisor, stack, and TUI run on `remote.host`; the laptop syncs files (Mutagen `two-way-safe` — a conflict *halts* the sync). It syncs the **main** worktree only; create worktrees on the host. While a sync is live, daemon commands (`status`, `logs`, `up`, `doctor`, `url`, …) auto-run on the remote — `devme logs api` streams the host's logs, and `devme url` rewrites to a laptop-reachable host. Run `devme remote doctor` before the first attach; if `devme remote status` shows conflicts the sync is halted — fix them first.
+- **Remote is remote-primary.** The supervisor, stack, and TUI run on `remote.host`; the laptop syncs files (Mutagen `two-way-safe` — a conflict *halts* the sync). It syncs the **main** worktree only; create worktrees on the host. While a sync is live, daemon commands (`status`, `logs`, `up`, `doctor`, `url`, …) auto-run on the remote — `devme logs api` streams the host's logs, and `devme url` rewrites to a laptop-reachable host. Run `devme remote doctor` before the first attach; if `devme remote status` shows conflicts the sync is halted — fix them first. While you're attached, `devme remote` watches the sync in the background and desktop-notifies if it halts (you can't see it from the remote TUI), and prints a closing sync summary on detach.

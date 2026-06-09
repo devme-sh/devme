@@ -15,8 +15,8 @@ use std::io::{BufRead, Write};
 use std::net::TcpListener;
 
 use devme_config::docker;
-use devme_core::{PortSpec, Scope};
 use devme_config::{Service, Stack};
+use devme_core::{PortSpec, Scope};
 
 // Shared Clack-style constants (kept in sync with `preflight.rs`).
 const S_BAR: &str = "│";
@@ -90,7 +90,10 @@ fn process_name(pid: u32) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Holder {
     /// A Docker container, with its Compose project (if any).
-    Container { name: String, project: Option<String> },
+    Container {
+        name: String,
+        project: Option<String>,
+    },
     /// One or more host processes (pid, name).
     Process(Vec<(u32, Option<String>)>),
     /// Taken, but we couldn't attribute it to a container or process.
@@ -149,9 +152,10 @@ fn compose_project_in_cmd(cmd: &str) -> Option<String> {
 /// session, intentionally persistent across worktrees (see ADR-0007).
 fn is_own_compose_service(holder: &Holder, cmd: &str) -> bool {
     match holder {
-        Holder::Container { project: Some(proj), .. } => {
-            compose_project_in_cmd(cmd).as_deref() == Some(proj.as_str())
-        }
+        Holder::Container {
+            project: Some(proj),
+            ..
+        } => compose_project_in_cmd(cmd).as_deref() == Some(proj.as_str()),
         _ => false,
     }
 }
@@ -195,7 +199,9 @@ pub fn check_ports<R: BufRead, W: Write>(
     let mut seen = std::collections::HashSet::new();
     let mut conflicts: Vec<Conflict> = Vec::new();
     for (name, svc) in &stack.service {
-        let Some(port) = checkable_port(svc) else { continue };
+        let Some(port) = checkable_port(svc) else {
+            continue;
+        };
         if !seen.insert(port) {
             continue;
         }
@@ -230,7 +236,11 @@ pub fn check_ports<R: BufRead, W: Write>(
 
     let mut unresolved = 0usize;
     for conflict in &conflicts {
-        let Conflict { service, port, holder } = conflict;
+        let Conflict {
+            service,
+            port,
+            holder,
+        } = conflict;
 
         let who = match holder {
             Holder::Container { name, project } => match project {
@@ -310,23 +320,18 @@ pub fn check_ports<R: BufRead, W: Write>(
         choices.push("Skip".to_string());
         actions.push(Act::Skip);
 
-        let picked = crate::prompt::select_one(input, output, &choices, 0)?
-            .unwrap_or(actions.len() - 1); // aborted → Skip (always last)
+        let picked =
+            crate::prompt::select_one(input, output, &choices, 0)?.unwrap_or(actions.len() - 1); // aborted → Skip (always last)
 
         let freed = match &actions[picked] {
             Act::Stop(name) => act(output, "docker stop", docker::stop_container(name)),
-            Act::Down(project) => {
-                act(output, "docker compose down", docker::compose_down(project))
-            }
+            Act::Down(project) => act(output, "docker compose down", docker::compose_down(project)),
             Act::Kill(pids) => {
                 let mut ok = true;
                 for (pid, _) in pids.iter() {
                     if let Err(e) = kill_pid(*pid) {
                         ok = false;
-                        writeln!(
-                            output,
-                            "  {C_DIM}{S_BAR}{C_RESET}    {C_RED}▲ {e}{C_RESET}"
-                        )?;
+                        writeln!(output, "  {C_DIM}{S_BAR}{C_RESET}    {C_RED}▲ {e}{C_RESET}")?;
                     }
                 }
                 if ok {
@@ -567,7 +572,10 @@ port = {{ fixed = {port} }}
             "docker compose -p some-other-project up db"
         ));
         // Service doesn't manage Compose at all → not ours.
-        assert!(!is_own_compose_service(&holder, "cloud-sql-proxy --port 15432"));
+        assert!(!is_own_compose_service(
+            &holder,
+            "cloud-sql-proxy --port 15432"
+        ));
         // Host-process holders are never adopted.
         assert!(!is_own_compose_service(
             &Holder::Process(vec![(123, Some("postgres".to_string()))]),

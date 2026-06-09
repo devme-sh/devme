@@ -289,6 +289,102 @@ pub fn rewrite_url_host(url: &str, url_host: &str) -> String {
         .replace("//127.0.0.1:", &format!("//{url_host}:"))
 }
 
+// --- live-sync health (laptop-side watcher) ---------------------------------
+
+/// Coarse health of a live sync, derived from Mutagen's status string + its
+/// conflict count — only the distinctions worth *telling the user* about,
+/// collapsing Mutagen's many internal states. Drives the background watcher
+/// that runs alongside an attached `devme remote` session and the
+/// `devme remote status --watch` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncHealth {
+    /// Scanning / watching / staging / applying / idle — nothing wrong.
+    Healthy,
+    /// One or more conflicts → two-way-safe halts. The actionable state: your
+    /// edits stop flowing until it's resolved.
+    Conflict,
+    /// Session gone, halted, errored, or an endpoint disconnected.
+    Down,
+}
+
+/// Classify a sync observation into a [`SyncHealth`]. `exists` is whether the
+/// session is still present at all; `status` is Mutagen's status string (None
+/// when the session is gone or the status couldn't be read); `conflicts` is
+/// its conflict count. Conflicts dominate — a halted-on-conflict sync is the
+/// #1 failure mode and the whole reason this watcher exists.
+pub fn classify_sync(exists: bool, status: Option<&str>, conflicts: u64) -> SyncHealth {
+    if !exists {
+        return SyncHealth::Down;
+    }
+    if conflicts > 0 {
+        return SyncHealth::Conflict;
+    }
+    match status {
+        // Session is present but its status couldn't be read (an unexpected
+        // Mutagen version) — assume healthy rather than cry wolf; a real
+        // conflict still shows up via the count above.
+        None => SyncHealth::Healthy,
+        Some(s) => {
+            let low = s.to_ascii_lowercase();
+            if low.contains("halt")
+                || low.contains("error")
+                || low.contains("disconnect")
+                || low.contains("problem")
+            {
+                SyncHealth::Down
+            } else {
+                SyncHealth::Healthy
+            }
+        }
+    }
+}
+
+/// What the watcher should announce when health moves `from` → `to` (edge-
+/// triggered). `None` means stay quiet: no change, or a change not worth a
+/// notification (notably a *healthy* first observation — we don't pop a banner
+/// just because the sync started fine). Passing `from: None` with a problem
+/// `to` yields the problem message, so it doubles as the "remind once" text.
+pub fn sync_transition_message(
+    from: Option<SyncHealth>,
+    to: SyncHealth,
+    conflicts: u64,
+) -> Option<String> {
+    if from == Some(to) {
+        return None;
+    }
+    match to {
+        SyncHealth::Conflict => Some(format!(
+            "⚠ {conflicts} sync conflict(s) — two-way-safe sync HALTED; \
+             your edits aren't flowing. Resolve: devme remote conflicts"
+        )),
+        SyncHealth::Down => {
+            Some("⚠ live-sync is down (halted / disconnected). Check: devme remote status".into())
+        }
+        // Only celebrate recovery if we were previously *in* a problem — not on
+        // a healthy cold start (from == None).
+        SyncHealth::Healthy => from.map(|_| "✓ live-sync healthy again".to_string()),
+    }
+}
+
+/// A compact one-line status for `devme remote status --watch` and the
+/// post-detach summary. `status` is Mutagen's raw status string, folded in
+/// when healthy for a little extra context ("✓ synced · Watching for changes").
+pub fn sync_status_line(health: SyncHealth, conflicts: u64, status: Option<&str>) -> String {
+    match health {
+        SyncHealth::Conflict => {
+            format!("⚠ {conflicts} conflict(s) — HALTED · resolve: devme remote conflicts")
+        }
+        SyncHealth::Down => match status {
+            Some(s) if !s.is_empty() => format!("⚠ sync down · {s}"),
+            _ => "⚠ sync down (halted / disconnected)".to_string(),
+        },
+        SyncHealth::Healthy => match status {
+            Some(s) if !s.is_empty() => format!("✓ synced · {s}"),
+            _ => "✓ synced".to_string(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +538,50 @@ mod tests {
         assert!(cfg.is_default());
         assert!(!cfg.is_empty());
         assert!(!RemoteConfig::default().is_default());
+    }
+
+    #[test]
+    fn classify_sync_prioritises_conflicts_then_down_then_healthy() {
+        use SyncHealth::*;
+        // A terminated/absent session is Down regardless of the rest.
+        assert_eq!(classify_sync(false, None, 0), Down);
+        // Conflicts dominate even a "Watching" status.
+        assert_eq!(classify_sync(true, Some("Watching for changes"), 3), Conflict);
+        // Problem words in the status → Down.
+        assert_eq!(classify_sync(true, Some("Halted on root emptied"), 0), Down);
+        assert_eq!(classify_sync(true, Some("Connection error"), 0), Down);
+        // Normal working states are Healthy.
+        assert_eq!(classify_sync(true, Some("Watching for changes"), 0), Healthy);
+        assert_eq!(classify_sync(true, Some("Staging files on beta"), 0), Healthy);
+        // Present but unreadable status → assume Healthy (don't cry wolf).
+        assert_eq!(classify_sync(true, None, 0), Healthy);
+    }
+
+    #[test]
+    fn sync_transition_is_edge_triggered() {
+        use SyncHealth::*;
+        // No change → silent.
+        assert_eq!(sync_transition_message(Some(Healthy), Healthy, 0), None);
+        // Healthy cold start → silent (no banner just for starting fine).
+        assert_eq!(sync_transition_message(None, Healthy, 0), None);
+        // Entering a conflict announces, with the count.
+        let m = sync_transition_message(Some(Healthy), Conflict, 2).unwrap();
+        assert!(m.contains("2 sync conflict") && m.contains("HALTED"), "{m}");
+        // From a cold start straight into a problem still announces (reused as
+        // the "remind once" text).
+        assert!(sync_transition_message(None, Conflict, 1).is_some());
+        assert!(sync_transition_message(None, Down, 0).is_some());
+        // Recovery is celebrated only when we were previously in a problem.
+        assert!(sync_transition_message(Some(Conflict), Healthy, 0).is_some());
+        assert_eq!(sync_transition_message(None, Healthy, 0), None);
+    }
+
+    #[test]
+    fn sync_status_line_is_glanceable() {
+        use SyncHealth::*;
+        assert!(sync_status_line(Conflict, 3, None).contains("3 conflict"));
+        assert!(sync_status_line(Down, 0, Some("Halted")).contains("Halted"));
+        assert!(sync_status_line(Healthy, 0, Some("Watching for changes")).starts_with("✓ synced"));
+        assert_eq!(sync_status_line(Healthy, 0, None), "✓ synced");
     }
 }

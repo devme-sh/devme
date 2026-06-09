@@ -123,10 +123,22 @@ pub struct MouseNote {
 /// before it reaches us). `v` copy mode is the companion for clean multi-line
 /// selection.
 pub const MOUSE_NOTES: &[MouseNote] = &[
-    MouseNote { label: "click", desc: "select stack / service tab" },
-    MouseNote { label: "wheel", desc: "scroll logs (over tab row: scroll tabs)" },
-    MouseNote { label: "drag bar", desc: "scrollbar → jump to position" },
-    MouseNote { label: "shift+drag", desc: "select text (v = clean multi-line)" },
+    MouseNote {
+        label: "click",
+        desc: "select stack / service tab",
+    },
+    MouseNote {
+        label: "wheel",
+        desc: "scroll logs (over tab row: scroll tabs)",
+    },
+    MouseNote {
+        label: "drag bar",
+        desc: "scrollbar → jump to position",
+    },
+    MouseNote {
+        label: "shift+drag",
+        desc: "select text (v = clean multi-line)",
+    },
 ];
 
 /// The source of truth for the help overlay. Every [`Action`] must appear in
@@ -138,14 +150,20 @@ pub const BINDINGS: &[Binding] = &[
         desc: "service tab",
         section: Section::Navigation,
         actions: &[Action::PrevService, Action::NextService],
-        footer: Some(FooterHint { keys: "hl", label: "svc" }),
+        footer: Some(FooterHint {
+            keys: "hl",
+            label: "svc",
+        }),
     },
     Binding {
         keys: "↑↓ / jk",
         desc: "stack",
         section: Section::Navigation,
         actions: &[Action::PrevStack, Action::NextStack],
-        footer: Some(FooterHint { keys: "jk", label: "stack" }),
+        footer: Some(FooterHint {
+            keys: "jk",
+            label: "stack",
+        }),
     },
     Binding {
         keys: "`",
@@ -221,14 +239,20 @@ pub const BINDINGS: &[Binding] = &[
             Action::StopService,
             Action::RestartService,
         ],
-        footer: Some(FooterHint { keys: "S/s/r", label: "start/stop/restart" }),
+        footer: Some(FooterHint {
+            keys: "S/s/r",
+            label: "start/stop/restart",
+        }),
     },
     Binding {
         keys: "o / c",
         desc: "open / copy service URL",
         section: Section::ServiceActions,
         actions: &[Action::OpenUrl, Action::CopyUrl],
-        footer: Some(FooterHint { keys: "o", label: "open" }),
+        footer: Some(FooterHint {
+            keys: "o",
+            label: "open",
+        }),
     },
     // session
     Binding {
@@ -271,14 +295,20 @@ pub const BINDINGS: &[Binding] = &[
         desc: "quit: stop all, detach, or cancel",
         section: Section::Session,
         actions: &[Action::Quit],
-        footer: Some(FooterHint { keys: "q", label: "quit" }),
+        footer: Some(FooterHint {
+            keys: "q",
+            label: "quit",
+        }),
     },
     Binding {
         keys: "?",
         desc: "toggle this overlay",
         section: Section::Session,
         actions: &[Action::ToggleHelp],
-        footer: Some(FooterHint { keys: "?", label: "help" }),
+        footer: Some(FooterHint {
+            keys: "?",
+            label: "help",
+        }),
     },
 ];
 
@@ -461,7 +491,10 @@ mod tests {
             }
         }
         for &action in ALL_ACTIONS {
-            assert!(seen.contains(&action), "{action:?} is not reachable from resolve");
+            assert!(
+                seen.contains(&action),
+                "{action:?} is not reachable from resolve"
+            );
         }
     }
 }

@@ -76,7 +76,10 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     } else {
         let outer = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(state.sidebar_width()), Constraint::Min(0)])
+            .constraints([
+                Constraint::Length(state.sidebar_width()),
+                Constraint::Min(0),
+            ])
             .split(vertical[0]);
         render_sidebar(frame, outer[0], state);
         // The main pane's left border (first column of outer[1]) is the visual
@@ -136,7 +139,12 @@ fn render_stack_info_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState
     let h = (info.fields.len() as u16 + 4).min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let modal = Rect { x, y, width: w, height: h };
+    let modal = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
 
     frame.render_widget(Clear, modal);
     let block = Block::default()
@@ -177,13 +185,21 @@ fn render_stack_info_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState
         let marker = if selected { "▸ " } else { "  " };
         let spans = vec![
             Span::styled(marker, Style::default().fg(p.accent)),
-            Span::styled(format!("{:<width$}", field.label, width = label_w), label_style),
+            Span::styled(
+                format!("{:<width$}", field.label, width = label_w),
+                label_style,
+            ),
             Span::raw("  "),
             Span::styled(field.value.clone(), value_style),
         ];
         render_filled(
             frame,
-            Rect { x: inner.x, y: row, width: inner.width, height: 1 },
+            Rect {
+                x: inner.x,
+                y: row,
+                width: inner.width,
+                height: 1,
+            },
             Line::from(spans),
             fill,
         );
@@ -193,18 +209,35 @@ fn render_stack_info_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState
     // Footer hint, pinned to the last row.
     if bottom > inner.y {
         let hint = Line::from(vec![
-            Span::styled(" ↑↓ ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " ↑↓ ",
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            ),
             Span::styled("move  ", Style::default().fg(p.overlay0)),
-            Span::styled("c/⏎ ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "c/⏎ ",
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            ),
             Span::styled("copy  ", Style::default().fg(p.overlay0)),
-            Span::styled("b/w ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "b/w ",
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            ),
             Span::styled("branch/path  ", Style::default().fg(p.overlay0)),
-            Span::styled("esc ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "esc ",
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            ),
             Span::styled("close", Style::default().fg(p.overlay0)),
         ]);
         frame.render_widget(
             Paragraph::new(hint),
-            Rect { x: inner.x, y: bottom - 1, width: inner.width, height: 1 },
+            Rect {
+                x: inner.x,
+                y: bottom - 1,
+                width: inner.width,
+                height: 1,
+            },
         );
     }
 }
@@ -222,7 +255,12 @@ fn render_notifications_overlay(frame: &mut Frame<'_>, area: Rect, state: &mut T
     let h = 18u16.min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let modal = Rect { x, y, width: w, height: h };
+    let modal = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
 
     frame.render_widget(Clear, modal);
     let block = Block::default()
@@ -255,7 +293,11 @@ fn render_notifications_overlay(frame: &mut Frame<'_>, area: Rect, state: &mut T
     // scroll window derived from the cursor so the selection is always visible.
     let list_rows = (inner.height.saturating_sub(1) as usize).max(1);
     let cursor = state.notif_cursor().min(len - 1);
-    let offset = if cursor < list_rows { 0 } else { cursor - list_rows + 1 };
+    let offset = if cursor < list_rows {
+        0
+    } else {
+        cursor - list_rows + 1
+    };
 
     // Build owned rows (`(line, display_index, selected)`) in one immutable
     // borrow of the history, so the borrow ends before we push click regions.
@@ -277,8 +319,8 @@ fn render_notifications_overlay(frame: &mut Frame<'_>, area: Rect, state: &mut T
                 };
                 let age = toast.age_label();
                 let title = theme::truncate(&toast.title, 12);
-                let body_budget =
-                    body_budget_base.saturating_sub(title.chars().count() + age.chars().count() + 5);
+                let body_budget = body_budget_base
+                    .saturating_sub(title.chars().count() + age.chars().count() + 5);
                 let title_style = Style::default().fg(p.text).add_modifier(Modifier::BOLD);
                 let line = Line::from(vec![
                     Span::styled("● ", Style::default().fg(dot_color)),
@@ -298,7 +340,12 @@ fn render_notifications_overlay(frame: &mut Frame<'_>, area: Rect, state: &mut T
     // and register it as a click-to-copy target.
     for (i, (line, d, selected)) in rows.into_iter().enumerate() {
         let ry = inner.y + i as u16;
-        let row = Rect { x: inner.x, y: ry, width: inner.width, height: 1 };
+        let row = Rect {
+            x: inner.x,
+            y: ry,
+            width: inner.width,
+            height: 1,
+        };
         let para = if selected {
             Paragraph::new(line).style(Style::default().bg(p.surface0))
         } else {
@@ -310,15 +357,22 @@ fn render_notifications_overlay(frame: &mut Frame<'_>, area: Rect, state: &mut T
 
     // Footer: cursor position + the keys this modal owns.
     let footer = Line::from(vec![Span::styled(
-        format!(" {} of {}   j/k select · c copy · Y all · n/esc close", cursor + 1, len),
+        format!(
+            " {} of {}   j/k select · c copy · Y all · n/esc close",
+            cursor + 1,
+            len
+        ),
         Style::default().fg(p.overlay0),
     )]);
     frame.render_widget(
         Paragraph::new(footer),
-        Rect { y: inner.y + inner.height - 1, height: 1, ..inner },
+        Rect {
+            y: inner.y + inner.height - 1,
+            height: 1,
+            ..inner
+        },
     );
 }
-
 
 /// Stack of auto-expiring toasts in the top-right of the main pane.
 fn render_toasts(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -339,7 +393,12 @@ fn render_toasts(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             break;
         }
         y -= 3;
-        let rect = Rect { x, y, width, height: 3 };
+        let rect = Rect {
+            x,
+            y,
+            width,
+            height: 3,
+        };
         let dot_color = match toast.kind {
             ToastKind::Failed => p.red,
             ToastKind::Ready => p.green,
@@ -357,7 +416,10 @@ fn render_toasts(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         let body_budget = (inner.width as usize).saturating_sub(title.chars().count() + 3);
         let line = Line::from(vec![
             Span::styled("● ", Style::default().fg(dot_color)),
-            Span::styled(title, Style::default().fg(p.text).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                title,
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 format!(" {}", theme::truncate(&toast.body, body_budget)),
                 Style::default().fg(p.subtext0),
@@ -376,7 +438,12 @@ fn render_skill_dialog(frame: &mut Frame<'_>, area: Rect, dlg: &crate::state::Sk
     let h = 9u16.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let modal = Rect { x, y, width: w, height: h };
+    let modal = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
 
     frame.render_widget(Clear, modal);
 
@@ -401,7 +468,9 @@ fn render_skill_dialog(frame: &mut Frame<'_>, area: Rect, dlg: &crate::state::Sk
     let key = |k: &'static str| {
         Span::styled(
             format!(" {k} "),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )
     };
     let desc = |d: String| Span::styled(d, Style::default().fg(Color::Gray));
@@ -414,8 +483,14 @@ fn render_skill_dialog(frame: &mut Frame<'_>, area: Rect, dlg: &crate::state::Sk
             )),
             Line::from(desc("to drive it. Install it for this repo?".into())),
             Line::default(),
-            Line::from(vec![key("i"), desc(" install (.claude/skills/devme)".into())]),
-            Line::from(vec![key("g"), desc(" install globally (~/.claude/...)".into())]),
+            Line::from(vec![
+                key("i"),
+                desc(" install (.claude/skills/devme)".into()),
+            ]),
+            Line::from(vec![
+                key("g"),
+                desc(" install globally (~/.claude/...)".into()),
+            ]),
             Line::from(vec![key("n"), dim(" not now")]),
         ],
         SkillPrompt::Update => {
@@ -432,7 +507,10 @@ fn render_skill_dialog(frame: &mut Frame<'_>, area: Rect, dlg: &crate::state::Sk
                 Line::from(desc(format!("Refresh {where_} from this binary?"))),
                 Line::default(),
                 Line::from(vec![key("u"), desc(" update now".into())]),
-                Line::from(vec![key("a"), desc(" always (auto-update from now on)".into())]),
+                Line::from(vec![
+                    key("a"),
+                    desc(" always (auto-update from now on)".into()),
+                ]),
                 Line::from(vec![key("n"), dim(" not now")]),
             ]
         }
@@ -453,7 +531,12 @@ fn render_port_conflict_dialog(
     let h = (7 + n).min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let modal = Rect { x, y, width: w, height: h };
+    let modal = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
 
     frame.render_widget(Clear, modal);
 
@@ -478,7 +561,9 @@ fn render_port_conflict_dialog(
             desc(format!("{} couldn't bind port ", dlg.service)),
             Span::styled(
                 dlg.port.to_string(),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(desc(format!("held by {}", dlg.holder_desc))),
@@ -490,7 +575,9 @@ fn render_port_conflict_dialog(
             (
                 "●",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             )
         } else {
             (
@@ -521,7 +608,11 @@ fn render_copy_mode(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
         .split(area);
     let header_area = layout[0];
     let log_area = layout[1];
@@ -535,10 +626,7 @@ fn render_copy_mode(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            format!(" {title} "),
-            Style::default().fg(Color::White),
-        ),
+        Span::styled(format!(" {title} "), Style::default().fg(Color::White)),
         Span::styled(
             "— select text with mouse ",
             Style::default().fg(Color::DarkGray),
@@ -547,7 +635,9 @@ fn render_copy_mode(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
     frame.render_widget(header, header_area);
 
     let dim = Style::default().fg(Color::DarkGray);
-    let key = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let key = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let footer = Paragraph::new(Line::from(vec![
         Span::styled(" y ", key),
         Span::styled("copy visible  ", dim),
@@ -593,7 +683,11 @@ fn render_zoom(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
     let p = *state.palette();
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
         .split(area);
 
     let (name, svc_state) = match state.selected_service() {
@@ -603,14 +697,22 @@ fn render_zoom(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
     let mut header = vec![
         Span::styled(
             " ⛶ zoom ",
-            Style::default().fg(p.panel_bg).bg(p.mauve).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(p.panel_bg)
+                .bg(p.mauve)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!(" {name} "), Style::default().fg(p.text).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(" {name} "),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ),
     ];
     if let Some(st) = &svc_state {
         header.push(Span::styled(
             state_label(st),
-            Style::default().fg(service_color(&p, st)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(service_color(&p, st))
+                .add_modifier(Modifier::BOLD),
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(header)), layout[0]);
@@ -652,7 +754,12 @@ fn render_stopped(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
     let h = 16u16.min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let card = Rect { x, y, width: w, height: h };
+    let card = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
 
     frame.render_widget(Clear, card);
     let block = Block::default()
@@ -684,7 +791,11 @@ fn render_stopped(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
     // the `u`/`q` chips, since the labels differ in width. Pad every label to
     // the widest so the rows share a width — and thus a common left edge.
     let hints: [(&str, &str); 2] = [("u", "start the stack again"), ("q", "quit devme")];
-    let label_w = hints.iter().map(|(_, l)| l.chars().count()).max().unwrap_or(0);
+    let label_w = hints
+        .iter()
+        .map(|(_, l)| l.chars().count())
+        .max()
+        .unwrap_or(0);
 
     // A small framed power badge — a deliberate "off" mark, not an error.
     let lines: Vec<Line> = vec![
@@ -692,7 +803,10 @@ fn render_stopped(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
         Line::from(Span::styled("╭─────╮", badge)),
         Line::from(vec![
             Span::styled("│  ", badge),
-            Span::styled("⏻", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "⏻",
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            ),
             Span::styled("  │", badge),
         ]),
         Line::from(Span::styled("╰─────╯", badge)),
@@ -712,7 +826,10 @@ fn render_stopped(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
         Paragraph::new(lines)
             .alignment(ratatui::layout::Alignment::Center)
             .wrap(Wrap { trim: true }),
-        Rect { height: head_lines.min(inner.height), ..inner },
+        Rect {
+            height: head_lines.min(inner.height),
+            ..inner
+        },
     );
 
     // The hint rows as a left-aligned block, centred as a unit. Block width =
@@ -726,11 +843,19 @@ fn render_stopped(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
         }
         let row = Line::from(vec![
             chip(k),
-            Span::styled(format!("  {label:<label_w$}"), Style::default().fg(p.subtext0)),
+            Span::styled(
+                format!("  {label:<label_w$}"),
+                Style::default().fg(p.subtext0),
+            ),
         ]);
         frame.render_widget(
             Paragraph::new(row),
-            Rect { x: hint_x, y: hint_y, width: block_w.min(inner.width), height: 1 },
+            Rect {
+                x: hint_x,
+                y: hint_y,
+                width: block_w.min(inner.width),
+                height: 1,
+            },
         );
         hint_y += 1;
     }
@@ -748,13 +873,21 @@ fn render_quit_confirm(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let h = 7u16.min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let modal = Rect { x, y, width: w, height: h };
+    let modal = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
 
     frame.render_widget(Clear, modal);
     let block = Block::default()
         .title(Span::styled(
             " quit ",
-            Style::default().fg(p.panel_bg).bg(p.red).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(p.panel_bg)
+                .bg(p.red)
+                .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -765,7 +898,10 @@ fn render_quit_confirm(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
     let bold = |c| Style::default().fg(c).add_modifier(Modifier::BOLD);
     let lines = vec![
-        Line::from(Span::styled("Quit the TUI — and the services?", Style::default().fg(p.text))),
+        Line::from(Span::styled(
+            "Quit the TUI — and the services?",
+            Style::default().fg(p.text),
+        )),
         Line::default(),
         Line::from(vec![
             Span::styled(" q ", bold(p.red)),
@@ -773,7 +909,10 @@ fn render_quit_confirm(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         ]),
         Line::from(vec![
             Span::styled(" d ", bold(p.accent)),
-            Span::styled("detach — leave services running", Style::default().fg(p.overlay0)),
+            Span::styled(
+                "detach — leave services running",
+                Style::default().fg(p.overlay0),
+            ),
         ]),
         Line::from(vec![
             Span::styled(" Esc ", bold(p.accent)),
@@ -794,19 +933,30 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let dim = Style::default().fg(p.overlay0);
     let key = Style::default().fg(p.accent).add_modifier(Modifier::BOLD);
 
-    let stack = if state.shared_selected() { "shared" } else { state.instance_label() };
-    let svc = state.selected_service().map(|s| s.name.as_str()).unwrap_or("—");
+    let stack = if state.shared_selected() {
+        "shared"
+    } else {
+        state.instance_label()
+    };
+    let svc = state
+        .selected_service()
+        .map(|s| s.name.as_str())
+        .unwrap_or("—");
     let breadcrumb = format!(" {stack} › {svc} ");
-    let left = Paragraph::new(Line::from(vec![
-        Span::styled(breadcrumb, Style::default().fg(p.text).add_modifier(Modifier::BOLD)),
-    ]));
+    let left = Paragraph::new(Line::from(vec![Span::styled(
+        breadcrumb,
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+    )]));
 
     let centre_line = if state.show_skill_hint() {
         Line::from(vec![
             Span::styled("hint: ", Style::default().fg(Color::DarkGray)),
             Span::styled("devme skill install", Style::default().fg(Color::Yellow)),
             Span::styled("  (suppress: ", Style::default().fg(Color::DarkGray)),
-            Span::styled("devme config set hints.skills false", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "devme config set hints.skills false",
+                Style::default().fg(Color::DarkGray),
+            ),
             Span::styled(")", Style::default().fg(Color::DarkGray)),
         ])
     } else {
@@ -814,14 +964,17 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         // in declaration order, so the bar can't drift from the bindings.
         let mut spans = Vec::new();
         for (i, hint) in keymap::footer_hints().enumerate() {
-            let sep = if i + 1 < keymap::footer_hints().count() { "  " } else { "" };
+            let sep = if i + 1 < keymap::footer_hints().count() {
+                "  "
+            } else {
+                ""
+            };
             spans.push(Span::styled(format!("{} ", hint.keys), key));
             spans.push(Span::styled(format!("{}{sep}", hint.label), dim));
         }
         Line::from(spans)
     };
-    let centre = Paragraph::new(centre_line)
-        .alignment(ratatui::layout::Alignment::Center);
+    let centre = Paragraph::new(centre_line).alignment(ratatui::layout::Alignment::Center);
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -835,7 +988,9 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
     let key = |k: &str| {
         Span::styled(
             format!(" {k:<13}"),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )
     };
     let desc = |d: &str| Span::styled(d.to_string(), Style::default().fg(Color::Gray));
@@ -879,7 +1034,12 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
     let h = (lines.len() as u16 + 2).min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let modal = Rect { x, y, width: w, height: h };
+    let modal = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
 
     // Clear erases anything behind the modal so the overlay text isn't
     // tangled with the layout underneath.
@@ -907,7 +1067,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
 /// and applied live. Mirrors herdr's settings screen, scaled to devme's
 /// handful of keys (so a flat list rather than tabbed sections).
 fn render_settings_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    use crate::state::{SettingControl, SETTINGS};
+    use crate::state::{SETTINGS, SettingControl};
     let Some(settings) = state.settings() else {
         return;
     };
@@ -918,7 +1078,12 @@ fn render_settings_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState) 
     let h = (SETTINGS.len() as u16 * 2 + 5).min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let modal = Rect { x, y, width: w, height: h };
+    let modal = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
 
     frame.render_widget(Clear, modal);
     let block = Block::default()
@@ -943,7 +1108,11 @@ fn render_settings_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState) 
             break;
         }
         let selected = i == settings.cursor;
-        let value = settings.values.get(i).map(String::as_str).unwrap_or(def.default);
+        let value = settings
+            .values
+            .get(i)
+            .map(String::as_str)
+            .unwrap_or(def.default);
         let fill = selected.then(|| Style::default().bg(p.surface0));
 
         // Row 1: label on the left, control value on the right.
@@ -961,17 +1130,30 @@ fn render_settings_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState) 
             }
             SettingControl::Choice(_) => vec![
                 Span::styled("‹ ", Style::default().fg(p.overlay0)),
-                Span::styled(value.to_string(), Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    value.to_string(),
+                    Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(" ›", Style::default().fg(p.overlay0)),
             ],
         };
         let control_w: usize = control.iter().map(|s| s.content.chars().count()).sum();
         let label = Span::styled(format!(" {}", def.label), label_style);
-        let pad = (inner.width as usize)
-            .saturating_sub(1 + def.label.chars().count() + control_w + 1);
+        let pad =
+            (inner.width as usize).saturating_sub(1 + def.label.chars().count() + control_w + 1);
         let mut spans = vec![label, Span::raw(" ".repeat(pad))];
         spans.extend(control);
-        render_filled(frame, Rect { x: inner.x, y: row, width: inner.width, height: 1 }, Line::from(spans), fill);
+        render_filled(
+            frame,
+            Rect {
+                x: inner.x,
+                y: row,
+                width: inner.width,
+                height: 1,
+            },
+            Line::from(spans),
+            fill,
+        );
         row += 1;
 
         // Row 2: description.
@@ -979,23 +1161,47 @@ fn render_settings_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState) 
             format!("   {}", def.desc),
             Style::default().fg(p.overlay0),
         ));
-        render_filled(frame, Rect { x: inner.x, y: row, width: inner.width, height: 1 }, desc, fill);
+        render_filled(
+            frame,
+            Rect {
+                x: inner.x,
+                y: row,
+                width: inner.width,
+                height: 1,
+            },
+            desc,
+            fill,
+        );
         row += 1;
     }
 
     // Footer hint, pinned to the last row.
     if bottom > inner.y {
         let hint = Line::from(vec![
-            Span::styled(" ↑↓ ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " ↑↓ ",
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            ),
             Span::styled("move  ", Style::default().fg(p.overlay0)),
-            Span::styled("←→/space ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "←→/space ",
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            ),
             Span::styled("change  ", Style::default().fg(p.overlay0)),
-            Span::styled("esc ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "esc ",
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            ),
             Span::styled("close", Style::default().fg(p.overlay0)),
         ]);
         frame.render_widget(
             Paragraph::new(hint),
-            Rect { x: inner.x, y: bottom - 1, width: inner.width, height: 1 },
+            Rect {
+                x: inner.x,
+                y: bottom - 1,
+                width: inner.width,
+                height: 1,
+            },
         );
     }
 }
@@ -1017,7 +1223,10 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let content = Rect { width: area.width - 1, ..area };
+    let content = Rect {
+        width: area.width - 1,
+        ..area
+    };
 
     // Tools section = divider row + header row + one row per step. It claims
     // a fixed slice off the bottom; stacks take the rest.
@@ -1073,9 +1282,15 @@ fn render_stacks_header_remote(p: &Palette, frame: &mut Frame<'_>, area: Rect, h
     let left = " stacks";
     let pad = width.saturating_sub(left.chars().count() + badge.chars().count());
     let line = Line::from(vec![
-        Span::styled(left, Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            left,
+            Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" ".repeat(pad)),
-        Span::styled(badge, Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            badge,
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        ),
     ]);
     frame.render_widget(Paragraph::new(line), Rect { height: 1, ..area });
 }
@@ -1133,11 +1348,24 @@ fn render_stack_row(
         Span::styled(theme::truncate(name, max_name), name_style),
     ]);
     let fill = selected.then(|| Style::default().bg(p.surface0));
-    render_filled(frame, Rect { y: area.y, height: 1, ..area }, name_line, fill);
+    render_filled(
+        frame,
+        Rect {
+            y: area.y,
+            height: 1,
+            ..area
+        },
+        name_line,
+        fill,
+    );
     if area.height > 1 && !secondary.is_empty() {
         render_filled(
             frame,
-            Rect { y: area.y + 1, height: 1, ..area },
+            Rect {
+                y: area.y + 1,
+                height: 1,
+                ..area
+            },
             Line::from(secondary),
             fill,
         );
@@ -1157,7 +1385,10 @@ fn stack_secondary(p: &Palette, state: &TuiState, i: usize) -> Vec<Span<'static>
             } else {
                 p.overlay0
             };
-            spans.push(Span::styled(format!("{up}/{total} up"), Style::default().fg(color)));
+            spans.push(Span::styled(
+                format!("{up}/{total} up"),
+                Style::default().fg(color),
+            ));
         }
         StackSummary::SharedOnly => {
             spans.push(Span::styled("shared only", Style::default().fg(p.overlay0)));
@@ -1175,10 +1406,16 @@ fn stack_secondary(p: &Palette, state: &TuiState, i: usize) -> Vec<Span<'static>
     }
     if let Some((ahead, behind)) = state.instance_ahead_behind(i) {
         if ahead > 0 {
-            spans.push(Span::styled(format!(" ↑{ahead}"), Style::default().fg(p.green)));
+            spans.push(Span::styled(
+                format!(" ↑{ahead}"),
+                Style::default().fg(p.green),
+            ));
         }
         if behind > 0 {
-            spans.push(Span::styled(format!(" ↓{behind}"), Style::default().fg(p.peach)));
+            spans.push(Span::styled(
+                format!(" ↓{behind}"),
+                Style::default().fg(p.peach),
+            ));
         }
     }
     spans
@@ -1226,20 +1463,38 @@ fn render_stacks_pane(p: &Palette, frame: &mut Frame<'_>, area: Rect, state: &mu
         let dot = health_dot(p, state.instance_health(i));
         let label = label.to_string();
         let secondary = stack_secondary(p, state, i);
-        render_stack_row(p, frame, Rect { y, height: 2, ..area }, dot, &label, secondary, is_selected);
+        render_stack_row(
+            p,
+            frame,
+            Rect {
+                y,
+                height: 2,
+                ..area
+            },
+            dot,
+            &label,
+            secondary,
+            is_selected,
+        );
         regions.push((y, ClickTarget::Stack(i)));
         y += 2;
     }
 
     // "▾ N more" hint when the list overflows the pane.
-    let shown = (scroll..total).take(((stack_bottom - content_top) / 2) as usize).count();
+    let shown = (scroll..total)
+        .take(((stack_bottom - content_top) / 2) as usize)
+        .count();
     if scroll + shown < total && y < stack_bottom {
         frame.render_widget(
             Paragraph::new(Span::styled(
                 format!("  ▾ {} more", total - scroll - shown),
                 Style::default().fg(p.overlay0),
             )),
-            Rect { y, height: 1, ..area },
+            Rect {
+                y,
+                height: 1,
+                ..area
+            },
         );
         y += 1;
     }
@@ -1255,12 +1510,29 @@ fn render_stacks_pane(p: &Palette, frame: &mut Frame<'_>, area: Rect, state: &mu
         let divider = "┈".repeat(area.width as usize);
         frame.render_widget(
             Paragraph::new(Span::styled(divider, Style::default().fg(p.surface1))),
-            Rect { y: sy, height: 1, ..area },
+            Rect {
+                y: sy,
+                height: 1,
+                ..area
+            },
         );
-        section_header(p, frame, Rect { y: sy + 1, height: 1, ..area }, "shared");
+        section_header(
+            p,
+            frame,
+            Rect {
+                y: sy + 1,
+                height: 1,
+                ..area
+            },
+            "shared",
+        );
 
         let svcs = state.shared_services();
-        let label = svcs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ");
+        let label = svcs
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         let dot = health_dot(p, state.shared_health());
         let up = svcs
             .iter()
@@ -1280,7 +1552,19 @@ fn render_stacks_pane(p: &Palette, frame: &mut Frame<'_>, area: Rect, state: &mu
             format!("   {up}/{} up", svcs.len()),
             Style::default().fg(color),
         )];
-        render_stack_row(p, frame, Rect { y: sy + 2, height: 2, ..area }, dot, &label, secondary, shared_active);
+        render_stack_row(
+            p,
+            frame,
+            Rect {
+                y: sy + 2,
+                height: 2,
+                ..area
+            },
+            dot,
+            &label,
+            secondary,
+            shared_active,
+        );
         regions.push((sy + 2, ClickTarget::Shared));
     }
 
@@ -1301,7 +1585,16 @@ fn render_tools_pane(p: &Palette, frame: &mut Frame<'_>, area: Rect, state: &Tui
         Paragraph::new(Span::styled(divider, Style::default().fg(p.surface1))),
         Rect { height: 1, ..area },
     );
-    section_header(p, frame, Rect { y: area.y + 1, height: 1, ..area }, "tools");
+    section_header(
+        p,
+        frame,
+        Rect {
+            y: area.y + 1,
+            height: 1,
+            ..area
+        },
+        "tools",
+    );
 
     let bottom = area.y + area.height;
     let mut y = area.y + 2;
@@ -1320,9 +1613,19 @@ fn render_tools_pane(p: &Palette, frame: &mut Frame<'_>, area: Rect, state: &Tui
                 Style::default().fg(step_color(p, s.state)),
             ),
             Span::raw(" "),
-            Span::styled(theme::truncate(s.name.as_str(), max_name), step_text_style(p, s.state)),
+            Span::styled(
+                theme::truncate(s.name.as_str(), max_name),
+                step_text_style(p, s.state),
+            ),
         ]);
-        frame.render_widget(Paragraph::new(line), Rect { y, height: 1, ..area });
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect {
+                y,
+                height: 1,
+                ..area
+            },
+        );
         y += 1;
     }
 }
@@ -1459,11 +1762,18 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
                     &mut spans,
                     &mut col,
                     "shared".into(),
-                    Style::default().fg(p.overlay0).add_modifier(Modifier::ITALIC),
+                    Style::default()
+                        .fg(p.overlay0)
+                        .add_modifier(Modifier::ITALIC),
                 );
                 push(&mut spans, &mut col, " ┊  ".into(), div);
             } else {
-                push(&mut spans, &mut col, " │ ".into(), Style::default().fg(p.surface1));
+                push(
+                    &mut spans,
+                    &mut col,
+                    " │ ".into(),
+                    Style::default().fg(p.surface1),
+                );
             }
         }
         let is_sel = i == sel_idx;
@@ -1481,8 +1791,14 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
         let (pad, dot_style, mut name_style) = if is_sel {
             (
                 Style::default().bg(p.surface0),
-                Style::default().fg(dot_color).bg(p.surface0).add_modifier(Modifier::BOLD),
-                Style::default().fg(p.text).bg(p.surface0).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(dot_color)
+                    .bg(p.surface0)
+                    .add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(p.text)
+                    .bg(p.surface0)
+                    .add_modifier(Modifier::BOLD),
             )
         } else {
             (
@@ -1526,9 +1842,7 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
     state.set_tab_ctx(ctx);
 
     let mut scroll_x = state.tab_scroll().min(max_scroll);
-    if selection_moved
-        && let Some((start, end)) = sel_range
-    {
+    if selection_moved && let Some((start, end)) = sel_range {
         // Reveal the selected tab: pull left if it's clipped off the right
         // edge, push right if it's off the left.
         if end > scroll_x + avail {
@@ -1568,7 +1882,11 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
         let rx = area.x + area.width.saturating_sub(1);
         frame.render_widget(
             Paragraph::new(Span::styled("›", marker)),
-            Rect { x: rx, width: 1, ..area },
+            Rect {
+                x: rx,
+                width: 1,
+                ..area
+            },
         );
         state.push_click_region(rx, area.y, 1, area.height, ClickTarget::TabScrollRight);
     }
@@ -1686,7 +2004,13 @@ fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) 
         let content_length = logs.len();
         // Record the track so a click/drag on it can scroll (last use of
         // `logs` is here, so the &mut borrow below is free under NLL).
-        state.set_scrollbar_hit(sb_area.x, sb_area.y, sb_area.height, content_length, viewport);
+        state.set_scrollbar_hit(
+            sb_area.x,
+            sb_area.y,
+            sb_area.height,
+            content_length,
+            viewport,
+        );
         let max_scroll = content_length.saturating_sub(viewport);
         let mut sb_state = ScrollbarState::new(max_scroll).position(start.min(max_scroll));
         let sb = Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -1755,7 +2079,10 @@ fn render_service_meta(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         spans.push(Span::raw(port.to_string()));
     }
     if svc.restart_count > 0 {
-        spans.push(Span::styled("  · restarts ", Style::default().fg(p.overlay0)));
+        spans.push(Span::styled(
+            "  · restarts ",
+            Style::default().fg(p.overlay0),
+        ));
         spans.push(Span::styled(
             svc.restart_count.to_string(),
             Style::default().fg(p.yellow),
@@ -1796,7 +2123,9 @@ fn step_glyph(state: StepState) -> &'static str {
 fn service_dot(state: &ServiceState, spinner: char) -> String {
     use ServiceState as S;
     match state {
-        S::Running { degraded: false, .. } => "●".to_string(),
+        S::Running {
+            degraded: false, ..
+        } => "●".to_string(),
         S::Running { degraded: true, .. } => "◐".to_string(),
         S::Starting | S::Restarting { .. } => spinner.to_string(),
         S::Failed { .. } | S::CrashLoop { .. } => "✗".to_string(),
@@ -1809,7 +2138,9 @@ fn service_dot(state: &ServiceState, spinner: char) -> String {
 fn service_color(p: &Palette, state: &ServiceState) -> Color {
     use ServiceState as S;
     match state {
-        S::Running { degraded: false, .. } => p.green,
+        S::Running {
+            degraded: false, ..
+        } => p.green,
         S::Running { degraded: true, .. } => p.yellow,
         S::Starting | S::Restarting { .. } => p.yellow,
         S::Failed { .. } | S::CrashLoop { .. } => p.red,
@@ -1885,9 +2216,15 @@ mod tests {
         let mut state = TuiState::default();
         state.enter_stopped(Some("kpi-dash".into()));
         let text = render_to_text(&mut state, 80, 24);
-        assert!(text.contains("All services stopped"), "missing title:\n{text}");
+        assert!(
+            text.contains("All services stopped"),
+            "missing title:\n{text}"
+        );
         assert!(text.contains("kpi-dash"), "missing repo name:\n{text}");
-        assert!(text.contains("start the stack again"), "missing start hint:\n{text}");
+        assert!(
+            text.contains("start the stack again"),
+            "missing start hint:\n{text}"
+        );
         assert!(text.contains("quit devme"), "missing quit hint:\n{text}");
     }
 
@@ -1952,7 +2289,10 @@ mod tests {
         // Narrow pane → the 12 tabs can't all fit.
         let first = render_to_text(&mut state, 60, 12);
         assert!(first.contains("service-00"), "first tab visible:\n{first}");
-        assert!(!first.contains("service-11"), "last tab off-screen initially:\n{first}");
+        assert!(
+            !first.contains("service-11"),
+            "last tab off-screen initially:\n{first}"
+        );
 
         // Scroll the row right (clamped to the content width) → the tail shows.
         state.scroll_tabs(500);
@@ -2164,8 +2504,14 @@ mod tests {
             .unwrap_or_else(|| panic!("selected (last) tab must be visible:\n{text}"));
         // Scrolled, so the row shows a left-overflow marker and the first tab
         // has been clipped away.
-        assert!(tab_line.contains('‹'), "left overflow marker expected:\n{tab_line}");
-        assert!(!tab_line.contains("alpha"), "first tab should be clipped:\n{tab_line}");
+        assert!(
+            tab_line.contains('‹'),
+            "left overflow marker expected:\n{tab_line}"
+        );
+        assert!(
+            !tab_line.contains("alpha"),
+            "first tab should be clipped:\n{tab_line}"
+        );
     }
 
     #[test]
@@ -2202,8 +2548,14 @@ mod tests {
         let mut state = TuiState::default();
         state.set_skill_dialog_for_test(SkillPrompt::Install);
         let text = render_to_text(&mut state, 80, 20);
-        assert!(text.contains("Install it"), "missing install prompt:\n{text}");
-        assert!(text.contains("install globally"), "missing global option:\n{text}");
+        assert!(
+            text.contains("Install it"),
+            "missing install prompt:\n{text}"
+        );
+        assert!(
+            text.contains("install globally"),
+            "missing global option:\n{text}"
+        );
         assert!(text.contains("not now"), "missing dismiss option:\n{text}");
     }
 
@@ -2213,8 +2565,14 @@ mod tests {
         let mut state = TuiState::default();
         state.set_skill_dialog_for_test(SkillPrompt::Update);
         let text = render_to_text(&mut state, 80, 20);
-        assert!(text.contains("out of date"), "missing update prompt:\n{text}");
-        assert!(text.contains("auto-update"), "missing always option:\n{text}");
+        assert!(
+            text.contains("out of date"),
+            "missing update prompt:\n{text}"
+        );
+        assert!(
+            text.contains("auto-update"),
+            "missing always option:\n{text}"
+        );
     }
 
     #[test]
@@ -2235,8 +2593,14 @@ mod tests {
         assert!(text.contains("postgres"), "missing service:\n{text}");
         assert!(text.contains("5432"), "missing port:\n{text}");
         assert!(text.contains("kpi-shared-db-1"), "missing holder:\n{text}");
-        assert!(text.contains("Stop container"), "missing stop option:\n{text}");
-        assert!(text.contains("Compose down"), "missing compose option:\n{text}");
+        assert!(
+            text.contains("Stop container"),
+            "missing stop option:\n{text}"
+        );
+        assert!(
+            text.contains("Compose down"),
+            "missing compose option:\n{text}"
+        );
         assert!(text.contains("Skip"), "missing skip option:\n{text}");
     }
 
@@ -2254,9 +2618,18 @@ mod tests {
         );
         let text = render_to_text(&mut state, 80, 20);
         // The port-conflict modal wins; the skill prompt is suppressed.
-        assert!(text.contains("Port conflict"), "port modal not on top:\n{text}");
-        assert!(text.contains("Kill node (123)"), "missing kill option:\n{text}");
-        assert!(!text.contains("Install it"), "skill prompt leaked through:\n{text}");
+        assert!(
+            text.contains("Port conflict"),
+            "port modal not on top:\n{text}"
+        );
+        assert!(
+            text.contains("Kill node (123)"),
+            "missing kill option:\n{text}"
+        );
+        assert!(
+            !text.contains("Install it"),
+            "skill prompt leaked through:\n{text}"
+        );
     }
 
     #[test]
@@ -2267,7 +2640,10 @@ mod tests {
         let text = render_to_text(&mut state, 140, 12);
         let last = text.lines().last().unwrap_or("");
         assert!(last.contains("help"), "footer missing 'help' (was: {last})");
-        assert!(last.contains("stack"), "footer missing stack nav (was: {last})");
+        assert!(
+            last.contains("stack"),
+            "footer missing stack nav (was: {last})"
+        );
         assert!(last.contains("svc"), "footer missing svc nav (was: {last})");
         assert!(last.contains("quit"), "footer missing quit (was: {last})");
     }
@@ -2276,13 +2652,22 @@ mod tests {
     fn help_overlay_renders_when_toggled() {
         let mut state = TuiState::default();
         let text = render_to_text(&mut state, 100, 30);
-        assert!(!text.contains("toggle this overlay"), "overlay leaked when hidden");
+        assert!(
+            !text.contains("toggle this overlay"),
+            "overlay leaked when hidden"
+        );
         state.toggle_help();
         let text = render_to_text(&mut state, 100, 30);
-        assert!(text.contains("toggle this overlay"), "overlay help text missing");
+        assert!(
+            text.contains("toggle this overlay"),
+            "overlay help text missing"
+        );
         state.toggle_help();
         let text = render_to_text(&mut state, 100, 30);
-        assert!(!text.contains("toggle this overlay"), "overlay should hide again");
+        assert!(
+            !text.contains("toggle this overlay"),
+            "overlay should hide again"
+        );
     }
 
     #[test]
@@ -2296,19 +2681,37 @@ mod tests {
         // The corner toasts still show their bodies while live, so the modal's
         // own footer ("… of N … n/esc close") is the reliable discriminator.
         let text = render_to_text(&mut state, 100, 30);
-        assert!(!text.contains("n/esc close"), "modal leaked when hidden:\n{text}");
+        assert!(
+            !text.contains("n/esc close"),
+            "modal leaked when hidden:\n{text}"
+        );
 
         state.toggle_notifications();
         let text = render_to_text(&mut state, 100, 30);
-        assert!(text.contains("notifications"), "modal title missing:\n{text}");
-        assert!(text.contains("copied 12 log lines"), "newest entry missing:\n{text}");
-        assert!(text.contains("example.test opened"), "older entry missing:\n{text}");
+        assert!(
+            text.contains("notifications"),
+            "modal title missing:\n{text}"
+        );
+        assert!(
+            text.contains("copied 12 log lines"),
+            "newest entry missing:\n{text}"
+        );
+        assert!(
+            text.contains("example.test opened"),
+            "older entry missing:\n{text}"
+        );
         assert!(text.contains("of 2"), "scroll footer missing:\n{text}");
-        assert!(text.contains("c copy"), "copy affordance missing from footer:\n{text}");
+        assert!(
+            text.contains("c copy"),
+            "copy affordance missing from footer:\n{text}"
+        );
 
         state.close_notifications();
         let text = render_to_text(&mut state, 100, 30);
-        assert!(!text.contains("n/esc close"), "modal should hide again:\n{text}");
+        assert!(
+            !text.contains("n/esc close"),
+            "modal should hide again:\n{text}"
+        );
     }
 
     #[test]
@@ -2316,14 +2719,21 @@ mod tests {
         let mut state = TuiState::default();
         state.toggle_notifications();
         let text = render_to_text(&mut state, 100, 30);
-        assert!(text.contains("no notifications yet"), "empty state missing:\n{text}");
+        assert!(
+            text.contains("no notifications yet"),
+            "empty state missing:\n{text}"
+        );
     }
 
     #[test]
     fn sidebar_badges_remote_host() {
         let mut state = TuiState::default();
         state.apply(ServerMessage::Subscribed {
-            instance: InstanceInfo { id: "id".into(), label: "main".into(), cwd: "/srv/app".into() },
+            instance: InstanceInfo {
+                id: "id".into(),
+                label: "main".into(),
+                cwd: "/srv/app".into(),
+            },
             services: vec![],
             steps: vec![],
         });
@@ -2336,9 +2746,15 @@ mod tests {
         state.set_remote_host(Some("vps.tail069899.ts.net".into()));
         let text = render_to_text(&mut state, 100, 20);
         assert!(text.contains("⇅"), "remote badge missing:\n{text}");
-        assert!(text.contains("vps"), "short host missing from badge:\n{text}");
+        assert!(
+            text.contains("vps"),
+            "short host missing from badge:\n{text}"
+        );
         // The long DNS suffix is dropped — only the first label shows.
-        assert!(!text.contains("tail069899"), "badge should shorten the host:\n{text}");
+        assert!(
+            !text.contains("tail069899"),
+            "badge should shorten the host:\n{text}"
+        );
     }
 
     #[test]
@@ -2362,7 +2778,10 @@ mod tests {
         });
 
         let text = render_to_text(&mut state, 100, 30);
-        assert!(!text.contains("Instance id"), "modal leaked when hidden:\n{text}");
+        assert!(
+            !text.contains("Instance id"),
+            "modal leaked when hidden:\n{text}"
+        );
 
         state.open_stack_info(Some(2), None);
         let text = render_to_text(&mut state, 100, 30);
@@ -2373,7 +2792,10 @@ mod tests {
 
         state.close_stack_info();
         let text = render_to_text(&mut state, 100, 30);
-        assert!(!text.contains("Instance id"), "modal should hide again:\n{text}");
+        assert!(
+            !text.contains("Instance id"),
+            "modal should hide again:\n{text}"
+        );
     }
 
     #[test]
@@ -2411,19 +2833,27 @@ mod tests {
         });
         let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
         state.apply(ServerMessage::LogChunk {
+            stream: devme_core::LogStream::Stdout,
             service: "api".into(),
             bytes: enc("listening on :8080"),
             ts: 1,
         });
         state.apply(ServerMessage::LogChunk {
+            stream: devme_core::LogStream::Stdout,
             service: "api".into(),
             bytes: enc("GET /health 200"),
             ts: 2,
         });
 
         let text = render_to_text(&mut state, 100, 20);
-        assert!(text.contains("listening on :8080"), "missing first log line:\n{text}");
-        assert!(text.contains("GET /health 200"), "missing second log line:\n{text}");
+        assert!(
+            text.contains("listening on :8080"),
+            "missing first log line:\n{text}"
+        );
+        assert!(
+            text.contains("GET /health 200"),
+            "missing second log line:\n{text}"
+        );
     }
 
     #[test]
@@ -2441,13 +2871,17 @@ mod tests {
         });
         for i in 0..3 {
             fits.apply(ServerMessage::LogChunk {
+                stream: devme_core::LogStream::Stdout,
                 service: "api".into(),
                 bytes: enc(&format!("line {i}")),
                 ts: i as u64,
             });
         }
         let text = render_to_text(&mut fits, 100, 20);
-        assert!(!text.contains('┃'), "scrollbar thumb shown when logs fit:\n{text}");
+        assert!(
+            !text.contains('┃'),
+            "scrollbar thumb shown when logs fit:\n{text}"
+        );
 
         // Far more lines than the viewport — the thumb must appear.
         let mut overflow = TuiState::default();
@@ -2458,13 +2892,17 @@ mod tests {
         });
         for i in 0..200 {
             overflow.apply(ServerMessage::LogChunk {
+                stream: devme_core::LogStream::Stdout,
                 service: "api".into(),
                 bytes: enc(&format!("line {i}")),
                 ts: i as u64,
             });
         }
         let text = render_to_text(&mut overflow, 100, 20);
-        assert!(text.contains('┃'), "scrollbar thumb missing when logs overflow:\n{text}");
+        assert!(
+            text.contains('┃'),
+            "scrollbar thumb missing when logs overflow:\n{text}"
+        );
     }
 
     #[test]
@@ -2495,7 +2933,11 @@ mod tests {
     fn title_bar_marks_remote() {
         let mut state = TuiState::default();
         state.apply(ServerMessage::Subscribed {
-            instance: InstanceInfo { id: "id".into(), label: "main".into(), cwd: "/srv/app".into() },
+            instance: InstanceInfo {
+                id: "id".into(),
+                label: "main".into(),
+                cwd: "/srv/app".into(),
+            },
             services: vec![],
             steps: vec![],
         });
@@ -2504,7 +2946,10 @@ mod tests {
         state.toggle_sidebar();
         state.set_remote_host(Some("vps.tail069899.ts.net".into()));
         let text = render_to_text(&mut state, 100, 20);
-        assert!(text.contains("⇅ vps"), "title-bar remote marker missing:\n{text}");
+        assert!(
+            text.contains("⇅ vps"),
+            "title-bar remote marker missing:\n{text}"
+        );
     }
 
     #[test]
@@ -2525,7 +2970,10 @@ mod tests {
             steps: vec![],
         });
         let text = render_to_text(&mut state, 100, 14);
-        assert!(text.contains("1/2 running"), "header count missing:\n{text}");
+        assert!(
+            text.contains("1/2 running"),
+            "header count missing:\n{text}"
+        );
     }
 
     #[test]
@@ -2533,12 +2981,19 @@ mod tests {
         let mut state = TuiState::default();
         state.apply(ServerMessage::Subscribed {
             instance: test_instance(),
-            services: vec![svc("api", ServiceState::Running { degraded: false, started_without: vec![] })],
+            services: vec![svc(
+                "api",
+                ServiceState::Running {
+                    degraded: false,
+                    started_without: vec![],
+                },
+            )],
             steps: vec![],
         });
         let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
         for i in 0..50 {
             state.apply(ServerMessage::LogChunk {
+                stream: devme_core::LogStream::Stdout,
                 service: "api".into(),
                 bytes: enc(&format!("line {i}")),
                 ts: i,
@@ -2551,7 +3006,10 @@ mod tests {
         // Scroll up; pill must appear.
         state.log_page_up(10);
         let text = render_to_text(&mut state, 100, 14);
-        assert!(text.contains("PAUSED"), "PAUSED missing while scrolled:\n{text}");
+        assert!(
+            text.contains("PAUSED"),
+            "PAUSED missing while scrolled:\n{text}"
+        );
         assert!(text.contains("G to follow"), "hint missing:\n{text}");
     }
 
@@ -2562,7 +3020,13 @@ mod tests {
             instance: test_instance(),
             services: vec![
                 svc("boom", ServiceState::Failed { exit_code: Some(7) }),
-                svc("tick", ServiceState::Running { degraded: false, started_without: vec![] }),
+                svc(
+                    "tick",
+                    ServiceState::Running {
+                        degraded: false,
+                        started_without: vec![],
+                    },
+                ),
             ],
             steps: vec![],
         });

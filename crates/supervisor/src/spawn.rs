@@ -59,7 +59,11 @@ pub async fn ensure_daemon(sock: &Path, cwd: &Path) -> anyhow::Result<bool> {
             let stderr = stderr.trim();
             return Err(anyhow::anyhow!(
                 "supervisor exited during startup\n{}",
-                if stderr.is_empty() { "(no stderr)" } else { stderr }
+                if stderr.is_empty() {
+                    "(no stderr)"
+                } else {
+                    stderr
+                }
             ));
         }
     }
@@ -124,7 +128,11 @@ pub async fn ensure_shared_daemon(cwd: &Path) -> anyhow::Result<bool> {
             let stderr = stderr.trim();
             return Err(anyhow::anyhow!(
                 "shared supervisor exited during startup\n{}",
-                if stderr.is_empty() { "(no stderr)" } else { stderr }
+                if stderr.is_empty() {
+                    "(no stderr)"
+                } else {
+                    stderr
+                }
             ));
         }
     }

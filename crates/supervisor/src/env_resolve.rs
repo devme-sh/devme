@@ -96,9 +96,11 @@ pub fn append_to_env_file(
         .open(path)?;
 
     if let Ok(existing) = std::fs::read_to_string(path)
-        && !existing.is_empty() && !existing.ends_with('\n') {
-            writeln!(file)?;
-        }
+        && !existing.is_empty()
+        && !existing.ends_with('\n')
+    {
+        writeln!(file)?;
+    }
 
     for (key, value) in vars {
         if value.contains(' ') || value.contains('"') || value.contains('#') {
@@ -187,72 +189,73 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
 
         // --- Generate vars: prompt with Enter-to-generate ---
         if let Some(gen_cmd) = &var.generate
-            && var.choices.is_empty() {
-                if interactive {
-                    writeln!(
-                        output,
-                        "  {C_DIM}{S_BAR}{C_RESET}  {C_CYAN}{C_BOLD}{name}{C_RESET}"
-                    )?;
-                    if let Some(help) = &var.help {
-                        writeln!(output, "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}{help}{C_RESET}")?;
-                    }
-                    write!(
-                        output,
-                        "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}Enter to auto-generate, or type a value ›{C_RESET} "
-                    )?;
-                    output.flush()?;
+            && var.choices.is_empty()
+        {
+            if interactive {
+                writeln!(
+                    output,
+                    "  {C_DIM}{S_BAR}{C_RESET}  {C_CYAN}{C_BOLD}{name}{C_RESET}"
+                )?;
+                if let Some(help) = &var.help {
+                    writeln!(output, "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}{help}{C_RESET}")?;
+                }
+                write!(
+                    output,
+                    "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}Enter to auto-generate, or type a value ›{C_RESET} "
+                )?;
+                output.flush()?;
 
-                    match read_line_safe(input)? {
-                        None => {
-                            writeln!(output)?;
-                            break;
-                        }
-                        Some(line) => {
-                            let trimmed = line.trim();
-                            if trimmed.is_empty() {
-                                match run_generate(gen_cmd, cwd) {
-                                    Ok(value) => {
-                                        writeln!(
-                                            output,
-                                            "  {C_DIM}{S_BAR}{C_RESET}  {C_GREEN}{S_STEP_SUBMIT}{C_RESET} Generated"
-                                        )?;
-                                        resolved.push(((*name).clone(), value));
-                                    }
-                                    Err(e) => {
-                                        writeln!(
-                                            output,
-                                            "  {C_DIM}{S_BAR}{C_RESET}  {C_YELLOW}▲{C_RESET} Generate failed: {e}"
-                                        )?;
-                                        skipped.push((*name).clone());
-                                    }
-                                }
-                            } else {
-                                writeln!(
-                                    output,
-                                    "  {C_DIM}{S_BAR}{C_RESET}  {C_GREEN}{S_STEP_SUBMIT}{C_RESET} Set"
-                                )?;
-                                resolved.push(((*name).clone(), trimmed.to_string()));
-                            }
-                        }
+                match read_line_safe(input)? {
+                    None => {
+                        writeln!(output)?;
+                        break;
                     }
-                    continue;
-                } else {
-                    // Non-interactive: auto-generate silently
-                    match run_generate(gen_cmd, cwd) {
-                        Ok(value) => {
+                    Some(line) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            match run_generate(gen_cmd, cwd) {
+                                Ok(value) => {
+                                    writeln!(
+                                        output,
+                                        "  {C_DIM}{S_BAR}{C_RESET}  {C_GREEN}{S_STEP_SUBMIT}{C_RESET} Generated"
+                                    )?;
+                                    resolved.push(((*name).clone(), value));
+                                }
+                                Err(e) => {
+                                    writeln!(
+                                        output,
+                                        "  {C_DIM}{S_BAR}{C_RESET}  {C_YELLOW}▲{C_RESET} Generate failed: {e}"
+                                    )?;
+                                    skipped.push((*name).clone());
+                                }
+                            }
+                        } else {
                             writeln!(
                                 output,
-                                "  {C_DIM}{S_BAR}{C_RESET}  {C_GREEN}{S_STEP_SUBMIT}{C_RESET} {C_DIM}{name}{C_RESET}  Generated"
+                                "  {C_DIM}{S_BAR}{C_RESET}  {C_GREEN}{S_STEP_SUBMIT}{C_RESET} Set"
                             )?;
-                            resolved.push(((*name).clone(), value));
-                        }
-                        Err(_) => {
-                            skipped.push((*name).clone());
+                            resolved.push(((*name).clone(), trimmed.to_string()));
                         }
                     }
-                    continue;
                 }
+                continue;
+            } else {
+                // Non-interactive: auto-generate silently
+                match run_generate(gen_cmd, cwd) {
+                    Ok(value) => {
+                        writeln!(
+                            output,
+                            "  {C_DIM}{S_BAR}{C_RESET}  {C_GREEN}{S_STEP_SUBMIT}{C_RESET} {C_DIM}{name}{C_RESET}  Generated"
+                        )?;
+                        resolved.push(((*name).clone(), value));
+                    }
+                    Err(_) => {
+                        skipped.push((*name).clone());
+                    }
+                }
+                continue;
             }
+        }
 
         // --- Non-interactive fallback ---
         if !interactive {
@@ -362,10 +365,7 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
                             output,
                             "  {C_DIM}{S_BAR}{C_RESET}  {C_RED}▲ This variable is required.{C_RESET}"
                         )?;
-                        write!(
-                            output,
-                            "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}›{C_RESET} "
-                        )?;
+                        write!(output, "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}›{C_RESET} ")?;
                         output.flush()?;
                         match read_line_safe(input)? {
                             None => {
@@ -525,15 +525,23 @@ mod tests {
         let env_path = dir.path().join(".env.local");
         std::fs::write(&env_path, "DB_URL=x\n").unwrap();
 
-        let declared = vec![
-            ("DB_URL".into(), make_env_var(true, None, None, None, vec![])),
-        ];
+        let declared = vec![(
+            "DB_URL".into(),
+            make_env_var(true, None, None, None, vec![]),
+        )];
 
         let mut input = Cursor::new(b"");
         let mut output = Vec::new();
 
-        let result = resolve_env_vars(&declared, &env_path, dir.path(), &mut input, &mut output, true)
-            .unwrap();
+        let result = resolve_env_vars(
+            &declared,
+            &env_path,
+            dir.path(),
+            &mut input,
+            &mut output,
+            true,
+        )
+        .unwrap();
 
         assert!(result.resolved.is_empty());
         assert!(result.skipped.is_empty());
@@ -546,18 +554,35 @@ mod tests {
         let env_path = dir.path().join(".env.local");
         std::fs::write(&env_path, "").unwrap();
 
-        let declared = vec![
-            ("DB_URL".into(), make_env_var(true, Some("postgres://localhost/dev"), Some("The database"), None, vec![])),
-        ];
+        let declared = vec![(
+            "DB_URL".into(),
+            make_env_var(
+                true,
+                Some("postgres://localhost/dev"),
+                Some("The database"),
+                None,
+                vec![],
+            ),
+        )];
 
         let mut input = Cursor::new(b"\n");
         let mut output = Vec::new();
 
-        let result = resolve_env_vars(&declared, &env_path, dir.path(), &mut input, &mut output, true)
-            .unwrap();
+        let result = resolve_env_vars(
+            &declared,
+            &env_path,
+            dir.path(),
+            &mut input,
+            &mut output,
+            true,
+        )
+        .unwrap();
 
         assert_eq!(result.resolved.len(), 1);
-        assert_eq!(result.resolved[0], ("DB_URL".into(), "postgres://localhost/dev".into()));
+        assert_eq!(
+            result.resolved[0],
+            ("DB_URL".into(), "postgres://localhost/dev".into())
+        );
 
         let content = std::fs::read_to_string(&env_path).unwrap();
         assert!(content.contains("DB_URL=postgres://localhost/dev"));
@@ -569,16 +594,24 @@ mod tests {
         let env_path = dir.path().join(".env.local");
         std::fs::write(&env_path, "").unwrap();
 
-        let declared = vec![
-            ("SECRET".into(), make_env_var(false, None, None, Some("echo test-secret-value"), vec![])),
-        ];
+        let declared = vec![(
+            "SECRET".into(),
+            make_env_var(false, None, None, Some("echo test-secret-value"), vec![]),
+        )];
 
         // Enter triggers auto-generate
         let mut input = Cursor::new(b"\n");
         let mut output = Vec::new();
 
-        let result = resolve_env_vars(&declared, &env_path, dir.path(), &mut input, &mut output, true)
-            .unwrap();
+        let result = resolve_env_vars(
+            &declared,
+            &env_path,
+            dir.path(),
+            &mut input,
+            &mut output,
+            true,
+        )
+        .unwrap();
 
         assert_eq!(result.resolved.len(), 1);
         assert_eq!(result.resolved[0].1, "test-secret-value");
@@ -590,16 +623,24 @@ mod tests {
         let env_path = dir.path().join(".env.local");
         std::fs::write(&env_path, "").unwrap();
 
-        let declared = vec![
-            ("SECRET".into(), make_env_var(false, None, None, Some("echo generated"), vec![])),
-        ];
+        let declared = vec![(
+            "SECRET".into(),
+            make_env_var(false, None, None, Some("echo generated"), vec![]),
+        )];
 
         // User types a custom value instead of pressing Enter
         let mut input = Cursor::new(b"my-custom-secret\n");
         let mut output = Vec::new();
 
-        let result = resolve_env_vars(&declared, &env_path, dir.path(), &mut input, &mut output, true)
-            .unwrap();
+        let result = resolve_env_vars(
+            &declared,
+            &env_path,
+            dir.path(),
+            &mut input,
+            &mut output,
+            true,
+        )
+        .unwrap();
 
         assert_eq!(result.resolved.len(), 1);
         assert_eq!(result.resolved[0].1, "my-custom-secret");
@@ -611,21 +652,29 @@ mod tests {
         let env_path = dir.path().join(".env.local");
         std::fs::write(&env_path, "").unwrap();
 
-        let declared = vec![
-            ("REGION".into(), make_env_var(
+        let declared = vec![(
+            "REGION".into(),
+            make_env_var(
                 false,
                 Some("https://us.i.posthog.com"),
                 None,
                 None,
                 vec!["https://us.i.posthog.com", "https://eu.i.posthog.com"],
-            )),
-        ];
+            ),
+        )];
 
         let mut input = Cursor::new(b"2\n");
         let mut output = Vec::new();
 
-        let result = resolve_env_vars(&declared, &env_path, dir.path(), &mut input, &mut output, true)
-            .unwrap();
+        let result = resolve_env_vars(
+            &declared,
+            &env_path,
+            dir.path(),
+            &mut input,
+            &mut output,
+            true,
+        )
+        .unwrap();
 
         assert_eq!(result.resolved.len(), 1);
         assert_eq!(result.resolved[0].1, "https://eu.i.posthog.com");
@@ -637,15 +686,23 @@ mod tests {
         let env_path = dir.path().join(".env.local");
         std::fs::write(&env_path, "").unwrap();
 
-        let declared = vec![
-            ("OPTIONAL_KEY".into(), make_env_var(false, None, None, None, vec![])),
-        ];
+        let declared = vec![(
+            "OPTIONAL_KEY".into(),
+            make_env_var(false, None, None, None, vec![]),
+        )];
 
         let mut input = Cursor::new(b"\n");
         let mut output = Vec::new();
 
-        let result = resolve_env_vars(&declared, &env_path, dir.path(), &mut input, &mut output, true)
-            .unwrap();
+        let result = resolve_env_vars(
+            &declared,
+            &env_path,
+            dir.path(),
+            &mut input,
+            &mut output,
+            true,
+        )
+        .unwrap();
 
         assert!(result.resolved.is_empty());
         assert_eq!(result.skipped, vec!["OPTIONAL_KEY"]);
@@ -660,10 +717,9 @@ mod tests {
 
     #[test]
     fn env_file_path_honours_stack_override() {
-        let stack = devme_config::Stack::parse(
-            "schema_version = 1\n\n[stack]\nenv_file = \".env\"\n",
-        )
-        .unwrap();
+        let stack =
+            devme_config::Stack::parse("schema_version = 1\n\n[stack]\nenv_file = \".env\"\n")
+                .unwrap();
         let path = env_file_path(&stack, Path::new("/repo"));
         assert_eq!(path, Path::new("/repo/.env"));
     }
@@ -673,10 +729,9 @@ mod tests {
         // With env_file = ".env", a missing var is written to .env, not
         // .env.local.
         let dir = TempDir::new().unwrap();
-        let stack = devme_config::Stack::parse(
-            "schema_version = 1\n\n[stack]\nenv_file = \".env\"\n",
-        )
-        .unwrap();
+        let stack =
+            devme_config::Stack::parse("schema_version = 1\n\n[stack]\nenv_file = \".env\"\n")
+                .unwrap();
         let env_path = env_file_path(&stack, dir.path());
 
         let declared = vec![(
@@ -685,9 +740,15 @@ mod tests {
         )];
         let mut input = Cursor::new(b"\n");
         let mut output = Vec::new();
-        let result =
-            resolve_env_vars(&declared, &env_path, dir.path(), &mut input, &mut output, true)
-                .unwrap();
+        let result = resolve_env_vars(
+            &declared,
+            &env_path,
+            dir.path(),
+            &mut input,
+            &mut output,
+            true,
+        )
+        .unwrap();
 
         assert_eq!(result.resolved.len(), 1);
         let dot_env = std::fs::read_to_string(dir.path().join(".env")).unwrap();
@@ -705,15 +766,28 @@ mod tests {
         std::fs::write(&env_path, "EXISTING=already_set\n").unwrap();
 
         let declared = vec![
-            ("EXISTING".into(), make_env_var(true, None, None, None, vec![])),
-            ("NEW_VAR".into(), make_env_var(false, Some("default_val"), None, None, vec![])),
+            (
+                "EXISTING".into(),
+                make_env_var(true, None, None, None, vec![]),
+            ),
+            (
+                "NEW_VAR".into(),
+                make_env_var(false, Some("default_val"), None, None, vec![]),
+            ),
         ];
 
         let mut input = Cursor::new(b"\n");
         let mut output = Vec::new();
 
-        let result = resolve_env_vars(&declared, &env_path, dir.path(), &mut input, &mut output, true)
-            .unwrap();
+        let result = resolve_env_vars(
+            &declared,
+            &env_path,
+            dir.path(),
+            &mut input,
+            &mut output,
+            true,
+        )
+        .unwrap();
 
         assert_eq!(result.existing.len(), 1);
         assert_eq!(result.resolved.len(), 1);

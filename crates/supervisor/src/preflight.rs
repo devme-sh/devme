@@ -10,7 +10,7 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 use std::process::Command;
 
-use devme_config::{Stack, Provision};
+use devme_config::{Provision, Stack};
 use devme_core::Trust;
 
 // Shared Clack-style constants
@@ -322,7 +322,10 @@ pub fn run_preflight<R: BufRead, W: Write>(
 
     // Outro
     writeln!(output, "  {C_DIM}{S_BAR}{C_RESET}")?;
-    let failed_count = results.iter().filter(|(_, r)| *r == StepResult::Failed).count();
+    let failed_count = results
+        .iter()
+        .filter(|(_, r)| *r == StepResult::Failed)
+        .count();
     if failed_count > 0 {
         writeln!(
             output,
@@ -351,13 +354,15 @@ mod tests {
 
     #[test]
     fn all_passing_shows_compact() {
-        let stack = parse_stack(r#"
+        let stack = parse_stack(
+            r#"
 schema_version = 1
 
 [step.shell]
 check = "true"
 description = "Shell available"
-"#);
+"#,
+        );
 
         let mut input = Cursor::new(b"");
         let mut output = Vec::new();
@@ -372,7 +377,8 @@ description = "Shell available"
 
     #[test]
     fn step_depending_on_service_is_excluded() {
-        let stack = parse_stack(r#"
+        let stack = parse_stack(
+            r#"
 schema_version = 1
 
 [step.tool]
@@ -386,7 +392,8 @@ depends_on = ["db"]
 
 [service.db]
 cmd = "echo db"
-"#);
+"#,
+        );
 
         let steps = preflight_steps(&stack);
         assert_eq!(steps, vec!["tool"]);
@@ -395,14 +402,16 @@ cmd = "echo db"
 
     #[test]
     fn failing_step_detected() {
-        let stack = parse_stack(r#"
+        let stack = parse_stack(
+            r#"
 schema_version = 1
 
 [step.missing]
 check = "false"
 provision = "echo install"
 description = "Missing tool"
-"#);
+"#,
+        );
 
         let mut input = Cursor::new(b"s\n");
         let mut output = Vec::new();

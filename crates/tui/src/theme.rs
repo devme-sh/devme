@@ -96,7 +96,13 @@ impl Palette {
         match name {
             "latte" | "light" => Self::latte(),
             "auto" => detect_terminal_background()
-                .map(|bg| if is_dark(bg) { Self::mocha() } else { Self::latte() })
+                .map(|bg| {
+                    if is_dark(bg) {
+                        Self::mocha()
+                    } else {
+                        Self::latte()
+                    }
+                })
                 .unwrap_or_else(Self::mocha),
             _ => Self::mocha(),
         }

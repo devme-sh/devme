@@ -23,8 +23,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use devme_config::{InterpContext, Stack, interpolate};
 use devme_core::{
-    ClientMessage, Envelope, InstanceInfo, ServerMessage, ServiceSnapshot, ServiceState,
-    Scope,
+    ClientMessage, Envelope, InstanceInfo, LogStream, Scope, ServerMessage, ServiceSnapshot,
+    ServiceState,
 };
 use devme_ipc::FrameCodec;
 use devme_supervisor::process::{ChildProcess, process_is_alive, send_sigkill, send_sigterm};
@@ -269,7 +269,7 @@ struct SharedState {
     /// Per-service ring of recent `(ts, line)` log lines, replayed to each
     /// new subscriber so late attachers see history. Bounded by
     /// [`LOG_RING_CAPACITY`] per service.
-    logs: Arc<Mutex<HashMap<String, VecDeque<(u64, String)>>>>,
+    logs: Arc<Mutex<HashMap<String, VecDeque<(u64, LogStream, String)>>>>,
     /// Set to true on Shutdown so the accept loop exits.
     shutdown: Arc<Mutex<bool>>,
     /// Active subscriber count. When this drops to 0, the idle grace timer
@@ -287,14 +287,22 @@ impl SharedState {
         let (events, _) = broadcast::channel(1024);
         let services_map: Arc<Mutex<HashMap<String, RunningService>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let logs: Arc<Mutex<HashMap<String, VecDeque<(u64, String)>>>> =
+        let logs: Arc<Mutex<HashMap<String, VecDeque<(u64, LogStream, String)>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let shutdown = Arc::new(Mutex::new(false));
 
         // Spawn each repo-scoped service. Failures are surfaced as Failed
         // snapshots rather than killing the whole daemon, because partial
         // availability is more useful than nothing at all.
-        for ResolvedService { name, cmd, env, port, url, stop } in services {
+        for ResolvedService {
+            name,
+            cmd,
+            env,
+            port,
+            url,
+            stop,
+        } in services
+        {
             let env_slice: Vec<(&str, &str)> =
                 env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
             match ChildProcess::spawn_parts::<&str>(cmd, cwd, &env_slice) {
@@ -309,7 +317,10 @@ impl SharedState {
                     );
                     let snapshot = ServiceSnapshot {
                         name: name.clone(),
-                        state: ServiceState::Running { degraded: false, started_without: vec![] },
+                        state: ServiceState::Running {
+                            degraded: false,
+                            started_without: vec![],
+                        },
                         pid: Some(pid),
                         port: *port,
                         url: url.clone(),
@@ -417,12 +428,12 @@ async fn teardown_one(name: &str, rec: RunningService, cwd: &std::path::Path) {
 /// padding and a noisy service would just push real content off-screen.
 fn spawn_log_forwarder(
     name: String,
-    mut lines: mpsc::UnboundedReceiver<String>,
+    mut lines: mpsc::UnboundedReceiver<(LogStream, String)>,
     events: broadcast::Sender<ServerMessage>,
-    logs: Arc<Mutex<HashMap<String, VecDeque<(u64, String)>>>>,
+    logs: Arc<Mutex<HashMap<String, VecDeque<(u64, LogStream, String)>>>>,
 ) {
     tokio::spawn(async move {
-        while let Some(line) = lines.recv().await {
+        while let Some((stream, line)) = lines.recv().await {
             if line.is_empty() {
                 continue;
             }
@@ -438,10 +449,15 @@ fn spawn_log_forwarder(
                 if ring.len() == LOG_RING_CAPACITY {
                     ring.pop_front();
                 }
-                ring.push_back((ts, line.clone()));
+                ring.push_back((ts, stream, line.clone()));
             }
             let bytes = base64::engine::general_purpose::STANDARD.encode(line.as_bytes());
-            let _ = events.send(ServerMessage::LogChunk { service: name.clone(), bytes, ts });
+            let _ = events.send(ServerMessage::LogChunk {
+                service: name.clone(),
+                bytes,
+                ts,
+                stream,
+            });
         }
     });
 }
@@ -462,7 +478,9 @@ fn spawn_exit_forwarder(
         let state = if code == 0 {
             ServiceState::Stopped
         } else {
-            ServiceState::Failed { exit_code: Some(code) }
+            ServiceState::Failed {
+                exit_code: Some(code),
+            }
         };
         let _ = events.send(ServerMessage::StatusUpdate {
             service: name,
@@ -566,22 +584,23 @@ async fn handle(
                             // sees history, not just lines from this moment on.
                             // Ordered by timestamp across services for a
                             // coherent scrollback.
-                            let mut replay: Vec<(u64, String, String)> = {
+                            let mut replay: Vec<(u64, LogStream, String, String)> = {
                                 let buf = state.logs.lock().await;
                                 buf.iter()
                                     .flat_map(|(svc, ring)| {
-                                        ring.iter()
-                                            .map(move |(ts, line)| (*ts, svc.clone(), line.clone()))
+                                        ring.iter().map(move |(ts, stream, line)| {
+                                            (*ts, *stream, svc.clone(), line.clone())
+                                        })
                                     })
                                     .collect()
                             };
-                            replay.sort_by_key(|(ts, _, _)| *ts);
-                            for (ts, svc, line) in replay {
+                            replay.sort_by_key(|(ts, _, _, _)| *ts);
+                            for (ts, stream, svc, line) in replay {
                                 let bytes = base64::engine::general_purpose::STANDARD
                                     .encode(line.as_bytes());
                                 send_msg(
                                     &mut framed,
-                                    ServerMessage::LogChunk { service: svc, bytes, ts },
+                                    ServerMessage::LogChunk { service: svc, bytes, ts, stream },
                                 )
                                 .await?;
                             }
@@ -623,7 +642,8 @@ async fn handle(
             }
         }
         Ok(())
-    }.await;
+    }
+    .await;
 
     if subscribed {
         state.subscribers.fetch_sub(1, Ordering::SeqCst);

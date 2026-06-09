@@ -121,7 +121,9 @@ impl AutoSpawner {
         // If we're not inside a git repo, there are no sibling worktrees
         // to watch for; just hold the per-root watcher(s) and return.
         let Some(common) = common else {
-            return Ok(Self { _watchers: watchers });
+            return Ok(Self {
+                _watchers: watchers,
+            });
         };
 
         let worktrees_dir = common.join("worktrees");
@@ -171,7 +173,9 @@ impl AutoSpawner {
             }
         });
 
-        Ok(Self { _watchers: watchers })
+        Ok(Self {
+            _watchers: watchers,
+        })
     }
 }
 
@@ -303,7 +307,9 @@ fn watch_worktree_root(
     })
     .ok()?;
     let mut watcher = watcher;
-    watcher.watch(&watch_path, RecursiveMode::NonRecursive).ok()?;
+    watcher
+        .watch(&watch_path, RecursiveMode::NonRecursive)
+        .ok()?;
     Some(watcher)
 }
 
@@ -347,7 +353,9 @@ fn ensure_docker_for(path: &Path) {
     }
     let cfg = GlobalConfig::load();
     let Some(daemon_id) = &cfg.docker.daemon else {
-        tracing::warn!("services need Docker but no daemon configured — run: devme config set docker.daemon <name>");
+        tracing::warn!(
+            "services need Docker but no daemon configured — run: devme config set docker.daemon <name>"
+        );
         return;
     };
     tracing::info!(daemon = %daemon_id, "starting Docker");
@@ -559,8 +567,13 @@ pub fn add_worktree(cwd: &Path, branch: &str, dest: Option<&str>) -> anyhow::Res
         }
         None => {
             let leaf = branch.rsplit('/').next().unwrap_or(branch);
-            let base = main.file_name().and_then(|n| n.to_str()).unwrap_or("worktree");
-            main.parent().unwrap_or(&main).join(format!("{base}-{leaf}"))
+            let base = main
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("worktree");
+            main.parent()
+                .unwrap_or(&main)
+                .join(format!("{base}-{leaf}"))
         }
     };
 
@@ -584,7 +597,11 @@ pub fn add_worktree(cwd: &Path, branch: &str, dest: Option<&str>) -> anyhow::Res
         .map_err(|e| anyhow::anyhow!("running git worktree add: {e}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let detail = if stderr.trim().is_empty() { "(no stderr)" } else { stderr.trim() };
+        let detail = if stderr.trim().is_empty() {
+            "(no stderr)"
+        } else {
+            stderr.trim()
+        };
         anyhow::bail!("git worktree add failed: {detail}");
     }
 
@@ -593,7 +610,12 @@ pub fn add_worktree(cwd: &Path, branch: &str, dest: Option<&str>) -> anyhow::Res
     let on_create_ran = stack_declares_on_create(&canon);
     run_on_create_if_needed(&canon);
 
-    Ok(AddReport { path: canon, branch: branch.to_string(), created_branch, on_create_ran })
+    Ok(AddReport {
+        path: canon,
+        branch: branch.to_string(),
+        created_branch,
+        on_create_ran,
+    })
 }
 
 /// Does a local branch named `branch` already exist?
@@ -601,7 +623,12 @@ fn branch_exists(cwd: &Path, branch: &str) -> bool {
     std::process::Command::new("git")
         .arg("-C")
         .arg(cwd)
-        .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -763,7 +790,11 @@ fn list_worktrees_detailed(cwd: &Path) -> Vec<WorktreeMeta> {
         if let Some(p) = path {
             let canon = std::fs::canonicalize(&p).unwrap_or(p);
             let is_main = metas.is_empty();
-            metas.push(WorktreeMeta { path: canon, branch, is_main });
+            metas.push(WorktreeMeta {
+                path: canon,
+                branch,
+                is_main,
+            });
         }
     };
     for line in String::from_utf8_lossy(&out.stdout).lines() {
@@ -803,9 +834,9 @@ fn resolve_target(worktrees: &[WorktreeMeta], target: &str) -> anyhow::Result<Wo
         .collect();
 
     match matches.as_slice() {
-        [] => anyhow::bail!(
-            "no worktree matches '{target}' (try a path, directory name, or branch)"
-        ),
+        [] => {
+            anyhow::bail!("no worktree matches '{target}' (try a path, directory name, or branch)")
+        }
         [one] => Ok((*one).clone()),
         many => {
             let names: Vec<String> = many.iter().map(|w| w.path.display().to_string()).collect();
@@ -945,10 +976,14 @@ fn list_worktrees(cwd: &Path) -> Vec<Worktree> {
         .args(["worktree", "list", "--porcelain"])
         .output();
     let Ok(out) = out else {
-        return vec![Worktree { path: cwd.to_path_buf() }];
+        return vec![Worktree {
+            path: cwd.to_path_buf(),
+        }];
     };
     if !out.status.success() {
-        return vec![Worktree { path: cwd.to_path_buf() }];
+        return vec![Worktree {
+            path: cwd.to_path_buf(),
+        }];
     }
     let mut worktrees = Vec::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
@@ -962,7 +997,9 @@ fn list_worktrees(cwd: &Path) -> Vec<Worktree> {
         }
     }
     if worktrees.is_empty() {
-        worktrees.push(Worktree { path: cwd.to_path_buf() });
+        worktrees.push(Worktree {
+            path: cwd.to_path_buf(),
+        });
     }
     worktrees
 }
@@ -1038,8 +1075,14 @@ mod tests {
         let paths: Vec<&Path> = wts.iter().map(|w| w.path.as_path()).collect();
         let main_canon = std::fs::canonicalize(&main).unwrap();
         let linked_canon = std::fs::canonicalize(&linked).unwrap();
-        assert!(paths.contains(&main_canon.as_path()), "missing main: {paths:?}");
-        assert!(paths.contains(&linked_canon.as_path()), "missing linked: {paths:?}");
+        assert!(
+            paths.contains(&main_canon.as_path()),
+            "missing main: {paths:?}"
+        );
+        assert!(
+            paths.contains(&linked_canon.as_path()),
+            "missing linked: {paths:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1075,7 +1118,17 @@ mod tests {
         }
         run_git(&main, &["commit", "-qm", "init"]);
         let linked = root.join("linked");
-        if !run_git(&main, &["worktree", "add", "-q", "-b", branch, linked.to_str().unwrap()]) {
+        if !run_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                branch,
+                linked.to_str().unwrap(),
+            ],
+        ) {
             let _ = std::fs::remove_dir_all(&root);
             return None;
         }
@@ -1092,8 +1145,7 @@ mod tests {
 
     #[test]
     fn resolve_target_matches_by_name_then_branch() {
-        let Some((root, _main, linked)) =
-            setup_linked_worktree("resolve", "feature/foo", None)
+        let Some((root, _main, linked)) = setup_linked_worktree("resolve", "feature/foo", None)
         else {
             return;
         };
@@ -1105,7 +1157,10 @@ mod tests {
         assert_eq!(by_dir.path, linked_canon);
         assert!(!by_dir.is_main);
         // by full branch name
-        assert_eq!(resolve_target(&wts, "feature/foo").unwrap().path, linked_canon);
+        assert_eq!(
+            resolve_target(&wts, "feature/foo").unwrap().path,
+            linked_canon
+        );
         // by branch tail
         assert_eq!(resolve_target(&wts, "foo").unwrap().path, linked_canon);
         // no match
@@ -1118,8 +1173,7 @@ mod tests {
     fn remove_worktree_runs_on_destroy_then_removes() {
         // on_destroy touches a marker in the run dir (the main worktree).
         let toml = "schema_version = 1\n\n[stack]\non_destroy = \"touch destroyed.marker\"\n";
-        let Some((root, main, linked)) =
-            setup_linked_worktree("happy", "feature/foo", Some(toml))
+        let Some((root, main, linked)) = setup_linked_worktree("happy", "feature/foo", Some(toml))
         else {
             return;
         };
@@ -1128,7 +1182,10 @@ mod tests {
 
         assert!(!linked.exists(), "worktree dir should be removed");
         assert_eq!(report.on_destroy_ran, Some(true));
-        assert!(main.join("destroyed.marker").exists(), "on_destroy didn't run in main root");
+        assert!(
+            main.join("destroyed.marker").exists(),
+            "on_destroy didn't run in main root"
+        );
         assert!(!report.instance_stopped, "no daemon was running");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1136,8 +1193,7 @@ mod tests {
 
     #[test]
     fn remove_worktree_refuses_main_worktree() {
-        let Some((root, main, _linked)) =
-            setup_linked_worktree("guard", "feature/foo", None)
+        let Some((root, main, _linked)) = setup_linked_worktree("guard", "feature/foo", None)
         else {
             return;
         };
@@ -1160,7 +1216,10 @@ mod tests {
 
         let err = block_on(remove_worktree(&main, "linked", false)).unwrap_err();
         assert!(err.to_string().contains("on_destroy"), "got: {err}");
-        assert!(linked.exists(), "worktree must remain when on_destroy can't resolve");
+        assert!(
+            linked.exists(),
+            "worktree must remain when on_destroy can't resolve"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

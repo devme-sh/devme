@@ -223,7 +223,12 @@ pub enum RemoteAction {
     /// `git`/`devme` — with a fixable hint per failure.
     Doctor,
     /// Show the live-sync's conflict-aware state for this project.
-    Status,
+    Status {
+        /// Refresh a single compact status line until Ctrl-C — for a laptop-
+        /// side split pane next to an attached session.
+        #[arg(long, short = 'w')]
+        watch: bool,
+    },
     /// List unresolved sync conflicts (two-way-safe halts on conflict): the
     /// paths involved, the full alpha/beta detail, and how to resolve them.
     Conflicts,
@@ -809,7 +814,7 @@ mod tests {
     fn remote_subcommands_parse() {
         for (arg, expected) in [
             ("doctor", RemoteAction::Doctor),
-            ("status", RemoteAction::Status),
+            ("status", RemoteAction::Status { watch: false }),
             ("conflicts", RemoteAction::Conflicts),
             ("sync", RemoteAction::Sync),
             ("flush", RemoteAction::Flush),
@@ -819,6 +824,21 @@ mod tests {
             let cli = Cli::parse_from(["devme", "remote", arg]);
             assert_eq!(cli.command, Some(Command::Remote { action: Some(expected) }));
         }
+    }
+
+    #[test]
+    fn remote_status_watch_flag_parses() {
+        let cli = Cli::parse_from(["devme", "remote", "status", "--watch"]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Remote { action: Some(RemoteAction::Status { watch: true }) })
+        );
+        // Short form too.
+        let cli = Cli::parse_from(["devme", "remote", "status", "-w"]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Remote { action: Some(RemoteAction::Status { watch: true }) })
+        );
     }
 
     #[test]

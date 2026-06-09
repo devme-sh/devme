@@ -20,9 +20,8 @@ fn real_main() -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let config_path = cwd.join("devme.toml");
 
-    let toml = std::fs::read_to_string(&config_path).map_err(|e| {
-        anyhow::anyhow!("reading {}: {e}", config_path.display())
-    })?;
+    let toml = std::fs::read_to_string(&config_path)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", config_path.display()))?;
     let mut stack = Stack::parse(&toml).map_err(|e| anyhow::anyhow!("parsing config: {e}"))?;
 
     // Repo-scoped services are owned by the shared supervisor (ADR-0007).
@@ -34,12 +33,13 @@ fn real_main() -> anyhow::Result<()> {
         if svc.scope == devme_core::Scope::Repo {
             svc.external = true;
             if svc.health.is_none()
-                && let Some(port) = svc.port {
-                    let resolved = port.resolve(0);
-                    svc.health = Some(devme_core::HealthCheck::Tcp {
-                        tcp: format!("localhost:{resolved}"),
-                    });
-                }
+                && let Some(port) = svc.port
+            {
+                let resolved = port.resolve(0);
+                svc.health = Some(devme_core::HealthCheck::Tcp {
+                    tcp: format!("localhost:{resolved}"),
+                });
+            }
         }
     }
 
@@ -143,4 +143,3 @@ fn git_branch_name(cwd: &std::path::Path) -> Option<String> {
     }
     Some(trimmed.to_string())
 }
-

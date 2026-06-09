@@ -13,13 +13,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum PortSpec {
-    SlotOffset {
-        base: u16,
-        slot_offset: u16,
-    },
-    Fixed {
-        fixed: u16,
-    },
+    SlotOffset { base: u16, slot_offset: u16 },
+    Fixed { fixed: u16 },
 }
 
 impl PortSpec {
@@ -40,13 +35,19 @@ mod tests {
 
     #[test]
     fn slot_offset_resolves_to_base_at_slot_zero() {
-        let p = PortSpec::SlotOffset { base: 8080, slot_offset: 10 };
+        let p = PortSpec::SlotOffset {
+            base: 8080,
+            slot_offset: 10,
+        };
         assert_eq!(p.resolve(0), 8080);
     }
 
     #[test]
     fn slot_offset_resolves_to_base_plus_slot_times_offset() {
-        let p = PortSpec::SlotOffset { base: 8080, slot_offset: 10 };
+        let p = PortSpec::SlotOffset {
+            base: 8080,
+            slot_offset: 10,
+        };
         assert_eq!(p.resolve(1), 8090);
         assert_eq!(p.resolve(3), 8110);
         assert_eq!(p.resolve(9), 8170);
@@ -63,7 +64,13 @@ mod tests {
     #[test]
     fn deserialize_slot_offset() {
         let p: PortSpec = serde_json::from_str(r#"{"base":8080,"slot_offset":10}"#).unwrap();
-        assert_eq!(p, PortSpec::SlotOffset { base: 8080, slot_offset: 10 });
+        assert_eq!(
+            p,
+            PortSpec::SlotOffset {
+                base: 8080,
+                slot_offset: 10
+            }
+        );
     }
 
     #[test]
@@ -75,7 +82,10 @@ mod tests {
     #[test]
     fn slot_offset_saturates_on_overflow() {
         // base near u16::MAX should saturate, not wrap or panic
-        let p = PortSpec::SlotOffset { base: 65000, slot_offset: 1000 };
+        let p = PortSpec::SlotOffset {
+            base: 65000,
+            slot_offset: 1000,
+        };
         assert_eq!(p.resolve(9), u16::MAX);
     }
 }

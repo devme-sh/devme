@@ -22,12 +22,18 @@ pub struct Dependency {
 impl Dependency {
     /// Construct a required dependency (the default form).
     pub fn required(name: impl Into<String>) -> Self {
-        Self { name: name.into(), required: true }
+        Self {
+            name: name.into(),
+            required: true,
+        }
     }
 
     /// Construct an optional dependency. Equivalent to writing `"name?"` in TOML.
     pub fn optional(name: impl Into<String>) -> Self {
-        Self { name: name.into(), required: false }
+        Self {
+            name: name.into(),
+            required: false,
+        }
     }
 }
 
@@ -65,7 +71,10 @@ impl<'de> Deserialize<'de> for Dependency {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         match DependencyRepr::deserialize(d)? {
             DependencyRepr::Short(s) => Ok(parse_short(&s)),
-            DependencyRepr::Object(o) => Ok(Self { name: o.name, required: o.required }),
+            DependencyRepr::Object(o) => Ok(Self {
+                name: o.name,
+                required: o.required,
+            }),
         }
     }
 }
@@ -136,17 +145,26 @@ mod tests {
     fn deserializes_mixed_list() {
         let v: Vec<Dependency> =
             serde_json::from_str(r#"["db", "proxy?", {"name":"redis","required":false}]"#).unwrap();
-        assert_eq!(v, vec![
-            Dependency::required("db"),
-            Dependency::optional("proxy"),
-            Dependency::optional("redis"),
-        ]);
+        assert_eq!(
+            v,
+            vec![
+                Dependency::required("db"),
+                Dependency::optional("proxy"),
+                Dependency::optional("redis"),
+            ]
+        );
     }
 
     #[test]
     fn serializes_to_compact_string_form() {
-        assert_eq!(serde_json::to_string(&Dependency::required("db")).unwrap(), r#""db""#);
-        assert_eq!(serde_json::to_string(&Dependency::optional("proxy")).unwrap(), r#""proxy?""#);
+        assert_eq!(
+            serde_json::to_string(&Dependency::required("db")).unwrap(),
+            r#""db""#
+        );
+        assert_eq!(
+            serde_json::to_string(&Dependency::optional("proxy")).unwrap(),
+            r#""proxy?""#
+        );
     }
 
     #[test]

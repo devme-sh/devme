@@ -35,27 +35,49 @@ mod tests {
     #[test]
     fn parse_tcp_form() {
         let h: HealthCheck = serde_json::from_str(r#"{"tcp":"localhost:8080"}"#).unwrap();
-        assert_eq!(h, HealthCheck::Tcp { tcp: "localhost:8080".into() });
+        assert_eq!(
+            h,
+            HealthCheck::Tcp {
+                tcp: "localhost:8080".into()
+            }
+        );
     }
 
     #[test]
     fn parse_http_form() {
-        let h: HealthCheck = serde_json::from_str(r#"{"http":"http://localhost:8080/health"}"#).unwrap();
-        assert_eq!(h, HealthCheck::Http { http: "http://localhost:8080/health".into() });
+        let h: HealthCheck =
+            serde_json::from_str(r#"{"http":"http://localhost:8080/health"}"#).unwrap();
+        assert_eq!(
+            h,
+            HealthCheck::Http {
+                http: "http://localhost:8080/health".into()
+            }
+        );
     }
 
     #[test]
     fn parse_shell_form() {
         let h: HealthCheck = serde_json::from_str(r#"{"shell":"true"}"#).unwrap();
-        assert_eq!(h, HealthCheck::Shell { shell: "true".into() });
+        assert_eq!(
+            h,
+            HealthCheck::Shell {
+                shell: "true".into()
+            }
+        );
     }
 
     #[test]
     fn round_trip_each_form() {
         let cases = vec![
-            HealthCheck::Tcp { tcp: "localhost:5432".into() },
-            HealthCheck::Http { http: "http://localhost:8080/health".into() },
-            HealthCheck::Shell { shell: "pg_isready".into() },
+            HealthCheck::Tcp {
+                tcp: "localhost:5432".into(),
+            },
+            HealthCheck::Http {
+                http: "http://localhost:8080/health".into(),
+            },
+            HealthCheck::Shell {
+                shell: "pg_isready".into(),
+            },
         ];
         for h in cases {
             let json = serde_json::to_string(&h).unwrap();

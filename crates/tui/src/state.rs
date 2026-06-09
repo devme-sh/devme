@@ -433,7 +433,14 @@ impl PortConflictDialog {
             action: PortConflictAction::Skip,
         });
 
-        Self { instance_id, service, port, holder_desc, options, selected: 0 }
+        Self {
+            instance_id,
+            service,
+            port,
+            holder_desc,
+            options,
+            selected: 0,
+        }
     }
 }
 
@@ -741,7 +748,11 @@ fn check_skill_hint_eligible() -> bool {
     let state_file = config_dir.join("skills-hint-state");
     match std::fs::read_to_string(&state_file) {
         Ok(contents) => {
-            let count: u32 = contents.lines().next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let count: u32 = contents
+                .lines()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             count < 4
         }
         Err(_) => true,
@@ -753,8 +764,7 @@ fn config_dir() -> Option<std::path::PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
         Some(std::path::PathBuf::from(xdg).join("devme"))
     } else {
-        std::env::var_os("HOME")
-            .map(|h| std::path::PathBuf::from(h).join(".config").join("devme"))
+        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config").join("devme"))
     }
 }
 
@@ -1061,7 +1071,10 @@ impl TuiState {
 
     /// All instance labels, in sidebar order. Mostly for the renderer.
     pub fn instances(&self) -> Vec<&str> {
-        self.instances.iter().map(|i| i.info.label.as_str()).collect()
+        self.instances
+            .iter()
+            .map(|i| i.info.label.as_str())
+            .collect()
     }
 
     pub fn selected_instance_index(&self) -> Option<usize> {
@@ -1113,7 +1126,11 @@ impl TuiState {
         if self.find_instance(&id).is_some() {
             return;
         }
-        let info = InstanceInfo { id, label: label.into(), cwd: cwd.into() };
+        let info = InstanceInfo {
+            id,
+            label: label.into(),
+            cwd: cwd.into(),
+        };
         self.instances.push(InstanceData::new(info));
         if self.selected_instance.is_none() {
             self.selected_instance = Some(0);
@@ -1147,7 +1164,9 @@ impl TuiState {
     /// uses this to surface "drop a devme.toml here" hints for
     /// placeholders.
     pub fn current_instance_cwd(&self) -> &str {
-        self.current_instance().map(|i| i.info.cwd.as_str()).unwrap_or("")
+        self.current_instance()
+            .map(|i| i.info.cwd.as_str())
+            .unwrap_or("")
     }
 
     // ── proxies to the selected instance ────────────────────────────────
@@ -1191,7 +1210,13 @@ impl TuiState {
             snapshot: Some(snapshot),
         };
         if self.shared_selected {
-            return self.shared.services.iter().cloned().map(shared_tab).collect();
+            return self
+                .shared
+                .services
+                .iter()
+                .cloned()
+                .map(shared_tab)
+                .collect();
         }
         let owned: Vec<TabEntry> = self
             .instance_only_services()
@@ -1290,7 +1315,10 @@ impl TuiState {
     /// existence when you switch onto such a stack, we fall back to the
     /// checks reported by any subscribed sibling.
     pub fn steps(&self) -> &[StepSnapshot] {
-        let own = self.current_instance().map(|i| i.steps.as_slice()).unwrap_or(&[]);
+        let own = self
+            .current_instance()
+            .map(|i| i.steps.as_slice())
+            .unwrap_or(&[]);
         if !own.is_empty() {
             return own;
         }
@@ -1337,12 +1365,7 @@ impl TuiState {
         }
         let healthy = services
             .iter()
-            .filter(|s| {
-                matches!(
-                    s.state,
-                    S::Running { .. } | S::External { healthy: true }
-                )
-            })
+            .filter(|s| matches!(s.state, S::Running { .. } | S::External { healthy: true }))
             .count();
         if healthy == 0 {
             StackHealth::Idle
@@ -1424,7 +1447,10 @@ impl TuiState {
     fn has_animated_service(&self) -> bool {
         let animated = |svcs: &[ServiceSnapshot]| {
             svcs.iter().any(|s| {
-                matches!(s.state, ServiceState::Starting | ServiceState::Restarting { .. })
+                matches!(
+                    s.state,
+                    ServiceState::Starting | ServiceState::Restarting { .. }
+                )
             })
         };
         self.instances.iter().any(|i| animated(&i.services)) || animated(&self.shared.services)
@@ -1583,7 +1609,13 @@ impl TuiState {
         }
         let was_failed = matches!(old, S::Failed { .. } | S::CrashLoop { .. });
         let now_failed = matches!(new, S::Failed { .. } | S::CrashLoop { .. });
-        let now_running = matches!(new, S::Running { degraded: false, .. });
+        let now_running = matches!(
+            new,
+            S::Running {
+                degraded: false,
+                ..
+            }
+        );
         let was_up = matches!(old, S::Running { .. } | S::External { healthy: true });
 
         if now_failed && !was_failed {
@@ -1628,13 +1660,13 @@ impl TuiState {
         let hit = if shared {
             self.shared.logs.get(service)
         } else {
-            self.find_instance(instance_id).and_then(|i| self.instances[i].logs.get(service))
+            self.find_instance(instance_id)
+                .and_then(|i| self.instances[i].logs.get(service))
         }
         .map(logs_show_addr_in_use)
         .unwrap_or(false);
         if hit {
-            self.pending_port_conflict =
-                Some((instance_id.to_string(), service.to_string(), port));
+            self.pending_port_conflict = Some((instance_id.to_string(), service.to_string(), port));
         }
     }
 
@@ -1655,8 +1687,12 @@ impl TuiState {
         if self.port_conflict.is_some() {
             return;
         }
-        self.port_conflict =
-            Some(PortConflictDialog::from_holder(instance_id, service, port, holder));
+        self.port_conflict = Some(PortConflictDialog::from_holder(
+            instance_id,
+            service,
+            port,
+            holder,
+        ));
     }
 
     pub fn port_conflict(&self) -> Option<&PortConflictDialog> {
@@ -1683,9 +1719,7 @@ impl TuiState {
 
     /// Take the highlighted choice and close the modal. Returns
     /// `(instance_id, service, action)` for the event loop to carry out.
-    pub fn take_port_conflict_choice(
-        &mut self,
-    ) -> Option<(String, String, PortConflictAction)> {
+    pub fn take_port_conflict_choice(&mut self) -> Option<(String, String, PortConflictAction)> {
         let d = self.port_conflict.take()?;
         let action = d
             .options
@@ -1697,7 +1731,11 @@ impl TuiState {
 
     /// Surface the outcome of a remediation as a corner toast.
     pub fn push_port_conflict_result(&mut self, ok: bool, detail: impl Into<String>) {
-        let kind = if ok { ToastKind::Info } else { ToastKind::Failed };
+        let kind = if ok {
+            ToastKind::Info
+        } else {
+            ToastKind::Failed
+        };
         self.push_toast(kind, "port", detail);
     }
 
@@ -1720,14 +1758,21 @@ impl TuiState {
     /// width; the sidebar can't shrink below [`MIN_SIDEBAR_WIDTH`] nor grow
     /// past `total_width - MIN_MAIN_WIDTH` (keeping the main pane usable).
     fn set_sidebar_width(&mut self, width: u16, total_width: u16) {
-        let max = total_width.saturating_sub(MIN_MAIN_WIDTH).max(MIN_SIDEBAR_WIDTH);
+        let max = total_width
+            .saturating_sub(MIN_MAIN_WIDTH)
+            .max(MIN_SIDEBAR_WIDTH);
         self.sidebar_width = width.clamp(MIN_SIDEBAR_WIDTH, max);
     }
 
     /// Record the divider's geometry for this frame (its column, vertical
     /// extent, and the frame width used to clamp drags).
     pub fn set_sidebar_divider(&mut self, x: u16, y: u16, h: u16, total_width: u16) {
-        self.sidebar_divider = Some(SidebarDivider { x, y, h, total_width });
+        self.sidebar_divider = Some(SidebarDivider {
+            x,
+            y,
+            h,
+            total_width,
+        });
     }
 
     /// Whether `(col, row)` falls on the sidebar divider. The hit zone is two
@@ -1735,12 +1780,7 @@ impl TuiState {
     /// easy to grab.
     pub fn sidebar_divider_at(&self, col: u16, row: u16) -> bool {
         match self.sidebar_divider {
-            Some(d) => {
-                row >= d.y
-                    && row < d.y + d.h
-                    && col <= d.x
-                    && col + 1 >= d.x
-            }
+            Some(d) => row >= d.y && row < d.y + d.h && col <= d.x && col + 1 >= d.x,
             None => false,
         }
     }
@@ -1773,9 +1813,10 @@ impl TuiState {
     pub fn pointer_shape_at(&self, col: u16, row: u16) -> PointerShape {
         if self.any_modal_open() {
             if self.notif_visible
-                && self.click_regions.iter().any(|r| {
-                    matches!(r.target, ClickTarget::Notif(_)) && r.contains(col, row)
-                })
+                && self
+                    .click_regions
+                    .iter()
+                    .any(|r| matches!(r.target, ClickTarget::Notif(_)) && r.contains(col, row))
             {
                 return PointerShape::Pointer;
             }
@@ -1939,7 +1980,11 @@ impl TuiState {
             return;
         }
         let cursor = fields.iter().position(|f| f.copyable).unwrap_or(0);
-        self.stack_info = Some(StackInfoState { title, fields, cursor });
+        self.stack_info = Some(StackInfoState {
+            title,
+            fields,
+            cursor,
+        });
     }
 
     /// Assemble the modal's heading and rows for whatever is focused — a
@@ -2122,7 +2167,11 @@ impl TuiState {
     pub fn open_settings(&mut self) {
         let values = SETTINGS
             .iter()
-            .map(|s| self.config.get(s.key).unwrap_or_else(|| s.default.to_string()))
+            .map(|s| {
+                self.config
+                    .get(s.key)
+                    .unwrap_or_else(|| s.default.to_string())
+            })
             .collect();
         self.settings = Some(SettingsState { cursor: 0, values });
     }
@@ -2147,7 +2196,11 @@ impl TuiState {
         let current = &s.values[s.cursor];
         let next = match def.control {
             SettingControl::Toggle => {
-                if current == "true" { "false".to_string() } else { "true".to_string() }
+                if current == "true" {
+                    "false".to_string()
+                } else {
+                    "true".to_string()
+                }
             }
             SettingControl::Choice(opts) => {
                 let i = opts.iter().position(|o| *o == current).unwrap_or(0) as i32;
@@ -2170,7 +2223,10 @@ impl TuiState {
         Some(if is_unset {
             SettingWrite::Unset { key: def.key }
         } else {
-            SettingWrite::Set { key: def.key, value: next }
+            SettingWrite::Set {
+                key: def.key,
+                value: next,
+            }
         })
     }
 
@@ -2196,8 +2252,7 @@ impl TuiState {
     /// owns no services). The placeholder is tab 0 and the default focus, so
     /// an unset selection counts as focused-on-placeholder.
     pub fn selected_tab_is_placeholder(&self) -> bool {
-        self.has_placeholder_tab()
-            && matches!(self.active_selected_service_idx(), None | Some(0))
+        self.has_placeholder_tab() && matches!(self.active_selected_service_idx(), None | Some(0))
     }
 
     /// Index of the highlighted tab in [`tab_services`](Self::tab_services).
@@ -2347,7 +2402,9 @@ impl TuiState {
     /// width (a "page"), so a couple of clicks sweep the whole row while still
     /// leaving context. Falls back to a small step before the first render.
     fn tab_page_step(&self) -> usize {
-        self.tab_row.map(|(_, _, w, _)| (w as usize / 2).max(4)).unwrap_or(8)
+        self.tab_row
+            .map(|(_, _, w, _)| (w as usize / 2).max(4))
+            .unwrap_or(8)
     }
 
     /// The tab context rendered last frame, for detecting selection changes.
@@ -2379,8 +2436,21 @@ impl TuiState {
     }
 
     /// Record the log scrollbar's track geometry for click/drag-to-scroll.
-    pub fn set_scrollbar_hit(&mut self, x: u16, y: u16, h: u16, content_len: usize, viewport: usize) {
-        self.scrollbar_hit = Some(ScrollbarHit { x, y, h, content_len, viewport });
+    pub fn set_scrollbar_hit(
+        &mut self,
+        x: u16,
+        y: u16,
+        h: u16,
+        content_len: usize,
+        viewport: usize,
+    ) {
+        self.scrollbar_hit = Some(ScrollbarHit {
+            x,
+            y,
+            h,
+            content_len,
+            viewport,
+        });
     }
 
     /// Whether any modal overlay is up. Clicks shouldn't fall through a modal
@@ -2488,7 +2558,11 @@ impl TuiState {
         let offset = self.log_scroll_offset();
         let end = logs.len().saturating_sub(offset);
         let start = end.saturating_sub(viewport);
-        logs.iter().skip(start).take(end - start).map(|s| s.as_str()).collect()
+        logs.iter()
+            .skip(start)
+            .take(end - start)
+            .map(|s| s.as_str())
+            .collect()
     }
 
     /// All log lines for the selected service.
@@ -2496,7 +2570,10 @@ impl TuiState {
         let Some(svc) = self.selected_service() else {
             return Vec::new();
         };
-        self.service_logs(&svc.name).iter().map(|s| s.as_str()).collect()
+        self.service_logs(&svc.name)
+            .iter()
+            .map(|s| s.as_str())
+            .collect()
     }
 
     /// Update the viewport height from the last render pass. Called by the
@@ -2530,7 +2607,11 @@ impl TuiState {
             return;
         }
         match msg {
-            ServerMessage::Subscribed { services, steps, instance } => {
+            ServerMessage::Subscribed {
+                services,
+                steps,
+                instance,
+            } => {
                 self.had_live_daemon = true;
                 let idx = self.upsert_instance(instance);
                 let inst = &mut self.instances[idx];
@@ -2547,7 +2628,12 @@ impl TuiState {
             ServerMessage::Goodbye { .. } => {
                 self.remove_instance(source_id);
             }
-            ServerMessage::StatusUpdate { service, state, port: msg_port, .. } => {
+            ServerMessage::StatusUpdate {
+                service,
+                state,
+                port: msg_port,
+                ..
+            } => {
                 let mut transition = None;
                 let mut port = msg_port;
                 if let Some(idx) = self.find_instance(source_id)
@@ -2575,14 +2661,18 @@ impl TuiState {
             }
             ServerMessage::StepStatusUpdate { step, state } => {
                 if let Some(idx) = self.find_instance(source_id)
-                    && let Some(s) = self.instances[idx].steps.iter_mut().find(|s| s.name == step)
+                    && let Some(s) = self.instances[idx]
+                        .steps
+                        .iter_mut()
+                        .find(|s| s.name == step)
                 {
                     s.state = state;
                 }
             }
             ServerMessage::LogChunk { service, bytes, .. } => {
                 Self::apply_log_chunk_to(
-                    self.find_instance(source_id).map(|idx| &mut self.instances[idx]),
+                    self.find_instance(source_id)
+                        .map(|idx| &mut self.instances[idx]),
                     &service,
                     &bytes,
                 );
@@ -2593,14 +2683,21 @@ impl TuiState {
 
     fn apply_shared(&mut self, source_id: &str, msg: ServerMessage) {
         match msg {
-            ServerMessage::Subscribed { services, instance, .. } => {
+            ServerMessage::Subscribed {
+                services, instance, ..
+            } => {
                 self.shared.id = Some(instance.id);
                 self.shared.services = services;
                 if self.shared.selected_service.is_none() && !self.shared.services.is_empty() {
                     self.shared.selected_service = Some(0);
                 }
             }
-            ServerMessage::StatusUpdate { service, state, port: msg_port, .. } => {
+            ServerMessage::StatusUpdate {
+                service,
+                state,
+                port: msg_port,
+                ..
+            } => {
                 let mut transition = None;
                 let mut port = msg_port;
                 if let Some(s) = self.shared.services.iter_mut().find(|s| s.name == service) {
@@ -2624,7 +2721,8 @@ impl TuiState {
                 let Some(text) = decoded else {
                     return;
                 };
-                let buf = self.shared
+                let buf = self
+                    .shared
                     .logs
                     .entry(service.clone())
                     .or_insert_with(|| VecDeque::with_capacity(TUI_LOG_CAP.min(64)));
@@ -2723,15 +2821,17 @@ impl TuiState {
     /// drive "send Start once" semantics; placeholders (no daemon yet)
     /// are skipped. Includes the shared daemon if it has services.
     pub fn attached_instance_ids(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.instances
+        let mut ids: Vec<String> = self
+            .instances
             .iter()
             .filter(|i| !i.services.is_empty())
             .map(|i| i.info.id.clone())
             .collect();
         if !self.shared.services.is_empty()
-            && let Some(id) = &self.shared.id {
-                ids.push(id.clone());
-            }
+            && let Some(id) = &self.shared.id
+        {
+            ids.push(id.clone());
+        }
         ids
     }
 
@@ -2874,7 +2974,10 @@ mod tests {
     fn running(name: &str) -> ServiceSnapshot {
         ServiceSnapshot {
             name: name.into(),
-            state: ServiceState::Running { degraded: false, started_without: vec![] },
+            state: ServiceState::Running {
+                degraded: false,
+                started_without: vec![],
+            },
             pid: None,
             port: None,
             url: None,
@@ -3101,7 +3204,10 @@ mod tests {
                 cwd: "/tmp/a".into(),
             },
             services: vec![svc("db")],
-            steps: vec![StepSnapshot { name: "uv".into(), state: StepState::Passed }],
+            steps: vec![StepSnapshot {
+                name: "uv".into(),
+                state: StepState::Passed,
+            }],
         });
         s.add_placeholder_instance("place", "feature/b", "/tmp/b");
 
@@ -3120,7 +3226,10 @@ mod tests {
 
     #[test]
     fn crash_and_recovery_raise_toasts() {
-        let running = || ServiceState::Running { degraded: false, started_without: vec![] };
+        let running = || ServiceState::Running {
+            degraded: false,
+            started_without: vec![],
+        };
         let status = |state: ServiceState| ServerMessage::StatusUpdate {
             service: "api".into(),
             state,
@@ -3132,7 +3241,10 @@ mod tests {
         // Start the service already up so the first transition is a crash.
         s.apply(ServerMessage::Subscribed {
             instance: test_instance(),
-            services: vec![ServiceSnapshot { state: running(), ..svc("api") }],
+            services: vec![ServiceSnapshot {
+                state: running(),
+                ..svc("api")
+            }],
             steps: vec![],
         });
         assert!(s.toasts().is_empty());
@@ -3161,7 +3273,10 @@ mod tests {
         assert_eq!(s.toasts().len(), MAX_TOASTS);
         assert_eq!(s.notifications().len(), MAX_TOASTS + 3);
         // Newest is last in history; rendered reversed by the modal.
-        assert_eq!(s.notifications().last().unwrap().body, format!("note {}", MAX_TOASTS + 2));
+        assert_eq!(
+            s.notifications().last().unwrap().body,
+            format!("note {}", MAX_TOASTS + 2)
+        );
     }
 
     #[test]
@@ -3178,7 +3293,10 @@ mod tests {
         assert_eq!(s.notif_cursor(), 0);
         let newest = s.notif_selected_text().unwrap();
         assert!(newest.contains("svc: event 2"), "got {newest:?}");
-        assert!(newest.starts_with("[0s ago]"), "missing age prefix: {newest:?}");
+        assert!(
+            newest.starts_with("[0s ago]"),
+            "missing age prefix: {newest:?}"
+        );
 
         // Cursor never runs past the oldest…
         s.notif_cursor_down(99);
@@ -3246,7 +3364,10 @@ mod tests {
 
         s.apply(ServerMessage::StatusUpdate {
             service: "web".into(),
-            state: ServiceState::Running { degraded: false, started_without: vec![] },
+            state: ServiceState::Running {
+                degraded: false,
+                started_without: vec![],
+            },
             pid: Some(123),
             port: Some(3030),
             restart_count: 0,
@@ -3344,7 +3465,13 @@ mod tests {
         // Row 0 is the theme choice (mocha → latte → auto → mocha).
         assert_eq!(s.settings().unwrap().values[0], "mocha");
         let change = s.settings_change(1).unwrap();
-        assert_eq!(change, SettingWrite::Set { key: "tui.theme", value: "latte".into() });
+        assert_eq!(
+            change,
+            SettingWrite::Set {
+                key: "tui.theme",
+                value: "latte".into()
+            }
+        );
         assert_eq!(s.settings().unwrap().values[0], "latte");
         // Live application swaps the palette.
         assert_eq!(*s.palette(), crate::theme::Palette::latte());
@@ -3353,7 +3480,13 @@ mod tests {
         s.settings_move(1);
         assert_eq!(s.settings().unwrap().cursor, 1);
         let change = s.settings_change(1).unwrap();
-        assert_eq!(change, SettingWrite::Set { key: "tui.toasts", value: "false".into() });
+        assert_eq!(
+            change,
+            SettingWrite::Set {
+                key: "tui.toasts",
+                value: "false".into()
+            }
+        );
 
         s.close_settings();
         assert!(!s.settings_visible());
@@ -3371,15 +3504,29 @@ mod tests {
         assert_eq!(s.settings().unwrap().values[row], "auto");
         // Forward to a real daemon → a Set.
         let change = s.settings_change(1).unwrap();
-        assert_eq!(change, SettingWrite::Set { key: "docker.daemon", value: "orbstack".into() });
+        assert_eq!(
+            change,
+            SettingWrite::Set {
+                key: "docker.daemon",
+                value: "orbstack".into()
+            }
+        );
         // Back to `auto` → an Unset.
         let change = s.settings_change(-1).unwrap();
-        assert_eq!(change, SettingWrite::Unset { key: "docker.daemon" });
+        assert_eq!(
+            change,
+            SettingWrite::Unset {
+                key: "docker.daemon"
+            }
+        );
     }
 
     #[test]
     fn disabling_toasts_suppresses_transition_notifications() {
-        let running = || ServiceState::Running { degraded: false, started_without: vec![] };
+        let running = || ServiceState::Running {
+            degraded: false,
+            started_without: vec![],
+        };
         let mut s = TuiState::default();
         s.set_config({
             let mut c = GlobalConfig::default();
@@ -3388,7 +3535,10 @@ mod tests {
         });
         s.apply(ServerMessage::Subscribed {
             instance: test_instance(),
-            services: vec![ServiceSnapshot { state: running(), ..svc("api") }],
+            services: vec![ServiceSnapshot {
+                state: running(),
+                ..svc("api")
+            }],
             steps: vec![],
         });
         // A crash that would normally raise a toast stays silent.
@@ -3399,7 +3549,10 @@ mod tests {
             port: None,
             restart_count: 0,
         });
-        assert!(s.toasts().is_empty(), "toasts should be suppressed when disabled");
+        assert!(
+            s.toasts().is_empty(),
+            "toasts should be suppressed when disabled"
+        );
         // But a config-parse warning still surfaces (it bypasses the gate).
         s.push_config_warning("broken".into());
         assert_eq!(s.toasts().len(), 1);
@@ -3508,7 +3661,11 @@ mod tests {
         // The status row carries the counts + git arrows but isn't copyable.
         let status = info.fields.iter().find(|f| f.label == "Status").unwrap();
         assert!(!status.copyable);
-        assert!(status.value.contains("0/1 up") && status.value.contains("↑1 ↓2"), "{}", status.value);
+        assert!(
+            status.value.contains("0/1 up") && status.value.contains("↑1 ↓2"),
+            "{}",
+            status.value
+        );
 
         // Cursor starts on the first copyable row (Branch) and `c` copies it.
         assert_eq!(s.stack_info_selected_value().as_deref(), Some("feature/x"));
@@ -3522,12 +3679,24 @@ mod tests {
         let info = s.stack_info().expect("modal open");
         // Host leads the rows and the cursor starts on it.
         assert_eq!(info.fields[0].label, "Host");
-        assert_eq!(s.stack_info_field("Host").as_deref(), Some("vps.tail123.ts.net"));
-        assert_eq!(s.stack_info_selected_value().as_deref(), Some("vps.tail123.ts.net"));
+        assert_eq!(
+            s.stack_info_field("Host").as_deref(),
+            Some("vps.tail123.ts.net")
+        );
+        assert_eq!(
+            s.stack_info_selected_value().as_deref(),
+            Some("vps.tail123.ts.net")
+        );
         // A local TUI (no host) has no Host row.
         s.close_stack_info();
         s.open_stack_info(Some(3), None);
-        assert!(s.stack_info().unwrap().fields.iter().all(|f| f.label != "Host"));
+        assert!(
+            s.stack_info()
+                .unwrap()
+                .fields
+                .iter()
+                .all(|f| f.label != "Host")
+        );
     }
 
     #[test]
@@ -3648,6 +3817,7 @@ mod tests {
         let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
         for i in 0..50 {
             s.apply(ServerMessage::LogChunk {
+                stream: devme_core::LogStream::Stdout,
                 service: "api".into(),
                 bytes: enc(&format!("line {i}")),
                 ts: i as u64,
@@ -3714,6 +3884,7 @@ mod tests {
         let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
         for i in 0..50 {
             s.apply(ServerMessage::LogChunk {
+                stream: devme_core::LogStream::Stdout,
                 service: "api".into(),
                 bytes: enc(&format!("line {i}")),
                 ts: i as u64,
@@ -3728,7 +3899,10 @@ mod tests {
         assert_eq!(s.log_scroll_offset(), 0);
         s.scrollbar_drag_to(4); // ~middle, lands between the ends
         let mid = s.log_scroll_offset();
-        assert!((1..30).contains(&mid), "mid offset {mid} not strictly between ends");
+        assert!(
+            (1..30).contains(&mid),
+            "mid offset {mid} not strictly between ends"
+        );
     }
 
     #[test]
@@ -3742,6 +3916,7 @@ mod tests {
         let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
         for i in 0..30 {
             s.apply(ServerMessage::LogChunk {
+                stream: devme_core::LogStream::Stdout,
                 service: "api".into(),
                 bytes: enc(&format!("line {i}")),
                 ts: i as u64,
@@ -3749,26 +3924,18 @@ mod tests {
         }
         s.log_page_up(10);
         // Visible "end" line index right after page-up.
-        let end_before =
-            s.service_logs("api").len() - s.log_scroll_offset();
-        let line_before = s
-            .service_logs("api")
-            .get(end_before - 1)
-            .cloned()
-            .unwrap();
+        let end_before = s.service_logs("api").len() - s.log_scroll_offset();
+        let line_before = s.service_logs("api").get(end_before - 1).cloned().unwrap();
         for i in 30..40 {
             s.apply(ServerMessage::LogChunk {
+                stream: devme_core::LogStream::Stdout,
                 service: "api".into(),
                 bytes: enc(&format!("line {i}")),
                 ts: i as u64,
             });
         }
         let end_after = s.service_logs("api").len() - s.log_scroll_offset();
-        let line_after = s
-            .service_logs("api")
-            .get(end_after - 1)
-            .cloned()
-            .unwrap();
+        let line_after = s.service_logs("api").get(end_after - 1).cloned().unwrap();
         assert_eq!(
             line_before, line_after,
             "viewport bottom drifted while user was scrolled off-tail"
@@ -3784,6 +3951,7 @@ mod tests {
         let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
         for i in 0..10 {
             s.apply(ServerMessage::LogChunk {
+                stream: devme_core::LogStream::Stdout,
                 service: "api".into(),
                 bytes: enc(&format!("line {i}")),
                 ts: i as u64,
@@ -3799,6 +3967,7 @@ mod tests {
         let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
         for i in 0..5 {
             s.apply(ServerMessage::LogChunk {
+                stream: devme_core::LogStream::Stdout,
                 service: "api".into(),
                 bytes: enc(&format!("line {i}")),
                 ts: i as u64,
@@ -3806,7 +3975,11 @@ mod tests {
         }
         s.log_page_up(100);
         // 5 lines, viewport 20 → all lines fit, max scroll = 0.
-        assert_eq!(s.log_scroll_offset(), 0, "should clamp: all lines fit viewport");
+        assert_eq!(
+            s.log_scroll_offset(),
+            0,
+            "should clamp: all lines fit viewport"
+        );
     }
 
     #[test]
@@ -3817,11 +3990,13 @@ mod tests {
         let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
         for n in 0..30 {
             s.apply(ServerMessage::LogChunk {
+                stream: devme_core::LogStream::Stdout,
                 service: "a".into(),
                 bytes: enc(&format!("a-{n}")),
                 ts: n,
             });
             s.apply(ServerMessage::LogChunk {
+                stream: devme_core::LogStream::Stdout,
                 service: "b".into(),
                 bytes: enc(&format!("b-{n}")),
                 ts: n,
@@ -3911,16 +4086,19 @@ mod tests {
         let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
 
         s.apply(ServerMessage::LogChunk {
+            stream: devme_core::LogStream::Stdout,
             service: "db".into(),
             bytes: enc("postgres ready"),
             ts: 1,
         });
         s.apply(ServerMessage::LogChunk {
+            stream: devme_core::LogStream::Stdout,
             service: "api".into(),
             bytes: enc("listening on 8080"),
             ts: 2,
         });
         s.apply(ServerMessage::LogChunk {
+            stream: devme_core::LogStream::Stdout,
             service: "db".into(),
             bytes: enc("connection accepted"),
             ts: 3,
@@ -3939,8 +4117,16 @@ mod tests {
         // id must land in that instance's buffer, not the currently-
         // selected one.
         let mut s = TuiState::default();
-        let a = InstanceInfo { id: "A".into(), label: "a".into(), cwd: "/a".into() };
-        let b = InstanceInfo { id: "B".into(), label: "b".into(), cwd: "/b".into() };
+        let a = InstanceInfo {
+            id: "A".into(),
+            label: "a".into(),
+            cwd: "/a".into(),
+        };
+        let b = InstanceInfo {
+            id: "B".into(),
+            label: "b".into(),
+            cwd: "/b".into(),
+        };
         s.apply_from(
             "A",
             ServerMessage::Subscribed {
@@ -3963,6 +4149,7 @@ mod tests {
         s.apply_from(
             "A",
             ServerMessage::LogChunk {
+                stream: devme_core::LogStream::Stdout,
                 service: "api".into(),
                 bytes: enc("only for A"),
                 ts: 0,
@@ -4000,6 +4187,7 @@ mod tests {
         // Push more than TUI_LOG_CAP lines.
         for i in 0..(super::TUI_LOG_CAP + 5) {
             s.apply(ServerMessage::LogChunk {
+                stream: devme_core::LogStream::Stdout,
                 service: "svc".into(),
                 bytes: enc(&format!("line {i}")),
                 ts: i as u64,
@@ -4009,7 +4197,10 @@ mod tests {
         assert_eq!(buf.len(), super::TUI_LOG_CAP);
         // Oldest survivor should be line 5 (lines 0..=4 evicted).
         assert_eq!(buf.first().unwrap(), "line 5");
-        assert_eq!(buf.last().unwrap(), &format!("line {}", super::TUI_LOG_CAP + 4));
+        assert_eq!(
+            buf.last().unwrap(),
+            &format!("line {}", super::TUI_LOG_CAP + 4)
+        );
     }
 
     // ── reactive port-conflict modal ────────────────────────────────────
@@ -4033,7 +4224,10 @@ mod tests {
 
     #[test]
     fn options_from_container_with_project() {
-        let h = Holder::Container { name: "pg-1".into(), project: Some("proj".into()) };
+        let h = Holder::Container {
+            name: "pg-1".into(),
+            project: Some("proj".into()),
+        };
         let d = PortConflictDialog::from_holder("id".into(), "db".into(), 5432, h);
         assert_eq!(d.options.len(), 3);
         assert!(d.options[0].label.contains("Stop container pg-1"));
@@ -4048,7 +4242,10 @@ mod tests {
         let d = PortConflictDialog::from_holder("id".into(), "web".into(), 3000, h);
         assert_eq!(d.options.len(), 2);
         assert!(d.options[0].label.contains("Kill node (123)"));
-        assert_eq!(d.options[0].action, PortConflictAction::KillProcess(vec![123]));
+        assert_eq!(
+            d.options[0].action,
+            PortConflictAction::KillProcess(vec![123])
+        );
         assert_eq!(d.options[1].action, PortConflictAction::Skip);
     }
 
@@ -4059,7 +4256,10 @@ mod tests {
             "id".into(),
             "db".into(),
             5432,
-            Holder::Container { name: "c".into(), project: None },
+            Holder::Container {
+                name: "c".into(),
+                project: None,
+            },
         );
         // options: [Stop, Skip]
         assert_eq!(s.port_conflict().unwrap().selected, 0);
@@ -4072,7 +4272,12 @@ mod tests {
     #[test]
     fn take_choice_returns_selection_and_closes() {
         let mut s = TuiState::default();
-        s.open_port_conflict("inst".into(), "db".into(), 5432, Holder::Process(vec![(9, None)]));
+        s.open_port_conflict(
+            "inst".into(),
+            "db".into(),
+            5432,
+            Holder::Process(vec![(9, None)]),
+        );
         let (id, svc, action) = s.take_port_conflict_choice().unwrap();
         assert_eq!(id, "inst");
         assert_eq!(svc, "db");
@@ -4087,6 +4292,7 @@ mod tests {
         // A log line showing the bind failure arrives first…
         let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
         s.apply(ServerMessage::LogChunk {
+            stream: devme_core::LogStream::Stdout,
             service: "db".into(),
             bytes: enc("Error: bind: address already in use"),
             ts: 1,
@@ -4111,6 +4317,7 @@ mod tests {
         s.apply(snapshot_msg(&["db"]));
         let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
         s.apply(ServerMessage::LogChunk {
+            stream: devme_core::LogStream::Stdout,
             service: "db".into(),
             bytes: enc("panic: nil pointer dereference"),
             ts: 1,
@@ -4147,7 +4354,11 @@ mod tests {
         s.apply_from(
             "A",
             ServerMessage::Subscribed {
-                instance: InstanceInfo { id: "A".into(), label: "a".into(), cwd: "/a".into() },
+                instance: InstanceInfo {
+                    id: "A".into(),
+                    label: "a".into(),
+                    cwd: "/a".into(),
+                },
                 services: vec![svc("api")],
                 steps: vec![],
             },
@@ -4157,7 +4368,12 @@ mod tests {
 
         // The daemon shuts down deliberately → Goodbye drops the row, and
         // with no daemon left the TUI should exit.
-        s.apply_from("A", ServerMessage::Goodbye { reason: "shutdown requested".into() });
+        s.apply_from(
+            "A",
+            ServerMessage::Goodbye {
+                reason: "shutdown requested".into(),
+            },
+        );
         assert!(!s.has_instance("A"), "Goodbye should drop the instance row");
         assert!(s.all_daemons_shut_down());
     }
@@ -4169,20 +4385,34 @@ mod tests {
             s.apply_from(
                 id,
                 ServerMessage::Subscribed {
-                    instance: InstanceInfo { id: id.into(), label: id.into(), cwd: format!("/{id}") },
+                    instance: InstanceInfo {
+                        id: id.into(),
+                        label: id.into(),
+                        cwd: format!("/{id}"),
+                    },
                     services: vec![svc("api")],
                     steps: vec![],
                 },
             );
         }
         // Down one worktree — the other is still live, so don't exit.
-        s.apply_from("A", ServerMessage::Goodbye { reason: "shutdown requested".into() });
+        s.apply_from(
+            "A",
+            ServerMessage::Goodbye {
+                reason: "shutdown requested".into(),
+            },
+        );
         assert!(!s.has_instance("A"));
         assert!(s.has_instance("B"));
         assert!(!s.all_daemons_shut_down());
 
         // Down the last one — now exit.
-        s.apply_from("B", ServerMessage::Goodbye { reason: "shutdown requested".into() });
+        s.apply_from(
+            "B",
+            ServerMessage::Goodbye {
+                reason: "shutdown requested".into(),
+            },
+        );
         assert!(s.all_daemons_shut_down());
     }
 
@@ -4195,7 +4425,11 @@ mod tests {
         s.apply_from(
             "A",
             ServerMessage::Subscribed {
-                instance: InstanceInfo { id: "A".into(), label: "a".into(), cwd: "/a".into() },
+                instance: InstanceInfo {
+                    id: "A".into(),
+                    label: "a".into(),
+                    cwd: "/a".into(),
+                },
                 services: vec![svc("api")],
                 steps: vec![],
             },
@@ -4230,7 +4464,10 @@ mod tests {
         assert!(after_right > 0, "clicking › pages the row right");
 
         assert!(s.click_at(0, 0), "‹ is a hit");
-        assert!(s.tab_scroll() < after_right, "clicking ‹ pages the row back left");
+        assert!(
+            s.tab_scroll() < after_right,
+            "clicking ‹ pages the row back left"
+        );
     }
 
     #[test]
@@ -4240,13 +4477,22 @@ mod tests {
         s.apply_from(
             "A",
             ServerMessage::Subscribed {
-                instance: InstanceInfo { id: "A".into(), label: "a".into(), cwd: "/a".into() },
+                instance: InstanceInfo {
+                    id: "A".into(),
+                    label: "a".into(),
+                    cwd: "/a".into(),
+                },
                 services: vec![svc("api")],
                 steps: vec![],
             },
         );
         // …then `devme down` elsewhere drains it.
-        s.apply_from("A", ServerMessage::Goodbye { reason: "down".into() });
+        s.apply_from(
+            "A",
+            ServerMessage::Goodbye {
+                reason: "down".into(),
+            },
+        );
         assert!(s.all_daemons_shut_down());
         assert!(!s.stopped(), "not stopped until the event loop enters it");
 
@@ -4259,7 +4505,11 @@ mod tests {
         s.apply_from(
             "A",
             ServerMessage::Subscribed {
-                instance: InstanceInfo { id: "A".into(), label: "a".into(), cwd: "/a".into() },
+                instance: InstanceInfo {
+                    id: "A".into(),
+                    label: "a".into(),
+                    cwd: "/a".into(),
+                },
                 services: vec![svc("api")],
                 steps: vec![],
             },

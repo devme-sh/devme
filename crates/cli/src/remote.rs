@@ -11,9 +11,23 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use devme_config::{GlobalConfig, paths, remote};
+use devme_config::remote::SyncHealth;
+
+/// How often the background watcher polls the sync's health while an attached
+/// `devme remote` session runs in the foreground.
+const SYNC_WATCH_INTERVAL: Duration = Duration::from_secs(5);
+/// Snappier cadence for the foreground `devme remote status --watch` line.
+const STATUS_WATCH_INTERVAL: Duration = Duration::from_secs(2);
+/// After this many consecutive polls still in a problem state, the background
+/// watcher re-notifies once (a single nag), so a halt you missed the first
+/// banner for resurfaces without spamming every poll. 6 × 5s ≈ 30s.
+const REMIND_AFTER_POLLS: u32 = 6;
 
 /// Mutagen label devme stamps on every sync it creates, so `devme remote
 /// wake` can flush *only* devme-managed sessions.
@@ -197,6 +211,93 @@ fn ensure_sync(r: &Resolved) -> Result<bool> {
     eprintln!("devme remote: waiting for initial sync…");
     sync_flush(&r.session)?;
     Ok(true)
+}
+
+// --- live-sync watcher (laptop-side, during an attached session) ------------
+
+/// One sync-health observation: whether the session exists, its raw status
+/// string, and conflict count. Polled by the watcher and the `--watch` line.
+fn observe_sync(session: &str) -> (bool, Option<String>, u64) {
+    if !sync_exists(session) {
+        return (false, None, 0);
+    }
+    let (status, conflicts) = sync_status_fields(session);
+    (true, status, conflicts.unwrap_or(0))
+}
+
+/// Sleep up to `total`, but wake early (in ~250ms slices) if `stop` is set, so
+/// a detach joins the watcher promptly instead of after a full poll interval.
+fn interruptible_sleep(stop: &AtomicBool, total: Duration) {
+    let slice = Duration::from_millis(250);
+    let mut left = total;
+    while left > Duration::ZERO && !stop.load(Ordering::Relaxed) {
+        let nap = slice.min(left);
+        std::thread::sleep(nap);
+        left = left.saturating_sub(nap);
+    }
+}
+
+/// Spawn a laptop-side background watcher for the duration of an attached
+/// remote session. It polls the sync's health and, **edge-triggered**, fires a
+/// desktop notification when health changes (a silent two-way-safe halt on
+/// conflict being the case that matters), plus one reminder if a problem
+/// persists. It deliberately does **not** print to stderr: the attached remote
+/// TUI owns this terminal, so writing to it would corrupt the display — the
+/// post-detach summary (printed once the terminal is ours again) is the
+/// on-screen channel. Returns a stop flag + join handle; the caller flips the
+/// flag and joins after the attach command returns.
+fn spawn_sync_watcher(session: String) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let handle = std::thread::spawn(move || {
+        let mut last: Option<SyncHealth> = None;
+        let mut polls_in_problem = 0u32;
+        let mut reminded = false;
+        while !stop_thread.load(Ordering::Relaxed) {
+            let (exists, status, conflicts) = observe_sync(&session);
+            let health = remote::classify_sync(exists, status.as_deref(), conflicts);
+            match remote::sync_transition_message(last, health, conflicts) {
+                Some(msg) => {
+                    // A real transition — announce and reset the nag timer.
+                    notify(&msg);
+                    polls_in_problem = 0;
+                    reminded = false;
+                }
+                None => {
+                    // Steady state. Nag once if we've been stuck in a problem.
+                    if matches!(health, SyncHealth::Conflict | SyncHealth::Down) {
+                        polls_in_problem += 1;
+                        if polls_in_problem >= REMIND_AFTER_POLLS && !reminded {
+                            if let Some(msg) =
+                                remote::sync_transition_message(None, health, conflicts)
+                            {
+                                notify(&msg);
+                            }
+                            reminded = true;
+                        }
+                    }
+                }
+            }
+            last = Some(health);
+            interruptible_sleep(&stop_thread, SYNC_WATCH_INTERVAL);
+        }
+    });
+    (stop, handle)
+}
+
+/// Print a one-line sync summary to stderr — used once the terminal is back in
+/// our hands after a detach, so the closing state is visible even on hosts
+/// without desktop notifications.
+fn print_sync_summary(session: &str) {
+    let (exists, status, conflicts) = observe_sync(session);
+    if !exists {
+        return; // sync was stopped/terminated — nothing to summarise.
+    }
+    let health = remote::classify_sync(exists, status.as_deref(), conflicts);
+    eprintln!(
+        "devme remote: {}",
+        remote::sync_status_line(health, conflicts, status.as_deref())
+    );
 }
 
 // --- ssh wrappers -----------------------------------------------------------
@@ -395,6 +496,13 @@ pub fn run(cwd: &Path) -> Result<()> {
 
     let cmd = remote::expand_attach(&r.attach, &r.host, &r.remote_path, &r.session, &r.url_host);
     eprintln!("devme remote: attaching ({}) → {}", r.attach, r.host);
+
+    // Watch the sync in the background for the life of the session: a two-way-
+    // safe halt on conflict is silent and laptop-side, so the remote TUI you're
+    // attached to can't show it. The watcher notifies (desktop) on a health
+    // change; it stays off stderr so it can't corrupt the remote TUI's screen.
+    let (stop, watcher) = spawn_sync_watcher(r.session.clone());
+
     // Hand the terminal to a real shell so all quoting in the attach template
     // is honored and a full-screen remote TUI gets the inherited TTY.
     let status = Command::new("sh")
@@ -402,6 +510,15 @@ pub fn run(cwd: &Path) -> Result<()> {
         .arg(&cmd)
         .status()
         .context("running attach command")?;
+
+    // Session over — stop the watcher and (terminal back in our hands) flush
+    // once and print the closing sync state, so anything that drifted while you
+    // worked is reconciled and visible even without desktop notifications.
+    stop.store(true, Ordering::Relaxed);
+    let _ = watcher.join();
+    let _ = sync_flush(&r.session);
+    print_sync_summary(&r.session);
+
     if !status.success() {
         // A non-zero exit here is usually just the user quitting the remote
         // session — report it without dressing it up as a devme failure.
@@ -575,9 +692,16 @@ fn sleepwatcher_present() -> bool {
 
 /// `devme remote status`: conflict-aware sync state. Silent Mutagen halts on
 /// conflict are the #1 failure mode, so the conflict count is surfaced first.
-pub fn status(cwd: &Path, json: bool) -> Result<()> {
+/// With `watch`, refresh a single compact line until Ctrl-C — meant for a
+/// laptop-side split pane next to an attached session.
+pub fn status(cwd: &Path, json: bool, watch: bool) -> Result<()> {
     let r = resolve(cwd)?;
     require_mutagen()?;
+    if watch {
+        // `--json` is a one-shot snapshot format; `--watch` is the live human
+        // line. Combining them is meaningless, so watch wins.
+        return status_watch(&r.session);
+    }
     let exists = sync_exists(&r.session);
 
     if json {
@@ -622,6 +746,32 @@ pub fn status(cwd: &Path, json: bool) -> Result<()> {
         .args(["sync", "list", &r.session])
         .status();
     Ok(())
+}
+
+/// `devme remote status --watch`: redraw one compact, colour-free status line
+/// in place every couple of seconds until Ctrl-C. Built to sit in a laptop-
+/// side split next to an attached session so a silent conflict-halt is visible
+/// at a glance. Owns its own terminal (it's not the attach), so overwriting the
+/// line with `\r` is safe here — unlike the background watcher.
+fn status_watch(session: &str) -> Result<()> {
+    use std::io::Write;
+    eprintln!("watching {session} (Ctrl-C to stop)…");
+    let mut last_line = String::new();
+    loop {
+        let (exists, status, conflicts) = observe_sync(session);
+        let line = if exists {
+            let health = remote::classify_sync(exists, status.as_deref(), conflicts);
+            remote::sync_status_line(health, conflicts, status.as_deref())
+        } else {
+            "no live-sync (run `devme remote` to start one)".to_string()
+        };
+        // Pad to clear any leftover from a previous, longer line before the \r.
+        let pad = last_line.chars().count().saturating_sub(line.chars().count());
+        print!("\r{line}{}", " ".repeat(pad));
+        let _ = std::io::stdout().flush();
+        last_line = line;
+        std::thread::sleep(STATUS_WATCH_INTERVAL);
+    }
 }
 
 /// Pull (status, conflict-count) from Mutagen via a Go template, best-effort.

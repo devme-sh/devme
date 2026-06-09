@@ -26,16 +26,34 @@ mod tests {
 
     #[test]
     fn serializes_kebab_case() {
-        assert_eq!(serde_json::to_string(&RestartPolicy::Never).unwrap(), r#""never""#);
-        assert_eq!(serde_json::to_string(&RestartPolicy::OnFailure).unwrap(), r#""on-failure""#);
-        assert_eq!(serde_json::to_string(&RestartPolicy::Always).unwrap(), r#""always""#);
+        assert_eq!(
+            serde_json::to_string(&RestartPolicy::Never).unwrap(),
+            r#""never""#
+        );
+        assert_eq!(
+            serde_json::to_string(&RestartPolicy::OnFailure).unwrap(),
+            r#""on-failure""#
+        );
+        assert_eq!(
+            serde_json::to_string(&RestartPolicy::Always).unwrap(),
+            r#""always""#
+        );
     }
 
     #[test]
     fn deserializes_kebab_case() {
-        assert_eq!(serde_json::from_str::<RestartPolicy>(r#""never""#).unwrap(), RestartPolicy::Never);
-        assert_eq!(serde_json::from_str::<RestartPolicy>(r#""on-failure""#).unwrap(), RestartPolicy::OnFailure);
-        assert_eq!(serde_json::from_str::<RestartPolicy>(r#""always""#).unwrap(), RestartPolicy::Always);
+        assert_eq!(
+            serde_json::from_str::<RestartPolicy>(r#""never""#).unwrap(),
+            RestartPolicy::Never
+        );
+        assert_eq!(
+            serde_json::from_str::<RestartPolicy>(r#""on-failure""#).unwrap(),
+            RestartPolicy::OnFailure
+        );
+        assert_eq!(
+            serde_json::from_str::<RestartPolicy>(r#""always""#).unwrap(),
+            RestartPolicy::Always
+        );
     }
 
     #[test]

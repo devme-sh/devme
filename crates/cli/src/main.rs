@@ -1048,7 +1048,7 @@ fn remote_cmd(action: Option<RemoteAction>, json: bool) -> anyhow::Result<()> {
     match action {
         None => devme_cli::remote::run(&cwd),
         Some(RemoteAction::Doctor) => devme_cli::remote::doctor(&cwd, json),
-        Some(RemoteAction::Status) => devme_cli::remote::status(&cwd, json),
+        Some(RemoteAction::Status { watch }) => devme_cli::remote::status(&cwd, json, watch),
         Some(RemoteAction::Conflicts) => devme_cli::remote::conflicts(&cwd, json),
         Some(RemoteAction::Sync) => devme_cli::remote::sync(&cwd),
         Some(RemoteAction::Flush) => devme_cli::remote::flush(&cwd),

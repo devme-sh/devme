@@ -1,14 +1,29 @@
-//! Wraps a portable-pty child in a tokio-friendly handle.
+//! Spawns a child under **two PTYs** — one for stdout, one for stderr — so the
+//! supervisor can tell the streams apart (errors and tracebacks almost always
+//! go to stderr) while both file descriptors still see a real terminal. Because
+//! each fd is a genuine PTY, `isatty(1)` *and* `isatty(2)` are true, so dev
+//! servers keep emitting color and progress exactly as in a developer's shell —
+//! we just read the two masters separately and tag every line with its
+//! [`LogStream`].
 //!
-//! The child runs inside a real PTY (so it sees a terminal — full-line
-//! buffering, ANSI escapes — exactly like a developer's terminal would).
-//! Output is streamed line-by-line, exit status is delivered through a
-//! oneshot, and `kill()` works from any thread.
+//! `portable-pty`'s high-level spawn wires stdin/stdout/stderr all onto a single
+//! slave, so it can't split the streams. We drop to a Unix `openpty(3)` ×2 plus
+//! a `pre_exec` hook (`setsid` + `TIOCSCTTY` + `dup2`) instead. `setsid` makes
+//! the child its own session/process-group leader (`pid == pgid`), which is what
+//! lets [`send_sigkill`]'s group-signal reap wrapper shells and their
+//! grandchildren.
+//!
+//! Cross-stream ordering is best-effort (two reader threads, timestamped by the
+//! daemon on receipt) — the same model already used to interleave across
+//! services. Within a single stream, order is exact.
 
 use std::io::{BufRead, BufReader};
+use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
+use std::process::Stdio;
 
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use devme_core::LogStream;
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, thiserror::Error)]
@@ -19,21 +34,22 @@ pub enum SpawnError {
     Spawn(#[source] anyhow::Error),
 }
 
+/// A line of output paired with the stream it came from.
+pub type TaggedLine = (LogStream, String);
+
 /// A running child process owned by the supervisor.
 pub struct ChildProcess {
     pid: u32,
-    lines_rx: mpsc::UnboundedReceiver<String>,
+    lines_rx: mpsc::UnboundedReceiver<TaggedLine>,
     exit_rx: Option<oneshot::Receiver<i32>>,
-    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
 }
 
 /// Splittable, task-friendly version of [`ChildProcess`]. The daemon's event
-/// loop holds the killer; per-process tasks own the receivers.
+/// loop kills by pid (see [`send_sigkill`]); per-process tasks own the receivers.
 pub struct SpawnParts {
     pub pid: u32,
-    pub lines: mpsc::UnboundedReceiver<String>,
+    pub lines: mpsc::UnboundedReceiver<TaggedLine>,
     pub exit: oneshot::Receiver<i32>,
-    pub killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
 }
 
 impl ChildProcess {
@@ -45,7 +61,7 @@ impl ChildProcess {
 
     /// Spawn into [`SpawnParts`] instead of bundling everything into one
     /// struct. Useful when the caller wants to hand the receivers to
-    /// different tasks but keep the killer.
+    /// different tasks.
     pub fn spawn_parts<S: AsRef<str>>(
         cmd: &str,
         cwd: &Path,
@@ -56,7 +72,6 @@ impl ChildProcess {
             pid: cp.pid,
             lines: cp.lines_rx,
             exit: cp.exit_rx.expect("exit_rx populated on fresh spawn"),
-            killer: cp.killer,
         })
     }
 
@@ -67,19 +82,29 @@ impl ChildProcess {
         cwd: &Path,
         extra_env: &[(S, S)],
     ) -> Result<Self, SpawnError> {
-        let pty = native_pty_system();
-        let pair = pty
-            .openpty(PtySize {
-                rows: 24,
-                cols: 200,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(SpawnError::Pty)?;
+        // One PTY per stream. Both slaves become the child's terminal so
+        // isatty() holds on stdout and stderr alike.
+        let (master_out, slave_out) = open_pty()?;
+        let (master_err, slave_err) = open_pty().inspect_err(|_| unsafe {
+            libc::close(master_out);
+            libc::close(slave_out);
+        })?;
 
-        let mut cmd_builder = CommandBuilder::new("sh");
-        cmd_builder.args(["-c", cmd]);
-        cmd_builder.cwd(cwd);
+        // Masters are parent-only — CLOEXEC so the forked child never inherits
+        // a read handle to its own terminal.
+        unsafe {
+            libc::fcntl(master_out, libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(master_err, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg(cmd).current_dir(cwd);
+        // Std sets up stdio (dup2 onto 0/1/2) *before* running pre_exec hooks,
+        // so point the builder at /dev/null and let pre_exec install the PTYs.
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         // Tame `docker compose`'s interactive TTY rendering. Because we give the
         // child a real PTY, compose otherwise draws its navigation menu
         // ("w Enable Watch  d Detach") as a sticky footer and animates progress
@@ -90,53 +115,74 @@ impl ChildProcess {
         // lines instead of redraws. Both are compose-only and ignored by every
         // other program. Set before `extra_env` so a user's devme.toml can still
         // override them.
-        cmd_builder.env("COMPOSE_MENU", "false");
-        cmd_builder.env("COMPOSE_PROGRESS", "plain");
+        command.env("COMPOSE_MENU", "false");
+        command.env("COMPOSE_PROGRESS", "plain");
         for (k, v) in extra_env {
-            cmd_builder.env(k.as_ref(), v.as_ref());
+            command.env(k.as_ref(), v.as_ref());
         }
 
-        let mut child = pair.slave.spawn_command(cmd_builder).map_err(SpawnError::Spawn)?;
-        let pid = child.process_id().unwrap_or(0);
-        let killer = child.clone_killer();
-        // Drop slave handle so the PTY closes when the child exits.
-        drop(pair.slave);
-
-        // Reader thread: stream lines from the master.
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| SpawnError::Pty(anyhow::Error::msg(e.to_string())))?;
-        let (lines_tx, lines_rx) = mpsc::unbounded_channel();
-        std::thread::spawn(move || {
-            let mut buf = BufReader::new(reader);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match buf.read_line(&mut line) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let trimmed = line.trim_end_matches(['\n', '\r']).to_string();
-                        let cleaned = strip_cursor_escapes(&trimmed);
-                        if cleaned.is_empty() {
-                            continue;
-                        }
-                        if lines_tx.send(cleaned).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+        // SAFETY: the closure runs in the forked child between fork and exec and
+        // uses only async-signal-safe libc calls (setsid/dup2/ioctl/close) and
+        // no allocation. `slave_out`/`slave_err` are plain fds captured by value.
+        unsafe {
+            command.pre_exec(move || {
+                // New session: child is its own session + process-group leader
+                // (pid == pgid), which makes the group-kill in send_signal()
+                // reap `sh -c …` wrappers and their grandchildren.
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
                 }
-            }
-        });
-        drop(pair.master);
+                // stdout PTY drives stdin+stdout; stderr PTY drives fd 2.
+                if libc::dup2(slave_out, 0) == -1
+                    || libc::dup2(slave_out, 1) == -1
+                    || libc::dup2(slave_err, 2) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Acquire the stdout PTY as controlling terminal (job control,
+                // SIGWINCH, /dev/tty). Best-effort — not fatal if it fails.
+                libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0);
+                if slave_out > 2 {
+                    libc::close(slave_out);
+                }
+                if slave_err > 2 {
+                    libc::close(slave_err);
+                }
+                Ok(())
+            });
+        }
 
-        // Waiter thread: block on child.wait(), forward exit code.
+        let spawn_result = command.spawn();
+        // Parent's slave copies are redundant once the child holds them; closing
+        // them lets the masters see EOF when the child exits.
+        unsafe {
+            libc::close(slave_out);
+            libc::close(slave_err);
+        }
+        let child = match spawn_result {
+            Ok(c) => c,
+            Err(e) => {
+                unsafe {
+                    libc::close(master_out);
+                    libc::close(master_err);
+                }
+                return Err(SpawnError::Spawn(anyhow::Error::msg(e.to_string())));
+            }
+        };
+        let pid = child.id();
+
+        // One reader thread per stream, each tagging its lines.
+        let (lines_tx, lines_rx) = mpsc::unbounded_channel();
+        spawn_reader(master_out, LogStream::Stdout, lines_tx.clone());
+        spawn_reader(master_err, LogStream::Stderr, lines_tx);
+
+        // Waiter thread: block on child.wait(), forward exit code. `code()` is
+        // None when signal-terminated → -1, matching the old behavior.
         let (exit_tx, exit_rx) = oneshot::channel();
+        let mut child = child;
         std::thread::spawn(move || {
-            let status = child.wait();
-            let code = match status {
-                Ok(s) => s.exit_code() as i32,
+            let code = match child.wait() {
+                Ok(s) => s.code().unwrap_or(-1),
                 Err(_) => -1,
             };
             let _ = exit_tx.send(code);
@@ -146,7 +192,6 @@ impl ChildProcess {
             pid,
             lines_rx,
             exit_rx: Some(exit_rx),
-            killer,
         })
     }
 
@@ -154,8 +199,9 @@ impl ChildProcess {
         self.pid
     }
 
-    /// Next line of output, or `None` when the PTY closes.
-    pub async fn next_line(&mut self) -> Option<String> {
+    /// Next line of output tagged with its stream, or `None` once both PTYs
+    /// have closed.
+    pub async fn next_line(&mut self) -> Option<TaggedLine> {
         self.lines_rx.recv().await
     }
 
@@ -168,12 +214,69 @@ impl ChildProcess {
         }
     }
 
-    /// Send SIGKILL (or equivalent) to the child. Safe from any task.
+    /// Send SIGKILL to the child's process group. Safe from any task.
     pub fn kill(&mut self) -> std::io::Result<()> {
-        self.killer
-            .kill()
-            .map_err(|e| std::io::Error::other(e.to_string()))
+        send_sigkill(self.pid);
+        Ok(())
     }
+}
+
+/// Open a PTY pair sized like a developer's terminal. Returns `(master, slave)`
+/// raw fds; the caller owns both.
+fn open_pty() -> Result<(RawFd, RawFd), SpawnError> {
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let mut winsize = libc::winsize {
+        ws_row: 24,
+        ws_col: 200,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: openpty writes two valid fds on success; a null termios uses
+    // sane defaults; winsize is a stack value valid for the call.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut winsize,
+        )
+    };
+    if rc != 0 {
+        return Err(SpawnError::Pty(anyhow::Error::msg(
+            std::io::Error::last_os_error().to_string(),
+        )));
+    }
+    Ok((master, slave))
+}
+
+/// Stream lines from a PTY master, cleaning cursor escapes and tagging each
+/// with `stream`. Ends (and drops its sender) when the master hits EOF.
+fn spawn_reader(master: RawFd, stream: LogStream, tx: mpsc::UnboundedSender<TaggedLine>) {
+    // SAFETY: we own `master` and hand it to exactly one File, which closes it.
+    let file = unsafe { std::fs::File::from_raw_fd(master) };
+    std::thread::spawn(move || {
+        let mut buf = BufReader::new(file);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match buf.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let trimmed = line.trim_end_matches(['\n', '\r']);
+                    let cleaned = strip_cursor_escapes(trimmed);
+                    if cleaned.is_empty() {
+                        continue;
+                    }
+                    if tx.send((stream, cleaned)).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
 }
 
 /// Send SIGTERM to `pid` — a *graceful* stop request the process can trap to
@@ -289,8 +392,9 @@ mod tests {
     #[tokio::test]
     async fn spawn_echo_emits_line_then_exits_zero() {
         let mut child = ChildProcess::spawn("echo hello", &std::env::temp_dir()).unwrap();
-        let line = child.next_line().await.unwrap();
+        let (stream, line) = child.next_line().await.unwrap();
         assert_eq!(line.trim(), "hello");
+        assert_eq!(stream, LogStream::Stdout);
         let exit = child.wait().await;
         assert_eq!(exit, 0);
     }
@@ -300,11 +404,57 @@ mod tests {
         let mut child =
             ChildProcess::spawn("printf 'one\\ntwo\\nthree\\n'", &std::env::temp_dir()).unwrap();
         let mut lines = Vec::new();
-        while let Some(l) = child.next_line().await {
+        while let Some((_, l)) = child.next_line().await {
             lines.push(l.trim().to_string());
         }
         assert_eq!(lines, vec!["one", "two", "three"]);
         assert_eq!(child.wait().await, 0);
+    }
+
+    #[tokio::test]
+    async fn stdout_and_stderr_lines_are_tagged_by_stream() {
+        let mut child = ChildProcess::spawn(
+            "printf 'to_out\\n'; printf 'to_err\\n' 1>&2",
+            &std::env::temp_dir(),
+        )
+        .unwrap();
+        let mut seen = std::collections::HashMap::new();
+        while let Some((stream, line)) = child.next_line().await {
+            seen.insert(line.trim().to_string(), stream);
+        }
+        assert_eq!(
+            seen.get("to_out"),
+            Some(&LogStream::Stdout),
+            "got: {seen:?}"
+        );
+        assert_eq!(
+            seen.get("to_err"),
+            Some(&LogStream::Stderr),
+            "got: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn both_stdout_and_stderr_are_real_ttys() {
+        // The whole point of dual-PTY: isatty() holds on *both* fds, so tools
+        // keep coloring/animating on stdout and stderr alike.
+        let mut child = ChildProcess::spawn(
+            "test -t 1 && echo OUT_TTY; test -t 2 && echo ERR_TTY 1>&2",
+            &std::env::temp_dir(),
+        )
+        .unwrap();
+        let mut got = Vec::new();
+        while let Some((s, l)) = child.next_line().await {
+            got.push((s, l.trim().to_string()));
+        }
+        assert!(
+            got.contains(&(LogStream::Stdout, "OUT_TTY".to_string())),
+            "stdout was not a tty: {got:?}"
+        );
+        assert!(
+            got.contains(&(LogStream::Stderr, "ERR_TTY".to_string())),
+            "stderr was not a tty: {got:?}"
+        );
     }
 
     #[tokio::test]
@@ -328,20 +478,17 @@ mod tests {
             &[("DEVME_TEST_VAR", "winning")],
         )
         .unwrap();
-        let line = child.next_line().await.unwrap();
+        let (_, line) = child.next_line().await.unwrap();
         assert_eq!(line.trim(), "winning");
     }
 
     #[tokio::test]
     async fn spawn_parts_streams_lines_and_exit_independently() {
-        let mut parts = ChildProcess::spawn_parts::<&str>(
-            "printf 'a\\nb\\n'",
-            &std::env::temp_dir(),
-            &[],
-        )
-        .unwrap();
+        let mut parts =
+            ChildProcess::spawn_parts::<&str>("printf 'a\\nb\\n'", &std::env::temp_dir(), &[])
+                .unwrap();
         let mut lines = Vec::new();
-        while let Some(l) = parts.lines.recv().await {
+        while let Some((_, l)) = parts.lines.recv().await {
             lines.push(l.trim().to_string());
         }
         assert_eq!(lines, vec!["a", "b"]);
@@ -380,6 +527,7 @@ mod tests {
             .recv()
             .await
             .expect("grandchild pid line")
+            .1
             .trim()
             .parse()
             .expect("pid parses");
@@ -404,7 +552,10 @@ mod tests {
     #[test]
     fn strip_cursor_escapes_keeps_sgr_colors() {
         let input = "\x1b[32m✔\x1b[0m Container created";
-        assert_eq!(strip_cursor_escapes(input), "\x1b[32m✔\x1b[0m Container created");
+        assert_eq!(
+            strip_cursor_escapes(input),
+            "\x1b[32m✔\x1b[0m Container created"
+        );
     }
 
     #[test]

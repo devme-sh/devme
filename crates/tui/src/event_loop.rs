@@ -865,7 +865,10 @@ fn is_remote_tui() -> bool {
 
 /// Toast body for a log-copy action, pluralised. `scope` is "visible"/"all".
 fn copied_lines_msg(scope: &str, n: usize) -> String {
-    format!("copied {n} {scope} log line{}", if n == 1 { "" } else { "s" })
+    format!(
+        "copied {n} {scope} log line{}",
+        if n == 1 { "" } else { "s" }
+    )
 }
 
 /// Copy `lines` to the clipboard. Tries the OS clipboard first (works even
@@ -921,7 +924,9 @@ fn copy_native(text: &str) -> bool {
             ("xsel", &["--clipboard", "--input"]),
         ]
     };
-    candidates.iter().any(|(cmd, args)| pipe_to(cmd, args, text))
+    candidates
+        .iter()
+        .any(|(cmd, args)| pipe_to(cmd, args, text))
 }
 
 fn pipe_to(cmd: &str, args: &[&str], text: &str) -> bool {
@@ -948,7 +953,11 @@ fn pipe_to(cmd: &str, args: &[&str], text: &str) -> bool {
 
 fn build_debug_prompt(state: &TuiState) -> String {
     let cwd = state.current_instance_cwd();
-    let label = if state.shared_selected() { "shared" } else { state.instance_label() };
+    let label = if state.shared_selected() {
+        "shared"
+    } else {
+        state.instance_label()
+    };
     let owned = state.services();
     // On a stack, fold in the repo-scoped shared services too — a broken
     // shared dependency (proxy, db) is often the real cause, and on a
@@ -983,7 +992,12 @@ fn build_debug_prompt(state: &TuiState) -> String {
         let tag = |shared: bool| if shared { " (shared)" } else { "" };
         prompt.push_str("## Service states\n\n");
         for (svc, shared) in &entries {
-            prompt.push_str(&format!("- **{}**{}: {:?}", svc.name, tag(*shared), svc.state));
+            prompt.push_str(&format!(
+                "- **{}**{}: {:?}",
+                svc.name,
+                tag(*shared),
+                svc.state
+            ));
             if let Some(pid) = svc.pid {
                 prompt.push_str(&format!(" (pid {})", pid));
             }
@@ -1003,7 +1017,10 @@ fn build_debug_prompt(state: &TuiState) -> String {
                 continue;
             }
             let tail: Vec<&str> = if logs.len() > 30 {
-                logs.iter().skip(logs.len() - 30).map(|s| s.as_str()).collect()
+                logs.iter()
+                    .skip(logs.len() - 30)
+                    .map(|s| s.as_str())
+                    .collect()
             } else {
                 logs.iter().map(|s| s.as_str()).collect()
             };
@@ -1022,7 +1039,10 @@ fn build_debug_prompt(state: &TuiState) -> String {
     }
 
     for step in state.steps() {
-        if matches!(step.state, devme_core::StepState::Failed | devme_core::StepState::ProvisionFailed) {
+        if matches!(
+            step.state,
+            devme_core::StepState::Failed | devme_core::StepState::ProvisionFailed
+        ) {
             prompt.push_str(&format!("Step `{}` is {:?}.\n", step.name, step.state));
             let logs = state.service_logs(&step.name);
             if !logs.is_empty() {
@@ -1036,9 +1056,7 @@ fn build_debug_prompt(state: &TuiState) -> String {
         }
     }
 
-    if let Ok(toml) = std::fs::read_to_string(
-        std::path::Path::new(cwd).join("devme.toml"),
-    ) {
+    if let Ok(toml) = std::fs::read_to_string(std::path::Path::new(cwd).join("devme.toml")) {
         prompt.push_str("## devme.toml\n\n```toml\n");
         prompt.push_str(&toml);
         prompt.push_str("```\n\n");
@@ -1057,7 +1075,10 @@ mod tests {
     fn running(name: &str) -> ServiceSnapshot {
         ServiceSnapshot {
             name: name.into(),
-            state: ServiceState::Running { degraded: false, started_without: vec![] },
+            state: ServiceState::Running {
+                degraded: false,
+                started_without: vec![],
+            },
             pid: None,
             port: None,
             url: None,
@@ -1082,7 +1103,13 @@ mod tests {
         let prompt = build_debug_prompt(&state);
         // The owned side is empty, but the shared deps are folded in (flagged).
         assert!(prompt.contains("No devme.toml"), "{prompt}");
-        assert!(prompt.contains("**proxy** (shared)"), "shared service missing:\n{prompt}");
-        assert!(prompt.contains("**postgres** (shared)"), "shared service missing:\n{prompt}");
+        assert!(
+            prompt.contains("**proxy** (shared)"),
+            "shared service missing:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("**postgres** (shared)"),
+            "shared service missing:\n{prompt}"
+        );
     }
 }

@@ -16,8 +16,8 @@ use std::time::{Duration, Instant, SystemTime};
 use base64::Engine;
 use devme_config::{Graph, InterpContext, Stack, interpolate};
 use devme_core::{
-    ClientMessage, Envelope, ErrorCode, HealthCheck, InstanceInfo, NoticeLevel, RestartPolicy,
-    ServerMessage, ServiceSnapshot, ServiceState, Slot, StepSnapshot, StepState,
+    ClientMessage, Envelope, ErrorCode, HealthCheck, InstanceInfo, LogStream, NoticeLevel,
+    RestartPolicy, ServerMessage, ServiceSnapshot, ServiceState, Slot, StepSnapshot, StepState,
 };
 use devme_executor::{Action, Event as ExecEvent, Executor, NodeStatus};
 use devme_ipc::FrameCodec;
@@ -80,6 +80,7 @@ enum InternalEvent {
     ProcessLine {
         service: String,
         generation: u64,
+        stream: LogStream,
         line: String,
     },
     ProcessExited {
@@ -127,7 +128,7 @@ struct ChildRecord {
 
 struct RingBuffer {
     capacity: usize,
-    lines: VecDeque<(u64, String)>,
+    lines: VecDeque<(u64, LogStream, String)>,
 }
 
 impl RingBuffer {
@@ -138,14 +139,14 @@ impl RingBuffer {
         }
     }
 
-    fn push(&mut self, ts: u64, line: String) {
+    fn push(&mut self, ts: u64, stream: LogStream, line: String) {
         if self.lines.len() == self.capacity {
             self.lines.pop_front();
         }
-        self.lines.push_back((ts, line));
+        self.lines.push_back((ts, stream, line));
     }
 
-    fn iter(&self) -> impl Iterator<Item = &(u64, String)> {
+    fn iter(&self) -> impl Iterator<Item = &(u64, LogStream, String)> {
         self.lines.iter()
     }
 }
@@ -404,7 +405,13 @@ impl DaemonServer {
     pub async fn serve(self) -> std::io::Result<()> {
         let (internal_tx, internal_rx) = mpsc::unbounded_channel::<InternalEvent>();
         let accept_tx = internal_tx.clone();
-        let DaemonServer { listener, path, stack, slot, instance } = self;
+        let DaemonServer {
+            listener,
+            path,
+            stack,
+            slot,
+            instance,
+        } = self;
 
         tokio::spawn(accept_loop(listener, accept_tx));
 
@@ -552,8 +559,9 @@ fn process_event(
         InternalEvent::ProcessLine {
             service,
             generation,
+            stream,
             line,
-        } => handle_process_line(state, service, generation, line),
+        } => handle_process_line(state, service, generation, stream, line),
         InternalEvent::ProcessExited {
             service,
             generation,
@@ -591,11 +599,14 @@ fn process_event(
                 .logs
                 .entry(step.clone())
                 .or_insert_with(|| RingBuffer::new(RING_CAPACITY));
-            buf.push(ts, line);
+            // Step check/provision output isn't split into streams yet (the
+            // executor spawns steps without dual-PTY); tag it stdout for now.
+            buf.push(ts, LogStream::Stdout, line);
             let msg = ServerMessage::LogChunk {
                 service: step.clone(),
                 bytes,
                 ts,
+                stream: LogStream::Stdout,
             };
             state.broadcast(Some(&step), msg);
         }
@@ -661,11 +672,12 @@ fn handle_client_message(
                 };
                 for name in names {
                     if let Some(buf) = state.logs.get(&name) {
-                        for (ts, line) in buf.iter() {
+                        for (ts, stream, line) in buf.iter() {
                             let _ = client.send(ServerMessage::LogChunk {
                                 service: name.clone(),
                                 bytes: encode_line(line),
                                 ts: *ts,
+                                stream: *stream,
                             });
                         }
                     }
@@ -764,7 +776,13 @@ fn handle_client_message(
     }
 }
 
-fn handle_process_line(state: &mut DaemonState, service: String, generation: u64, line: String) {
+fn handle_process_line(
+    state: &mut DaemonState,
+    service: String,
+    generation: u64,
+    stream: LogStream,
+    line: String,
+) {
     let current_gen = state
         .children
         .get(&service)
@@ -779,13 +797,14 @@ fn handle_process_line(state: &mut DaemonState, service: String, generation: u64
         .logs
         .entry(service.clone())
         .or_insert_with(|| RingBuffer::new(RING_CAPACITY));
-    buf.push(ts, line.clone());
+    buf.push(ts, stream, line.clone());
     state.broadcast(
         Some(&service),
         ServerMessage::LogChunk {
             service: service.clone(),
             bytes: encode_line(&line),
             ts,
+            stream,
         },
     );
 }
@@ -852,7 +871,10 @@ fn handle_process_exited(
                 .entry(service.clone())
                 .or_insert_with(|| VecDeque::with_capacity(CRASH_LOOP_THRESHOLD + 1));
             let window = Duration::from_secs(CRASH_LOOP_WINDOW_SECS);
-            while exits.front().is_some_and(|&t| now.duration_since(t) > window) {
+            while exits
+                .front()
+                .is_some_and(|&t| now.duration_since(t) > window)
+            {
                 exits.pop_front();
             }
             exits.push_back(now);
@@ -970,7 +992,9 @@ fn handle_external_healthy(
     // re-subscribe or duplicate event must stay idempotent).
     if matches!(
         state.executor.state(&service),
-        Some(NodeStatus::Service(ServiceState::External { healthy: true }))
+        Some(NodeStatus::Service(ServiceState::External {
+            healthy: true
+        }))
     ) {
         return;
     }
@@ -1108,11 +1132,12 @@ fn enact_actions(
                 let lines_name = name.clone();
                 let mut lines_rx = parts.lines;
                 tokio::spawn(async move {
-                    while let Some(line) = lines_rx.recv().await {
+                    while let Some((stream, line)) = lines_rx.recv().await {
                         if lines_tx
                             .send(InternalEvent::ProcessLine {
                                 service: lines_name.clone(),
                                 generation,
+                                stream,
                                 line,
                             })
                             .is_err()
@@ -1144,9 +1169,7 @@ fn enact_actions(
                     tokio::spawn(async move {
                         let mut ticker =
                             tokio::time::interval(Duration::from_millis(PROBE_INTERVAL_MS));
-                        ticker.set_missed_tick_behavior(
-                            tokio::time::MissedTickBehavior::Delay,
-                        );
+                        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                         // Skip the immediate first tick — give the service a
                         // beat to actually start listening.
                         ticker.tick().await;
@@ -1215,8 +1238,9 @@ fn enact_actions(
                     loop {
                         ticker.tick().await;
                         if probe(&check).await {
-                            let _ = probe_tx
-                                .send(InternalEvent::ExternalHealthy { service: probe_name });
+                            let _ = probe_tx.send(InternalEvent::ExternalHealthy {
+                                service: probe_name,
+                            });
                             return;
                         }
                     }
@@ -1226,11 +1250,7 @@ fn enact_actions(
                 begin_stop(state, &name, tx);
             }
             Action::RunCheck(name) => {
-                let cmd = state
-                    .stack
-                    .step
-                    .get(&name)
-                    .map(|s| s.check.clone());
+                let cmd = state.stack.step.get(&name).map(|s| s.check.clone());
                 let Some(cmd) = cmd else { continue };
                 let ctx = state.node_ctx(None);
                 let cmd = interpolate(&cmd, &ctx).unwrap_or(cmd);
@@ -1238,8 +1258,7 @@ fn enact_actions(
                 let check_tx = tx.clone();
                 let step_name = name.clone();
                 tokio::spawn(async move {
-                    let passed =
-                        run_shell_streaming(&cmd, &cwd, &step_name, &check_tx).await;
+                    let passed = run_shell_streaming(&cmd, &cwd, &step_name, &check_tx).await;
                     let _ = check_tx.send(InternalEvent::StepCheckResult {
                         step: step_name,
                         passed,
@@ -1305,8 +1324,7 @@ fn enact_actions(
                 let provision_tx = tx.clone();
                 let step_name = name.clone();
                 tokio::spawn(async move {
-                    let passed =
-                        run_shell_streaming(&cmd, &cwd, &step_name, &provision_tx).await;
+                    let passed = run_shell_streaming(&cmd, &cwd, &step_name, &provision_tx).await;
                     let _ = provision_tx.send(InternalEvent::StepProvisionResult {
                         step: step_name,
                         passed,
@@ -1349,7 +1367,9 @@ fn interpolate_health(check: &HealthCheck, ctx: &InterpContext) -> HealthCheck {
     let resolve = |s: &str| interpolate(s, ctx).unwrap_or_else(|_| s.to_string());
     match check {
         HealthCheck::Tcp { tcp } => HealthCheck::Tcp { tcp: resolve(tcp) },
-        HealthCheck::Http { http } => HealthCheck::Http { http: resolve(http) },
+        HealthCheck::Http { http } => HealthCheck::Http {
+            http: resolve(http),
+        },
         HealthCheck::Shell { shell } => HealthCheck::Shell {
             shell: resolve(shell),
         },
@@ -1492,10 +1512,7 @@ mod tests {
         panic!("could not connect to {}", sock.display());
     }
 
-    async fn send_msg(
-        conn: &mut Framed<UnixStream, FrameCodec>,
-        msg: ClientMessage,
-    ) {
+    async fn send_msg(conn: &mut Framed<UnixStream, FrameCodec>, msg: ClientMessage) {
         let env = Envelope::new(msg);
         let bytes = serde_json::to_vec(&env).unwrap();
         conn.send(bytes.as_slice()).await.unwrap();
@@ -1538,7 +1555,11 @@ cmd = "true"
             ServerMessage::Subscribed { services, .. } => {
                 let names: Vec<_> = services.iter().map(|s| s.name.as_str()).collect();
                 assert_eq!(names, vec!["db", "api"]);
-                assert!(services.iter().all(|s| matches!(s.state, ServiceState::Stopped)));
+                assert!(
+                    services
+                        .iter()
+                        .all(|s| matches!(s.state, ServiceState::Stopped))
+                );
             }
             other => panic!("expected Subscribed, got {other:?}"),
         }
@@ -1642,12 +1663,7 @@ cmd = "printf 'one\\ntwo\\n'; sleep 5"
             let msg = tokio::time::timeout(Duration::from_secs(2), recv_msg(&mut conn))
                 .await
                 .expect("timed out waiting for log chunks");
-            if let ServerMessage::LogChunk {
-                service,
-                bytes,
-                ..
-            } = msg
-            {
+            if let ServerMessage::LogChunk { service, bytes, .. } = msg {
                 let decoded = base64::engine::general_purpose::STANDARD
                     .decode(bytes.as_bytes())
                     .unwrap();
@@ -1767,12 +1783,9 @@ port = {{ base = 9000, slot_offset = 10 }}
 
         let stack = make_stack(&toml);
         // Slot 3 → 9000 + 3*10 = 9030.
-        let server = DaemonServer::bind_with_stack_and_slot(
-            &sock,
-            stack,
-            devme_core::Slot::new(3).unwrap(),
-        )
-        .unwrap();
+        let server =
+            DaemonServer::bind_with_stack_and_slot(&sock, stack, devme_core::Slot::new(3).unwrap())
+                .unwrap();
         let task = tokio::spawn(server.serve());
 
         let mut conn = connect(&sock).await;
@@ -1889,8 +1902,9 @@ cwd = "{cwd_str}"
         // Single-quote the echo payload so the shell treats `|` literally
         // (devme has already substituted the {vars} by spawn time, so the
         // quotes don't suppress anything we need).
-        let cmd =
-            format!("echo '{{port.backend}}|{{worktree}}' > {marker_path}; echo {{branch}}; sleep 30");
+        let cmd = format!(
+            "echo '{{port.backend}}|{{worktree}}' > {marker_path}; echo {{branch}}; sleep 30"
+        );
         let toml = format!(
             r#"
 schema_version = 1
@@ -1908,12 +1922,9 @@ env = {{ VITE_API_BASE_URL = "http://localhost:{{port.backend}}" }}
 
         let stack = make_stack(&toml);
         // Slot 2 → backend = 8080 + 2*10 = 8100.
-        let server = DaemonServer::bind_with_stack_and_slot(
-            &sock,
-            stack,
-            devme_core::Slot::new(2).unwrap(),
-        )
-        .unwrap();
+        let server =
+            DaemonServer::bind_with_stack_and_slot(&sock, stack, devme_core::Slot::new(2).unwrap())
+                .unwrap();
         let task = tokio::spawn(server.serve());
 
         let mut conn = connect(&sock).await;
@@ -1964,8 +1975,7 @@ port = { base = 8080, slot_offset = 10 }
 [service.frontend]
 cmd = "echo {port.backed}; sleep 30"
 "#;
-        let server =
-            DaemonServer::bind_with_stack(&sock, make_stack(toml)).unwrap();
+        let server = DaemonServer::bind_with_stack(&sock, make_stack(toml)).unwrap();
         let task = tokio::spawn(server.serve());
 
         let mut conn = connect(&sock).await;
@@ -2057,7 +2067,10 @@ depends_on = ["tools"]
             }
         }
         assert!(saw_step_passed, "step never reported Passed");
-        assert!(saw_app_running, "service blocked on step never reached Running");
+        assert!(
+            saw_app_running,
+            "service blocked on step never reached Running"
+        );
 
         send_msg(&mut conn, ClientMessage::Shutdown).await;
         let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
@@ -2099,9 +2112,7 @@ check = "echo hello from check; echo line two"
             && !got.iter().any(|l| l.contains("hello from check"))
         {
             match tokio::time::timeout(Duration::from_millis(500), recv_msg(&mut conn)).await {
-                Ok(ServerMessage::LogChunk {
-                    service, bytes, ..
-                }) if service == "greeting" => {
+                Ok(ServerMessage::LogChunk { service, bytes, .. }) if service == "greeting" => {
                     let decoded = base64::engine::general_purpose::STANDARD
                         .decode(bytes.as_bytes())
                         .unwrap();
@@ -2154,8 +2165,7 @@ provision = "{provision}"
 
         let mut last_state: Option<StepState> = None;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::time::Instant::now() < deadline
-            && !matches!(last_state, Some(StepState::Passed))
+        while std::time::Instant::now() < deadline && !matches!(last_state, Some(StepState::Passed))
         {
             match tokio::time::timeout(Duration::from_millis(500), recv_msg(&mut conn)).await {
                 Ok(ServerMessage::StepStatusUpdate { step, state }) if step == "bootstrap" => {
@@ -2416,11 +2426,8 @@ health = {{ shell = "{probe_cmd}" }}
     async fn shutdown_sends_goodbye_and_exits() {
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("d.sock");
-        let server = DaemonServer::bind_with_stack(
-            &sock,
-            make_stack("schema_version = 1\n"),
-        )
-        .unwrap();
+        let server =
+            DaemonServer::bind_with_stack(&sock, make_stack("schema_version = 1\n")).unwrap();
         let task = tokio::spawn(server.serve());
 
         let mut conn = connect(&sock).await;

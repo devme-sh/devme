@@ -208,10 +208,7 @@ async fn attach_one(
     });
 
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<ClientMessage>();
-    conns
-        .lock()
-        .await
-        .push((id.clone(), Connection { cmd_tx }));
+    conns.lock().await.push((id.clone(), Connection { cmd_tx }));
 
     let tx_t = tx.clone();
     let id_t = id;

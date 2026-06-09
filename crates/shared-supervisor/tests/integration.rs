@@ -18,11 +18,7 @@ impl ShortTmp {
     fn new() -> Self {
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let p = std::path::PathBuf::from(format!(
-            "/tmp/devme-test-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let p = std::path::PathBuf::from(format!("/tmp/devme-test-{}-{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         Self(p)
@@ -126,7 +122,11 @@ async fn binds_and_responds_to_subscribe_with_shared_identity() {
         .await
         .unwrap();
     let id = match resp {
-        ServerMessage::Subscribed { instance, services, steps } => {
+        ServerMessage::Subscribed {
+            instance,
+            services,
+            steps,
+        } => {
             assert!(services.is_empty(), "shared daemon has no services yet");
             assert!(steps.is_empty(), "shared daemon has no steps yet");
             instance.id
@@ -200,7 +200,10 @@ cmd = "while true; do echo INSTANCE-MARKER; sleep 0.2; done"
         other => panic!("expected Subscribed, got {other:?}"),
     };
     let names: Vec<&str> = services.iter().map(|s| s.name.as_str()).collect();
-    assert!(names.contains(&"cache"), "cache must be spawned, got {names:?}");
+    assert!(
+        names.contains(&"cache"),
+        "cache must be spawned, got {names:?}"
+    );
     assert!(
         !names.contains(&"web"),
         "instance-scoped 'web' must NOT be spawned by shared daemon, got {names:?}"
@@ -295,7 +298,10 @@ stop = "touch {}"
             .expect("db service should have a pid"),
         other => panic!("expected Subscribed, got {other:?}"),
     };
-    assert!(!marker.exists(), "stop hook must not have run before shutdown");
+    assert!(
+        !marker.exists(),
+        "stop hook must not have run before shutdown"
+    );
 
     let _ = client.send(ClientMessage::Shutdown).await;
 
@@ -309,7 +315,10 @@ stop = "touch {}"
         }
     })
     .await;
-    assert!(exited.is_ok(), "shared-supervisor did not exit after Shutdown");
+    assert!(
+        exited.is_ok(),
+        "shared-supervisor did not exit after Shutdown"
+    );
 
     assert!(marker.exists(), "stop hook command did not run on shutdown");
     // The `sleep 1000` must have been signalled dead, not orphaned.

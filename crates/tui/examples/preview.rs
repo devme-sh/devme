@@ -3,9 +3,7 @@
 //! without leaving the editor — `cargo run --example preview -p devme-tui`.
 
 use base64::Engine;
-use devme_core::{
-    ServerMessage, ServiceSnapshot, ServiceState, StepSnapshot, StepState,
-};
+use devme_core::{ServerMessage, ServiceSnapshot, ServiceState, StepSnapshot, StepState};
 use devme_tui::render::render;
 use devme_tui::state::TuiState;
 use ratatui::Terminal;
@@ -84,13 +82,17 @@ fn main() {
         ("backend", "INFO  POST /api/login          200  18ms"),
         ("backend", "\x1b[33mWARN \x1b[0m queue depth high (n=137)"),
         ("backend", "INFO  GET  /api/dashboards     200  4.8ms"),
-        ("backend", "\x1b[31mERROR\x1b[0m upstream timeout on /api/billing"),
+        (
+            "backend",
+            "\x1b[31mERROR\x1b[0m upstream timeout on /api/billing",
+        ),
         ("backend", "INFO  GET  /api/users/42       200  2.1ms"),
         ("backend", "INFO  GET  /api/dashboards/9   200  3.0ms"),
         ("db", "LOG: database system is ready to accept connections"),
         ("db", "LOG: checkpoint starting: time"),
     ] {
         state.apply(ServerMessage::LogChunk {
+            stream: devme_core::LogStream::Stdout,
             service: svc.into(),
             bytes: enc(line),
             ts: 0,

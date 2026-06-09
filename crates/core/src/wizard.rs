@@ -18,18 +18,32 @@ pub enum WizardEvent {
     /// matching `WizardResponse` on stdin.
     Ask(AskPrompt),
     /// Long-running operation started. `total` is `None` for indeterminate.
-    ProgressStart { id: String, label: String, total: Option<u64> },
+    ProgressStart {
+        id: String,
+        label: String,
+        total: Option<u64>,
+    },
     /// Progress update. The runner advances the progress bar; if `total` was
     /// `None` initially, this is just a heartbeat.
-    ProgressUpdate { id: String, current: u64, message: Option<String> },
+    ProgressUpdate {
+        id: String,
+        current: u64,
+        message: Option<String>,
+    },
     /// Operation finished. The progress widget for `id` collapses to a
     /// single line showing the final message.
     ProgressEnd { id: String, message: Option<String> },
     /// Print a log line in the wizard panel.
-    Log { level: WizardLogLevel, message: String },
+    Log {
+        level: WizardLogLevel,
+        message: String,
+    },
     /// Persist a key/value pair to `.devme/state.json` so later steps in
     /// the same wizard, or later launches of devme, can read it.
-    SetVar { key: String, value: serde_json::Value },
+    SetVar {
+        key: String,
+        value: serde_json::Value,
+    },
     /// Wizard finished. The runner closes the script's stdin and surfaces
     /// the `summary` in the Supervisor tab.
     Done { summary: String },
@@ -50,10 +64,7 @@ pub enum AskPrompt {
         required: bool,
     },
     /// Like `Text` but the runner hides the entered characters.
-    Password {
-        id: String,
-        prompt: String,
-    },
+    Password { id: String, prompt: String },
     /// Pick one option from a list.
     Choice {
         id: String,
@@ -113,7 +124,10 @@ pub enum WizardLogLevel {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WizardResponse {
     /// The user provided a value. `id` must match the `Ask`'s id.
-    Value { id: String, value: serde_json::Value },
+    Value {
+        id: String,
+        value: serde_json::Value,
+    },
     /// The user cancelled. The runner closes the script's stdin; the script
     /// should terminate cleanly with a non-zero exit code.
     Cancel { id: String },
@@ -192,11 +206,16 @@ mod tests {
 
     #[test]
     fn confirm_default_false() {
-        let p: AskPrompt = serde_json::from_str(
-            r#"{"type":"confirm","id":"q","prompt":"continue?"}"#,
-        )
-        .unwrap();
-        assert_eq!(p, AskPrompt::Confirm { id: "q".into(), prompt: "continue?".into(), default: false });
+        let p: AskPrompt =
+            serde_json::from_str(r#"{"type":"confirm","id":"q","prompt":"continue?"}"#).unwrap();
+        assert_eq!(
+            p,
+            AskPrompt::Confirm {
+                id: "q".into(),
+                prompt: "continue?".into(),
+                default: false
+            }
+        );
     }
 
     #[test]

@@ -24,14 +24,23 @@ mod tests {
 
     #[test]
     fn serializes_to_lowercase_string() {
-        assert_eq!(serde_json::to_string(&Scope::Instance).unwrap(), r#""instance""#);
+        assert_eq!(
+            serde_json::to_string(&Scope::Instance).unwrap(),
+            r#""instance""#
+        );
         assert_eq!(serde_json::to_string(&Scope::Repo).unwrap(), r#""repo""#);
     }
 
     #[test]
     fn deserializes_from_lowercase_string() {
-        assert_eq!(serde_json::from_str::<Scope>(r#""instance""#).unwrap(), Scope::Instance);
-        assert_eq!(serde_json::from_str::<Scope>(r#""repo""#).unwrap(), Scope::Repo);
+        assert_eq!(
+            serde_json::from_str::<Scope>(r#""instance""#).unwrap(),
+            Scope::Instance
+        );
+        assert_eq!(
+            serde_json::from_str::<Scope>(r#""repo""#).unwrap(),
+            Scope::Repo
+        );
     }
 
     #[test]
