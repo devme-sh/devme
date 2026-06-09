@@ -196,6 +196,8 @@ impl GlobalConfig {
             "remote.root" => self.remote.root.clone(),
             "remote.sync_mode" => self.remote.sync_mode.clone(),
             "remote.attach" => self.remote.attach.clone(),
+            "remote.url_host" => self.remote.url_host.clone(),
+            "remote.default" => self.remote.default.map(|b| b.to_string()),
             _ => None,
         }
     }
@@ -252,6 +254,16 @@ impl GlobalConfig {
                 self.remote.attach = Some(value.to_string());
                 Ok(())
             }
+            "remote.url_host" => {
+                self.remote.url_host = Some(value.to_string());
+                Ok(())
+            }
+            "remote.default" => {
+                let b = parse_bool(value)
+                    .ok_or_else(|| format!("remote.default expects true/false, got: {value}"))?;
+                self.remote.default = Some(b);
+                Ok(())
+            }
             _ => Err(format!("unknown config key: {key}")),
         }
     }
@@ -298,6 +310,14 @@ impl GlobalConfig {
                 self.remote.attach = None;
                 Ok(())
             }
+            "remote.url_host" => {
+                self.remote.url_host = None;
+                Ok(())
+            }
+            "remote.default" => {
+                self.remote.default = None;
+                Ok(())
+            }
             _ => Err(format!("unknown config key: {key}")),
         }
     }
@@ -314,6 +334,8 @@ impl GlobalConfig {
             ("remote.root", "Remote parent dir for synced projects (default ~/development)"),
             ("remote.sync_mode", "Mutagen sync mode (two-way-safe/two-way-resolved)"),
             ("remote.attach", "Attach command after sync: preset (tui/ssh/tmux/herdr) or a raw template"),
+            ("remote.url_host", "Host for service URLs over a live remote (default: remote.host, e.g. a Tailscale name)"),
+            ("remote.default", "Make bare `devme` behave as `devme remote` (true/false)"),
         ]
     }
 
@@ -363,7 +385,9 @@ fn parse_bool(value: &str) -> Option<bool> {
 /// string-typed `hints.skills`) is quoted.
 fn render_toml_value(key: &str, value: &str) -> String {
     match key {
-        "skill.auto_update" | "tui.confirm_quit" | "tui.toasts" => value.to_string(),
+        "skill.auto_update" | "tui.confirm_quit" | "tui.toasts" | "remote.default" => {
+            value.to_string()
+        }
         _ => format!("\"{value}\""),
     }
 }

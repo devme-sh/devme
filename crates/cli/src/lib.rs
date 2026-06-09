@@ -42,6 +42,13 @@ pub struct Cli {
     /// "I know what I want" mode (ADR-0002).
     #[arg(long, short = 'y', global = true)]
     pub yes: bool,
+
+    /// Force a command to run against the *local* daemon even when this
+    /// project has a live remote sync. By default, daemon-facing commands
+    /// (`status`, `logs`, `up`, …) transparently proxy to the remote host
+    /// while a sync is active; `--local` is the escape hatch.
+    #[arg(long, global = true)]
+    pub local: bool,
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

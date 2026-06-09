@@ -71,6 +71,16 @@ pub struct RemoteConfig {
     /// Mutagen ignore patterns. Empty → [`DEFAULT_IGNORES`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignore: Vec<String>,
+    /// Hostname to build service URLs from when a sync is live (e.g. a
+    /// Tailscale MagicDNS name reachable from the laptop browser). Defaults
+    /// to `host` with any `user@` stripped — so `devme url` over a live
+    /// remote resolves to `http://<url_host>:<port>` instead of localhost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url_host: Option<String>,
+    /// When true, bare `devme` behaves as `devme remote` — the project is
+    /// remote-first, so opening it attaches to the remote stack's TUI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<bool>,
 }
 
 impl RemoteConfig {
@@ -80,6 +90,22 @@ impl RemoteConfig {
             && self.sync_mode.is_none()
             && self.attach.is_none()
             && self.ignore.is_empty()
+            && self.url_host.is_none()
+            && self.default.is_none()
+    }
+
+    /// Whether bare `devme` should default to `devme remote` for this user.
+    pub fn is_default(&self) -> bool {
+        self.default.unwrap_or(false)
+    }
+
+    /// The host to build browser URLs from: explicit `url_host`, else `host`
+    /// with any `user@` prefix stripped (an SSH login user isn't part of an
+    /// HTTP authority).
+    pub fn url_host_for(&self, host: &str) -> String {
+        self.url_host
+            .clone()
+            .unwrap_or_else(|| host.rsplit('@').next().unwrap_or(host).to_string())
     }
 
     pub fn root_or_default(&self) -> &str {
@@ -186,6 +212,15 @@ pub fn expand_attach(attach: &str, host: &str, remote_path: &str, name: &str) ->
         .replace("{name}", name)
 }
 
+/// Rewrite a local URL's host to `url_host` so a `http://localhost:<port>`
+/// from the remote daemon becomes reachable from the laptop (e.g. over
+/// Tailscale). Only the loopback authority is swapped; the port and path are
+/// preserved.
+pub fn rewrite_url_host(url: &str, url_host: &str) -> String {
+    url.replace("//localhost:", &format!("//{url_host}:"))
+        .replace("//127.0.0.1:", &format!("//{url_host}:"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,5 +312,30 @@ mod tests {
     fn attach_raw_template_substitutes_placeholders() {
         let cmd = expand_attach("mosh {host} -- tmux a -t {name}", "box", "/p", "proj");
         assert_eq!(cmd, "mosh box -- tmux a -t proj");
+    }
+
+    #[test]
+    fn url_host_strips_login_user_and_honors_override() {
+        let cfg = RemoteConfig::default();
+        assert_eq!(cfg.url_host_for("vps"), "vps");
+        assert_eq!(cfg.url_host_for("dev@10.0.0.1"), "10.0.0.1");
+        let cfg = RemoteConfig { url_host: Some("vps.tailnet.ts.net".into()), ..Default::default() };
+        assert_eq!(cfg.url_host_for("dev@10.0.0.1"), "vps.tailnet.ts.net");
+    }
+
+    #[test]
+    fn rewrite_url_host_swaps_only_loopback_authority() {
+        assert_eq!(rewrite_url_host("http://localhost:8090", "vps"), "http://vps:8090");
+        assert_eq!(rewrite_url_host("http://127.0.0.1:5432/db", "vps"), "http://vps:5432/db");
+        // A non-loopback host is left alone.
+        assert_eq!(rewrite_url_host("http://example.com:80", "vps"), "http://example.com:80");
+    }
+
+    #[test]
+    fn default_flag_round_trips() {
+        let cfg = RemoteConfig { default: Some(true), ..Default::default() };
+        assert!(cfg.is_default());
+        assert!(!cfg.is_empty());
+        assert!(!RemoteConfig::default().is_default());
     }
 }

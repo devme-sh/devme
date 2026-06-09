@@ -28,6 +28,8 @@ struct Resolved {
     sync_mode: String,
     attach: String,
     root: String,
+    /// Browser-reachable host for service URLs (Tailscale name etc.).
+    url_host: String,
     ignores: Vec<String>,
 }
 
@@ -48,6 +50,7 @@ fn resolve(cwd: &Path) -> Result<Resolved> {
     let remote_path = remote::remote_path(&root, &local_root);
     let session = remote::sync_session_name(&local_root);
     let beta = format!("{host}:{remote_path}");
+    let url_host = r.url_host_for(&host);
     Ok(Resolved {
         host,
         local_root,
@@ -57,6 +60,7 @@ fn resolve(cwd: &Path) -> Result<Resolved> {
         sync_mode: r.sync_mode_or_default().to_string(),
         attach: r.attach_or_default().to_string(),
         root,
+        url_host,
         ignores: r.ignores(),
     })
 }
@@ -168,6 +172,127 @@ fn ssh_check(host: &str, remote_cmd: &str) -> (bool, String) {
             (o.status.success(), s.trim().to_string())
         }
         Err(e) => (false, e.to_string()),
+    }
+}
+
+// --- transparent proxy ------------------------------------------------------
+
+/// Is a live sync session present for this repo? That's the signal that the
+/// project is in **remote mode**: the stack runs on the VPS, so daemon-facing
+/// commands forward there. Returns the resolved context when active.
+fn remote_active(cwd: &Path) -> Option<Resolved> {
+    let r = resolve(cwd).ok()?;
+    if sync_exists(&r.session) { Some(r) } else { None }
+}
+
+/// Daemon/stack-facing commands forward to the remote when remote mode is
+/// active. Machine-local commands (`config`, `skill`, `completions`) and
+/// `remote` itself always run locally and are absent here.
+fn is_proxyable(command: &Option<crate::Command>) -> bool {
+    use crate::Command as C;
+    matches!(
+        command,
+        Some(
+            C::Up { .. }
+                | C::Down { .. }
+                | C::Status { .. }
+                | C::Start { .. }
+                | C::Stop { .. }
+                | C::Restart { .. }
+                | C::Logs { .. }
+                | C::Url { .. }
+                | C::Doctor { .. }
+                | C::Worktree { .. }
+        )
+    )
+}
+
+/// Transparent remote proxy. When a live sync exists and `command` is
+/// daemon-facing, run it on the remote over SSH so `devme logs`, `status`,
+/// etc. behave exactly as local but read from the VPS. Returns the remote's
+/// exit code, or `None` to fall through to local execution.
+pub fn maybe_proxy(command: &Option<crate::Command>) -> Option<i32> {
+    if !is_proxyable(command) {
+        return None;
+    }
+    let cwd = std::env::current_dir().ok()?;
+    let r = remote_active(&cwd)?;
+    // `url` is special: ask the remote for the port, but rewrite the host so
+    // it's reachable from the laptop browser (e.g. over Tailscale), and open
+    // locally rather than on the headless VPS.
+    if let Some(crate::Command::Url { service, open }) = command {
+        return Some(proxy_url(&r, service, *open));
+    }
+    Some(proxy_passthrough(&r))
+}
+
+/// Forward this invocation's own arguments to the remote verbatim, dropping
+/// `--local` (a local-only escape hatch the remote shouldn't see).
+fn forwarded_args() -> Vec<String> {
+    std::env::args().skip(1).filter(|a| a != "--local").collect()
+}
+
+/// POSIX single-quote a shell argument. Simple tokens (service names, flags,
+/// numbers) pass through unquoted. The `'\''` escape is also valid in fish,
+/// so this is safe whatever login shell the remote uses.
+fn shell_quote(s: &str) -> String {
+    let simple = !s.is_empty()
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || "_./:=-".contains(c));
+    if simple {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+/// Build the remote command: `cd <remote_path> && devme <args…>`.
+fn remote_devme_cmd(r: &Resolved, args: &[String]) -> String {
+    let mut parts = vec!["devme".to_string()];
+    parts.extend(args.iter().map(|a| shell_quote(a)));
+    format!("cd {} && {}", shell_quote(&r.remote_path), parts.join(" "))
+}
+
+/// Stream a command through to the remote with an inherited TTY (so `logs
+/// -f`, `up` foreground, and Ctrl-C all behave).
+fn proxy_passthrough(r: &Resolved) -> i32 {
+    let cmd = remote_devme_cmd(r, &forwarded_args());
+    let status = Command::new("ssh").args(["-t", &r.host]).arg(&cmd).status();
+    match status {
+        Ok(s) => s.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("devme: remote proxy failed: {e}");
+            1
+        }
+    }
+}
+
+/// Resolve a service URL against the remote, then rewrite localhost → the
+/// browser-reachable host and (optionally) open it on the laptop.
+fn proxy_url(r: &Resolved, service: &str, open: bool) -> i32 {
+    let cmd = remote_devme_cmd(r, &["url".into(), service.into()]);
+    let out = Command::new("ssh")
+        .args(["-o", "BatchMode=yes", &r.host])
+        .arg(&cmd)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let raw = String::from_utf8_lossy(&o.stdout);
+            let raw = raw.lines().next().unwrap_or("").trim();
+            let url = remote::rewrite_url_host(raw, &r.url_host);
+            println!("{url}");
+            if open && let Err(e) = devme_config::browser::open_url(&url) {
+                eprintln!("devme: couldn't open browser: {e}");
+            }
+            0
+        }
+        Ok(o) => {
+            eprint!("{}", String::from_utf8_lossy(&o.stderr));
+            o.status.code().unwrap_or(1)
+        }
+        Err(e) => {
+            eprintln!("devme: remote proxy failed: {e}");
+            1
+        }
     }
 }
 
@@ -326,12 +451,56 @@ fn sync_status_fields(session: &str) -> (Option<String>, Option<u64>) {
     }
 }
 
+/// Does the project's `devme.toml` declare any Docker-backed services? Used
+/// to decide whether the remote-Docker doctor check is even relevant.
+fn local_stack_needs_docker(root: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(root.join("devme.toml")) else {
+        return false;
+    };
+    match devme_config::Stack::parse(&text) {
+        Ok(stack) => devme_config::docker::stack_needs_docker(&stack),
+        Err(_) => false,
+    }
+}
+
 /// One preflight check result.
 struct Check {
     name: &'static str,
     ok: bool,
     detail: String,
     hint: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Command as C;
+
+    #[test]
+    fn shell_quote_passes_simple_tokens_and_quotes_the_rest() {
+        assert_eq!(shell_quote("api"), "api");
+        assert_eq!(shell_quote("--tail"), "--tail");
+        assert_eq!(shell_quote("200"), "200");
+        assert_eq!(shell_quote("svc-1.2/x:y=z"), "svc-1.2/x:y=z");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn proxyable_commands_are_daemon_facing_only() {
+        assert!(is_proxyable(&Some(C::Status { all: false })));
+        assert!(is_proxyable(&Some(C::Logs {
+            service: "api".into(),
+            follow: false,
+            tail: 200
+        })));
+        assert!(is_proxyable(&Some(C::Down { timeout: 10 })));
+        // Machine-local / non-daemon commands never proxy.
+        assert!(!is_proxyable(&Some(C::Config { action: None })));
+        assert!(!is_proxyable(&Some(C::Remote { action: None })));
+        assert!(!is_proxyable(&None));
+    }
 }
 
 /// `devme remote doctor`: preflight that turns "works on my machine" into
@@ -389,6 +558,25 @@ pub fn doctor(cwd: &Path, json: bool) -> Result<()> {
             detail: if root_ok { format!("{root} ok") } else { format!("{root}: {root_detail}") },
             hint: (!root_ok).then(|| format!("ensure {root} is creatable/writable on the remote")),
         });
+
+        // 4b. Docker on the remote — only flagged if this project's stack
+        //     actually needs it (a synced devme.toml with Docker services).
+        //     A warning, not a hard failure: the stack just won't start
+        //     without it, and the user may run Docker elsewhere.
+        if local_stack_needs_docker(&r.local_root) {
+            let (docker_ok, _) = ssh_check(&r.host, "docker info");
+            checks.push(Check {
+                name: "remote docker",
+                ok: docker_ok,
+                detail: if docker_ok {
+                    "running".into()
+                } else {
+                    "not running (this stack uses Docker)".into()
+                },
+                hint: (!docker_ok)
+                    .then(|| "start Docker on the remote host (or it'll fail when the stack boots)".to_string()),
+            });
+        }
 
         // 5. Remote devme present + version-compatible. A remote supervisor on
         //    a mismatched IPC protocol is a real failure mode, so we compare

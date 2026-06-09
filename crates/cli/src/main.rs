@@ -72,14 +72,18 @@ fn main() {
 }
 
 async fn run(cli: Cli) -> i32 {
+    // Transparent remote proxy: while this project has a live remote sync,
+    // daemon-facing commands (status, logs, up, …) run on the remote host so
+    // they behave exactly as local but read the VPS. `--local` opts out. See
+    // DEV-5.
+    if !cli.local
+        && let Some(code) = devme_cli::remote::maybe_proxy(&cli.command)
+    {
+        return code;
+    }
+
     let result = match cli.command {
-        None => return match launch_tui().await {
-            Ok(code) => code,
-            Err(e) => {
-                eprintln!("devme: {e}");
-                1
-            }
-        },
+        None => return launch_default(cli.local).await,
         Some(Command::Status { all }) => {
             if all {
                 status_all(cli.json).await
@@ -897,6 +901,38 @@ fn skill_cmd(action: SkillAction, json: bool) -> anyhow::Result<()> {
 fn print_completions(shell: Shell) {
     let mut cmd = Cli::command();
     generate(shell, &mut cmd, "devme", &mut std::io::stdout());
+}
+
+/// Bare `devme` entry point. With `remote.default = true` (and a host set),
+/// the project is remote-first, so this behaves as `devme remote` — ensure
+/// the live-sync, then attach to the remote stack's TUI. Otherwise it opens
+/// the local TUI. `--local` forces the local TUI regardless.
+async fn launch_default(force_local: bool) -> i32 {
+    if !force_local {
+        let cfg = devme_config::GlobalConfig::load();
+        if cfg.remote.is_default() && cfg.remote.host.is_some() {
+            return match std::env::current_dir() {
+                Ok(cwd) => match devme_cli::remote::run(&cwd) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        eprintln!("devme: {e}");
+                        1
+                    }
+                },
+                Err(e) => {
+                    eprintln!("devme: {e}");
+                    1
+                }
+            };
+        }
+    }
+    match launch_tui().await {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("devme: {e}");
+            1
+        }
+    }
 }
 
 /// Launch the TUI directly. Runs preflight checks first, then hands off
