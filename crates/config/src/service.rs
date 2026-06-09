@@ -120,7 +120,11 @@ impl Service {
         self.port?;
         Some(match &self.health {
             Some(HealthCheck::Http { http }) => {
-                let scheme = if http.starts_with("https://") { "https" } else { "http" };
+                let scheme = if http.starts_with("https://") {
+                    "https"
+                } else {
+                    "http"
+                };
                 format!("{scheme}://{{host}}:{{port}}")
             }
             _ => "{host}:{port}".to_string(),
@@ -134,18 +138,26 @@ mod tests {
 
     fn parse_one(toml_src: &str) -> Service {
         #[derive(Deserialize)]
-        struct Wrap { service: indexmap::IndexMap<String, Service> }
+        struct Wrap {
+            service: indexmap::IndexMap<String, Service>,
+        }
 
         let w: Wrap = toml::from_str(toml_src).unwrap();
-        w.service.into_iter().next().expect("at least one service").1
+        w.service
+            .into_iter()
+            .next()
+            .expect("at least one service")
+            .1
     }
 
     #[test]
     fn minimal_service_just_cmd() {
-        let s = parse_one(r#"
+        let s = parse_one(
+            r#"
 [service.backend]
 cmd = "uv run manage.py runserver"
-"#);
+"#,
+        );
         assert_eq!(s.cmd, "uv run manage.py runserver");
         assert!(s.cwd.is_none());
         assert!(s.env.is_empty());
@@ -159,7 +171,8 @@ cmd = "uv run manage.py runserver"
 
     #[test]
     fn full_service_with_all_fields() {
-        let s = parse_one(r#"
+        let s = parse_one(
+            r#"
 [service.backend]
 cmd = "uv run manage.py runserver 0.0.0.0:{port}"
 cwd = "backend"
@@ -171,18 +184,28 @@ depends_on = ["db", "proxy?"]
 restart = "on-failure"
 health = { http = "http://localhost:{port}/health" }
 description = "Django dev server"
-"#);
+"#,
+        );
         assert_eq!(s.cmd, "uv run manage.py runserver 0.0.0.0:{port}");
         assert_eq!(s.cwd.as_deref(), Some("backend"));
         assert_eq!(s.stop.as_deref(), Some("docker compose down"));
-        assert_eq!(s.env.get("DATABASE_URL").unwrap(), "postgres://localhost/dev");
+        assert_eq!(
+            s.env.get("DATABASE_URL").unwrap(),
+            "postgres://localhost/dev"
+        );
         assert_eq!(s.env.get("DEBUG").unwrap(), "1");
-        assert_eq!(s.port, Some(PortSpec::SlotOffset { base: 8080, slot_offset: 10 }));
+        assert_eq!(
+            s.port,
+            Some(PortSpec::SlotOffset {
+                base: 8080,
+                slot_offset: 10
+            })
+        );
         assert_eq!(s.scope, Scope::Instance);
-        assert_eq!(s.depends_on, vec![
-            Dependency::required("db"),
-            Dependency::optional("proxy"),
-        ]);
+        assert_eq!(
+            s.depends_on,
+            vec![Dependency::required("db"), Dependency::optional("proxy"),]
+        );
         assert_eq!(s.restart, RestartPolicy::OnFailure);
         assert!(matches!(s.health, Some(HealthCheck::Http { .. })));
     }
@@ -190,37 +213,48 @@ description = "Django dev server"
     #[test]
     fn url_template_picks_scheme_from_health() {
         // http health → browser-openable http URL.
-        let web = parse_one(r#"
+        let web = parse_one(
+            r#"
 [service.backend]
 cmd = "runserver 0.0.0.0:{port}"
 port = { base = 8080, slot_offset = 10 }
 health = { http = "http://localhost:{port}/health" }
-"#);
+"#,
+        );
         assert_eq!(web.url_template().as_deref(), Some("http://{host}:{port}"));
 
         // https health → https.
-        let secure = parse_one(r#"
+        let secure = parse_one(
+            r#"
 [service.api]
 cmd = "serve"
 port = { fixed = 8443 }
 health = { http = "https://localhost:{port}/" }
-"#);
-        assert_eq!(secure.url_template().as_deref(), Some("https://{host}:{port}"));
+"#,
+        );
+        assert_eq!(
+            secure.url_template().as_deref(),
+            Some("https://{host}:{port}")
+        );
 
         // tcp/shell health (a database) → bare host:port for DB clients.
-        let db = parse_one(r#"
+        let db = parse_one(
+            r#"
 [service.postgres]
 cmd = "docker compose up db"
 port = { fixed = 5433 }
 health = { tcp = "localhost:{port}" }
-"#);
+"#,
+        );
         assert_eq!(db.url_template().as_deref(), Some("{host}:{port}"));
 
         // No port → nothing to point at.
-        let portless = parse_one(r#"
+        let portless = parse_one(
+            r#"
 [service.worker]
 cmd = "run-worker"
-"#);
+"#,
+        );
         assert_eq!(portless.url_template(), None);
     }
 
@@ -229,35 +263,47 @@ cmd = "run-worker"
         // A web dev server with no http health check would otherwise be
         // misread as a bare `host:port` (a database) and refuse to open.
         // An explicit `url` makes it openable.
-        let frontend = parse_one(r#"
+        let frontend = parse_one(
+            r#"
 [service.frontend]
 cmd = "npm run dev"
 port = { base = 5173, slot_offset = 10 }
 url = "http://{host}:{port}"
-"#);
-        assert_eq!(frontend.url_template().as_deref(), Some("http://{host}:{port}"));
+"#,
+        );
+        assert_eq!(
+            frontend.url_template().as_deref(),
+            Some("http://{host}:{port}")
+        );
 
         // `url` wins even over an http health check pointing elsewhere — the
         // user said exactly where to open.
-        let proxied = parse_one(r#"
+        let proxied = parse_one(
+            r#"
 [service.web]
 cmd = "serve"
 port = { fixed = 8080 }
 health = { http = "http://localhost:{port}/healthz" }
 url = "http://{host}:{port}/app"
-"#);
-        assert_eq!(proxied.url_template().as_deref(), Some("http://{host}:{port}/app"));
+"#,
+        );
+        assert_eq!(
+            proxied.url_template().as_deref(),
+            Some("http://{host}:{port}/app")
+        );
     }
 
     #[test]
     fn repo_scoped_service() {
-        let s = parse_one(r#"
+        let s = parse_one(
+            r#"
 [service.proxy]
 cmd = "cloud-sql-proxy --port {port} my-project:eu-west-1:db"
 scope = "repo"
 port = { fixed = 15432 }
 restart = "always"
-"#);
+"#,
+        );
         assert_eq!(s.scope, Scope::Repo);
         assert_eq!(s.port, Some(PortSpec::Fixed { fixed: 15432 }));
         assert_eq!(s.restart, RestartPolicy::Always);
@@ -265,24 +311,31 @@ restart = "always"
 
     #[test]
     fn external_service() {
-        let s = parse_one(r#"
+        let s = parse_one(
+            r#"
 [service.postgres]
 cmd = ""
 external = true
 health = { tcp = "localhost:5432" }
 log_tail = "/usr/local/var/log/postgresql.log"
-"#);
+"#,
+        );
         assert!(s.external);
         assert!(matches!(s.health, Some(HealthCheck::Tcp { .. })));
-        assert_eq!(s.log_tail.as_deref(), Some("/usr/local/var/log/postgresql.log"));
+        assert_eq!(
+            s.log_tail.as_deref(),
+            Some("/usr/local/var/log/postgresql.log")
+        );
     }
 
     #[test]
     fn rejects_unknown_field() {
-        let result: Result<Service, _> = toml::from_str(r#"
+        let result: Result<Service, _> = toml::from_str(
+            r#"
 cmd = "true"
 unexpected = 1
-"#);
+"#,
+        );
         assert!(result.is_err());
     }
 }

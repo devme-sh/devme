@@ -24,7 +24,11 @@ pub fn validate(stack: &Stack) -> Result<(), Vec<ConfigError>> {
     check_no_cycles(stack, &mut errors);
     check_external_services_have_health(stack, &mut errors);
 
-    if errors.is_empty() { Ok(()) } else { Err(errors) }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 /// A non-fatal advisory: the config parses and [`validate`]s, but something
@@ -164,7 +168,11 @@ fn check_no_cycles(stack: &Stack, errors: &mut Vec<ConfigError>) {
     for (name, step) in &stack.step {
         adj.insert(
             name.as_str(),
-            step.depends_on.iter().map(|d| d.name.as_str()).filter(|n| known.contains(n)).collect(),
+            step.depends_on
+                .iter()
+                .map(|d| d.name.as_str())
+                .filter(|n| known.contains(n))
+                .collect(),
         );
     }
     for (name, service) in &stack.service {
@@ -270,7 +278,8 @@ mod tests {
 
     #[test]
     fn simple_valid_graph() {
-        let s = parse(r#"
+        let s = parse(
+            r#"
 schema_version = 1
 
 [step.tooling]
@@ -282,13 +291,15 @@ cmd = "docker run postgres"
 [service.backend]
 cmd = "uv run x"
 depends_on = ["tooling", "db"]
-"#);
+"#,
+        );
         assert!(validate(&s).is_ok());
     }
 
     #[test]
     fn name_collision_between_step_and_service() {
-        let s = parse(r#"
+        let s = parse(
+            r#"
 schema_version = 1
 
 [step.db]
@@ -296,40 +307,51 @@ check = "true"
 
 [service.db]
 cmd = "true"
-"#);
+"#,
+        );
         let errs = validate(&s).unwrap_err();
         assert!(matches!(errs.as_slice(), [ConfigError::NameCollision { name }] if name == "db"));
     }
 
     #[test]
     fn unknown_dependency_is_caught() {
-        let s = parse(r#"
+        let s = parse(
+            r#"
 schema_version = 1
 
 [service.backend]
 cmd = "true"
 depends_on = ["does_not_exist"]
-"#);
+"#,
+        );
         let errs = validate(&s).unwrap_err();
-        assert!(matches!(errs.as_slice(), [ConfigError::UnknownDependency { from, to }] if from == "backend" && to == "does_not_exist"));
+        assert!(
+            matches!(errs.as_slice(), [ConfigError::UnknownDependency { from, to }] if from == "backend" && to == "does_not_exist")
+        );
     }
 
     #[test]
     fn unknown_dependency_through_optional_suffix_still_caught() {
-        let s = parse(r#"
+        let s = parse(
+            r#"
 schema_version = 1
 
 [service.backend]
 cmd = "true"
 depends_on = ["ghost?"]
-"#);
+"#,
+        );
         let errs = validate(&s).unwrap_err();
-        assert!(matches!(errs.as_slice(), [ConfigError::UnknownDependency { .. }]));
+        assert!(matches!(
+            errs.as_slice(),
+            [ConfigError::UnknownDependency { .. }]
+        ));
     }
 
     #[test]
     fn detects_two_node_cycle() {
-        let s = parse(r#"
+        let s = parse(
+            r#"
 schema_version = 1
 
 [service.a]
@@ -339,14 +361,16 @@ depends_on = ["b"]
 [service.b]
 cmd = "true"
 depends_on = ["a"]
-"#);
+"#,
+        );
         let errs = validate(&s).unwrap_err();
         assert!(errs.iter().any(|e| matches!(e, ConfigError::Cycle { .. })));
     }
 
     #[test]
     fn detects_three_node_cycle() {
-        let s = parse(r#"
+        let s = parse(
+            r#"
 schema_version = 1
 
 [service.a]
@@ -360,28 +384,35 @@ depends_on = ["c"]
 [service.c]
 cmd = "true"
 depends_on = ["a"]
-"#);
+"#,
+        );
         let errs = validate(&s).unwrap_err();
-        let cycles: Vec<_> = errs.iter().filter(|e| matches!(e, ConfigError::Cycle { .. })).collect();
+        let cycles: Vec<_> = errs
+            .iter()
+            .filter(|e| matches!(e, ConfigError::Cycle { .. }))
+            .collect();
         assert_eq!(cycles.len(), 1, "expected exactly one cycle, got: {errs:?}");
     }
 
     #[test]
     fn detects_self_loop() {
-        let s = parse(r#"
+        let s = parse(
+            r#"
 schema_version = 1
 
 [service.a]
 cmd = "true"
 depends_on = ["a"]
-"#);
+"#,
+        );
         let errs = validate(&s).unwrap_err();
         assert!(errs.iter().any(|e| matches!(e, ConfigError::Cycle { .. })));
     }
 
     #[test]
     fn linear_chain_is_not_a_cycle() {
-        let s = parse(r#"
+        let s = parse(
+            r#"
 schema_version = 1
 
 [service.a]
@@ -394,14 +425,16 @@ depends_on = ["a"]
 [service.c]
 cmd = "true"
 depends_on = ["b"]
-"#);
+"#,
+        );
         assert!(validate(&s).is_ok(), "expected linear chain to validate");
     }
 
     #[test]
     fn diamond_dependency_is_not_a_cycle() {
         // d depends on b and c; both depend on a. Common in real configs.
-        let s = parse(r#"
+        let s = parse(
+            r#"
 schema_version = 1
 
 [service.a]
@@ -418,33 +451,40 @@ depends_on = ["a"]
 [service.d]
 cmd = "true"
 depends_on = ["b", "c"]
-"#);
+"#,
+        );
         assert!(validate(&s).is_ok());
     }
 
     #[test]
     fn external_service_without_health_is_an_error() {
-        let s = parse(r#"
+        let s = parse(
+            r#"
 schema_version = 1
 
 [service.postgres]
 cmd = ""
 external = true
-"#);
+"#,
+        );
         let errs = validate(&s).unwrap_err();
-        assert!(matches!(errs.as_slice(), [ConfigError::ExternalServiceMissingHealth { name }] if name == "postgres"));
+        assert!(
+            matches!(errs.as_slice(), [ConfigError::ExternalServiceMissingHealth { name }] if name == "postgres")
+        );
     }
 
     #[test]
     fn external_service_with_health_is_valid() {
-        let s = parse(r#"
+        let s = parse(
+            r#"
 schema_version = 1
 
 [service.postgres]
 cmd = ""
 external = true
 health = { tcp = "localhost:5432" }
-"#);
+"#,
+        );
         assert!(validate(&s).is_ok());
     }
 
@@ -452,19 +492,27 @@ health = { tcp = "localhost:5432" }
     fn unsupported_schema_version_is_an_error() {
         let s = parse("schema_version = 99");
         let errs = validate(&s).unwrap_err();
-        assert!(matches!(errs.as_slice(), [ConfigError::UnsupportedSchemaVersion { found: 99, expected: 1 }]));
+        assert!(matches!(
+            errs.as_slice(),
+            [ConfigError::UnsupportedSchemaVersion {
+                found: 99,
+                expected: 1
+            }]
+        ));
     }
 
     #[test]
     fn lint_flags_web_service_without_url_or_health() {
         // The motivating case: a Vite-style dev server, port but no url/health.
-        let s = parse(r#"
+        let s = parse(
+            r#"
 schema_version = 1
 
 [service.frontend]
 cmd = "npm run dev"
 port = { base = 5173, slot_offset = 10 }
-"#);
+"#,
+        );
         let lints = lint(&s);
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].target, "frontend");
@@ -474,14 +522,16 @@ port = { base = 5173, slot_offset = 10 }
 
     #[test]
     fn lint_silent_when_url_declared() {
-        let s = parse(r#"
+        let s = parse(
+            r#"
 schema_version = 1
 
 [service.frontend]
 cmd = "npm run dev"
 port = { base = 5173, slot_offset = 10 }
 url = "http://{host}:{port}"
-"#);
+"#,
+        );
         assert!(lint(&s).is_empty());
     }
 
@@ -489,26 +539,30 @@ url = "http://{host}:{port}"
     fn lint_silent_when_health_declared() {
         // A tcp health check is a clear "this is a TCP/db service" signal — not
         // ambiguous, so no nudge.
-        let s = parse(r#"
+        let s = parse(
+            r#"
 schema_version = 1
 
 [service.db]
 cmd = "docker run postgres"
 port = { fixed = 5432 }
 health = { tcp = "localhost:{port}" }
-"#);
+"#,
+        );
         assert!(lint(&s).is_empty());
     }
 
     #[test]
     fn lint_flags_port_placeholder_without_port_spec() {
-        let s = parse(r#"
+        let s = parse(
+            r#"
 schema_version = 1
 
 [service.api]
 cmd = "serve --port {port}"
 url = "http://{host}:{port}"
-"#);
+"#,
+        );
         let lints = lint(&s);
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].target, "api");
@@ -518,7 +572,8 @@ url = "http://{host}:{port}"
     #[test]
     fn multiple_errors_returned_together() {
         // Two unknown deps + a name collision — we report all three.
-        let s = parse(r#"
+        let s = parse(
+            r#"
 schema_version = 1
 
 [step.db]
@@ -527,8 +582,13 @@ check = "true"
 [service.db]
 cmd = "true"
 depends_on = ["ghost1", "ghost2"]
-"#);
+"#,
+        );
         let errs = validate(&s).unwrap_err();
-        assert!(errs.len() >= 3, "expected at least 3 errors, got {}: {errs:?}", errs.len());
+        assert!(
+            errs.len() >= 3,
+            "expected at least 3 errors, got {}: {errs:?}",
+            errs.len()
+        );
     }
 }

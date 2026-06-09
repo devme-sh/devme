@@ -68,9 +68,11 @@ mod tests {
 
     #[test]
     fn minimal_env_var() {
-        let vars = parse_env(r#"
+        let vars = parse_env(
+            r#"
 [env.API_KEY]
-"#);
+"#,
+        );
         let v = &vars["API_KEY"];
         assert!(!v.required);
         assert!(v.default.is_none());
@@ -81,29 +83,39 @@ mod tests {
 
     #[test]
     fn full_env_var_with_all_fields() {
-        let vars = parse_env(r#"
+        let vars = parse_env(
+            r#"
 [env.DATABASE_URL]
 required = true
 default = "postgres://localhost/dev"
 help = "Connection string for the dev database"
 generate = "echo postgres://localhost/dev"
 choices = ["postgres://localhost/dev", "postgres://localhost/test"]
-"#);
+"#,
+        );
         let v = &vars["DATABASE_URL"];
         assert!(v.required);
         assert_eq!(v.default.as_deref(), Some("postgres://localhost/dev"));
-        assert_eq!(v.help.as_deref(), Some("Connection string for the dev database"));
+        assert_eq!(
+            v.help.as_deref(),
+            Some("Connection string for the dev database")
+        );
         assert_eq!(v.generate.as_deref(), Some("echo postgres://localhost/dev"));
-        assert_eq!(v.choices, vec!["postgres://localhost/dev", "postgres://localhost/test"]);
+        assert_eq!(
+            v.choices,
+            vec!["postgres://localhost/dev", "postgres://localhost/test"]
+        );
     }
 
     #[test]
     fn env_var_with_generate_only() {
-        let vars = parse_env(r#"
+        let vars = parse_env(
+            r#"
 [env.SECRET_KEY]
 generate = "openssl rand -hex 32"
 help = "Auto-generated signing key"
-"#);
+"#,
+        );
         let v = &vars["SECRET_KEY"];
         assert!(!v.required);
         assert_eq!(v.generate.as_deref(), Some("openssl rand -hex 32"));
@@ -111,12 +123,14 @@ help = "Auto-generated signing key"
 
     #[test]
     fn env_var_with_choices() {
-        let vars = parse_env(r#"
+        let vars = parse_env(
+            r#"
 [env.REGION]
 choices = ["us-east-1", "eu-west-1", "ap-southeast-1"]
 default = "eu-west-1"
 help = "AWS region for the dev environment"
-"#);
+"#,
+        );
         let v = &vars["REGION"];
         assert_eq!(v.choices.len(), 3);
         assert_eq!(v.default.as_deref(), Some("eu-west-1"));
@@ -124,7 +138,8 @@ help = "AWS region for the dev environment"
 
     #[test]
     fn declaration_order_preserved() {
-        let vars = parse_env(r#"
+        let vars = parse_env(
+            r#"
 [env.FIRST]
 help = "first"
 
@@ -133,17 +148,20 @@ help = "second"
 
 [env.THIRD]
 help = "third"
-"#);
+"#,
+        );
         let names: Vec<&str> = vars.keys().map(String::as_str).collect();
         assert_eq!(names, vec!["FIRST", "SECOND", "THIRD"]);
     }
 
     #[test]
     fn rejects_unknown_field() {
-        let result: Result<EnvVar, _> = toml::from_str(r#"
+        let result: Result<EnvVar, _> = toml::from_str(
+            r#"
 required = true
 bogus_field = "oops"
-"#);
+"#,
+        );
         assert!(result.is_err());
     }
 

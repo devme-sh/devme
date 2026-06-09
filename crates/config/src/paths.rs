@@ -54,9 +54,10 @@ pub fn repo_id(cwd: &Path) -> String {
 pub fn main_worktree_root(cwd: &Path) -> PathBuf {
     match git_common_dir(cwd) {
         // `<main>/.git` → the main worktree is its parent.
-        Some(gd) if gd.file_name().and_then(|n| n.to_str()) == Some(".git") => {
-            gd.parent().map(Path::to_path_buf).unwrap_or_else(|| gd.clone())
-        }
+        Some(gd) if gd.file_name().and_then(|n| n.to_str()) == Some(".git") => gd
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| gd.clone()),
         // A bare repo (or unusual layout) has no separate worktree — use cwd.
         Some(_) | None => std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
     }
@@ -106,6 +107,21 @@ pub fn shared_socket(cwd: &Path) -> std::io::Result<PathBuf> {
 /// state (instance sockets, shared socket, lock files) lives here.
 pub fn shared_dir(cwd: &Path) -> std::io::Result<PathBuf> {
     repo_socket_dir(cwd)
+}
+
+/// `<runtime>/devme/repos/<repo-id>/<instance-id>-logs/` — the per-instance
+/// directory the daemon spills service logs into (one `<service>.log` plus a
+/// rotated `.log.1` each). Sits beside the instance socket and is removed when
+/// the stack is torn down, so a worktree's logs don't outlive it.
+pub fn instance_log_dir(cwd: &Path) -> std::io::Result<PathBuf> {
+    let dir = repo_socket_dir(cwd)?.join(format!("{}-logs", instance_id(cwd)));
+    Ok(dir)
+}
+
+/// `<runtime>/devme/repos/<repo-id>/shared-logs/` — the shared supervisor's
+/// equivalent of [`instance_log_dir`] for `scope = "repo"` services.
+pub fn shared_log_dir(cwd: &Path) -> std::io::Result<PathBuf> {
+    Ok(repo_socket_dir(cwd)?.join("shared-logs"))
 }
 
 /// Shared slot-allocator registry path. One file per host coordinates

@@ -29,10 +29,14 @@ mod tests {
     #[test]
     fn parse_shell_form_from_bare_string() {
         #[derive(serde::Deserialize)]
-        struct Wrap { provision: Provision }
+        struct Wrap {
+            provision: Provision,
+        }
 
         let w: Wrap = toml::from_str(r#"provision = "brew install gcloud""#).unwrap();
-        let Provision::Shell(cmd) = &w.provision else { panic!("expected shell") };
+        let Provision::Shell(cmd) = &w.provision else {
+            panic!("expected shell")
+        };
         assert_eq!(cmd, "brew install gcloud");
     }
 
@@ -43,10 +47,14 @@ mod tests {
 provision = { wizard = ".devme/setup/env.ts" }
 "#;
         #[derive(serde::Deserialize)]
-        struct Wrap { provision: Provision }
+        struct Wrap {
+            provision: Provision,
+        }
 
         let w: Wrap = toml::from_str(toml_src).unwrap();
-        let Provision::Wizard { wizard } = &w.provision else { panic!("expected wizard") };
+        let Provision::Wizard { wizard } = &w.provision else {
+            panic!("expected wizard")
+        };
         assert_eq!(wizard, ".devme/setup/env.ts");
     }
 
@@ -60,7 +68,9 @@ provision = { wizard = ".devme/setup/env.ts" }
 
     #[test]
     fn round_trip_wizard_form_via_json() {
-        let p = Provision::Wizard { wizard: ".devme/setup.ts".into() };
+        let p = Provision::Wizard {
+            wizard: ".devme/setup.ts".into(),
+        };
         let json = serde_json::to_string(&p).unwrap();
         let back: Provision = serde_json::from_str(&json).unwrap();
         assert_eq!(p, back);

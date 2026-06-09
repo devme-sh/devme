@@ -108,7 +108,8 @@ mod tests {
 
     #[test]
     fn parse_full_config() {
-        let s = Stack::parse(r#"
+        let s = Stack::parse(
+            r#"
 schema_version = 1
 
 [stack]
@@ -136,7 +137,9 @@ cmd = "uv run manage.py runserver 0.0.0.0:{port}"
 port = { base = 8080, slot_offset = 10 }
 depends_on = ["gcloud_auth", "db"]
 health = { http = "http://localhost:{port}/health" }
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         assert_eq!(s.schema_version, 1);
         let meta = s.stack.as_ref().unwrap();
@@ -157,7 +160,8 @@ health = { http = "http://localhost:{port}/health" }
     fn declaration_order_preserved_via_indexmap() {
         // IndexMap preserves insertion order — important for the TUI tab
         // ordering and Supervisor-tab listing to match the user's config.
-        let s = Stack::parse(r#"
+        let s = Stack::parse(
+            r#"
 schema_version = 1
 
 [service.frontend]
@@ -168,7 +172,9 @@ cmd = "uv run manage.py runserver"
 
 [service.db]
 cmd = "docker run postgres"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let names: Vec<&str> = s.service.keys().map(String::as_str).collect();
         assert_eq!(names, vec!["frontend", "backend", "db"]);
@@ -176,31 +182,37 @@ cmd = "docker run postgres"
 
     #[test]
     fn missing_schema_version_is_a_parse_error() {
-        let result = Stack::parse(r#"
+        let result = Stack::parse(
+            r#"
 [service.backend]
 cmd = "true"
-"#);
+"#,
+        );
         assert!(result.is_err(), "expected missing schema_version to fail");
     }
 
     #[test]
     fn rejects_unknown_top_level_key() {
-        let result = Stack::parse(r#"
+        let result = Stack::parse(
+            r#"
 schema_version = 1
 typo_field = "oops"
-"#);
+"#,
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn rejects_unknown_stack_meta_key() {
-        let result = Stack::parse(r#"
+        let result = Stack::parse(
+            r#"
 schema_version = 1
 
 [stack]
 name = "x"
 unsupported_meta = true
-"#);
+"#,
+        );
         assert!(result.is_err());
     }
 
@@ -226,7 +238,8 @@ unsupported_meta = true
 
     #[test]
     fn parse_stack_meta_env_file_and_on_destroy() {
-        let s = Stack::parse(r#"
+        let s = Stack::parse(
+            r#"
 schema_version = 1
 
 [stack]
@@ -234,27 +247,36 @@ name = "kpi"
 env_file = ".env"
 on_create = "uv sync"
 on_destroy = "dropdb optoscale_slot{slot}"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let meta = s.stack.as_ref().unwrap();
         assert_eq!(meta.env_file.as_deref(), Some(".env"));
         assert_eq!(meta.on_create.as_deref(), Some("uv sync"));
-        assert_eq!(meta.on_destroy.as_deref(), Some("dropdb optoscale_slot{slot}"));
+        assert_eq!(
+            meta.on_destroy.as_deref(),
+            Some("dropdb optoscale_slot{slot}")
+        );
     }
 
     #[test]
     fn env_file_defaults_to_none_when_unset() {
-        let s = Stack::parse(r#"
+        let s = Stack::parse(
+            r#"
 schema_version = 1
 
 [stack]
 name = "x"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         assert!(s.stack.as_ref().unwrap().env_file.is_none());
     }
 
     #[test]
     fn parse_config_with_env_vars() {
-        let s = Stack::parse(r#"
+        let s = Stack::parse(
+            r#"
 schema_version = 1
 
 [env.DATABASE_URL]
@@ -271,11 +293,16 @@ default = "eu-west-1"
 
 [service.web]
 cmd = "npm run dev"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         assert_eq!(s.env.len(), 3);
         assert!(s.env["DATABASE_URL"].required);
-        assert_eq!(s.env["SECRET_KEY"].generate.as_deref(), Some("openssl rand -hex 32"));
+        assert_eq!(
+            s.env["SECRET_KEY"].generate.as_deref(),
+            Some("openssl rand -hex 32")
+        );
         assert_eq!(s.env["REGION"].choices, vec!["us-east-1", "eu-west-1"]);
     }
 

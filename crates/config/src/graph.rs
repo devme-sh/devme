@@ -77,7 +77,13 @@ impl Graph {
             nodes.push(name.clone());
         }
 
-        Self { edges, nodes, kinds, has_provision, external }
+        Self {
+            edges,
+            nodes,
+            kinds,
+            has_provision,
+            external,
+        }
     }
 
     /// True if `node` is a Step whose config declared a `provision`.
@@ -100,10 +106,7 @@ impl Graph {
     }
 
     pub fn dependencies(&self, node: &str) -> &[Dependency] {
-        self.edges
-            .get(node)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.edges.get(node).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Topological order: every node appears after all of its required
@@ -123,11 +126,8 @@ impl Graph {
     pub fn layers(&self) -> Result<Vec<Vec<String>>, GraphError> {
         // Kahn's algorithm with grouped output. Count predecessors using only
         // *required* edges — optional deps don't block startup ordering.
-        let mut in_degree: HashMap<&str, usize> = self
-            .nodes
-            .iter()
-            .map(|n| (n.as_str(), 0))
-            .collect();
+        let mut in_degree: HashMap<&str, usize> =
+            self.nodes.iter().map(|n| (n.as_str(), 0)).collect();
         let mut reverse: HashMap<&str, Vec<&str>> = HashMap::new();
 
         for (node, deps) in &self.edges {

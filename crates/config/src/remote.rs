@@ -235,7 +235,9 @@ pub fn expand_attach(
     let template = match attach {
         "tui" => "ssh -t {host} 'cd {remote_path} && exec env DEVME_URL_HOST={url_host} devme tui'",
         "ssh" => "ssh -t {host} 'cd {remote_path} && exec $SHELL'",
-        "tmux" => "ssh -t {host} 'tmux new -A -s {name} -c {remote_path} env DEVME_URL_HOST={url_host} devme tui'",
+        "tmux" => {
+            "ssh -t {host} 'tmux new -A -s {name} -c {remote_path} env DEVME_URL_HOST={url_host} devme tui'"
+        }
         "herdr" => "herdr --remote {host} --session {name}",
         raw => raw,
     };
@@ -424,19 +426,28 @@ mod tests {
         // Nothing configured → None, so a plain laptop `devme url` is untouched.
         assert_eq!(pick_advertise_host(None, None, None), None);
         // Blanks are treated as absent.
-        assert_eq!(pick_advertise_host(Some("  "), Some("  "), Some("ts")), None);
+        assert_eq!(
+            pick_advertise_host(Some("  "), Some("  "), Some("ts")),
+            None
+        );
     }
 
     #[test]
     fn up_on_attach_round_trips() {
-        let cfg = RemoteConfig { up_on_attach: Some(false), ..Default::default() };
+        let cfg = RemoteConfig {
+            up_on_attach: Some(false),
+            ..Default::default()
+        };
         assert!(!cfg.up_on_attach_or_default());
         assert!(!cfg.is_empty());
     }
 
     #[test]
     fn explicit_ignore_replaces_defaults() {
-        let cfg = RemoteConfig { ignore: vec!["foo".into()], ..Default::default() };
+        let cfg = RemoteConfig {
+            ignore: vec!["foo".into()],
+            ..Default::default()
+        };
         assert_eq!(cfg.ignores(), vec!["foo".to_string()]);
         assert!(!cfg.is_empty());
     }
@@ -511,7 +522,13 @@ mod tests {
 
     #[test]
     fn attach_raw_template_substitutes_placeholders() {
-        let cmd = expand_attach("mosh {host} -- tmux a -t {name}", "box", "/p", "proj", "box");
+        let cmd = expand_attach(
+            "mosh {host} -- tmux a -t {name}",
+            "box",
+            "/p",
+            "proj",
+            "box",
+        );
         assert_eq!(cmd, "mosh box -- tmux a -t proj");
     }
 
@@ -520,21 +537,36 @@ mod tests {
         let cfg = RemoteConfig::default();
         assert_eq!(cfg.url_host_for("vps"), "vps");
         assert_eq!(cfg.url_host_for("dev@10.0.0.1"), "10.0.0.1");
-        let cfg = RemoteConfig { url_host: Some("vps.tailnet.ts.net".into()), ..Default::default() };
+        let cfg = RemoteConfig {
+            url_host: Some("vps.tailnet.ts.net".into()),
+            ..Default::default()
+        };
         assert_eq!(cfg.url_host_for("dev@10.0.0.1"), "vps.tailnet.ts.net");
     }
 
     #[test]
     fn rewrite_url_host_swaps_only_loopback_authority() {
-        assert_eq!(rewrite_url_host("http://localhost:8090", "vps"), "http://vps:8090");
-        assert_eq!(rewrite_url_host("http://127.0.0.1:5432/db", "vps"), "http://vps:5432/db");
+        assert_eq!(
+            rewrite_url_host("http://localhost:8090", "vps"),
+            "http://vps:8090"
+        );
+        assert_eq!(
+            rewrite_url_host("http://127.0.0.1:5432/db", "vps"),
+            "http://vps:5432/db"
+        );
         // A non-loopback host is left alone.
-        assert_eq!(rewrite_url_host("http://example.com:80", "vps"), "http://example.com:80");
+        assert_eq!(
+            rewrite_url_host("http://example.com:80", "vps"),
+            "http://example.com:80"
+        );
     }
 
     #[test]
     fn default_flag_round_trips() {
-        let cfg = RemoteConfig { default: Some(true), ..Default::default() };
+        let cfg = RemoteConfig {
+            default: Some(true),
+            ..Default::default()
+        };
         assert!(cfg.is_default());
         assert!(!cfg.is_empty());
         assert!(!RemoteConfig::default().is_default());
@@ -546,13 +578,22 @@ mod tests {
         // A terminated/absent session is Down regardless of the rest.
         assert_eq!(classify_sync(false, None, 0), Down);
         // Conflicts dominate even a "Watching" status.
-        assert_eq!(classify_sync(true, Some("Watching for changes"), 3), Conflict);
+        assert_eq!(
+            classify_sync(true, Some("Watching for changes"), 3),
+            Conflict
+        );
         // Problem words in the status → Down.
         assert_eq!(classify_sync(true, Some("Halted on root emptied"), 0), Down);
         assert_eq!(classify_sync(true, Some("Connection error"), 0), Down);
         // Normal working states are Healthy.
-        assert_eq!(classify_sync(true, Some("Watching for changes"), 0), Healthy);
-        assert_eq!(classify_sync(true, Some("Staging files on beta"), 0), Healthy);
+        assert_eq!(
+            classify_sync(true, Some("Watching for changes"), 0),
+            Healthy
+        );
+        assert_eq!(
+            classify_sync(true, Some("Staging files on beta"), 0),
+            Healthy
+        );
         // Present but unreadable status → assume Healthy (don't cry wolf).
         assert_eq!(classify_sync(true, None, 0), Healthy);
     }

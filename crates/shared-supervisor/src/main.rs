@@ -27,6 +27,7 @@ use devme_core::{
     ServiceState,
 };
 use devme_ipc::FrameCodec;
+use devme_supervisor::logstore::LogStore;
 use devme_supervisor::process::{ChildProcess, process_is_alive, send_sigkill, send_sigterm};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -270,6 +271,9 @@ struct SharedState {
     /// new subscriber so late attachers see history. Bounded by
     /// [`LOG_RING_CAPACITY`] per service.
     logs: Arc<Mutex<HashMap<String, VecDeque<(u64, LogStream, String)>>>>,
+    /// On-disk history tier for repo-scoped services — the ring's durable
+    /// complement (survives eviction + restart, backs `--since`).
+    log_store: Arc<Mutex<LogStore>>,
     /// Set to true on Shutdown so the accept loop exits.
     shutdown: Arc<Mutex<bool>>,
     /// Active subscriber count. When this drops to 0, the idle grace timer
@@ -289,6 +293,10 @@ impl SharedState {
             Arc::new(Mutex::new(HashMap::new()));
         let logs: Arc<Mutex<HashMap<String, VecDeque<(u64, LogStream, String)>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let log_store = Arc::new(Mutex::new(LogStore::new(
+            devme_config::paths::shared_log_dir(cwd)
+                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/devme/orphan-shared-logs")),
+        )));
         let shutdown = Arc::new(Mutex::new(false));
 
         // Spawn each repo-scoped service. Failures are surfaced as Failed
@@ -308,7 +316,13 @@ impl SharedState {
             match ChildProcess::spawn_parts::<&str>(cmd, cwd, &env_slice) {
                 Ok(parts) => {
                     let pid = parts.pid;
-                    spawn_log_forwarder(name.clone(), parts.lines, events.clone(), logs.clone());
+                    spawn_log_forwarder(
+                        name.clone(),
+                        parts.lines,
+                        events.clone(),
+                        logs.clone(),
+                        log_store.clone(),
+                    );
                     spawn_exit_forwarder(
                         name.clone(),
                         parts.exit,
@@ -345,6 +359,7 @@ impl SharedState {
             services: services_map,
             events,
             logs,
+            log_store,
             shutdown,
             subscribers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             sub_notify: Arc::new(tokio::sync::Notify::new()),
@@ -431,6 +446,7 @@ fn spawn_log_forwarder(
     mut lines: mpsc::UnboundedReceiver<(LogStream, String)>,
     events: broadcast::Sender<ServerMessage>,
     logs: Arc<Mutex<HashMap<String, VecDeque<(u64, LogStream, String)>>>>,
+    log_store: Arc<Mutex<LogStore>>,
 ) {
     tokio::spawn(async move {
         while let Some((stream, line)) = lines.recv().await {
@@ -441,8 +457,10 @@ fn spawn_log_forwarder(
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            // Retain for replay before broadcasting, so a subscriber that
-            // connects a moment later still sees this line.
+            // Spill to the disk history tier, then retain in the ring for live
+            // replay before broadcasting (so a subscriber that connects a moment
+            // later still sees this line).
+            log_store.lock().await.append(&name, ts, stream, &line);
             {
                 let mut buf = logs.lock().await;
                 let ring = buf.entry(name.clone()).or_default();

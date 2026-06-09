@@ -27,6 +27,7 @@ use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 
 use crate::health::probe;
+use crate::logstore::LogStore;
 use crate::process::{ChildProcess, process_is_alive, send_sigkill, send_sigterm};
 
 /// Per-service log ring capacity. ~2000 lines is enough to scroll back a
@@ -170,6 +171,9 @@ struct DaemonState {
     branch: String,
     children: HashMap<String, ChildRecord>,
     logs: HashMap<String, RingBuffer>,
+    /// On-disk history tier (see [`LogStore`]). The ring stays the live path;
+    /// this survives ring eviction and daemon restarts and backs `--since`.
+    log_store: LogStore,
     clients: HashMap<ClientId, ClientTx>,
     /// Per-client subscription filter. Empty vec = subscribed to everything.
     subscriptions: HashMap<ClientId, Vec<String>>,
@@ -200,6 +204,10 @@ impl DaemonState {
         let graph = Graph::from_stack(&stack);
         let worktree = instance.cwd.clone();
         let branch = current_git_branch(Path::new(&worktree)).unwrap_or_default();
+        let log_store = LogStore::new(
+            devme_config::paths::instance_log_dir(Path::new(&worktree))
+                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/devme/orphan-logs")),
+        );
         Self {
             stack,
             executor: Executor::new(graph),
@@ -209,6 +217,7 @@ impl DaemonState {
             branch,
             children: HashMap::new(),
             logs: HashMap::new(),
+            log_store,
             clients: HashMap::new(),
             subscriptions: HashMap::new(),
             intentional_stops: HashSet::new(),
@@ -595,12 +604,13 @@ fn process_event(
         InternalEvent::StepLine { step, line } => {
             let ts = now_ms();
             let bytes = encode_line(&line);
+            // Step check/provision output isn't split into streams yet (the
+            // executor spawns steps without dual-PTY); tag it stdout for now.
+            state.log_store.append(&step, ts, LogStream::Stdout, &line);
             let buf = state
                 .logs
                 .entry(step.clone())
                 .or_insert_with(|| RingBuffer::new(RING_CAPACITY));
-            // Step check/provision output isn't split into streams yet (the
-            // executor spawns steps without dual-PTY); tag it stdout for now.
             buf.push(ts, LogStream::Stdout, line);
             let msg = ServerMessage::LogChunk {
                 service: step.clone(),
@@ -793,6 +803,8 @@ fn handle_process_line(
         return;
     }
     let ts = now_ms();
+    // Spill to the disk history tier first, then the live ring.
+    state.log_store.append(&service, ts, stream, &line);
     let buf = state
         .logs
         .entry(service.clone())

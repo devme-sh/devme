@@ -282,7 +282,10 @@ mod tests {
 
         let old_body = "old skill body";
         fs::write(&file, old_body).unwrap();
-        let rec = SkillInstall { version: "0.0.1".into(), hash: fnv1a(old_body) };
+        let rec = SkillInstall {
+            version: "0.0.1".into(),
+            hash: fnv1a(old_body),
+        };
         assert_eq!(status_at(&file, Some(&rec)), InstallStatus::Outdated);
 
         fs::write(&file, "user edited this").unwrap();

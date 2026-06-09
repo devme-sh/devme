@@ -7,6 +7,7 @@
 pub mod daemon;
 pub mod env_resolve;
 pub mod health;
+pub mod logstore;
 pub mod port_preflight;
 pub mod preflight;
 pub mod process;

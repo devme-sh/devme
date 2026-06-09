@@ -27,10 +27,7 @@ const DAEMONS: &[DaemonDef] = &[
     DaemonDef {
         id: "orbstack",
         label: "OrbStack",
-        detect: || {
-            std::path::Path::new("/Applications/OrbStack.app").exists()
-                || which("orbstack")
-        },
+        detect: || std::path::Path::new("/Applications/OrbStack.app").exists() || which("orbstack"),
         start_cmd: &["open", "-a", "OrbStack"],
     },
     DaemonDef {
@@ -112,7 +109,10 @@ pub fn start_daemon(id: &str) -> Result<(), String> {
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    Err(format!("{} started but Docker didn't become ready within 30s", def.label))
+    Err(format!(
+        "{} started but Docker didn't become ready within 30s",
+        def.label
+    ))
 }
 
 /// True if any service in the stack uses docker in its command.
@@ -147,7 +147,13 @@ pub fn start_command_for(id: &str) -> Option<String> {
 /// the caller then falls back to host-process detection.
 pub fn container_publishing_port(host_port: u16) -> Option<String> {
     let out = std::process::Command::new("docker")
-        .args(["ps", "--filter", &format!("publish={host_port}"), "--format", "{{.Names}}"])
+        .args([
+            "ps",
+            "--filter",
+            &format!("publish={host_port}"),
+            "--format",
+            "{{.Names}}",
+        ])
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
@@ -196,7 +202,10 @@ pub fn stop_container(container: &str) -> Result<(), String> {
 /// project (the bigger hammer; volumes survive). Works by project name without
 /// the compose file present, since Compose locates containers by label.
 pub fn compose_down(project: &str) -> Result<(), String> {
-    run_docker(["compose", "-p", project, "down"], &format!("docker compose -p {project} down"))
+    run_docker(
+        ["compose", "-p", project, "down"],
+        &format!("docker compose -p {project} down"),
+    )
 }
 
 fn run_docker<const N: usize>(args: [&str; N], label: &str) -> Result<(), String> {

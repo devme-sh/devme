@@ -122,7 +122,12 @@ impl GlobalConfig {
         match toml::from_str(&text) {
             Ok(cfg) => (cfg, None),
             Err(e) => {
-                let first = e.to_string().lines().next().unwrap_or("parse error").to_string();
+                let first = e
+                    .to_string()
+                    .lines()
+                    .next()
+                    .unwrap_or("parse error")
+                    .to_string();
                 (
                     Self::default(),
                     Some(format!(
@@ -265,8 +270,9 @@ impl GlobalConfig {
                 Ok(())
             }
             "remote.up_on_attach" => {
-                let b = parse_bool(value)
-                    .ok_or_else(|| format!("remote.up_on_attach expects true/false, got: {value}"))?;
+                let b = parse_bool(value).ok_or_else(|| {
+                    format!("remote.up_on_attach expects true/false, got: {value}")
+                })?;
                 self.remote.up_on_attach = Some(b);
                 Ok(())
             }
@@ -344,20 +350,56 @@ impl GlobalConfig {
 
     pub fn keys() -> &'static [(&'static str, &'static str)] {
         &[
-            ("docker.daemon", "Docker daemon to start (orbstack, docker-desktop, colima, rancher-desktop)"),
+            (
+                "docker.daemon",
+                "Docker daemon to start (orbstack, docker-desktop, colima, rancher-desktop)",
+            ),
             ("hints.skills", "Show AI skill install hint (true/false)"),
-            ("skill.auto_update", "Auto-update the embedded AI skill when devme updates (true/false)"),
+            (
+                "skill.auto_update",
+                "Auto-update the embedded AI skill when devme updates (true/false)",
+            ),
             ("tui.theme", "TUI colour theme (mocha/latte/auto)"),
-            ("tui.confirm_quit", "Confirm before quitting the TUI (true/false)"),
-            ("tui.toasts", "Show service crash/recovery notifications (true/false)"),
-            ("remote.host", "Remote dev host: an SSH target (Tailscale MagicDNS name, ~/.ssh/config alias, or user@host)"),
-            ("remote.root", "Remote parent dir for synced projects (default ~/development)"),
-            ("remote.sync_mode", "Mutagen sync mode (two-way-safe/two-way-resolved)"),
-            ("remote.attach", "Attach command after sync: preset (tui/ssh/tmux/herdr) or a raw template"),
-            ("remote.url_host", "Host for service URLs over a live remote (default: remote.host, e.g. a Tailscale name)"),
-            ("remote.advertise_host", "Host THIS machine puts in `devme url` output when it runs the stack (a hostname or \"auto\" for its Tailscale name). Set on the remote/VPS."),
-            ("remote.up_on_attach", "Ensure the remote stack is up (devme up -d) before attaching (true/false, default true)"),
-            ("remote.default", "Make bare `devme` behave as `devme remote` (true/false)"),
+            (
+                "tui.confirm_quit",
+                "Confirm before quitting the TUI (true/false)",
+            ),
+            (
+                "tui.toasts",
+                "Show service crash/recovery notifications (true/false)",
+            ),
+            (
+                "remote.host",
+                "Remote dev host: an SSH target (Tailscale MagicDNS name, ~/.ssh/config alias, or user@host)",
+            ),
+            (
+                "remote.root",
+                "Remote parent dir for synced projects (default ~/development)",
+            ),
+            (
+                "remote.sync_mode",
+                "Mutagen sync mode (two-way-safe/two-way-resolved)",
+            ),
+            (
+                "remote.attach",
+                "Attach command after sync: preset (tui/ssh/tmux/herdr) or a raw template",
+            ),
+            (
+                "remote.url_host",
+                "Host for service URLs over a live remote (default: remote.host, e.g. a Tailscale name)",
+            ),
+            (
+                "remote.advertise_host",
+                "Host THIS machine puts in `devme url` output when it runs the stack (a hostname or \"auto\" for its Tailscale name). Set on the remote/VPS.",
+            ),
+            (
+                "remote.up_on_attach",
+                "Ensure the remote stack is up (devme up -d) before attaching (true/false, default true)",
+            ),
+            (
+                "remote.default",
+                "Make bare `devme` behave as `devme remote` (true/false)",
+            ),
         ]
     }
 
@@ -372,7 +414,10 @@ impl GlobalConfig {
     pub fn record_skill_install(&mut self, path: &str, version: &str, hash: &str) {
         self.skill.installs.insert(
             path.to_string(),
-            SkillInstall { version: version.to_string(), hash: hash.to_string() },
+            SkillInstall {
+                version: version.to_string(),
+                hash: hash.to_string(),
+            },
         );
     }
 
@@ -433,7 +478,10 @@ pub fn global_config_path() -> PathBuf {
         return PathBuf::from(xdg).join("devme").join("config.toml");
     }
     if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".config").join("devme").join("config.toml");
+        return PathBuf::from(home)
+            .join(".config")
+            .join("devme")
+            .join("config.toml");
     }
     PathBuf::from("/tmp/devme-config.toml")
 }

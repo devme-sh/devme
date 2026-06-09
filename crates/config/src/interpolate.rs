@@ -121,11 +121,7 @@ pub fn interpolate(template: &str, ctx: &InterpContext) -> Result<String, Interp
                 // ensures the shell-var detection at the top of the loop
                 // gets a chance to fire on `${...}`.
                 let chunk_start = i;
-                while i < bytes.len()
-                    && bytes[i] != b'{'
-                    && bytes[i] != b'}'
-                    && bytes[i] != b'$'
-                {
+                while i < bytes.len() && bytes[i] != b'{' && bytes[i] != b'}' && bytes[i] != b'$' {
                     i += 1;
                 }
                 out.push_str(&template[chunk_start..i]);
@@ -166,11 +162,8 @@ mod tests {
 
     #[test]
     fn substitutes_multiple_variables() {
-        let out = interpolate(
-            "cmd: 0.0.0.0:{port} (slot {slot}, branch {branch})",
-            &ctx(),
-        )
-        .unwrap();
+        let out =
+            interpolate("cmd: 0.0.0.0:{port} (slot {slot}, branch {branch})", &ctx()).unwrap();
         assert_eq!(out, "cmd: 0.0.0.0:8080 (slot 0, branch main)");
     }
 
@@ -183,7 +176,9 @@ mod tests {
     #[test]
     fn unknown_variable_carries_offset() {
         let err = interpolate("aaa {unknown}", &ctx()).unwrap_err();
-        let InterpError::UnknownVariable { offset, .. } = err else { panic!() };
+        let InterpError::UnknownVariable { offset, .. } = err else {
+            panic!()
+        };
         assert_eq!(offset, 4);
     }
 
@@ -196,7 +191,10 @@ mod tests {
     #[test]
     fn lonely_close_brace_is_an_error() {
         let err = interpolate("oops } here", &ctx()).unwrap_err();
-        assert!(matches!(err, InterpError::UnexpectedCloseBrace { offset: 5 }));
+        assert!(matches!(
+            err,
+            InterpError::UnexpectedCloseBrace { offset: 5 }
+        ));
     }
 
     #[test]
