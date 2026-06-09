@@ -14,22 +14,41 @@ use tokio::sync::mpsc;
 use crate::discovery::Registry;
 use crate::keymap;
 use crate::render::render;
-use crate::state::TuiState;
+use crate::state::{PointerShape, TuiState};
 use crate::worktree::{AutoSpawner, WorktreeEvent};
 
 const LOG_PAGE: usize = 20;
 const MOUSE_SCROLL_LINES: usize = 3;
+/// Columns the tab row scrolls per wheel notch when the pointer is over it.
+const MOUSE_TAB_SCROLL_COLS: isize = 4;
 
-// 1002 = button-event tracking: reports press, release, AND motion *while a
-// button is held* (drag). Plain 1000 reports press/release only — no drag
-// events — so divider/scrollbar dragging never fired under it. 1006 = SGR
-// extended coordinates (so columns past 223 still report).
+// 1003 = any-event tracking: reports press, release, motion while a button is
+// held (drag), AND motion with no button (hover). We need hover to swap the
+// mouse-pointer shape over clickable/resizable cells; plain 1002 (drag only)
+// or 1000 (press/release only) wouldn't deliver it. 1006 = SGR extended
+// coordinates (so columns past 223 still report).
 fn enable_mouse(w: &mut impl std::io::Write) -> std::io::Result<()> {
-    w.write_all(b"\x1b[?1002h\x1b[?1006h")
+    w.write_all(b"\x1b[?1003h\x1b[?1006h")
 }
 
+// Also reset the pointer shape to the terminal default (OSC 22) so a hand left
+// over from a hover doesn't persist after we let go of the mouse.
 fn disable_mouse(w: &mut impl std::io::Write) -> std::io::Result<()> {
-    w.write_all(b"\x1b[?1002l\x1b[?1006l")
+    w.write_all(b"\x1b[?1003l\x1b[?1006l\x1b]22;default\x1b\\")
+}
+
+/// Request a mouse-pointer shape from the terminal via OSC 22 (the kitty
+/// pointer-shape protocol, supported by Ghostty/kitty/foot). Terminals without
+/// it ignore the sequence. Names are CSS cursor keywords.
+fn set_pointer_shape(w: &mut impl std::io::Write, shape: PointerShape) -> std::io::Result<()> {
+    let name = match shape {
+        PointerShape::Default => "default",
+        PointerShape::Pointer => "pointer",
+        PointerShape::ColResize => "ew-resize",
+        PointerShape::RowResize => "ns-resize",
+    };
+    write!(w, "\x1b]22;{name}\x1b\\")?;
+    w.flush()
 }
 
 /// Launch the TUI. Must be called from within a tokio runtime.
@@ -104,6 +123,9 @@ async fn run(
 
     let mut started: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut home_selected = false;
+    // Last mouse-pointer shape we asked the terminal for, so we only emit an
+    // OSC 22 update when the cell under the cursor changes category.
+    let mut pointer_shape = PointerShape::Default;
 
     // Animation/expiry tick — drives the service spinner and toast timeout.
     let mut anim = tokio::time::interval(std::time::Duration::from_millis(120));
@@ -340,6 +362,41 @@ async fn run(
                             }
                             _ => {}
                         },
+                        // Stack-info modal: j/k (or arrows) move between
+                        // copyable fields; c/Enter copy the highlighted one;
+                        // b/w jump-copy the branch / worktree path directly.
+                        // A copy is the terminal action — it closes the modal
+                        // (like copy-mode's `y`), so the toast is the only thing
+                        // left on screen. i/Esc/q close without copying.
+                        _ if state.stack_info_visible() => match k.code {
+                            KeyCode::Up | KeyCode::Char('k') => state.stack_info_move(-1),
+                            KeyCode::Down | KeyCode::Char('j') => state.stack_info_move(1),
+                            KeyCode::Char('c') | KeyCode::Enter => {
+                                if let Some(text) = state.stack_info_selected_value() {
+                                    copy_to_clipboard(&[&text]);
+                                    state.close_stack_info();
+                                    state.notify_transient("copy", format!("copied {text}"));
+                                }
+                            }
+                            KeyCode::Char('b') => {
+                                if let Some(text) = state.stack_info_field("Branch") {
+                                    copy_to_clipboard(&[&text]);
+                                    state.close_stack_info();
+                                    state.notify_transient("copy", format!("copied {text}"));
+                                }
+                            }
+                            KeyCode::Char('w') => {
+                                if let Some(text) = state.stack_info_field("Path") {
+                                    copy_to_clipboard(&[&text]);
+                                    state.close_stack_info();
+                                    state.notify_transient("copy", format!("copied {text}"));
+                                }
+                            }
+                            KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('q') => {
+                                state.close_stack_info()
+                            }
+                            _ => {}
+                        },
                         // Notifications-history modal: j/k (or arrows) move the
                         // cursor; c/Enter copy the selected notification, Y the
                         // whole history; n/Esc/q close it. (Click-to-copy is in
@@ -523,6 +580,17 @@ async fn run(
                                         }
                                     }
                                 }
+                                Action::StackInfo => {
+                                    // The slot lives in the allocator registry,
+                                    // not TUI state — read it here (off the
+                                    // render path) and hand it to the modal.
+                                    let slot = if state.shared_selected() {
+                                        None
+                                    } else {
+                                        crate::worktree::slot_for_cwd(state.current_instance_cwd())
+                                    };
+                                    state.open_stack_info(slot);
+                                }
                                 Action::Settings => state.open_settings(),
                                 Action::Notifications => state.toggle_notifications(),
                                 // Re-read global.toml (`R`, vs lowercase `r` =
@@ -556,9 +624,28 @@ async fn run(
                         }
                     }
                 }
-                Some(Event::Mouse(me)) => match me.kind {
-                    MouseEventKind::ScrollUp => state.log_scroll_up(MOUSE_SCROLL_LINES),
-                    MouseEventKind::ScrollDown => state.log_scroll_down(MOUSE_SCROLL_LINES),
+                Some(Event::Mouse(me)) => {
+                    match me.kind {
+                    // Wheel over the tab row scrolls the (possibly overflowing)
+                    // tabs horizontally; anywhere else it scrolls the logs.
+                    MouseEventKind::ScrollUp => {
+                        if state.tab_row_at(me.column, me.row) {
+                            state.scroll_tabs(-MOUSE_TAB_SCROLL_COLS);
+                        } else {
+                            state.log_scroll_up(MOUSE_SCROLL_LINES);
+                        }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        if state.tab_row_at(me.column, me.row) {
+                            state.scroll_tabs(MOUSE_TAB_SCROLL_COLS);
+                        } else {
+                            state.log_scroll_down(MOUSE_SCROLL_LINES);
+                        }
+                    }
+                    // Horizontal wheel / trackpad (when the terminal sends it)
+                    // always scrolls the tabs.
+                    MouseEventKind::ScrollLeft => state.scroll_tabs(-MOUSE_TAB_SCROLL_COLS),
+                    MouseEventKind::ScrollRight => state.scroll_tabs(MOUSE_TAB_SCROLL_COLS),
                     // In the notifications modal, a left-click on a row copies
                     // that notification (and moves the cursor to it).
                     MouseEventKind::Down(MouseButton::Left) if state.notifications_visible() => {
@@ -597,6 +684,23 @@ async fn run(
                         state.end_scrollbar_drag();
                     }
                     _ => {}
+                    }
+                    // Hint the pointer shape for the cell under the cursor: a
+                    // resize arrow while dragging a divider or scrollbar,
+                    // otherwise whatever the hit map says (hand / resize / arrow).
+                    // Only emit OSC 22 when it actually changes, so a still
+                    // pointer doesn't spew escapes every motion event.
+                    let want = if state.sidebar_dragging() {
+                        PointerShape::ColResize
+                    } else if state.scrollbar_dragging() {
+                        PointerShape::RowResize
+                    } else {
+                        state.pointer_shape_at(me.column, me.row)
+                    };
+                    if want != pointer_shape {
+                        pointer_shape = want;
+                        let _ = set_pointer_shape(terminal.backend_mut(), want);
+                    }
                 }
                 Some(_) => {}
                 None => return Ok(()),

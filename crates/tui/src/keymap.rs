@@ -45,6 +45,7 @@ pub enum Action {
     OpenUrl,
     CopyUrl,
     // session
+    StackInfo,
     Settings,
     Notifications,
     ReloadConfig,
@@ -123,7 +124,7 @@ pub struct MouseNote {
 /// selection.
 pub const MOUSE_NOTES: &[MouseNote] = &[
     MouseNote { label: "click", desc: "select stack / service tab" },
-    MouseNote { label: "wheel", desc: "scroll logs" },
+    MouseNote { label: "wheel", desc: "scroll logs (over tab row: scroll tabs)" },
     MouseNote { label: "drag bar", desc: "scrollbar → jump to position" },
     MouseNote { label: "shift+drag", desc: "select text (v = clean multi-line)" },
 ];
@@ -231,6 +232,13 @@ pub const BINDINGS: &[Binding] = &[
     },
     // session
     Binding {
+        keys: "i",
+        desc: "stack info (copy branch / path / slot)",
+        section: Section::Session,
+        actions: &[Action::StackInfo],
+        footer: None,
+    },
+    Binding {
         keys: ",",
         desc: "settings",
         section: Section::Session,
@@ -300,6 +308,7 @@ pub const ALL_ACTIONS: &[Action] = &[
     Action::RestartService,
     Action::OpenUrl,
     Action::CopyUrl,
+    Action::StackInfo,
     Action::Settings,
     Action::Notifications,
     Action::ReloadConfig,
@@ -337,6 +346,7 @@ fn exhaustive_marker(a: Action) {
         | Action::RestartService
         | Action::OpenUrl
         | Action::CopyUrl
+        | Action::StackInfo
         | Action::Settings
         | Action::Notifications
         | Action::ReloadConfig
@@ -379,6 +389,7 @@ pub fn resolve(k: &KeyEvent) -> Option<Action> {
         (KeyCode::Char('o'), false) => OpenUrl,
         (KeyCode::Char('c'), false) => CopyUrl,
         // session
+        (KeyCode::Char('i'), false) => StackInfo,
         (KeyCode::Char(','), false) => Settings,
         (KeyCode::Char('n'), false) => Notifications,
         (KeyCode::Char('R'), false) => ReloadConfig,
@@ -425,7 +436,7 @@ mod tests {
         let code = |kc: KeyCode| KeyEvent::new(kc, KeyModifiers::NONE);
 
         let mut events: Vec<KeyEvent> = Vec::new();
-        for c in "lhjkbfgGJKyYpvzSsrocqD,nR?` ".chars() {
+        for c in "lhjkbfgGJKyYpvzSsrociqD,nR?` ".chars() {
             events.push(plain(c));
         }
         for c in ['u', 'd', 'c'] {

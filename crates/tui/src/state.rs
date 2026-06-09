@@ -463,6 +463,21 @@ pub enum ClickTarget {
     Notif(usize),
 }
 
+/// Mouse pointer shape to request from the terminal (via OSC 22) for the cell
+/// under the pointer. A hint only — terminals without pointer-shape support
+/// ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointerShape {
+    /// The terminal's normal arrow — nothing interactive here.
+    Default,
+    /// A hand: a clickable row, tab, or scrollbar.
+    Pointer,
+    /// Horizontal resize: the sidebar/main divider.
+    ColResize,
+    /// Vertical resize: the log scrollbar track.
+    RowResize,
+}
+
 /// A recorded clickable region: a screen rectangle and what clicking it does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ClickRegion {
@@ -491,6 +506,29 @@ struct ScrollbarHit {
     content_len: usize,
     /// Visible rows (the thumb's span).
     viewport: usize,
+}
+
+/// One row in the stack-info modal: a labelled value. `copyable` rows are
+/// selectable and yield their `value` to the clipboard; info-only rows (the
+/// status line) are skipped by the cursor and rendered dimmer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackInfoField {
+    pub label: &'static str,
+    pub value: String,
+    pub copyable: bool,
+}
+
+/// The stack-info modal (`i`): identity + status for the focused stack, with
+/// per-field copy. Built once when the modal opens so a slow allocator read
+/// (for the slot) stays off the render path. Extensible: custom per-stack
+/// commands would render as a second section of action rows here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackInfoState {
+    /// Heading — the branch/stack name (or "shared services").
+    pub title: String,
+    pub fields: Vec<StackInfoField>,
+    /// Cursor as an index into `fields`, always resting on a copyable row.
+    pub cursor: usize,
 }
 
 /// Default sidebar width in columns. Wide enough for stack names + a health
@@ -607,6 +645,24 @@ pub struct TuiState {
     /// Friendly repo label captured when entering the stopped state, shown on
     /// the hero card. `None` if it couldn't be resolved.
     stopped_repo: Option<String>,
+    /// The stack-info modal (`i`), when open. Identity + status for the focused
+    /// stack, with per-field copy.
+    stack_info: Option<StackInfoState>,
+    /// Horizontal scroll offset (columns) of the service-tab row, for when the
+    /// tabs overflow the pane. Driven manually by the mouse wheel over the row;
+    /// the renderer also nudges it to keep the *selected* tab in view when the
+    /// selection changes (see `tab_ctx`). Clamped to the content width each
+    /// frame in `render_tabs`.
+    tab_scroll: usize,
+    /// Last-rendered tab context `(stack signature, selected tab index)`. When
+    /// it changes between frames the selection moved (key nav, click, stack
+    /// switch), so the renderer scrolls that tab back into view; while it's
+    /// unchanged, manual wheel scrolling is left alone.
+    tab_ctx: Option<(usize, usize)>,
+    /// Screen geometry of the tab row this frame `(x, y, w, h)`, so a mouse
+    /// wheel over it scrolls the tabs rather than the logs. Recorded each
+    /// render, cleared by `begin_frame_hits`.
+    tab_row: Option<(u16, u16, u16, u16)>,
 }
 
 impl Default for TuiState {
@@ -646,6 +702,10 @@ impl Default for TuiState {
             sidebar_dragging: false,
             stopped: false,
             stopped_repo: None,
+            stack_info: None,
+            tab_scroll: 0,
+            tab_ctx: None,
+            tab_row: None,
         }
     }
 }
@@ -799,6 +859,7 @@ impl TuiState {
         self.quit_confirm = false;
         self.zoom = false;
         self.copy_mode = false;
+        self.stack_info = None;
     }
 
     /// Leave the stopped state — a daemon reattached (a fresh `devme up`), so
@@ -1695,6 +1756,33 @@ impl TuiState {
         self.set_sidebar_width(col, d.total_width);
     }
 
+    /// The pointer shape the cell at `(col, row)` should hint — a hand over
+    /// clickable targets, a resize arrow over the divider/scrollbar. Mirrors
+    /// the same hit map the click handlers use, so the cursor and the action
+    /// can never disagree. Under a modal only the notifications rows are live.
+    pub fn pointer_shape_at(&self, col: u16, row: u16) -> PointerShape {
+        if self.any_modal_open() {
+            if self.notif_visible
+                && self.click_regions.iter().any(|r| {
+                    matches!(r.target, ClickTarget::Notif(_)) && r.contains(col, row)
+                })
+            {
+                return PointerShape::Pointer;
+            }
+            return PointerShape::Default;
+        }
+        if self.sidebar_divider_at(col, row) {
+            return PointerShape::ColResize;
+        }
+        if self.scrollbar_at(col, row) {
+            return PointerShape::RowResize;
+        }
+        if self.click_regions.iter().any(|r| r.contains(col, row)) {
+            return PointerShape::Pointer;
+        }
+        PointerShape::Default
+    }
+
     // ── fullscreen log zoom ─────────────────────────────────────────────
 
     pub fn zoom(&self) -> bool {
@@ -1809,6 +1897,163 @@ impl TuiState {
             .iter()
             .map(|i| (i.info.id.clone(), i.info.cwd.clone()))
             .collect()
+    }
+
+    // ── stack-info modal ────────────────────────────────────────────────
+
+    /// Open the stack-info modal for the focused stack. `slot` is the port
+    /// slot it holds (looked up by the caller off the render path, since that
+    /// reads the allocator registry); `None` when unknown or for the shared
+    /// row. `remote_host` is the reachable hostname when this TUI is attached
+    /// to a remote stack (over `devme remote`) — it surfaces as a leading
+    /// `Host` row so the remote path/slot below read as remote, and is itself
+    /// copyable to `ssh` in. `None` for a local TUI (no Host row). A no-op if
+    /// there's nothing to describe.
+    pub fn open_stack_info(&mut self, slot: Option<u8>, remote_host: Option<String>) {
+        let (title, fields) = self.build_stack_info(slot, remote_host);
+        if fields.is_empty() {
+            return;
+        }
+        let cursor = fields.iter().position(|f| f.copyable).unwrap_or(0);
+        self.stack_info = Some(StackInfoState { title, fields, cursor });
+    }
+
+    /// Assemble the modal's heading and rows for whatever is focused — a
+    /// worktree stack (branch / path / slot / status / id) or the shared row
+    /// (id / status), with a leading `Host` row when `remote_host` is set.
+    /// Pure: reads only in-memory state plus the passed slot/host.
+    fn build_stack_info(
+        &self,
+        slot: Option<u8>,
+        remote_host: Option<String>,
+    ) -> (String, Vec<StackInfoField>) {
+        let mut fields = Vec::new();
+        let copyable = |label: &'static str, value: String| StackInfoField {
+            label,
+            value,
+            copyable: true,
+        };
+        // On a remote TUI, lead with the host so the path/slot below read as
+        // remote (and the host itself is copyable to ssh in).
+        if let Some(host) = remote_host {
+            fields.push(copyable("Host", host));
+        }
+
+        if self.shared_selected {
+            if let Some(id) = &self.shared.id {
+                fields.push(copyable("Instance id", id.clone()));
+            }
+            fields.push(StackInfoField {
+                label: "Status",
+                value: Self::up_total_label(&self.shared.services),
+                copyable: false,
+            });
+            return ("shared services".to_string(), fields);
+        }
+
+        let Some(idx) = self.selected_instance else {
+            return (String::new(), fields);
+        };
+        let Some(inst) = self.instances.get(idx) else {
+            return (String::new(), fields);
+        };
+        let title = inst.info.label.clone();
+        fields.push(copyable("Branch", inst.info.label.clone()));
+        fields.push(copyable("Path", inst.info.cwd.clone()));
+        if let Some(slot) = slot {
+            fields.push(copyable("Slot", slot.to_string()));
+        }
+        fields.push(StackInfoField {
+            label: "Status",
+            value: self.stack_status_label(idx),
+            copyable: false,
+        });
+        fields.push(copyable("Instance id", inst.info.id.clone()));
+        (title, fields)
+    }
+
+    /// `up/total` running count for a service set, e.g. `2/3 up`.
+    fn up_total_label(services: &[ServiceSnapshot]) -> String {
+        let up = services
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.state,
+                    ServiceState::Running { .. } | ServiceState::External { healthy: true }
+                )
+            })
+            .count();
+        format!("{up}/{} up", services.len())
+    }
+
+    /// The status row for a stack: owned-service counts plus the git
+    /// ahead/behind arrows when known, e.g. `2/3 up · ↑1 ↓2`.
+    fn stack_status_label(&self, idx: usize) -> String {
+        let mut parts = match self.instance_service_summary(idx) {
+            StackSummary::NoDaemon => "no daemon".to_string(),
+            StackSummary::SharedOnly => "shared services only".to_string(),
+            StackSummary::Counted { up, total } => format!("{up}/{total} up"),
+        };
+        if let Some((ahead, behind)) = self.instance_ahead_behind(idx)
+            && (ahead > 0 || behind > 0)
+        {
+            parts.push_str(&format!(" · ↑{ahead} ↓{behind}"));
+        }
+        parts
+    }
+
+    pub fn stack_info(&self) -> Option<&StackInfoState> {
+        self.stack_info.as_ref()
+    }
+
+    pub fn stack_info_visible(&self) -> bool {
+        self.stack_info.is_some()
+    }
+
+    pub fn close_stack_info(&mut self) {
+        self.stack_info = None;
+    }
+
+    /// Move the cursor to the next/previous *copyable* row (`delta` ±1),
+    /// skipping info-only rows. Clamped — no wrap.
+    pub fn stack_info_move(&mut self, delta: i32) {
+        let Some(info) = self.stack_info.as_mut() else {
+            return;
+        };
+        let copyable: Vec<usize> = info
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.copyable)
+            .map(|(i, _)| i)
+            .collect();
+        if copyable.is_empty() {
+            return;
+        }
+        let pos = copyable.iter().position(|&i| i == info.cursor).unwrap_or(0);
+        let next = (pos as i32 + delta).clamp(0, copyable.len() as i32 - 1) as usize;
+        info.cursor = copyable[next];
+    }
+
+    /// The highlighted row's value, for `c`/Enter copy. `None` if the cursor
+    /// isn't on a copyable row (shouldn't happen — the cursor only rests on
+    /// copyable rows).
+    pub fn stack_info_selected_value(&self) -> Option<String> {
+        let info = self.stack_info.as_ref()?;
+        info.fields
+            .get(info.cursor)
+            .filter(|f| f.copyable)
+            .map(|f| f.value.clone())
+    }
+
+    /// A field's value by label (for the direct-copy hotkeys, e.g. `b` →
+    /// "Branch", `w` → "Path"). `None` if absent or not copyable.
+    pub fn stack_info_field(&self, label: &str) -> Option<String> {
+        let info = self.stack_info.as_ref()?;
+        info.fields
+            .iter()
+            .find(|f| f.label == label && f.copyable)
+            .map(|f| f.value.clone())
     }
 
     // ── settings overlay ────────────────────────────────────────────────
@@ -2051,6 +2296,50 @@ impl TuiState {
         self.click_regions.clear();
         self.scrollbar_hit = None;
         self.sidebar_divider = None;
+        self.tab_row = None;
+    }
+
+    // ── service-tab horizontal scroll ───────────────────────────────────
+
+    /// Current horizontal scroll offset (columns) of the tab row.
+    pub fn tab_scroll(&self) -> usize {
+        self.tab_scroll
+    }
+
+    /// Set the tab row's scroll offset (the renderer writes back the clamped
+    /// value each frame).
+    pub fn set_tab_scroll(&mut self, cols: usize) {
+        self.tab_scroll = cols;
+    }
+
+    /// Nudge the tab row horizontally by `delta` columns (negative = left).
+    /// Floors at 0; the upper bound is clamped to the content width in
+    /// `render_tabs`, which knows the laid-out row width.
+    pub fn scroll_tabs(&mut self, delta: isize) {
+        self.tab_scroll = (self.tab_scroll as isize + delta).max(0) as usize;
+    }
+
+    /// The tab context rendered last frame, for detecting selection changes.
+    pub fn tab_ctx(&self) -> Option<(usize, usize)> {
+        self.tab_ctx
+    }
+
+    /// Record the tab context rendered this frame.
+    pub fn set_tab_ctx(&mut self, ctx: (usize, usize)) {
+        self.tab_ctx = Some(ctx);
+    }
+
+    /// Record the tab row's screen rect so a wheel over it scrolls the tabs.
+    pub fn set_tab_row(&mut self, x: u16, y: u16, w: u16, h: u16) {
+        self.tab_row = Some((x, y, w, h));
+    }
+
+    /// Whether `(col, row)` falls on the tab row recorded this frame.
+    pub fn tab_row_at(&self, col: u16, row: u16) -> bool {
+        match self.tab_row {
+            Some((x, y, w, h)) => col >= x && col < x + w && row >= y && row < y + h,
+            None => false,
+        }
     }
 
     /// Record a clickable region (screen cells) and what activating it does.
@@ -2072,6 +2361,7 @@ impl TuiState {
             || self.settings.is_some()
             || self.port_conflict.is_some()
             || self.notif_visible
+            || self.stack_info.is_some()
     }
 
     /// Apply a left-click at screen `(col, row)` to the recorded hit map.
@@ -2986,6 +3276,26 @@ mod tests {
     }
 
     #[test]
+    fn pointer_shape_reflects_the_hit_map() {
+        let mut s = TuiState::default();
+        // Empty hit map → plain arrow everywhere.
+        assert_eq!(s.pointer_shape_at(5, 5), PointerShape::Default);
+
+        // A clickable row → hand.
+        s.push_click_region(0, 1, 22, 1, ClickTarget::Stack(0));
+        assert_eq!(s.pointer_shape_at(3, 1), PointerShape::Pointer);
+        assert_eq!(s.pointer_shape_at(3, 2), PointerShape::Default);
+
+        // The divider takes priority and reads as a horizontal resize.
+        s.set_sidebar_divider(28, 0, 24, 80);
+        assert_eq!(s.pointer_shape_at(28, 5), PointerShape::ColResize);
+
+        // The scrollbar track reads as a vertical resize.
+        s.set_scrollbar_hit(100, 2, 10, 200, 20);
+        assert_eq!(s.pointer_shape_at(100, 5), PointerShape::RowResize);
+    }
+
+    #[test]
     fn settings_overlay_cycles_and_toggles() {
         let mut s = TuiState::default();
         s.open_settings();
@@ -3138,6 +3448,49 @@ mod tests {
         let idx = s.find_instance("test-id").unwrap();
         s.apply_git_refresh("test-id", None, None);
         assert_eq!(s.instances()[idx], "test");
+    }
+
+    #[test]
+    fn stack_info_lists_copyable_fields_and_copies() {
+        let mut s = TuiState::default();
+        s.apply(snapshot_msg(&["api"]));
+        s.apply_git_refresh("test-id", Some("feature/x".into()), Some((1, 2)));
+
+        s.open_stack_info(Some(3));
+        let info = s.stack_info().expect("modal open");
+        assert_eq!(info.title, "feature/x");
+        // Branch, Path, Slot, Status, Instance id — Status is info-only.
+        let labels: Vec<_> = info.fields.iter().map(|f| f.label).collect();
+        assert_eq!(labels, ["Branch", "Path", "Slot", "Status", "Instance id"]);
+        assert_eq!(s.stack_info_field("Branch").as_deref(), Some("feature/x"));
+        assert_eq!(s.stack_info_field("Path").as_deref(), Some("/tmp/test"));
+        assert_eq!(s.stack_info_field("Slot").as_deref(), Some("3"));
+        // The status row carries the counts + git arrows but isn't copyable.
+        let status = info.fields.iter().find(|f| f.label == "Status").unwrap();
+        assert!(!status.copyable);
+        assert!(status.value.contains("0/1 up") && status.value.contains("↑1 ↓2"), "{}", status.value);
+
+        // Cursor starts on the first copyable row (Branch) and `c` copies it.
+        assert_eq!(s.stack_info_selected_value().as_deref(), Some("feature/x"));
+    }
+
+    #[test]
+    fn stack_info_cursor_skips_info_only_rows() {
+        let mut s = TuiState::default();
+        s.apply(snapshot_msg(&["api"]));
+        s.open_stack_info(None); // no slot → Branch, Path, Status, Instance id
+
+        // Down past Path lands on Instance id, hopping over the Status row.
+        s.stack_info_move(1); // Path
+        assert_eq!(s.stack_info_selected_value().as_deref(), Some("/tmp/test"));
+        s.stack_info_move(1); // skips Status → Instance id
+        assert_eq!(s.stack_info_selected_value().as_deref(), Some("test-id"));
+        // Clamped at the end — no wrap.
+        s.stack_info_move(1);
+        assert_eq!(s.stack_info_selected_value().as_deref(), Some("test-id"));
+
+        s.close_stack_info();
+        assert!(!s.stack_info_visible());
     }
 
     #[test]

@@ -80,6 +80,18 @@ impl ChildProcess {
         let mut cmd_builder = CommandBuilder::new("sh");
         cmd_builder.args(["-c", cmd]);
         cmd_builder.cwd(cwd);
+        // Tame `docker compose`'s interactive TTY rendering. Because we give the
+        // child a real PTY, compose otherwise draws its navigation menu
+        // ("w Enable Watch  d Detach") as a sticky footer and animates progress
+        // in place with cursor movement — both turn into garbage in an
+        // append-only log buffer (the footer gets prepended to every line; each
+        // spinner frame becomes a duplicate line). `COMPOSE_MENU=false` drops
+        // the footer; `COMPOSE_PROGRESS=plain` emits clean sequential progress
+        // lines instead of redraws. Both are compose-only and ignored by every
+        // other program. Set before `extra_env` so a user's devme.toml can still
+        // override them.
+        cmd_builder.env("COMPOSE_MENU", "false");
+        cmd_builder.env("COMPOSE_PROGRESS", "plain");
         for (k, v) in extra_env {
             cmd_builder.env(k.as_ref(), v.as_ref());
         }

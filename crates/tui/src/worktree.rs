@@ -825,6 +825,13 @@ fn read_on_destroy(path: &Path) -> Option<String> {
     Stack::parse(&toml).ok()?.stack.and_then(|m| m.on_destroy)
 }
 
+/// The slot the worktree rooted at `cwd` currently holds, by path string —
+/// the TUI's stack-info modal reads it here (off the render path, since it
+/// touches the allocator registry file). `None` when the dir holds no claim.
+pub fn slot_for_cwd(cwd: &str) -> Option<u8> {
+    slot_for(Path::new(cwd))
+}
+
 /// The slot a worktree currently holds, from the allocator registry.
 fn slot_for(path: &Path) -> Option<u8> {
     let registry = devme_config::paths::slot_registry().ok()?;

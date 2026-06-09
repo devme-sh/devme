@@ -100,10 +100,112 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
         render_quit_confirm(frame, area, state);
     } else if state.settings_visible() {
         render_settings_overlay(frame, area, state);
+    } else if state.stack_info_visible() {
+        render_stack_info_overlay(frame, area, state);
     } else if state.notifications_visible() {
         render_notifications_overlay(frame, area, state);
     } else if state.help_visible() {
         render_help_overlay(frame, area);
+    }
+}
+
+/// Stack-info modal (`i`): the focused stack's identity (branch, worktree
+/// path, slot, instance id) and status, one field per row. Copyable rows are
+/// selectable; `c`/Enter copy the highlighted one, `b`/`w` jump-copy the
+/// branch / path. The status row is info-only (dimmer, skipped by the cursor).
+fn render_stack_info_overlay(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let Some(info) = state.stack_info() else {
+        return;
+    };
+    let p = *state.palette();
+
+    // Width fits the longest "  label  value" line *and* the footer hint
+    // below (whichever is wider), clamped to the frame.
+    let label_w = info.fields.iter().map(|f| f.label.len()).max().unwrap_or(0);
+    let widest_field = info
+        .fields
+        .iter()
+        .map(|f| 3 + label_w + 2 + f.value.chars().count())
+        .max()
+        .unwrap_or(20);
+    // Keep in sync with the footer hint rendered at the bottom.
+    const FOOTER_W: usize = 46;
+    let content_w = widest_field.max(FOOTER_W);
+    let w = (content_w as u16 + 2).clamp(28, area.width.saturating_sub(4));
+    // Title + fields + divider + footer.
+    let h = (info.fields.len() as u16 + 4).min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let modal = Rect { x, y, width: w, height: h };
+
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" {} ", info.title),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(p.accent))
+        .style(Style::default().bg(p.panel_bg));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    if inner.height < 2 {
+        return;
+    }
+
+    let mut row = inner.y;
+    let bottom = inner.y + inner.height;
+    for (i, field) in info.fields.iter().enumerate() {
+        if row + 1 >= bottom {
+            break;
+        }
+        let selected = field.copyable && i == info.cursor;
+        let fill = selected.then(|| Style::default().bg(p.surface0));
+        let label_style = if field.copyable {
+            Style::default().fg(p.subtext0)
+        } else {
+            Style::default().fg(p.overlay0)
+        };
+        let value_style = if selected {
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD)
+        } else if field.copyable {
+            Style::default().fg(p.text)
+        } else {
+            Style::default().fg(p.overlay0)
+        };
+        let marker = if selected { "▸ " } else { "  " };
+        let spans = vec![
+            Span::styled(marker, Style::default().fg(p.accent)),
+            Span::styled(format!("{:<width$}", field.label, width = label_w), label_style),
+            Span::raw("  "),
+            Span::styled(field.value.clone(), value_style),
+        ];
+        render_filled(
+            frame,
+            Rect { x: inner.x, y: row, width: inner.width, height: 1 },
+            Line::from(spans),
+            fill,
+        );
+        row += 1;
+    }
+
+    // Footer hint, pinned to the last row.
+    if bottom > inner.y {
+        let hint = Line::from(vec![
+            Span::styled(" ↑↓ ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("move  ", Style::default().fg(p.overlay0)),
+            Span::styled("c/⏎ ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("copy  ", Style::default().fg(p.overlay0)),
+            Span::styled("b/w ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("branch/path  ", Style::default().fg(p.overlay0)),
+            Span::styled("esc ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("close", Style::default().fg(p.overlay0)),
+        ]);
+        frame.render_widget(
+            Paragraph::new(hint),
+            Rect { x: inner.x, y: bottom - 1, width: inner.width, height: 1 },
+        );
     }
 }
 
@@ -567,7 +669,6 @@ fn render_stopped(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
     let repo = state.stopped_repo().unwrap_or("This stack").to_string();
     let badge = Style::default().fg(p.mauve);
     let dim = |s: String| Span::styled(s, Style::default().fg(p.overlay0));
-    let body = |s: &'static str| Span::styled(s, Style::default().fg(p.subtext0));
     let chip = |k: &'static str| {
         Span::styled(
             format!(" {k} "),
@@ -577,6 +678,13 @@ fn render_stopped(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
                 .add_modifier(Modifier::BOLD),
         )
     };
+
+    // Key hints render as their own centred block (below) rather than as part
+    // of the centred paragraph: centring each line independently would stagger
+    // the `u`/`q` chips, since the labels differ in width. Pad every label to
+    // the widest so the rows share a width — and thus a common left edge.
+    let hints: [(&str, &str); 2] = [("u", "start the stack again"), ("q", "quit devme")];
+    let label_w = hints.iter().map(|(_, l)| l.chars().count()).max().unwrap_or(0);
 
     // A small framed power badge — a deliberate "off" mark, not an error.
     let lines: Vec<Line> = vec![
@@ -597,16 +705,35 @@ fn render_stopped(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
         Line::from(dim(format!("{repo} was shut down via devme down."))),
         Line::from(dim("The dashboard is still live.".into())),
         Line::default(),
-        Line::from(vec![chip("u"), body("  start the stack again")]),
-        Line::from(vec![chip("q"), body("  quit devme")]),
     ];
+    let head_lines = lines.len() as u16;
 
     frame.render_widget(
         Paragraph::new(lines)
             .alignment(ratatui::layout::Alignment::Center)
             .wrap(Wrap { trim: true }),
-        inner,
+        Rect { height: head_lines.min(inner.height), ..inner },
     );
+
+    // The hint rows as a left-aligned block, centred as a unit. Block width =
+    // chip (3 cols) + gap (2) + the padded label, so both rows align exactly.
+    let block_w = (3 + 2 + label_w) as u16;
+    let hint_x = inner.x + inner.width.saturating_sub(block_w) / 2;
+    let mut hint_y = inner.y + head_lines;
+    for (k, label) in hints {
+        if hint_y >= inner.y + inner.height {
+            break;
+        }
+        let row = Line::from(vec![
+            chip(k),
+            Span::styled(format!("  {label:<label_w$}"), Style::default().fg(p.subtext0)),
+        ]);
+        frame.render_widget(
+            Paragraph::new(row),
+            Rect { x: hint_x, y: hint_y, width: block_w.min(inner.width), height: 1 },
+        );
+        hint_y += 1;
+    }
 
     // Toasts on top so the "starting…" ack (and any late crash notice) shows.
     render_toasts(frame, area, state);
@@ -745,9 +872,11 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
 
     // Centered modal, sized to fit the generated content (so adding a binding
     // never silently clips a row), clamped to the available area. Wide enough
-    // to read at a glance, narrow enough that the layout shows around it.
+    // to read at a glance, narrow enough that the layout shows around it. The
+    // height keeps a small margin when the content fits, but gives that margin
+    // up on short terminals so a full keymap still renders its last row.
     let w = 56u16.min(area.width.saturating_sub(4));
-    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let h = (lines.len() as u16 + 2).min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let modal = Rect { x, y, width: w, height: h };
@@ -1328,14 +1457,43 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
         tab_spans.push((i, start, col));
     }
 
-    // Scroll just enough that the selected tab's right edge is on screen (and,
-    // since a tab is far narrower than the pane, its whole label with it).
+    // Horizontal scroll. The offset is manual (mouse wheel over the row), but
+    // when the *selection* moves we scroll it back into view — so keyboard nav
+    // and clicks always reveal the focused tab, while free wheel-scrolling
+    // between selections is left untouched. We detect a selection change by
+    // comparing this frame's tab context (stack + selected tab) to last
+    // frame's; only then do we "scroll into view".
     let total = col;
     let avail = area.width as usize;
-    let scroll_x = match sel_range {
-        Some((_, end)) if total > avail && end > avail => (end - avail).min(total - avail),
-        _ => 0,
+    let max_scroll = total.saturating_sub(avail);
+
+    let stack_sig = if state.shared_selected() {
+        usize::MAX
+    } else {
+        state.selected_instance_index().unwrap_or(usize::MAX)
     };
+    let ctx = (stack_sig, sel_idx);
+    let selection_moved = state.tab_ctx() != Some(ctx);
+    state.set_tab_ctx(ctx);
+
+    let mut scroll_x = state.tab_scroll().min(max_scroll);
+    if selection_moved
+        && let Some((start, end)) = sel_range
+    {
+        // Reveal the selected tab: pull left if it's clipped off the right
+        // edge, push right if it's off the left.
+        if end > scroll_x + avail {
+            scroll_x = end - avail;
+        }
+        if start < scroll_x {
+            scroll_x = start;
+        }
+    }
+    scroll_x = scroll_x.min(max_scroll);
+    state.set_tab_scroll(scroll_x);
+    // Record the row so a mouse wheel over it scrolls the tabs, not the logs.
+    state.set_tab_row(area.x, area.y, area.width, area.height);
+
     frame.render_widget(
         Paragraph::new(Line::from(spans)).scroll((0, scroll_x as u16)),
         area,
@@ -1445,22 +1603,23 @@ fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) 
     }
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), text_area);
 
-    // Scrollbar: track length = full log buffer, thumb position = top of
-    // the visible window (i.e., `start`). Ratatui sizes the thumb from the
-    // ratio of `viewport / content_length` implicitly through its render.
+    // Scrollbar. ratatui (0.29) sizes the thumb as
+    // `viewport / ((content_length - 1) + viewport)` of the track. Feeding it
+    // the raw line count as `content_length` makes the thumb ~half the track
+    // whenever the buffer merely fills the viewport — even though nothing
+    // scrolls. So we feed it the number of *scroll steps* instead
+    // (`total - viewport`): the thumb then reflects the fraction of the buffer
+    // on screen, and the bar disappears entirely when everything fits
+    // (ratatui renders nothing for `content_length == 0`). `position` is the
+    // index of the top visible line (`start`); offset 0 (live tail) lands it
+    // at the bottom. Hit-testing still gets the true total for drag mapping.
     if let Some(sb_area) = sb_area {
         let content_length = logs.len();
         // Record the track so a click/drag on it can scroll (last use of
         // `logs` is here, so the &mut borrow below is free under NLL).
         state.set_scrollbar_hit(sb_area.x, sb_area.y, sb_area.height, content_length, viewport);
-        let sb_position = if offset == 0 {
-            content_length
-        } else {
-            start
-        };
-        let mut sb_state = ScrollbarState::new(content_length)
-            .position(sb_position)
-            .viewport_content_length(viewport);
+        let max_scroll = content_length.saturating_sub(viewport);
+        let mut sb_state = ScrollbarState::new(max_scroll).position(start.min(max_scroll));
         let sb = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .style(Style::default().fg(Color::DarkGray))
             .thumb_style(if offset > 0 {
@@ -1705,6 +1864,59 @@ mod tests {
         let i_be = tab_line.find("backend").unwrap();
         let i_fe = tab_line.find("frontend").unwrap();
         assert!(i_db < i_be && i_be < i_fe);
+    }
+
+    /// Many tabs in a narrow pane overflow; the row can be scrolled
+    /// horizontally to reveal the ones clipped off the right edge.
+    #[test]
+    fn tabs_scroll_horizontally_when_overflowing() {
+        let mut state = TuiState::default();
+        let services: Vec<_> = (0..12)
+            .map(|i| svc(&format!("service-{i:02}"), ServiceState::Stopped))
+            .collect();
+        state.apply(ServerMessage::Subscribed {
+            instance: test_instance(),
+            services,
+            steps: vec![],
+        });
+
+        // Narrow pane → the 12 tabs can't all fit.
+        let first = render_to_text(&mut state, 60, 12);
+        assert!(first.contains("service-00"), "first tab visible:\n{first}");
+        assert!(!first.contains("service-11"), "last tab off-screen initially:\n{first}");
+
+        // Scroll the row right (clamped to the content width) → the tail shows.
+        state.scroll_tabs(500);
+        let scrolled = render_to_text(&mut state, 60, 12);
+        assert!(
+            scrolled.contains("service-11"),
+            "last tab revealed after scrolling:\n{scrolled}"
+        );
+    }
+
+    /// Moving the selection scrolls the focused tab back into view even after a
+    /// manual scroll parked it off-screen.
+    #[test]
+    fn selected_tab_scrolls_into_view() {
+        let mut state = TuiState::default();
+        let services: Vec<_> = (0..12)
+            .map(|i| svc(&format!("service-{i:02}"), ServiceState::Stopped))
+            .collect();
+        state.apply(ServerMessage::Subscribed {
+            instance: test_instance(),
+            services,
+            steps: vec![],
+        });
+        let _ = render_to_text(&mut state, 60, 12); // prime the tab context
+
+        for _ in 0..11 {
+            state.select_next_service();
+        }
+        let text = render_to_text(&mut state, 60, 12);
+        assert!(
+            text.contains("service-11"),
+            "selected last tab scrolled into view:\n{text}"
+        );
     }
 
     #[test]
@@ -2036,6 +2248,41 @@ mod tests {
         state.toggle_notifications();
         let text = render_to_text(&mut state, 100, 30);
         assert!(text.contains("no notifications yet"), "empty state missing:\n{text}");
+    }
+
+    #[test]
+    fn stack_info_overlay_renders_fields_when_open() {
+        let mut state = TuiState::default();
+        state.apply(ServerMessage::Subscribed {
+            instance: InstanceInfo {
+                id: "id".into(),
+                label: "feature/x".into(),
+                cwd: "/tmp/wt-x".into(),
+            },
+            services: vec![ServiceSnapshot {
+                name: "api".into(),
+                state: ServiceState::Stopped,
+                pid: None,
+                port: None,
+                url: None,
+                restart_count: 0,
+            }],
+            steps: vec![],
+        });
+
+        let text = render_to_text(&mut state, 100, 30);
+        assert!(!text.contains("Instance id"), "modal leaked when hidden:\n{text}");
+
+        state.open_stack_info(Some(2));
+        let text = render_to_text(&mut state, 100, 30);
+        assert!(text.contains("feature/x"), "branch/title missing:\n{text}");
+        assert!(text.contains("/tmp/wt-x"), "worktree path missing:\n{text}");
+        assert!(text.contains("Slot"), "slot row missing:\n{text}");
+        assert!(text.contains("branch/path"), "footer hint missing:\n{text}");
+
+        state.close_stack_info();
+        let text = render_to_text(&mut state, 100, 30);
+        assert!(!text.contains("Instance id"), "modal should hide again:\n{text}");
     }
 
     #[test]
