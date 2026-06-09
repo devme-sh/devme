@@ -15,7 +15,7 @@
 //! no new subscriber arrives within a 30-second grace window. An
 //! explicit `Shutdown` message also triggers immediate teardown.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -244,6 +244,12 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 /// don't linger forever.
 const IDLE_GRACE_SECS: u64 = 30;
 
+/// How many recent log lines to retain per service for replay. A late
+/// subscriber (a TUI attaching after boot, or `devme logs proxy` from a
+/// worktree) replays these so it sees history, not just lines that happen to
+/// arrive after it connected. Matches the instance daemon's ring size.
+const LOG_RING_CAPACITY: usize = 500;
+
 /// Live state shared between the accept loop and connection handlers.
 struct SharedState {
     /// Service name → running handle. `Mutex` because Shutdown reaches in
@@ -252,6 +258,10 @@ struct SharedState {
     /// Broadcast every server message so each subscriber's writer task can
     /// forward it. `LogChunk` and `StatusUpdate` go through here.
     events: broadcast::Sender<ServerMessage>,
+    /// Per-service ring of recent `(ts, line)` log lines, replayed to each
+    /// new subscriber so late attachers see history. Bounded by
+    /// [`LOG_RING_CAPACITY`] per service.
+    logs: Arc<Mutex<HashMap<String, VecDeque<(u64, String)>>>>,
     /// Set to true on Shutdown so the accept loop exits.
     shutdown: Arc<Mutex<bool>>,
     /// Active subscriber count. When this drops to 0, the idle grace timer
@@ -269,6 +279,8 @@ impl SharedState {
         let (events, _) = broadcast::channel(1024);
         let services_map: Arc<Mutex<HashMap<String, RunningService>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let logs: Arc<Mutex<HashMap<String, VecDeque<(u64, String)>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let shutdown = Arc::new(Mutex::new(false));
 
         // Spawn each repo-scoped service. Failures are surfaced as Failed
@@ -280,7 +292,7 @@ impl SharedState {
             match ChildProcess::spawn_parts::<&str>(cmd, cwd, &env_slice) {
                 Ok(parts) => {
                     let pid = parts.pid;
-                    spawn_log_forwarder(name.clone(), parts.lines, events.clone());
+                    spawn_log_forwarder(name.clone(), parts.lines, events.clone(), logs.clone());
                     spawn_exit_forwarder(
                         name.clone(),
                         parts.exit,
@@ -312,6 +324,7 @@ impl SharedState {
         Arc::new(Self {
             services: services_map,
             events,
+            logs,
             shutdown,
             subscribers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             sub_notify: Arc::new(tokio::sync::Notify::new()),
@@ -397,6 +410,7 @@ fn spawn_log_forwarder(
     name: String,
     mut lines: mpsc::UnboundedReceiver<String>,
     events: broadcast::Sender<ServerMessage>,
+    logs: Arc<Mutex<HashMap<String, VecDeque<(u64, String)>>>>,
 ) {
     tokio::spawn(async move {
         while let Some(line) = lines.recv().await {
@@ -407,6 +421,16 @@ fn spawn_log_forwarder(
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
+            // Retain for replay before broadcasting, so a subscriber that
+            // connects a moment later still sees this line.
+            {
+                let mut buf = logs.lock().await;
+                let ring = buf.entry(name.clone()).or_default();
+                if ring.len() == LOG_RING_CAPACITY {
+                    ring.pop_front();
+                }
+                ring.push_back((ts, line.clone()));
+            }
             let bytes = base64::engine::general_purpose::STANDARD.encode(line.as_bytes());
             let _ = events.send(ServerMessage::LogChunk { service: name.clone(), bytes, ts });
         }
@@ -529,6 +553,29 @@ async fn handle(
                                 steps: vec![],
                             };
                             send_msg(&mut framed, reply).await?;
+                            // Replay buffered log lines so a late subscriber
+                            // sees history, not just lines from this moment on.
+                            // Ordered by timestamp across services for a
+                            // coherent scrollback.
+                            let mut replay: Vec<(u64, String, String)> = {
+                                let buf = state.logs.lock().await;
+                                buf.iter()
+                                    .flat_map(|(svc, ring)| {
+                                        ring.iter()
+                                            .map(move |(ts, line)| (*ts, svc.clone(), line.clone()))
+                                    })
+                                    .collect()
+                            };
+                            replay.sort_by_key(|(ts, _, _)| *ts);
+                            for (ts, svc, line) in replay {
+                                let bytes = base64::engine::general_purpose::STANDARD
+                                    .encode(line.as_bytes());
+                                send_msg(
+                                    &mut framed,
+                                    ServerMessage::LogChunk { service: svc, bytes, ts },
+                                )
+                                .await?;
+                            }
                         }
                         ClientMessage::Unsubscribe => {
                             if subscribed {
