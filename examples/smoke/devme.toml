@@ -6,8 +6,10 @@ schema_version = 1
 [step.tools]
 check = "command -v sh"
 
+# Fast cadence on purpose: the smoke test scrolls back (PAUSED pill), which
+# needs more buffered lines than the viewport holds within a few seconds.
 [service.tick]
-cmd = "while true; do echo tick $(date +%H:%M:%S); sleep 1; done"
+cmd = "while true; do echo tick $(date +%H:%M:%S); sleep 0.1; done"
 depends_on = ["tools"]
 
 [service.flaky]
