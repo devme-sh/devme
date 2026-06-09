@@ -6,13 +6,15 @@ semantic versioning. Each released version has its own section so the entries
 stay structured enough to render elsewhere later (e.g. a release-notes panel in
 the TUI).
 
-## [Unreleased]
+## [0.2.0] — 2026-06-10
 
-### Logs: agent-first overhaul (in progress)
+### Logs: agent-first overhaul
 
-Reworking how logs are captured and queried, with the primary reader being a
+Reworks how logs are captured and queried, with the primary reader being a
 coding agent that pays context tokens per line — so the north star is
-signal-to-token and deterministic "find the right slice" queries.
+signal-to-token and deterministic "find the right slice" queries. The
+partition: `config check` = is the file valid, `status` = what's running
+where, `logs` = what the services are saying, `doctor` = why it's broken.
 
 #### Added
 - **Dual-PTY capture.** Each service now runs under *two* PTYs — one for stdout,
@@ -65,4 +67,17 @@ signal-to-token and deterministic "find the right slice" queries.
 - **`devme logs <step>` redirects instead of hanging.** Steps have
   check/provision *output*, not a runtime stream; asking for a step's logs now
   errors with a pointer to `devme doctor <step>`, and an unknown name errors
-  immediately instead of waiting for logs that will never come.
+  immediately instead of waiting for logs that will never come. Step lines are
+  filtered out of the all-services interleave too, even when a step re-runs
+  mid-`--follow`.
+- **One-shot queries can't tear down shared services.** A plain `devme logs` /
+  `status` against a detached stack no longer bumps the shared supervisor's
+  subscriber refcount, so its disconnect can't arm the 30-second idle teardown.
+
+#### Changed
+- **`devme status` rows are annotated.** Steps and services show their
+  `description` from devme.toml; unevaluated steps say ``runs on `devme up```
+  instead of an unexplained "pending"; the all-stopped summary names the next
+  move (`devme up -d`).
+- New `scripts/logs-smoke.sh` — 19 end-to-end assertions over the whole log
+  surface, in an isolated fixture.
