@@ -651,9 +651,14 @@ async fn run(
                         }
                     }
                     // Horizontal wheel / trackpad (when the terminal sends it)
-                    // always scrolls the tabs.
-                    MouseEventKind::ScrollLeft => state.scroll_tabs(-MOUSE_TAB_SCROLL_COLS),
-                    MouseEventKind::ScrollRight => state.scroll_tabs(MOUSE_TAB_SCROLL_COLS),
+                    // scrolls the tabs — but only over the tab row, so a
+                    // sideways swipe elsewhere in the UI doesn't move them.
+                    MouseEventKind::ScrollLeft if state.tab_row_at(me.column, me.row) => {
+                        state.scroll_tabs(-MOUSE_TAB_SCROLL_COLS);
+                    }
+                    MouseEventKind::ScrollRight if state.tab_row_at(me.column, me.row) => {
+                        state.scroll_tabs(MOUSE_TAB_SCROLL_COLS);
+                    }
                     // In the notifications modal, a left-click on a row copies
                     // that notification (and moves the cursor to it).
                     MouseEventKind::Down(MouseButton::Left) if state.notifications_visible() => {
