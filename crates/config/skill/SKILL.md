@@ -15,17 +15,21 @@ Route on `$action`. Default to diagnostics when none is given.
 
 ### action "doctor" or empty — diagnose and fix
 
-1. Run `devme doctor --tail 30`. It returns JSON: each service's state, pid, port, restart count, recent logs. Summarize for the user; don't dump raw. (`status: "no_daemon"` → tell them to run `devme up -d`.)
-2. For each `Failed`/`CrashLoop` service, read its `logs` for the root error and fix:
+1. Run `devme doctor`. It returns an error-anchored JSON digest: per-service state/pid/port/restart count + `recent_errors` (stderr only — tracebacks, not access logs), and step states with a *failed* step's check/provision output inline. History is disk-backed, so a service that crashed an hour ago still shows its dying stderr. Summarize for the user; don't dump raw. (`status: "no_daemon"` → tell them to run `devme up -d`.)
+2. Zoom with `devme doctor <name>` — for a failed step it returns the full check/provision output (the **only** place step output surfaces); for a service, `recent_errors` + `recent_logs` (`[stderr]`-prefixed). Then fix:
    - Container name conflict ("already in use") → `docker rm -f <name>`, then `devme restart <svc>`
    - Port conflict ("address already in use") → `lsof -ti :<port> | xargs kill -9`, then `devme restart <svc>`
    - Docker not running → `devme config set docker.daemon orbstack`, then `devme up -d`
    - Failed step → fix the cause, then `devme restart <dependent>` (step states gate dependent services)
-3. Confirm with `devme doctor --tail 10`.
+3. Confirm with `devme doctor`.
 
 ### action "logs" — read service logs
 
-`devme logs <svc> --tail 100`. If no service named, `devme doctor --tail 20` to see all.
+- `devme logs <svc> --tail 100` — one service. `devme logs` (no name) — **all services interleaved by timestamp**, the fastest way to see cross-service causality ("api 500s right after postgres restarted").
+- `devme logs --since 5m` (`30s`/`2h`/`1d`/epoch-ms) — "what happened since my last check"; disk-backed, so it works even after the daemon restarted. Prefer `--since` over guessing a `--tail` count.
+- `devme logs --json` — NDJSON `{ts, service, stream, text}` (ANSI-stripped), pipe to jq: `devme logs --json --since 10m | jq -c 'select(.stream == "stderr")'` is the cheapest error sweep.
+- Each line is stream-tagged: errors/tracebacks live on `stderr`, routine chatter on `stdout` — filter on that before reading everything.
+- `logs` is **services only**: `devme logs <step>` errors and points you to `devme doctor <step>`, where step check/provision output lives. Unknown names error immediately — don't wait for output that will never come.
 
 ### action "setup" — generate devme.toml
 
@@ -81,9 +85,9 @@ Rules:
 
 | Command | Purpose |
 |---------|---------|
-| `devme doctor --tail N` | JSON: states + last N log lines per service |
+| `devme doctor [<name>] [--tail N]` | JSON error digest: states + stderr-only `recent_errors` per service, failed-step output inline. `<name>` zooms into one step (full check/provision output) or service |
 | `devme status [--all]` | Grouped STEPS/SERVICES snapshot: state glyph, resolved `http://host:PORT`, pid, restart count, plus a warning footer naming any unhealthy service. `--all` = port matrix across every worktree (`*` = current); `--json` for structured |
-| `devme logs <svc> --tail N` | Last N lines of a service |
+| `devme logs [<svc>] [--tail N] [--since 5m] [--json] [-f]` | Service log streams (disk-backed history). No name = all services interleaved by ts; `--json` = NDJSON `{ts, service, stream, text}` for jq; steps are refused (→ doctor) |
 | `devme url <svc> [-o]` | Print a service's URL; `-o` opens it in the browser |
 | `devme start/stop/restart <svc>` | Lifecycle a single service |
 | `devme up -d` / `up -y` / `down [--all]` | Start all detached / start running `prompt` provisions unattended (CI) / stop this worktree's stack (`--all` = every worktree, like `status --all`) |
@@ -96,6 +100,7 @@ Rules:
 
 ### Notes
 
+- **Which command answers which question.** `devme config check` = "is the toml valid" (static). `devme status` = "what's running where" (states + ports, no logs). `devme logs` = "what are the services saying" (runtime streams only). `devme doctor` = "why is it broken" (error digest + step output). Don't read full logs to find errors — `doctor` or a `--json` stderr filter is cheaper.
 - **Worktree-aware.** Each git worktree runs its own supervisor, slot, and ports. `up`/`down`/`doctor`/`status`/`logs`/`url` act on the worktree you're in — just call them. `devme down --all` stops every worktree's stack (and the shared services); `devme status --all` shows every worktree's ports; `devme url <svc>` gives a ready link without guessing the slot.
 - **Restart cascades.** Services have dependency ordering; restarting a DB can cascade to dependents.
 - **Remote is remote-primary.** The supervisor, stack, and TUI run on `remote.host`; the laptop syncs files (Mutagen `two-way-safe` — a conflict *halts* the sync). It syncs the **main** worktree only; create worktrees on the host. While a sync is live, daemon commands (`status`, `logs`, `up`, `doctor`, `url`, …) auto-run on the remote — `devme logs api` streams the host's logs, and `devme url` rewrites to a laptop-reachable host. Run `devme remote doctor` before the first attach; if `devme remote status` shows conflicts the sync is halted — fix them first. While you're attached, `devme remote` watches the sync in the background and desktop-notifies if it halts (you can't see it from the remote TUI), and prints a closing sync summary on detach.

@@ -34,6 +34,10 @@ grid — `tmux new-session -d -x W -y H '…devme'`, `send-keys`, `capture-pane 
 - `scripts/tui-smoke.sh` — general TUI smoke (sidebar, pause/scroll, quit).
 - `scripts/skill-modal-smoke.sh` — the `devme skill` startup modals
   (install / update / silent auto-update) under an isolated `HOME`.
+- `scripts/logs-smoke.sh` — the agent-first log surface: `logs`
+  (--tail exactness, --since, --json/NDJSON, stream tags, step redirect) and
+  `doctor` (error digest, per-node zoom). Plain shell, no tmux; runs in an
+  isolated fixture under /tmp.
 
 ## Releasing
 
