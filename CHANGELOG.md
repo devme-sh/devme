@@ -45,6 +45,19 @@ signal-to-token and deterministic "find the right slice" queries.
   - A rotation warning (stderr, never stdout) fires only when requested
     history actually rotated away — not when you asked for a `--tail` clip.
 
+- **`devme doctor` reframed as the error digest.** The no-arg report now
+  anchors on *errors* instead of dumping every service's recent chatter:
+  per-service `recent_errors` (stderr only — tracebacks, not access logs),
+  failed/crash-looped states up front, and a failed step's check/provision
+  output inline. Healthy steps stay one line. Replays come from the disk
+  history tier, so the diagnosis survives ring eviction and daemon restarts —
+  a service that crashed an hour ago still has its dying stderr here.
+- **`devme doctor <name>` zooms into one node.** For a step: its full
+  check/provision output (the only place step output surfaces — `logs` is
+  services-only). For a service: state, pid, port, restart count,
+  `recent_errors` (stderr) and `recent_logs` (both streams, `[stderr]`
+  prefixed). Unknown names error immediately.
+
 #### Fixed
 - **`devme logs <name>` no longer renders the "Check dependencies" provisioning
   tree.** Log queries now connect without running the preflight, so the

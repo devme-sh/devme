@@ -106,7 +106,7 @@ async fn run(cli: Cli) -> i32 {
             print_completions(shell);
             Ok(())
         }
-        Some(Command::Doctor { tail }) => doctor(tail).await,
+        Some(Command::Doctor { name, tail }) => doctor(name, tail).await,
         Some(Command::Config { action }) => config_cmd(action, cli.json),
         Some(Command::Worktree { action }) => worktree_cmd(action, cli.json).await,
         Some(Command::Remote { action }) => remote_cmd(action, cli.json),
@@ -353,13 +353,23 @@ async fn status(as_json: bool) -> anyhow::Result<()> {
         .request(ClientMessage::Subscribe { services: vec![] })
         .await?;
 
+    // One stack parse serves both the step-check overlay and the
+    // description annotations.
+    let stack = std::fs::read_to_string(cwd.join("devme.toml"))
+        .ok()
+        .and_then(|t| Stack::parse(&t).ok());
+
     match reply {
-        ServerMessage::Subscribed { services, mut steps, .. } => {
-            overlay_step_checks(&mut steps, &cwd);
+        ServerMessage::Subscribed { mut services, mut steps, .. } => {
+            if let Some(stack) = &stack {
+                overlay_step_checks(&mut steps, stack, &cwd);
+                overlay_shared_services(&mut services, stack, &cwd).await;
+            }
             if as_json {
                 println!("{}", format_status_json(&services, &steps));
             } else {
-                print!("{}", format_status_text(&services, &steps, !no_color()));
+                let descriptions = stack.as_ref().map(node_descriptions).unwrap_or_default();
+                print!("{}", format_status_text(&services, &steps, &descriptions, !no_color()));
             }
             Ok(())
         }
@@ -369,6 +379,73 @@ async fn status(as_json: bool) -> anyhow::Result<()> {
     }
 }
 
+/// Overlay repo-scoped (`scope = "repo"`) services with the shared
+/// supervisor's own snapshot. The instance daemon only *health-probes*
+/// these (it doesn't own the process), so a freshly-spawned daemon reports
+/// them `Stopped` before its first probe lands — `status` right after a
+/// Ctrl-C showed the proxy as stopped while it was still running. The
+/// shared daemon is the owner; its state is the truth. Connect-only: if no
+/// shared daemon is listening the services really are down, and we must
+/// not spawn one just to ask. Uses a one-shot `LogQuery` (not `Subscribe`)
+/// so the probe never registers as a subscriber — a Subscribe's disconnect
+/// would arm the shared daemon's idle teardown.
+async fn overlay_shared_services(
+    services: &mut [devme_core::ServiceSnapshot],
+    stack: &Stack,
+    cwd: &std::path::Path,
+) {
+    let repo_scoped: Vec<&str> = stack
+        .service
+        .iter()
+        .filter(|(_, s)| s.scope == devme_core::Scope::Repo)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if repo_scoped.is_empty() {
+        return;
+    }
+    let Ok(shared_sock) = devme_config::paths::shared_socket(cwd) else {
+        return;
+    };
+    let Ok(mut shared) = devme_client::Client::connect(&shared_sock).await else {
+        return;
+    };
+    let Ok(ServerMessage::Subscribed { services: shared_snap, .. }) = shared
+        .request(ClientMessage::LogQuery {
+            services: vec![],
+            since: None,
+            tail: Some(0),
+            follow: false,
+        })
+        .await
+    else {
+        return;
+    };
+    for s in services.iter_mut().filter(|s| repo_scoped.contains(&s.name.as_str())) {
+        if let Some(owned) = shared_snap.iter().find(|o| o.name == s.name) {
+            s.state = owned.state.clone();
+            s.pid = owned.pid;
+            if owned.port.is_some() {
+                s.port = owned.port;
+            }
+        }
+    }
+}
+
+/// Node name → `description` from devme.toml, for the status table's dim
+/// annotation column. Steps and services share the map; the config layer
+/// already rejects a step and service with the same name.
+fn node_descriptions(stack: &Stack) -> std::collections::HashMap<String, String> {
+    let steps = stack
+        .step
+        .iter()
+        .filter_map(|(name, s)| Some((name.clone(), s.description.clone()?)));
+    let services = stack
+        .service
+        .iter()
+        .filter_map(|(name, s)| Some((name.clone(), s.description.clone()?)));
+    steps.chain(services).collect()
+}
+
 /// Fill in step states the daemon hasn't evaluated yet. The daemon only
 /// runs step checks when the graph advances (`up`), so a daemon freshly
 /// spawned by `status` reports every step as `Unknown` ("pending") even
@@ -376,18 +453,16 @@ async fn status(as_json: bool) -> anyhow::Result<()> {
 /// quietly and overlay the results; states the daemon *has* established
 /// win, and service-dependent steps stay `Unknown` (only meaningful with
 /// their services up).
-fn overlay_step_checks(steps: &mut [devme_core::StepSnapshot], cwd: &std::path::Path) {
+fn overlay_step_checks(
+    steps: &mut [devme_core::StepSnapshot],
+    stack: &Stack,
+    cwd: &std::path::Path,
+) {
     use devme_core::StepState;
     if !steps.iter().any(|s| s.state == StepState::Unknown) {
         return;
     }
-    let Ok(toml_str) = std::fs::read_to_string(cwd.join("devme.toml")) else {
-        return;
-    };
-    let Ok(stack) = Stack::parse(&toml_str) else {
-        return;
-    };
-    let results = devme_supervisor::preflight::quiet_check_results(&stack, cwd);
+    let results = devme_supervisor::preflight::quiet_check_results(stack, cwd);
     for s in steps.iter_mut().filter(|s| s.state == StepState::Unknown) {
         if let Some((_, passed)) = results.iter().find(|(name, _)| name == &s.name) {
             s.state = if *passed { StepState::Passed } else { StepState::Failed };
@@ -731,23 +806,32 @@ async fn logs(
     // `doctor` — steps have check/provision *output*, not a runtime stream, and
     // dumping it here is the "logs build shows the dependency tree" bug. An
     // unknown name errors instead of silently waiting for logs that never come.
-    if let (Some(name), ServerMessage::Subscribed { services, steps, .. }) = (&service, &snap) {
-        let is_service = services.iter().any(|s| &s.name == name);
-        let is_step = steps.iter().any(|s| &s.name == name);
-        if !is_service && is_step {
-            return Err(anyhow::anyhow!(
-                "{name:?} is a step, not a service — its check/provision output lives in \
-                 `devme doctor {name}`, not the log stream"
-            ));
-        }
-        if !is_service && !is_step {
-            return Err(anyhow::anyhow!("no service or step named {name:?} in devme.toml"));
+    let mut service_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let ServerMessage::Subscribed { services, steps, .. } = &snap {
+        service_names = services.iter().map(|s| s.name.clone()).collect();
+        if let Some(name) = &service {
+            let is_service = service_names.contains(name);
+            let is_step = steps.iter().any(|s| &s.name == name);
+            if !is_service && is_step {
+                return Err(anyhow::anyhow!(
+                    "{name:?} is a step, not a service — its check/provision output lives in \
+                     `devme doctor {name}`, not the log stream"
+                ));
+            }
+            if !is_service && !is_step {
+                return Err(anyhow::anyhow!("no service or step named {name:?} in devme.toml"));
+            }
         }
     }
 
-    // Single-service mode filters to that service; all-services mode accepts
-    // every chunk (the daemon broadcasts all of them).
-    let want = |s: &str| service.as_deref().map(|n| n == s).unwrap_or(true);
+    // Single-service mode filters to that service. All-services mode accepts
+    // only *service* chunks — the daemon also broadcasts step check/provision
+    // lines (for the TUI), and those must never leak into the logs channel
+    // (they live in `doctor`), e.g. when a step re-runs mid-`--follow`.
+    let want = |s: &str| match service.as_deref() {
+        Some(n) => n == s,
+        None => service_names.contains(s),
+    };
 
     // Drain the disk-backed replay up to the daemon's LogEnd marker. The
     // generous timeout is only a safety net against a daemon that dies
@@ -887,7 +971,10 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-async fn doctor(tail: usize) -> anyhow::Result<()> {
+/// One captured log line for `doctor`: (ts, stream, text).
+type DoctorLine = (u64, devme_core::LogStream, String);
+
+async fn doctor(name: Option<String>, tail: usize) -> anyhow::Result<()> {
     let sock = socket_path();
     let mut client = match devme_client::Client::connect(&sock).await {
         Ok(c) => c,
@@ -903,20 +990,52 @@ async fn doctor(tail: usize) -> anyhow::Result<()> {
         }
     };
 
+    // One LogQuery serves both modes. It replays the *disk* history tier, so
+    // the diagnosis survives ring eviction and daemon restarts — a service
+    // that crashed an hour ago still has its dying stderr here. Explicit
+    // names also reach step output (which `logs` deliberately refuses).
     client
-        .send(ClientMessage::Subscribe { services: vec![] })
+        .send(ClientMessage::LogQuery {
+            services: name.clone().map(|n| vec![n]).unwrap_or_default(),
+            since: None,
+            tail: None,
+            follow: false,
+        })
         .await?;
     let (services, steps) = match client.next_event().await? {
         Some(ServerMessage::Subscribed { services, steps, .. }) => (services, steps),
         _ => return Err(anyhow::anyhow!("unexpected reply from daemon")),
     };
 
-    let drain_idle = std::time::Duration::from_millis(80);
-    let mut all_logs: std::collections::HashMap<String, Vec<String>> =
+    // Validate the zoom target before draining, so a typo fails fast.
+    if let Some(n) = &name
+        && !services.iter().any(|s| &s.name == n)
+        && !steps.iter().any(|s| &s.name == n)
+    {
+        return Err(anyhow::anyhow!("no service or step named {n:?} in devme.toml"));
+    }
+
+    // The empty-names query covers services only; step output must be asked
+    // for by name. For the no-arg digest, issue a second query naming the
+    // steps so failed checks come back with their output.
+    if name.is_none() && !steps.is_empty() {
+        client
+            .send(ClientMessage::LogQuery {
+                services: steps.iter().map(|s| s.name.clone()).collect(),
+                since: None,
+                tail: None,
+                follow: false,
+            })
+            .await?;
+    }
+
+    let mut log_ends_expected = if name.is_none() && !steps.is_empty() { 2 } else { 1 };
+    let drain_max = std::time::Duration::from_secs(10);
+    let mut all_logs: std::collections::HashMap<String, Vec<DoctorLine>> =
         std::collections::HashMap::new();
     loop {
-        match tokio::time::timeout(drain_idle, client.next_event()).await {
-            Ok(Ok(Some(ServerMessage::LogChunk { service, bytes, .. }))) => {
+        match tokio::time::timeout(drain_max, client.next_event()).await {
+            Ok(Ok(Some(ServerMessage::LogChunk { service, bytes, ts, stream }))) => {
                 if let Ok(decoded) =
                     base64::engine::general_purpose::STANDARD.decode(bytes.as_bytes())
                     && let Ok(text) = String::from_utf8(decoded)
@@ -925,17 +1044,71 @@ async fn doctor(tail: usize) -> anyhow::Result<()> {
                     for line in text.split('\n') {
                         let line = line.trim_end_matches('\r');
                         if !line.is_empty() {
-                            buf.push(line.to_string());
+                            buf.push((ts, stream, strip_ansi(line)));
                         }
                     }
                 }
             }
+            Ok(Ok(Some(ServerMessage::LogEnd {}))) => {
+                log_ends_expected -= 1;
+                if log_ends_expected == 0 {
+                    break;
+                }
+            }
             Ok(Ok(Some(_))) => {}
-            Ok(Ok(None)) | Ok(Err(_)) => break,
-            Err(_) => break,
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
         }
     }
 
+    // The last N lines of `lines`, formatted as `[stream] text` so an agent
+    // can tell a traceback (stderr) from routine chatter (stdout) without a
+    // second query. `tail == 0` means everything.
+    let fmt_tail = |lines: &[DoctorLine], tail: usize| -> Vec<String> {
+        let skip = if tail == 0 { 0 } else { lines.len().saturating_sub(tail) };
+        lines[skip..]
+            .iter()
+            .map(|(_, stream, text)| match stream {
+                devme_core::LogStream::Stderr => format!("[stderr] {text}"),
+                devme_core::LogStream::Stdout => text.clone(),
+            })
+            .collect()
+    };
+
+    // Zoom mode: everything devme knows about one node, inline.
+    if let Some(n) = name {
+        let lines = all_logs.remove(&n).unwrap_or_default();
+        let report = if let Some(s) = steps.iter().find(|s| s.name == n) {
+            serde_json::json!({
+                "name": n,
+                "kind": "step",
+                "state": format!("{:?}", s.state),
+                // A step's full check/provision output — this is the only
+                // place it surfaces (it is not a runtime log stream).
+                "output": fmt_tail(&lines, tail),
+            })
+        } else {
+            let s = services.iter().find(|s| s.name == n).expect("validated above");
+            let errors: Vec<DoctorLine> =
+                lines.iter().filter(|(_, st, _)| st.is_stderr()).cloned().collect();
+            serde_json::json!({
+                "name": n,
+                "kind": "service",
+                "state": format!("{:?}", s.state),
+                "pid": s.pid,
+                "port": s.port,
+                "restart_count": s.restart_count,
+                "recent_errors": fmt_tail(&errors, tail),
+                "recent_logs": fmt_tail(&lines, tail),
+            })
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    // Digest mode: states for everything, but log lines anchored on *errors* —
+    // per-service stderr, plus step output only when the step actually failed.
+    // Healthy chatter costs the reader tokens without aiding diagnosis; it
+    // stays one `devme logs` away.
     let has_failures = services.iter().any(|s| {
         matches!(
             s.state,
@@ -951,19 +1124,16 @@ async fn doctor(tail: usize) -> anyhow::Result<()> {
     let svc_json: Vec<serde_json::Value> = services
         .iter()
         .map(|s| {
-            let mut logs = all_logs
-                .get(&s.name)
-                .cloned()
-                .unwrap_or_default();
-            let skip = if tail == 0 { 0 } else { logs.len().saturating_sub(tail) };
-            logs = logs.into_iter().skip(skip).collect();
+            let lines = all_logs.get(&s.name).map(|v| v.as_slice()).unwrap_or(&[]);
+            let errors: Vec<DoctorLine> =
+                lines.iter().filter(|(_, st, _)| st.is_stderr()).cloned().collect();
             serde_json::json!({
                 "name": s.name,
                 "state": format!("{:?}", s.state),
                 "pid": s.pid,
                 "port": s.port,
                 "restart_count": s.restart_count,
-                "logs": logs,
+                "recent_errors": fmt_tail(&errors, tail),
             })
         })
         .collect();
@@ -971,15 +1141,19 @@ async fn doctor(tail: usize) -> anyhow::Result<()> {
     let step_json: Vec<serde_json::Value> = steps
         .iter()
         .map(|s| {
-            let logs = all_logs
-                .get(&s.name)
-                .cloned()
-                .unwrap_or_default();
-            serde_json::json!({
+            let failed = matches!(
+                s.state,
+                devme_core::StepState::Failed | devme_core::StepState::ProvisionFailed
+            );
+            let mut node = serde_json::json!({
                 "name": s.name,
                 "state": format!("{:?}", s.state),
-                "logs": logs,
-            })
+            });
+            if failed {
+                let lines = all_logs.get(&s.name).map(|v| v.as_slice()).unwrap_or(&[]);
+                node["output"] = serde_json::json!(fmt_tail(lines, tail));
+            }
+            node
         })
         .collect();
 
@@ -987,6 +1161,7 @@ async fn doctor(tail: usize) -> anyhow::Result<()> {
         "status": if has_failures { "unhealthy" } else { "healthy" },
         "services": svc_json,
         "steps": step_json,
+        "hint": "zoom with `devme doctor <name>`; stream services with `devme logs`",
     });
 
     println!("{}", serde_json::to_string_pretty(&report)?);

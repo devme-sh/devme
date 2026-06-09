@@ -631,7 +631,14 @@ async fn handle(
                         }
                         ClientMessage::LogQuery { services, since, tail, follow } => {
                             forward_logs = follow;
-                            if !subscribed {
+                            // Only a streaming query registers as a subscriber
+                            // (the ipc contract for `follow: false`). A one-shot
+                            // must not touch the count: its disconnect would
+                            // drop it to 0 and arm the idle teardown — a plain
+                            // `devme logs proxy` or `status` against a detached
+                            // stack would silently stop the shared services
+                            // 30 seconds later.
+                            if follow && !subscribed {
                                 subscribed = true;
                                 state.subscribers.fetch_add(1, Ordering::SeqCst);
                                 state.sub_notify.notify_one();

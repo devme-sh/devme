@@ -137,10 +137,16 @@ pub enum Command {
         /// Target shell.
         shell: Shell,
     },
-    /// Diagnostic snapshot: service states + recent error logs. Designed for
-    /// agents — outputs structured JSON with everything needed to diagnose
-    /// failures without multiple round-trips.
+    /// Diagnostic snapshot: service states + recent error (stderr) lines, plus
+    /// step check results. Designed for agents — outputs structured JSON with
+    /// everything needed to diagnose failures without multiple round-trips.
+    ///
+    /// `devme doctor <name>` zooms into one node: a step's check/provision
+    /// output (this is where step output lives — `logs` is services-only), or
+    /// a service's state + recent stderr.
     Doctor {
+        /// Zoom into one step or service by name.
+        name: Option<String>,
         /// Maximum log lines per service (default 50).
         #[arg(long, default_value_t = 50)]
         tail: usize,
@@ -446,6 +452,9 @@ fn status_summary_line(
         format!("  {passed}/{} steps passed", steps.len())
     } else if running == total {
         "  ✔ all services running".to_string()
+    } else if running == 0 {
+        // Nothing running and nothing broken: name the obvious next move.
+        format!("  0/{total} services running — start with `devme up -d`")
     } else {
         format!("  {running}/{total} services running")
     };
@@ -456,12 +465,17 @@ fn status_summary_line(
 /// and `SERVICES` headers, declaration order preserved within each, matching
 /// the TUI sidebar. Each row leads with a colored status glyph; services show
 /// a clickable `http://host:PORT` URL plus pid and restart count so an agent
-/// (or human) sees the worktree's live state at a glance. A closing line
-/// surfaces anything unhealthy with the command to dig in. `color` gates all
-/// ANSI; callers pass `false` for pipes / `NO_COLOR` / `--no-color`.
+/// (or human) sees the worktree's live state at a glance. `descriptions`
+/// (node name → `description` from devme.toml) annotates rows that would
+/// otherwise be bare, so a step name like `gcloud_adc` explains itself;
+/// steps the daemon hasn't evaluated get a "runs on `devme up`" note instead
+/// of an unexplained "pending". A closing line surfaces anything unhealthy
+/// with the command to dig in. `color` gates all ANSI; callers pass `false`
+/// for pipes / `NO_COLOR` / `--no-color`.
 pub fn format_status_text(
     services: &[ServiceSnapshot],
     steps: &[StepSnapshot],
+    descriptions: &std::collections::HashMap<String, String>,
     color: bool,
 ) -> String {
     use devme_core::ServiceState;
@@ -496,11 +510,20 @@ pub fn format_status_text(
         for s in steps {
             let (glyph, gcolor) = step_glyph(&s.state);
             let label = step_state_label(&s.state);
+            // An unevaluated step isn't broken — it just runs with the stack.
+            // Say so instead of leaving "pending" unexplained. Evaluated
+            // steps carry their devme.toml description.
+            let note = if matches!(s.state, devme_core::StepState::Unknown) {
+                Some("runs on `devme up`".to_string())
+            } else {
+                descriptions.get(&s.name).cloned()
+            };
             let line = format!(
-                "    {} {}  {}",
+                "    {} {}  {}  {}",
                 paint(color, gcolor, glyph),
                 paint(color, ansi::BOLD, &format!("{:<name_w$}", s.name)),
                 paint(color, gcolor, &format!("{label:<label_w$}")),
+                paint(color, ansi::DIM, note.as_deref().unwrap_or_default()),
             );
             out.push_str(line.trim_end());
             out.push('\n');
@@ -547,6 +570,13 @@ pub fn format_status_text(
                     detail.push_str("  ");
                 }
                 detail.push_str(&paint(color, ansi::DIM, &format!("↻{}", s.restart_count)));
+            }
+            // A row with no live detail (typically stopped) still benefits
+            // from saying what the service *is*.
+            if detail.is_empty()
+                && let Some(desc) = descriptions.get(&s.name)
+            {
+                detail.push_str(&paint(color, ansi::DIM, desc));
             }
 
             let line = format!(
@@ -856,7 +886,7 @@ mod tests {
         ];
         let steps = vec![step("tools", StepState::Passed)];
 
-        let out = format_status_text(&services, &steps, false);
+        let out = format_status_text(&services, &steps, &Default::default(), false);
         // Steps group precedes the services group, declaration order preserved.
         let tools = out.find("tools").unwrap();
         let backend = out.find("backend").unwrap();
@@ -877,7 +907,7 @@ mod tests {
 
     #[test]
     fn empty_snapshot_prints_a_friendly_note() {
-        let out = format_status_text(&[], &[], false);
+        let out = format_status_text(&[], &[], &Default::default(), false);
         assert!(out.contains("No services or steps"), "got: {out}");
         // Nothing declared means nothing to color — no stray escape bytes.
         assert!(!out.contains('\x1b'), "leaked ANSI: {out:?}");
@@ -890,7 +920,7 @@ mod tests {
             ServiceState::Running { degraded: false, started_without: vec![] },
         );
         s.port = Some(8090);
-        let out = format_status_text(&[s], &[step("tools", StepState::Passed)], false);
+        let out = format_status_text(&[s], &[step("tools", StepState::Passed)], &Default::default(), false);
         assert!(out.contains("running"), "got: {out}");
         assert!(out.contains(":8090"), "port missing: {out}");
         // The port is rendered as a clickable URL, not a bare `:PORT`.
@@ -906,7 +936,7 @@ mod tests {
             svc("api", ServiceState::Failed { exit_code: Some(1) }),
             svc("db", ServiceState::Running { degraded: false, started_without: vec![] }),
         ];
-        let out = format_status_text(&services, &[], false);
+        let out = format_status_text(&services, &[], &Default::default(), false);
         let footer = out.lines().last().unwrap();
         assert!(footer.contains("⚠"), "no warning glyph: {out}");
         assert!(footer.contains("api failed(1)"), "missing failed service: {out}");
@@ -916,7 +946,7 @@ mod tests {
     #[test]
     fn status_footer_warns_on_failed_steps_with_provision_hint() {
         let steps = vec![step("rust", StepState::Failed)];
-        let out = format_status_text(&[], &steps, false);
+        let out = format_status_text(&[], &steps, &Default::default(), false);
         let footer = out.lines().last().unwrap();
         assert!(footer.contains("rust failed"), "missing failed step: {out}");
         assert!(footer.contains("devme up"), "missing provision hint: {out}");
@@ -928,8 +958,36 @@ mod tests {
             svc("api", ServiceState::Running { degraded: false, started_without: vec![] }),
             svc("db", ServiceState::Running { degraded: false, started_without: vec![] }),
         ];
-        let out = format_status_text(&services, &[], false);
+        let out = format_status_text(&services, &[], &Default::default(), false);
         assert!(out.lines().last().unwrap().contains("all services running"), "got: {out}");
+    }
+
+    #[test]
+    fn status_annotates_with_descriptions_and_up_note() {
+        let steps = vec![
+            step("gcloud_adc", StepState::Passed),
+            step("migrate", StepState::Unknown),
+        ];
+        let services = vec![svc("db", ServiceState::Stopped)];
+        let descriptions: std::collections::HashMap<String, String> = [
+            ("gcloud_adc".to_string(), "gcloud app-default creds".to_string()),
+            ("db".to_string(), "Postgres via Docker".to_string()),
+        ]
+        .into();
+        let out = format_status_text(&services, &steps, &descriptions, false);
+        assert!(out.contains("gcloud app-default creds"), "step desc missing: {out}");
+        assert!(out.contains("runs on `devme up`"), "up note missing: {out}");
+        assert!(out.contains("Postgres via Docker"), "stopped svc desc missing: {out}");
+    }
+
+    #[test]
+    fn status_footer_suggests_up_when_nothing_runs() {
+        let services = vec![svc("db", ServiceState::Stopped)];
+        let out = format_status_text(&services, &[], &Default::default(), false);
+        assert!(
+            out.lines().last().unwrap().contains("devme up -d"),
+            "missing up hint: {out}"
+        );
     }
 
     #[test]
@@ -940,7 +998,7 @@ mod tests {
         );
         s.port = Some(5432);
         s.url = Some("postgres://{host}:{port}/dev".into());
-        let out = format_status_text(&[s], &[], false);
+        let out = format_status_text(&[s], &[], &Default::default(), false);
         assert!(out.contains("postgres://localhost:5432/dev"), "got: {out}");
         assert!(!out.contains("http://"), "template should win: {out}");
     }
@@ -948,9 +1006,9 @@ mod tests {
     #[test]
     fn status_color_wraps_glyphs_in_ansi_and_no_color_stays_plain() {
         let services = vec![svc("db", ServiceState::Stopped)];
-        let colored = format_status_text(&services, &[], true);
+        let colored = format_status_text(&services, &[], &Default::default(), true);
         assert!(colored.contains('\x1b'), "expected ANSI when color=true");
-        let plain = format_status_text(&services, &[], false);
+        let plain = format_status_text(&services, &[], &Default::default(), false);
         assert!(!plain.contains('\x1b'), "expected no ANSI when color=false");
     }
 
