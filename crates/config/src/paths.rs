@@ -43,6 +43,25 @@ pub fn repo_id(cwd: &Path) -> String {
     }
 }
 
+/// The filesystem root of the repo's **main** working tree — the checkout
+/// that holds the real `.git` directory, as opposed to a linked `git
+/// worktree` (which holds only a `.git` *pointer file*).
+///
+/// `devme remote` syncs this single root (shared-`.git` model 1a): every
+/// worktree of a repo resolves to the same main root, so running `devme
+/// remote` from any worktree drives one sync session. Outside a git repo it
+/// falls back to the canonicalized `cwd`.
+pub fn main_worktree_root(cwd: &Path) -> PathBuf {
+    match git_common_dir(cwd) {
+        // `<main>/.git` → the main worktree is its parent.
+        Some(gd) if gd.file_name().and_then(|n| n.to_str()) == Some(".git") => {
+            gd.parent().map(Path::to_path_buf).unwrap_or_else(|| gd.clone())
+        }
+        // A bare repo (or unusual layout) has no separate worktree — use cwd.
+        Some(_) | None => std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
+    }
+}
+
 fn hash_path(p: &Path) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();

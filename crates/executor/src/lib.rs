@@ -23,6 +23,11 @@ pub enum Action {
     RunProvision(String),
     /// Spawn the Service.
     StartService(String),
+    /// Health-check an `external` Service instead of spawning it. The
+    /// supervisor probes its `health` until it passes, then reports back via
+    /// [`Event::ExternalHealthy`]. Used for repo-scoped services owned by the
+    /// shared supervisor — the instance daemon must not spawn its own copy.
+    ProbeExternal(String),
     /// Terminate the Service.
     StopService(String),
 }
@@ -43,6 +48,10 @@ pub enum Event {
     /// The Service is healthy (passed its `health` probe, or simply
     /// reached "alive" if it has no probe).
     ServiceHealthy { name: String },
+    /// An `external` Service's health probe passed. Transitions it to
+    /// [`ServiceState::External`] `{ healthy: true }` so dependents proceed,
+    /// without devme ever owning the process.
+    ExternalHealthy { name: String },
     /// The Service exited or was killed. `exit_code = None` for signal exits.
     ServiceExited {
         name: String,
@@ -131,6 +140,13 @@ impl Executor {
                 );
                 self.advance()
             }
+            Event::ExternalHealthy { name } => {
+                self.nodes.insert(
+                    name,
+                    NodeStatus::Service(ServiceState::External { healthy: true }),
+                );
+                self.advance()
+            }
             Event::StepProvisionCompleted { name, passed } => {
                 if passed {
                     // Re-run the check — provision succeeded, but the check
@@ -163,6 +179,16 @@ impl Executor {
                     out.push(Action::RunCheck(name.clone()));
                     self.nodes
                         .insert(name, NodeStatus::Step(StepState::Unknown));
+                }
+                Some(NodeKind::Service) if self.graph.is_external(&name) => {
+                    // Don't spawn — the process is owned elsewhere (e.g. the
+                    // shared supervisor). Probe its health and wait for an
+                    // ExternalHealthy event before unblocking dependents.
+                    out.push(Action::ProbeExternal(name.clone()));
+                    self.nodes.insert(
+                        name,
+                        NodeStatus::Service(ServiceState::External { healthy: false }),
+                    );
                 }
                 Some(NodeKind::Service) => {
                     out.push(Action::StartService(name.clone()));
@@ -451,6 +477,54 @@ cmd = "postgres"
         // After UserStop, db is marked Stopped; advance() wouldn't re-pick it.
         let actions = e.reset("db");
         assert_eq!(actions, vec![Action::StartService("db".into())]);
+    }
+
+    #[test]
+    fn external_service_probes_instead_of_starting() {
+        let mut e = Executor::new(graph(
+            r#"
+schema_version = 1
+
+[service.proxy]
+cmd = "cloud-sql-proxy"
+external = true
+health = { tcp = "localhost:15432" }
+"#,
+        ));
+        let actions = e.handle(Event::Start);
+        assert_eq!(actions, vec![Action::ProbeExternal("proxy".into())]);
+        assert!(matches!(
+            e.state("proxy"),
+            Some(NodeStatus::Service(ServiceState::External { healthy: false }))
+        ));
+    }
+
+    #[test]
+    fn external_healthy_unblocks_dependent_service() {
+        let mut e = Executor::new(graph(
+            r#"
+schema_version = 1
+
+[service.proxy]
+cmd = "cloud-sql-proxy"
+external = true
+health = { tcp = "localhost:15432" }
+
+[service.backend]
+cmd = "server"
+depends_on = ["proxy"]
+"#,
+        ));
+        let first = e.handle(Event::Start);
+        // Only the external probe is requested; backend waits on it.
+        assert_eq!(first, vec![Action::ProbeExternal("proxy".into())]);
+
+        let after = e.handle(Event::ExternalHealthy { name: "proxy".into() });
+        assert_eq!(after, vec![Action::StartService("backend".into())]);
+        assert!(matches!(
+            e.state("proxy"),
+            Some(NodeStatus::Service(ServiceState::External { healthy: true }))
+        ));
     }
 
     #[test]

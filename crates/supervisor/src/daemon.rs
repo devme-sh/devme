@@ -91,6 +91,11 @@ enum InternalEvent {
         service: String,
         generation: u64,
     },
+    /// An `external` service's health probe passed. Carries no generation —
+    /// devme doesn't own the process, so there's no child to match against.
+    ExternalHealthy {
+        service: String,
+    },
     /// Restart-policy backoff timer expired — try to bring the service back.
     AutoRestart {
         service: String,
@@ -557,6 +562,7 @@ fn process_event(
             service,
             generation,
         } => handle_grace_passed(state, service, generation, tx),
+        InternalEvent::ExternalHealthy { service } => handle_external_healthy(state, service, tx),
         InternalEvent::AutoRestart { service } => handle_auto_restart(state, service, tx),
         InternalEvent::StepCheckResult { step, passed } => {
             let actions = state.executor.handle(ExecEvent::StepCheckCompleted {
@@ -951,6 +957,44 @@ fn handle_grace_passed(
     enact_actions(state, actions, tx);
 }
 
+/// An external service's probe passed. There's no child process to track —
+/// devme only health-checks it — so we transition the executor straight to
+/// `External { healthy: true }` and let dependents advance.
+fn handle_external_healthy(
+    state: &mut DaemonState,
+    service: String,
+    tx: &mpsc::UnboundedSender<InternalEvent>,
+) {
+    // Already healthy? Nothing to do (the probe loop only fires once, but a
+    // re-subscribe or duplicate event must stay idempotent).
+    if matches!(
+        state.executor.state(&service),
+        Some(NodeStatus::Service(ServiceState::External { healthy: true }))
+    ) {
+        return;
+    }
+    let actions = state.executor.handle(ExecEvent::ExternalHealthy {
+        name: service.clone(),
+    });
+    let port = state
+        .stack
+        .service
+        .get(&service)
+        .and_then(|s| s.port)
+        .map(|spec| spec.resolve(state.slot.as_u8()));
+    state.broadcast(
+        Some(&service),
+        ServerMessage::StatusUpdate {
+            service: service.clone(),
+            state: ServiceState::External { healthy: true },
+            pid: None,
+            port,
+            restart_count: 0,
+        },
+    );
+    enact_actions(state, actions, tx);
+}
+
 fn enact_actions(
     state: &mut DaemonState,
     actions: Vec<Action>,
@@ -1128,6 +1172,55 @@ fn enact_actions(
                     });
                 }
             }
+            Action::ProbeExternal(name) => {
+                // External service: never spawn — the process is owned by
+                // someone else (the shared supervisor, or a developer's own
+                // daemon). Poll its health probe until it passes, then report
+                // ExternalHealthy. No ChildRecord, no exit waiter, so `devme
+                // down` never tries to signal a PID we don't own.
+                let svc = match state.stack.service.get(&name) {
+                    Some(s) => s.clone(),
+                    None => continue,
+                };
+                let port = svc.port.map(|spec| spec.resolve(state.slot.as_u8()));
+                let ctx = state.node_ctx(port);
+
+                state.broadcast(
+                    Some(&name),
+                    ServerMessage::StatusUpdate {
+                        service: name.clone(),
+                        state: ServiceState::External { healthy: false },
+                        pid: None,
+                        port,
+                        restart_count: 0,
+                    },
+                );
+
+                // No health probe declared → treat as healthy immediately
+                // (nothing to wait on). In practice the instance supervisor
+                // attaches a default TCP probe to repo-scoped services, so
+                // this branch is the degenerate "external with no health" case.
+                let Some(check) = svc.health.clone() else {
+                    let _ = tx.send(InternalEvent::ExternalHealthy { service: name });
+                    continue;
+                };
+                let check = interpolate_health(&check, &ctx);
+                let probe_tx = tx.clone();
+                let probe_name = name.clone();
+                tokio::spawn(async move {
+                    let mut ticker =
+                        tokio::time::interval(Duration::from_millis(PROBE_INTERVAL_MS));
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        ticker.tick().await;
+                        if probe(&check).await {
+                            let _ = probe_tx
+                                .send(InternalEvent::ExternalHealthy { service: probe_name });
+                            return;
+                        }
+                    }
+                });
+            }
             Action::StopService(name) => {
                 begin_stop(state, &name, tx);
             }
@@ -1180,6 +1273,33 @@ fn enact_actions(
                         continue;
                     }
                 };
+                // `trust = "manual"` (ADR-0002): never auto-run inside the
+                // daemon — surface the command and report the step unmet so
+                // the user runs it themselves. `auto`/`prompt` both run here:
+                // the detached daemon has no terminal to prompt on, so the
+                // consent gate for these lives in the foreground preflight.
+                let trust = state
+                    .stack
+                    .step
+                    .get(&name)
+                    .map(|s| s.trust)
+                    .unwrap_or_default();
+                if trust == devme_core::Trust::Manual {
+                    state.broadcast(
+                        None,
+                        ServerMessage::Notice {
+                            level: NoticeLevel::Warn,
+                            message: format!(
+                                "step {name}: manual provision — run it yourself: {cmd}"
+                            ),
+                        },
+                    );
+                    let _ = tx.send(InternalEvent::StepProvisionResult {
+                        step: name,
+                        passed: false,
+                    });
+                    continue;
+                }
                 let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
                 let provision_tx = tx.clone();
                 let step_name = name.clone();

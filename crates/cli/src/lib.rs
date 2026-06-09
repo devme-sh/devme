@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 use devme_core::{ServiceSnapshot, StepSnapshot};
 
+pub mod remote;
 pub mod skill;
 
 #[derive(Debug, Parser, PartialEq, Eq)]
@@ -34,6 +35,13 @@ pub struct Cli {
     /// environment variable (see https://no-color.org) and a non-TTY stdout.
     #[arg(long, global = true)]
     pub no_color: bool,
+
+    /// Run suggested provision fixes without asking — promotes every
+    /// `trust = "prompt"` step to `auto` for this invocation. `trust =
+    /// "manual"` steps are still never run. Intended for CI and
+    /// "I know what I want" mode (ADR-0002).
+    #[arg(long, short = 'y', global = true)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -129,6 +137,24 @@ pub enum Command {
         #[command(subcommand)]
         action: WorktreeAction,
     },
+    /// Live-sync this project to a remote dev host and attach to its
+    /// (remote-primary) dev environment.
+    ///
+    /// The remote runs the stack, supervisor, and `devme tui`; your laptop
+    /// edits files (synced via Mutagen) and views the TUI. Work survives
+    /// closing the lid — reopen and it reconciles. Configure the host once:
+    /// `devme config set remote.host <ssh-target>`.
+    ///
+    /// `devme remote` — ensure the live-sync, then attach.
+    /// `devme remote doctor` — preflight the local + remote setup.
+    /// `devme remote status` — conflict-aware sync state.
+    /// `devme remote sync` — reconcile without attaching.
+    /// `devme remote flush` — force an immediate reconcile (e.g. on wake).
+    /// `devme remote stop` — terminate the live-sync.
+    Remote {
+        #[command(subcommand)]
+        action: Option<RemoteAction>,
+    },
     /// Install or update the devme AI agent skill — a `SKILL.md` that teaches
     /// coding agents (Claude Code et al.) how to drive devme.
     ///
@@ -161,6 +187,21 @@ pub enum WorktreeAction {
         #[arg(long, short = 'f')]
         force: bool,
     },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum RemoteAction {
+    /// Preflight the local tooling, host reachability, and remote
+    /// `git`/`devme` — with a fixable hint per failure.
+    Doctor,
+    /// Show the live-sync's conflict-aware state for this project.
+    Status,
+    /// Reconcile the live-sync now without attaching.
+    Sync,
+    /// Force an immediate reconcile (e.g. right after the laptop wakes).
+    Flush,
+    /// Terminate the live-sync. The remote files stay; the live link stops.
+    Stop,
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -704,6 +745,26 @@ mod tests {
     #[test]
     fn worktree_rm_without_target_is_an_error() {
         assert!(Cli::try_parse_from(["devme", "worktree", "rm"]).is_err());
+    }
+
+    #[test]
+    fn remote_bare_parses_to_no_action() {
+        let cli = Cli::parse_from(["devme", "remote"]);
+        assert_eq!(cli.command, Some(Command::Remote { action: None }));
+    }
+
+    #[test]
+    fn remote_subcommands_parse() {
+        for (arg, expected) in [
+            ("doctor", RemoteAction::Doctor),
+            ("status", RemoteAction::Status),
+            ("sync", RemoteAction::Sync),
+            ("flush", RemoteAction::Flush),
+            ("stop", RemoteAction::Stop),
+        ] {
+            let cli = Cli::parse_from(["devme", "remote", arg]);
+            assert_eq!(cli.command, Some(Command::Remote { action: Some(expected) }));
+        }
     }
 
     #[test]

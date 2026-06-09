@@ -8,7 +8,7 @@ use base64::Engine;
 use clap::{CommandFactory, Parser};
 use clap_complete::{Shell, generate};
 use devme_cli::{
-    Cli, Command, ConfigAction, SkillAction, WorktreeAction, format_status_all,
+    Cli, Command, ConfigAction, RemoteAction, SkillAction, WorktreeAction, format_status_all,
     format_status_json, format_status_text,
 };
 use devme_config::Stack;
@@ -20,9 +20,16 @@ static NO_COLOR: AtomicBool = AtomicBool::new(false);
 /// True when informational stderr output should be suppressed (`-q`).
 /// Errors print regardless.
 static QUIET: AtomicBool = AtomicBool::new(false);
+/// True when `--yes` was passed: promote `prompt` provisions to `auto` so
+/// preflight fixes run without asking. Set once in `main`.
+static ASSUME_YES: AtomicBool = AtomicBool::new(false);
 
 fn no_color() -> bool {
     NO_COLOR.load(Ordering::Relaxed)
+}
+
+fn assume_yes() -> bool {
+    ASSUME_YES.load(Ordering::Relaxed)
 }
 
 /// Print to stderr unless `--quiet` was passed. Errors should go through
@@ -46,6 +53,7 @@ fn main() {
         || !std::io::stdout().is_terminal();
     NO_COLOR.store(no_color, Ordering::Relaxed);
     QUIET.store(cli.quiet, Ordering::Relaxed);
+    ASSUME_YES.store(cli.yes, Ordering::Relaxed);
 
     let is_tui = cli.command.is_none();
     let mut builder = if is_tui {
@@ -95,6 +103,7 @@ async fn run(cli: Cli) -> i32 {
         Some(Command::Doctor { tail }) => doctor(tail).await,
         Some(Command::Config { action }) => config_cmd(action),
         Some(Command::Worktree { action }) => worktree_cmd(action, cli.json).await,
+        Some(Command::Remote { action }) => remote_cmd(action, cli.json),
         Some(Command::Skill { action }) => skill_cmd(action, cli.json),
     };
     match result {
@@ -303,6 +312,18 @@ async fn up(
     //
     // Detached (`-d`): kick the graph and exit, leaving the daemon running.
     let sock = socket_path();
+    // Repo-scoped services (scope = "repo") are owned by the shared
+    // supervisor, not this instance daemon — which now treats them as
+    // external and only health-checks them. So `up` must make sure the
+    // shared daemon is running, or nothing ever spawns proxy/postgres and
+    // their dependents wait forever. Non-fatal: a stack with no repo-scoped
+    // services simply has no shared daemon to start. The TUI does the same
+    // (see tui::worktree).
+    if let Ok(cwd) = std::env::current_dir()
+        && let Err(e) = ensure_shared_daemon(&cwd).await
+    {
+        eprintln!("devme: shared supervisor not started: {e}");
+    }
     let fresh_daemon = ensure_daemon(&sock).await?;
     let mut client = devme_client::Client::connect(&sock).await?;
     client
@@ -550,8 +571,26 @@ async fn restart(service: String) -> anyhow::Result<()> {
 }
 
 async fn logs(service: String, follow: bool, tail: usize) -> anyhow::Result<()> {
-    let sock = socket_path();
-    ensure_daemon(&sock).await?;
+    // Repo-scoped services are owned by the shared supervisor — the instance
+    // daemon only health-checks them and holds no log buffer. Route the logs
+    // request to the shared socket so `devme logs proxy` works from any
+    // worktree instead of silently showing nothing.
+    let cwd = std::env::current_dir()?;
+    let is_repo_scoped = std::fs::read_to_string(cwd.join("devme.toml"))
+        .ok()
+        .and_then(|t| Stack::parse(&t).ok())
+        .and_then(|s| s.service.get(&service).map(|svc| svc.scope == devme_core::Scope::Repo))
+        .unwrap_or(false);
+
+    let sock = if is_repo_scoped {
+        let shared = devme_config::paths::shared_socket(&cwd)?;
+        let _ = ensure_shared_daemon(&cwd).await;
+        shared
+    } else {
+        let s = socket_path();
+        ensure_daemon(&s).await?;
+        s
+    };
     let mut client = devme_client::Client::connect(&sock).await?;
 
     // Confirm the requested name is actually known to the daemon — otherwise
@@ -831,6 +870,20 @@ async fn worktree_cmd(action: WorktreeAction, json: bool) -> anyhow::Result<()> 
     }
 }
 
+/// `devme remote …` — live-sync + attach to a remote dev host. Shells out
+/// to `mutagen`/`ssh`, so it's synchronous (no devme daemon involved).
+fn remote_cmd(action: Option<RemoteAction>, json: bool) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    match action {
+        None => devme_cli::remote::run(&cwd),
+        Some(RemoteAction::Doctor) => devme_cli::remote::doctor(&cwd, json),
+        Some(RemoteAction::Status) => devme_cli::remote::status(&cwd, json),
+        Some(RemoteAction::Sync) => devme_cli::remote::sync(&cwd),
+        Some(RemoteAction::Flush) => devme_cli::remote::flush(&cwd),
+        Some(RemoteAction::Stop) => devme_cli::remote::stop(&cwd),
+    }
+}
+
 /// `devme skill …` — manage the embedded AI agent skill. Pure filesystem
 /// work, so it's synchronous (no daemon involved).
 fn skill_cmd(action: SkillAction, json: bool) -> anyhow::Result<()> {
@@ -874,7 +927,7 @@ async fn launch_tui() -> anyhow::Result<i32> {
                     let mut stdin = std::io::BufReader::new(std::io::stdin());
                     let mut stderr = std::io::stderr();
                     let _ = devme_supervisor::preflight::run_preflight(
-                        &stack, &cwd, &mut stdin, &mut stderr, interactive,
+                        &stack, &cwd, &mut stdin, &mut stderr, interactive, assume_yes(),
                     );
                 }
                 ensure_docker_if_needed(&stack)?;
@@ -897,6 +950,7 @@ async fn launch_tui() -> anyhow::Result<i32> {
 
 use devme_supervisor::spawn::{
     ensure_daemon as ensure_daemon_inner,
+    ensure_shared_daemon,
 };
 
 /// Make sure a daemon is listening on `sock` for the current cwd. Thin
@@ -934,7 +988,7 @@ async fn ensure_daemon(sock: &std::path::Path) -> anyhow::Result<bool> {
                 let mut stdin = std::io::BufReader::new(std::io::stdin());
                 let mut stderr = std::io::stderr();
                 let _ = devme_supervisor::preflight::run_preflight(
-                    &stack, &cwd, &mut stdin, &mut stderr, interactive,
+                    &stack, &cwd, &mut stdin, &mut stderr, interactive, assume_yes(),
                 );
 
                 ensure_docker_if_needed(&stack)?;

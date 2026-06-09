@@ -31,6 +31,10 @@ pub struct Graph {
     kinds: HashMap<String, NodeKind>,
     /// Names of steps that declare a `provision` command.
     has_provision: std::collections::HashSet<String>,
+    /// Names of services marked `external` — the daemon health-checks them
+    /// instead of spawning them (e.g. a repo-scoped service owned by the
+    /// shared supervisor, as seen from an instance daemon). See ADR-0007.
+    external: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -54,6 +58,7 @@ impl Graph {
         let mut nodes = Vec::with_capacity(stack.step.len() + stack.service.len());
         let mut kinds = HashMap::new();
         let mut has_provision = std::collections::HashSet::new();
+        let mut external = std::collections::HashSet::new();
 
         for (name, step) in &stack.step {
             edges.insert(name.clone(), step.depends_on.clone());
@@ -66,15 +71,24 @@ impl Graph {
         for (name, service) in &stack.service {
             edges.insert(name.clone(), service.depends_on.clone());
             kinds.insert(name.clone(), NodeKind::Service);
+            if service.external {
+                external.insert(name.clone());
+            }
             nodes.push(name.clone());
         }
 
-        Self { edges, nodes, kinds, has_provision }
+        Self { edges, nodes, kinds, has_provision, external }
     }
 
     /// True if `node` is a Step whose config declared a `provision`.
     pub fn has_provision(&self, node: &str) -> bool {
         self.has_provision.contains(node)
+    }
+
+    /// True if `node` is a Service marked `external` — health-checked rather
+    /// than spawned by this daemon.
+    pub fn is_external(&self, node: &str) -> bool {
+        self.external.contains(node)
     }
 
     pub fn nodes(&self) -> &[String] {

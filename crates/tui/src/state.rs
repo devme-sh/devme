@@ -183,7 +183,7 @@ pub const SETTINGS: &[SettingDef] = &[
         label: "Confirm quit",
         desc: "Ask before quitting (which stops every service)",
         control: SettingControl::Toggle,
-        default: "false",
+        default: "true",
         unset_value: None,
     },
     SettingDef {
@@ -1153,9 +1153,12 @@ impl TuiState {
 
     // ── quit confirmation (gated on `tui.confirm_quit`) ──────────────────
 
-    /// Whether quitting should pop a confirmation first.
+    /// Whether quitting should pop a confirmation first. Defaults to on when
+    /// the key is unset — quitting stops every service (and the shared ones),
+    /// so a deliberate confirm is the safer default; opt out via
+    /// `tui.confirm_quit = false`.
     pub fn confirm_quit_enabled(&self) -> bool {
-        self.config.get("tui.confirm_quit").as_deref() == Some("true")
+        self.config.get("tui.confirm_quit").as_deref() != Some("false")
     }
 
     pub fn quit_confirm_visible(&self) -> bool {
@@ -1928,7 +1931,16 @@ mod tests {
     #[test]
     fn confirm_quit_reads_config_and_toggles_modal() {
         let mut s = TuiState::default();
+        // Default-on: an unset key means "confirm before quitting".
+        assert!(s.confirm_quit_enabled());
+        // Explicit opt-out disables it.
+        s.set_config({
+            let mut c = GlobalConfig::default();
+            c.set("tui.confirm_quit", "false").unwrap();
+            c
+        });
         assert!(!s.confirm_quit_enabled());
+        // Re-enabling restores the confirm gate.
         s.set_config({
             let mut c = GlobalConfig::default();
             c.set("tui.confirm_quit", "true").unwrap();

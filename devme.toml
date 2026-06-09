@@ -1,0 +1,41 @@
+schema_version = 1
+
+[stack]
+name = "devme"
+
+# ── C toolchain / linker — trust = "manual" ──────────────────────────
+# cargo needs a linker. Installing it is privileged (Xcode CLT prompt on
+# macOS, `sudo apt install` on Ubuntu). `trust = "manual"` shows the exact
+# fix command but never runs it — devme won't fire sudo/GUI prompts on your
+# behalf; you run it yourself.
+[step.cc]
+check = "command -v cc && command -v make"
+provision = 'if [ "$(uname)" = "Darwin" ]; then xcode-select --install; else sudo apt-get update && sudo apt-get install -y build-essential; fi'
+trust = "manual"
+description = "C compiler + linker (Xcode CLT on macOS, build-essential on Ubuntu)"
+
+# ── Rust toolchain — auto-installs on macOS + Ubuntu x86 ──────────────
+[step.rust]
+# Tolerate cargo not yet being on the daemon's PATH right after install.
+check = 'command -v cargo || test -x "$HOME/.cargo/bin/cargo"'
+provision = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path"
+depends_on = ["cc"]
+description = "Rust toolchain (rustup -y, non-interactive)"
+
+[step.just]
+check = 'command -v just || test -x "$HOME/.cargo/bin/just"'
+provision = 'export PATH="$HOME/.cargo/bin:$PATH"; cargo install just'
+depends_on = ["rust"]
+description = "just command runner"
+
+[step.cargo-watch]
+check = 'export PATH="$HOME/.cargo/bin:$PATH"; cargo watch --version'
+provision = 'export PATH="$HOME/.cargo/bin:$PATH"; cargo install cargo-watch'
+depends_on = ["rust"]
+description = "cargo-watch for the build loop"
+
+# ── Running: rebuild on change ───────────────────────────────────────
+[service.build]
+cmd = 'export PATH="$HOME/.cargo/bin:$PATH"; cargo watch -w crates -x "build --release"'
+depends_on = ["cargo-watch"]
+description = "Rebuild the workspace on every change"

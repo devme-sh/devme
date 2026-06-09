@@ -205,10 +205,22 @@ fn send_signal(pid: u32, sig: i32) {
     if pid == 0 {
         return;
     }
-    // SAFETY: `kill(2)` with a plain pid and signal number has no memory
-    // effects; an invalid/dead pid just returns ESRCH which we ignore.
+    let pid = pid as libc::pid_t;
+    // SAFETY: `getpgid`/`kill` with a plain pid have no memory effects; a
+    // dead/invalid pid just returns ESRCH which we ignore.
     unsafe {
-        libc::kill(pid as libc::pid_t, sig);
+        // Each child runs in its own PTY session (portable-pty calls setsid),
+        // so the child is its own process-group leader: pid == pgid. When that
+        // holds, signal the whole group (`kill(-pgid)`) so wrapper shells like
+        // `sh -c …`, `bun x vite`, and `docker compose` take their
+        // grandchildren down with them instead of leaving orphans. The
+        // pgid == pid guard means we never signal the supervisor's own group
+        // if the child somehow wasn't a session leader.
+        if libc::getpgid(pid) == pid {
+            libc::kill(-pid, sig);
+        } else {
+            libc::kill(pid, sig);
+        }
     }
 }
 
@@ -337,6 +349,44 @@ mod tests {
             .await
             .expect("wait timed out — kill didn't work");
         assert_ne!(exit, 0, "killed child should not report exit 0");
+    }
+
+    #[tokio::test]
+    async fn sigkill_reaps_grandchildren_via_process_group() {
+        // `sh` forks a backgrounded `sleep` (a grandchild), prints its pid,
+        // then waits. Killing the sh pid must also take the grandchild down,
+        // which only happens if we signal the whole process group.
+        let mut parts = ChildProcess::spawn_parts::<&str>(
+            "sleep 30 & echo $!; wait",
+            &std::env::temp_dir(),
+            &[],
+        )
+        .unwrap();
+        let parent = parts.pid;
+        let grandchild: u32 = parts
+            .lines
+            .recv()
+            .await
+            .expect("grandchild pid line")
+            .trim()
+            .parse()
+            .expect("pid parses");
+        // Let both settle.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(process_is_alive(grandchild), "grandchild should be alive");
+
+        send_sigkill(parent);
+
+        // Poll for the grandchild to die (group kill), up to ~2s.
+        let mut reaped = false;
+        for _ in 0..40 {
+            if !process_is_alive(grandchild) {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(reaped, "grandchild {grandchild} survived a group SIGKILL");
     }
 
     #[test]

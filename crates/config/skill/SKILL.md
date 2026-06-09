@@ -50,7 +50,10 @@ default = "eu-west-1"
 # Steps. Prerequisites checked before services start.
 # check: command that returns 0 on success.
 # provision: command to auto-fix when check fails.
-# trust = "auto": run provision without prompting.
+# trust controls consent for provision:
+#   "prompt" (default) — ask before running (interactive Enter/skip)
+#   "auto"             — run without asking (safe/idempotent setup, CI)
+#   "manual"           — show the command but never run it (privileged/sudo)
 [step.bun]
 check = "command -v bun"
 provision = "curl -fsSL https://bun.sh/install | bash"
@@ -81,6 +84,8 @@ depends_on = ["deps"]
 - Docker services: always use `--rm --name <project>-<service>`
 - Use `{port}` interpolation with `port = { base = <default>, slot_offset = 10 }`
 - Steps that install deps should use `trust = "auto"` and depend on the runtime step
+- Privileged fixes (`sudo …`, Xcode CLT) should use `trust = "manual"`: devme shows the command but never runs it (it can't answer a sudo/GUI prompt)
+- Interactive installers (rustup menu, `gh auth login`) work under `prompt`/`auto`: the foreground preflight runs them attached to the real terminal
 - Database migration steps should depend on both `deps` and the database service
 - Scan `.env.example` or `.env` for variables to declare in `[env.*]`
 - Add `help` to env vars so the user knows where to find the value
@@ -127,10 +132,15 @@ Run `devme logs <service> --tail 100` for the service the user asks about. If th
 | `devme start <svc>` | Start a stopped service |
 | `devme stop <svc>` | Stop a service |
 | `devme up -d` | Start everything detached |
+| `devme up -y` | Start, running `prompt` provisions without asking (`--yes`; promotes `prompt`→`auto`, never runs `manual`). Use for unattended/CI setup |
 | `devme down` | Stop everything |
 | `devme worktree rm <target>` | Stop a worktree's stack, run its `[stack] on_destroy` hook, then `git worktree remove` it. Target by path, dir name, or branch; `-f` forces a dirty worktree |
 | `devme config` | Show global config |
 | `devme config set <key> <val>` | Set a config value |
+| `devme remote` | Live-sync this project to the configured remote host and attach to its dev environment (remote-primary; the stack + TUI run there). Needs `remote.host` set |
+| `devme remote doctor` | Preflight the remote setup: local mutagen, SSH reachability, remote `git`/`devme`. `--json` for structured output |
+| `devme remote status` | Conflict-aware live-sync state for this project. `--json` for structured output |
+| `devme remote sync` / `flush` / `stop` | Reconcile without attaching / force an immediate reconcile (e.g. on wake) / terminate the live-sync |
 | `devme skill install` | Install/refresh this very skill into `.claude/skills/devme/` (`-g` for `~/.claude/...`). It's embedded in the binary, so it always matches the installed devme version |
 
 ### Gotchas
@@ -142,3 +152,4 @@ Run `devme logs <service> --tail 100` for the service the user asks about. If th
 - If no daemon: `devme doctor` returns `status: "no_daemon"`. Tell user to run `devme up -d`.
 - **Port-conflict preflight.** On `devme up`/launch, devme probes the ports it can know in advance (fixed ports, and repo-scoped services at slot 0) before starting the daemon. If one is already taken it prints a `Port conflicts` block naming the holder — a container (offering `docker stop`, or `docker compose down` for a Compose project) or a host process (offering to kill it) — and, when interactive, lets the user free it in place. Non-interactive runs only report; the launch still proceeds. Instance slot-offset ports are allocated daemon-side and aren't checked here.
 - **Worktree-aware.** Each git worktree runs its own supervisor with its own slot and ports. `doctor`, `status`, `logs`, and `url` all act on the worktree you're in (the current directory) — an agent in a worktree just calls them and gets that worktree's data. Use `devme status --all` to see every worktree's slot and ports at once, and `devme url <svc>` to get a ready-to-hit `http://localhost:<port>` without guessing the slot offset.
+- **`devme remote` is remote-primary.** The supervisor, stack, and `devme tui` run on the remote host; the laptop syncs files (Mutagen, `two-way-safe` so a conflict halts rather than clobbers) and views the TUI. It syncs the repo's **main** worktree only (shared `.git`); create worktrees on the remote. Config lives in global `[remote]` (`host`, `root`, `sync_mode`, `attach`, `ignore`); the `attach` setting is a preset (`tui`/`ssh`/`tmux`/`herdr`) or a raw `{host}`/`{remote_path}`/`{name}` template, so devme isn't tied to any one multiplexer. If `devme remote status` shows conflicts, the sync is **halted** — resolve it before expecting changes to flow. Run `devme remote doctor` first on a new host; it won't attach if the remote lacks `devme`.

@@ -111,6 +111,51 @@ pub fn identify_holder(port: u16) -> Holder {
     Holder::Unknown
 }
 
+/// Extract the Compose project name from a `docker compose … -p NAME …`
+/// service command. Returns `None` when the command isn't a Compose
+/// invocation or declares no explicit project. Handles `-p NAME`, `-pNAME`,
+/// `--project-name NAME`, and `--project-name=NAME`.
+fn compose_project_in_cmd(cmd: &str) -> Option<String> {
+    // Guard: only treat `-p` as a project flag inside an actual compose
+    // command — other tools (psql, etc.) use `-p` for unrelated things.
+    if !cmd.contains("compose") {
+        return None;
+    }
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    for (i, t) in tokens.iter().enumerate() {
+        if let Some(v) = t.strip_prefix("--project-name=") {
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        } else if *t == "--project-name" || *t == "-p" {
+            if let Some(v) = tokens.get(i + 1).filter(|v| !v.is_empty()) {
+                return Some((*v).to_string());
+            }
+        } else if let Some(v) = t.strip_prefix("-p") {
+            // attached short form `-pNAME` (bare `-p` handled above)
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// True when `holder` is a container in the same Compose project that this
+/// service's `cmd` manages — i.e. devme's own already-running shared
+/// service. `docker compose up` will adopt the running container rather than
+/// collide with it, so this is no conflict; the daemon's health check is the
+/// real arbiter. The common case: a repo-scoped Postgres left up by a prior
+/// session, intentionally persistent across worktrees (see ADR-0007).
+fn is_own_compose_service(holder: &Holder, cmd: &str) -> bool {
+    match holder {
+        Holder::Container { project: Some(proj), .. } => {
+            compose_project_in_cmd(cmd).as_deref() == Some(proj.as_str())
+        }
+        _ => false,
+    }
+}
+
 /// `kill <pid>` (SIGTERM). Frees a port held by a plain host process.
 pub fn kill_pid(pid: u32) -> Result<(), String> {
     let status = std::process::Command::new("kill")
@@ -157,10 +202,18 @@ pub fn check_ports<R: BufRead, W: Write>(
         if is_port_free(port) {
             continue;
         }
+        let holder = identify_holder(port);
+        // Adopt, don't conflict: when the port is held by devme's own
+        // already-running shared Compose service, `docker compose up` reuses
+        // it and the daemon's health check governs. Skip it silently rather
+        // than prompting the user to tear down their own warm shared stack.
+        if is_own_compose_service(&holder, &svc.cmd) {
+            continue;
+        }
         conflicts.push(Conflict {
             service: name.clone(),
             port,
-            holder: identify_holder(port),
+            holder,
         });
     }
 
@@ -470,6 +523,56 @@ port = {{ fixed = {port} }}
         assert!(text.contains("Port conflicts"), "got: {text}");
         assert!(text.contains(&port.to_string()));
         assert!(text.contains("unresolved"));
+    }
+
+    #[test]
+    fn compose_project_parsed_from_cmd_variants() {
+        let p = compose_project_in_cmd;
+        assert_eq!(
+            p("docker compose -f docker-compose.yml -p kpi-shared up db").as_deref(),
+            Some("kpi-shared")
+        );
+        assert_eq!(
+            p("docker compose --project-name kpi-shared up db").as_deref(),
+            Some("kpi-shared")
+        );
+        assert_eq!(
+            p("docker compose --project-name=kpi-shared up db").as_deref(),
+            Some("kpi-shared")
+        );
+        assert_eq!(
+            p("docker compose -pkpi-shared up db").as_deref(),
+            Some("kpi-shared")
+        );
+        // No explicit project.
+        assert_eq!(p("docker compose up db"), None);
+        // Not a compose command — `-p` must not be read as a project flag.
+        assert_eq!(p("psql -h localhost -p 5433 -U postgres"), None);
+    }
+
+    #[test]
+    fn own_compose_service_is_adopted_not_conflicted() {
+        let holder = Holder::Container {
+            name: "kpi-shared-db-1".to_string(),
+            project: Some("kpi-shared".to_string()),
+        };
+        // Same project the service manages → ours, adopt.
+        assert!(is_own_compose_service(
+            &holder,
+            "docker compose -f docker-compose.yml -p kpi-shared up db"
+        ));
+        // A foreign project with the same port → genuine conflict.
+        assert!(!is_own_compose_service(
+            &holder,
+            "docker compose -p some-other-project up db"
+        ));
+        // Service doesn't manage Compose at all → not ours.
+        assert!(!is_own_compose_service(&holder, "cloud-sql-proxy --port 15432"));
+        // Host-process holders are never adopted.
+        assert!(!is_own_compose_service(
+            &Holder::Process(vec![(123, Some("postgres".to_string()))]),
+            "docker compose -p kpi-shared up db"
+        ));
     }
 
     #[test]

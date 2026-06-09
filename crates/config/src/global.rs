@@ -18,6 +18,8 @@ pub struct GlobalConfig {
     pub skill: SkillConfig,
     #[serde(default, skip_serializing_if = "TuiConfig::is_empty")]
     pub tui: TuiConfig,
+    #[serde(default, skip_serializing_if = "crate::RemoteConfig::is_empty")]
+    pub remote: crate::RemoteConfig,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,6 +192,10 @@ impl GlobalConfig {
             "tui.theme" => self.tui.theme.clone(),
             "tui.confirm_quit" => self.tui.confirm_quit.map(|b| b.to_string()),
             "tui.toasts" => self.tui.toasts.map(|b| b.to_string()),
+            "remote.host" => self.remote.host.clone(),
+            "remote.root" => self.remote.root.clone(),
+            "remote.sync_mode" => self.remote.sync_mode.clone(),
+            "remote.attach" => self.remote.attach.clone(),
             _ => None,
         }
     }
@@ -229,6 +235,23 @@ impl GlobalConfig {
                 self.tui.toasts = Some(b);
                 Ok(())
             }
+            "remote.host" => {
+                self.remote.host = Some(value.to_string());
+                Ok(())
+            }
+            "remote.root" => {
+                self.remote.root = Some(value.to_string());
+                Ok(())
+            }
+            "remote.sync_mode" => {
+                crate::remote::validate_sync_mode(value)?;
+                self.remote.sync_mode = Some(value.to_string());
+                Ok(())
+            }
+            "remote.attach" => {
+                self.remote.attach = Some(value.to_string());
+                Ok(())
+            }
             _ => Err(format!("unknown config key: {key}")),
         }
     }
@@ -259,6 +282,22 @@ impl GlobalConfig {
                 self.tui.toasts = None;
                 Ok(())
             }
+            "remote.host" => {
+                self.remote.host = None;
+                Ok(())
+            }
+            "remote.root" => {
+                self.remote.root = None;
+                Ok(())
+            }
+            "remote.sync_mode" => {
+                self.remote.sync_mode = None;
+                Ok(())
+            }
+            "remote.attach" => {
+                self.remote.attach = None;
+                Ok(())
+            }
             _ => Err(format!("unknown config key: {key}")),
         }
     }
@@ -271,6 +310,10 @@ impl GlobalConfig {
             ("tui.theme", "TUI colour theme (mocha/latte/auto)"),
             ("tui.confirm_quit", "Confirm before quitting the TUI (true/false)"),
             ("tui.toasts", "Show service crash/recovery notifications (true/false)"),
+            ("remote.host", "Remote dev host: an SSH target (Tailscale MagicDNS name, ~/.ssh/config alias, or user@host)"),
+            ("remote.root", "Remote parent dir for synced projects (default ~/development)"),
+            ("remote.sync_mode", "Mutagen sync mode (two-way-safe/two-way-resolved)"),
+            ("remote.attach", "Attach command after sync: preset (tui/ssh/tmux/herdr) or a raw template"),
         ]
     }
 
@@ -396,6 +439,29 @@ mod tests {
         assert_eq!(render_toml_value("tui.confirm_quit", "true"), "true");
         assert_eq!(render_toml_value("tui.toasts", "false"), "false");
         assert_eq!(render_toml_value("tui.theme", "latte"), "\"latte\"");
+    }
+
+    #[test]
+    fn remote_keys_round_trip_and_validate() {
+        let mut cfg = GlobalConfig::default();
+        assert_eq!(cfg.get("remote.host"), None);
+        cfg.set("remote.host", "vps").unwrap();
+        cfg.set("remote.root", "~/dev").unwrap();
+        cfg.set("remote.sync_mode", "two-way-safe").unwrap();
+        cfg.set("remote.attach", "tui").unwrap();
+        assert_eq!(cfg.get("remote.host"), Some("vps".into()));
+        assert_eq!(cfg.get("remote.sync_mode"), Some("two-way-safe".into()));
+        // Bad sync mode is rejected at set time.
+        assert!(cfg.set("remote.sync_mode", "one-way-replica").is_err());
+        // Round-trips through the file.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        cfg.save_to(&path).unwrap();
+        let loaded = GlobalConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.remote.host.as_deref(), Some("vps"));
+        assert_eq!(loaded.remote.attach.as_deref(), Some("tui"));
+        cfg.unset("remote.host").unwrap();
+        assert_eq!(cfg.get("remote.host"), None);
     }
 
     #[test]

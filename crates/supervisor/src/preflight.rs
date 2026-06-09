@@ -11,6 +11,7 @@ use std::path::Path;
 use std::process::Command;
 
 use devme_config::{Stack, Provision};
+use devme_core::Trust;
 
 // Shared Clack-style constants
 const S_BAR: &str = "│";
@@ -31,6 +32,9 @@ pub enum StepResult {
     Provisioned,
     Failed,
     Skipped,
+    /// `trust = "manual"`: the suggested command was displayed but devme
+    /// deliberately did not run it — the user must run it themselves.
+    Manual,
 }
 
 pub struct PreflightResult {
@@ -105,11 +109,43 @@ fn run_provision(cmd: &str, cwd: &Path) -> bool {
     Command::new("sh")
         .args(["-c", cmd])
         .current_dir(cwd)
+        // stdin is intentionally left inherited so interactive installers
+        // (rustup's menu, `gh auth login`, any `read` prompt) can talk to the
+        // user's real terminal. The preflight runs before the TUI takes the
+        // screen, so the terminal is still in cooked mode here.
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Run a provision, re-check, and render the outcome line. Shared by the
+/// `auto` path (runs unconditionally) and the `prompt` path (runs after the
+/// user hits Enter). Returns the resulting [`StepResult`].
+fn provision_and_report<W: Write>(
+    check: &str,
+    cmd: &str,
+    cwd: &Path,
+    output: &mut W,
+) -> Result<StepResult, std::io::Error> {
+    writeln!(
+        output,
+        "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}running...{C_RESET}"
+    )?;
+    if run_provision(cmd, cwd) && run_check(check, cwd) {
+        writeln!(
+            output,
+            "  {C_DIM}{S_BAR}{C_RESET}    {C_GREEN}{S_STEP_SUBMIT} Installed{C_RESET}"
+        )?;
+        Ok(StepResult::Provisioned)
+    } else {
+        writeln!(
+            output,
+            "  {C_DIM}{S_BAR}{C_RESET}    {C_RED}▲ Failed to install{C_RESET}"
+        )?;
+        Ok(StepResult::Failed)
+    }
 }
 
 /// True if every preflight step's `check` command passes. Runs silently.
@@ -123,12 +159,17 @@ pub fn all_checks_pass(stack: &Stack, cwd: &Path) -> bool {
 
 /// Run preflight step checks and render results.
 /// Returns the check results so the caller can decide whether to proceed.
+///
+/// `assume_yes` (the `--yes` flag) promotes every `trust = "prompt"` step to
+/// `auto` for this run — fixes run without asking. `manual` steps are never
+/// run regardless (ADR-0002).
 pub fn run_preflight<R: BufRead, W: Write>(
     stack: &Stack,
     cwd: &Path,
     input: &mut R,
     output: &mut W,
     interactive: bool,
+    assume_yes: bool,
 ) -> Result<PreflightResult, std::io::Error> {
     let steps = preflight_steps(stack);
     if steps.is_empty() {
@@ -196,68 +237,72 @@ pub fn run_preflight<R: BufRead, W: Write>(
                 "  {C_DIM}{S_BAR}{C_RESET}  {C_YELLOW}▲{C_RESET} {C_BOLD}{label}{C_RESET}  {C_DIM}not found{C_RESET}"
             )?;
 
+            // `--yes` promotes a `prompt` step to `auto`; `manual` is never
+            // promoted and `auto` is already unattended.
+            let effective_trust = if assume_yes && step.trust == Trust::Prompt {
+                Trust::Auto
+            } else {
+                step.trust
+            };
+
             match &step.provision {
                 Some(Provision::Shell(cmd)) => {
-                    if interactive {
-                        writeln!(
-                            output,
-                            "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}fix: {cmd}{C_RESET}"
-                        )?;
-                        write!(
-                            output,
-                            "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}Run fix? Enter to run, s to skip ›{C_RESET} "
-                        )?;
-                        output.flush()?;
-
-                        let mut line = String::new();
-                        match input.read_line(&mut line) {
-                            Ok(0) => {
-                                writeln!(output)?;
-                                results.push((name.clone(), StepResult::Skipped));
-                                continue;
-                            }
-                            Ok(_) => {}
-                            Err(_) => {
-                                results.push((name.clone(), StepResult::Skipped));
-                                continue;
-                            }
+                    writeln!(
+                        output,
+                        "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}fix: {cmd}{C_RESET}"
+                    )?;
+                    match effective_trust {
+                        // Never auto-run: surface the command for the user.
+                        Trust::Manual => {
+                            writeln!(
+                                output,
+                                "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}run this yourself{C_RESET}"
+                            )?;
+                            results.push((name.clone(), StepResult::Manual));
                         }
-
-                        let trimmed = line.trim();
-                        if trimmed == "s" || trimmed == "S" || trimmed == "skip" {
-                            writeln!(
-                                output,
-                                "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}{S_STEP_SUBMIT} Skipped{C_RESET}"
-                            )?;
-                            results.push((name.clone(), StepResult::Skipped));
-                        } else {
-                            // Run provision
-                            writeln!(
-                                output,
-                                "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}running...{C_RESET}"
-                            )?;
-                            let success = run_provision(cmd, cwd);
-                            if success && run_check(&step.check, cwd) {
-                                writeln!(
-                                    output,
-                                    "  {C_DIM}{S_BAR}{C_RESET}    {C_GREEN}{S_STEP_SUBMIT} Installed{C_RESET}"
-                                )?;
-                                results.push((name.clone(), StepResult::Provisioned));
-                            } else {
-                                writeln!(
-                                    output,
-                                    "  {C_DIM}{S_BAR}{C_RESET}    {C_RED}▲ Failed to install{C_RESET}"
-                                )?;
+                        // Safe by declaration (or `--yes`): run without asking.
+                        Trust::Auto => {
+                            let r = provision_and_report(&step.check, cmd, cwd, output)?;
+                            results.push((name.clone(), r));
+                        }
+                        // Ask first — but only when we have a terminal.
+                        Trust::Prompt => {
+                            if !interactive {
                                 results.push((name.clone(), StepResult::Failed));
+                                continue;
+                            }
+                            write!(
+                                output,
+                                "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}Run fix? Enter to run, s to skip ›{C_RESET} "
+                            )?;
+                            output.flush()?;
+
+                            let mut line = String::new();
+                            match input.read_line(&mut line) {
+                                Ok(0) => {
+                                    writeln!(output)?;
+                                    results.push((name.clone(), StepResult::Skipped));
+                                    continue;
+                                }
+                                Ok(_) => {}
+                                Err(_) => {
+                                    results.push((name.clone(), StepResult::Skipped));
+                                    continue;
+                                }
+                            }
+
+                            let trimmed = line.trim();
+                            if trimmed == "s" || trimmed == "S" || trimmed == "skip" {
+                                writeln!(
+                                    output,
+                                    "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}{S_STEP_SUBMIT} Skipped{C_RESET}"
+                                )?;
+                                results.push((name.clone(), StepResult::Skipped));
+                            } else {
+                                let r = provision_and_report(&step.check, cmd, cwd, output)?;
+                                results.push((name.clone(), r));
                             }
                         }
-                    } else {
-                        // Non-interactive: show what's needed and skip
-                        writeln!(
-                            output,
-                            "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}fix: {cmd}{C_RESET}"
-                        )?;
-                        results.push((name.clone(), StepResult::Failed));
                     }
                 }
                 Some(Provision::Wizard { wizard }) => {
@@ -318,7 +363,7 @@ description = "Shell available"
         let mut output = Vec::new();
         let dir = std::env::temp_dir();
 
-        let result = run_preflight(&stack, &dir, &mut input, &mut output, false).unwrap();
+        let result = run_preflight(&stack, &dir, &mut input, &mut output, false, false).unwrap();
         assert_eq!(result.results[0].1, StepResult::Passed);
 
         let text = String::from_utf8(output).unwrap();
@@ -363,7 +408,97 @@ description = "Missing tool"
         let mut output = Vec::new();
         let dir = std::env::temp_dir();
 
-        let result = run_preflight(&stack, &dir, &mut input, &mut output, true).unwrap();
+        let result = run_preflight(&stack, &dir, &mut input, &mut output, true, false).unwrap();
         assert_eq!(result.results[0].1, StepResult::Skipped);
+    }
+
+    /// A throwaway directory used as `cwd` so provisions can `touch` a marker
+    /// relative to it without env vars or cross-test races. Removed on drop.
+    struct TempCwd(std::path::PathBuf);
+    impl TempCwd {
+        fn new(tag: &str) -> Self {
+            // Unique per (process, tag, address-of-local) to avoid collisions
+            // across parallel tests without needing a clock or RNG.
+            let mut p = std::env::temp_dir();
+            let probe = 0u8;
+            p.push(format!(
+                "devme-preflight-{}-{tag}-{:p}",
+                std::process::id(),
+                &probe
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            TempCwd(p)
+        }
+    }
+    impl Drop for TempCwd {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn auto_trust_runs_without_prompt() {
+        // `trust = "auto"` runs the provision with no input available.
+        let stack = parse_stack(
+            r#"
+schema_version = 1
+
+[step.mk]
+check = "test -f marker"
+provision = "touch marker"
+trust = "auto"
+"#,
+        );
+        let cwd = TempCwd::new("auto");
+        let mut input = Cursor::new(b""); // no input — proves no prompt
+        let mut output = Vec::new();
+        let result = run_preflight(&stack, &cwd.0, &mut input, &mut output, false, false).unwrap();
+
+        assert_eq!(result.results[0].1, StepResult::Provisioned);
+    }
+
+    #[test]
+    fn manual_trust_never_runs() {
+        // `trust = "manual"` shows the command but does not run it, even
+        // though stdin would accept an Enter.
+        let stack = parse_stack(
+            r#"
+schema_version = 1
+
+[step.priv]
+check = "false"
+provision = "echo would-run"
+trust = "manual"
+description = "Privileged step"
+"#,
+        );
+        let dir = std::env::temp_dir();
+        let mut input = Cursor::new(b"\n");
+        let mut output = Vec::new();
+        let result = run_preflight(&stack, &dir, &mut input, &mut output, true, false).unwrap();
+
+        assert_eq!(result.results[0].1, StepResult::Manual);
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("run this yourself"));
+    }
+
+    #[test]
+    fn yes_flag_promotes_prompt_to_auto() {
+        // With `assume_yes`, a `prompt` step runs without consuming input.
+        let stack = parse_stack(
+            r#"
+schema_version = 1
+
+[step.mk]
+check = "test -f marker"
+provision = "touch marker"
+"#,
+        );
+        let cwd = TempCwd::new("yes");
+        let mut input = Cursor::new(b""); // no Enter available
+        let mut output = Vec::new();
+        let result = run_preflight(&stack, &cwd.0, &mut input, &mut output, false, true).unwrap();
+
+        assert_eq!(result.results[0].1, StepResult::Provisioned);
     }
 }
