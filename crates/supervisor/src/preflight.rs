@@ -157,6 +157,21 @@ pub fn all_checks_pass(stack: &Stack, cwd: &Path) -> bool {
     })
 }
 
+/// Run every preflight-eligible step's `check` silently — no rendering, no
+/// provisioning — and report per-step pass/fail in declaration order. For
+/// read-only commands (`status`) that want fresh results without taking
+/// over the terminal. Steps whose dependency chain includes a service are
+/// not checked (their result is only meaningful with the service up).
+pub fn quiet_check_results(stack: &Stack, cwd: &Path) -> Vec<(String, bool)> {
+    preflight_steps(stack)
+        .iter()
+        .map(|name| {
+            let step = &stack.step[name];
+            (name.clone(), run_check(&step.check, cwd))
+        })
+        .collect()
+}
+
 /// Run preflight step checks and render results.
 /// Returns the check results so the caller can decide whether to proceed.
 ///

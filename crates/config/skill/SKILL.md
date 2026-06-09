@@ -82,7 +82,7 @@ Rules:
 | Command | Purpose |
 |---------|---------|
 | `devme doctor --tail N` | JSON: states + last N log lines per service |
-| `devme status [--all]` | One line per service with resolved `:PORT`. `--all` = every worktree (`*` = current); `--json` for structured |
+| `devme status [--all]` | Grouped STEPS/SERVICES snapshot: state glyph, resolved `http://host:PORT`, pid, restart count, plus a warning footer naming any unhealthy service. `--all` = port matrix across every worktree (`*` = current); `--json` for structured |
 | `devme logs <svc> --tail N` | Last N lines of a service |
 | `devme url <svc> [-o]` | Print a service's URL; `-o` opens it in the browser |
 | `devme start/stop/restart <svc>` | Lifecycle a single service |

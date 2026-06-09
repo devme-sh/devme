@@ -27,3 +27,29 @@ signal-to-token and deterministic "find the right slice" queries.
   crash-looping service can never fill the disk. This is what makes `--since`
   reliable rather than best-effort. Reads can flag when older history rotated
   away, so a clipped window is never mistaken for the whole story.
+- **`devme logs` is now the agent workhorse.**
+  - `devme logs` with no service interleaves *all* services into one
+    timestamp-ordered stream — cross-service causality ("api 500s right after
+    postgres restarted") in a single query.
+  - `--since 30s|5m|2h|1d|<epoch-ms>` time-anchors the window: "what happened
+    since my last check" instead of guessing a `--tail` count.
+  - `--json` emits NDJSON (`{ts, service, stream, text}`, ANSI-stripped, one
+    object per line) so output pipes straight to `jq` — e.g.
+    `devme logs --json | jq 'select(.stream == "stderr")'` for errors only.
+  - Queries are served from the disk history tier, so they reach past ring
+    eviction and daemon restarts.
+  - One-shot queries are deterministic: the daemon marks end-of-replay
+    (`LogEnd`) and doesn't subscribe non-follow clients, so a `--tail N`
+    window always contains exactly the last N lines — a freshly-emitted live
+    line can't race into it. Also drops ~120 ms of idle-timeout latency.
+  - A rotation warning (stderr, never stdout) fires only when requested
+    history actually rotated away — not when you asked for a `--tail` clip.
+
+#### Fixed
+- **`devme logs <name>` no longer renders the "Check dependencies" provisioning
+  tree.** Log queries now connect without running the preflight, so the
+  dependency-check UI can't leak into the logs channel.
+- **`devme logs <step>` redirects instead of hanging.** Steps have
+  check/provision *output*, not a runtime stream; asking for a step's logs now
+  errors with a pointer to `devme doctor <step>`, and an unknown name errors
+  immediately instead of waiting for logs that will never come.

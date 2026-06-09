@@ -67,6 +67,28 @@ pub enum ClientMessage {
     /// Subscribe to log + status streams for the named services. Empty list
     /// means all services.
     Subscribe { services: Vec<String> },
+    /// One-shot log query for the CLI `logs` command. Unlike [`Subscribe`]
+    /// (which replays the in-memory ring for the live TUI), this replays the
+    /// **disk** history tier, so `since` can reach past what the ring still
+    /// holds. The daemon replays matching records (merged across services and
+    /// ordered by timestamp), warns via a `Notice` if older history had
+    /// rotated away, then marks the end of the replay with
+    /// [`ServerMessage::LogEnd`]. Empty `services` means every service.
+    LogQuery {
+        services: Vec<String>,
+        /// Replay only lines with `ts >= since` (epoch ms). `None` = no floor.
+        #[serde(default)]
+        since: Option<u64>,
+        /// Keep at most the last N lines of the merged replay. `None` = all.
+        #[serde(default)]
+        tail: Option<usize>,
+        /// Keep streaming live lines after the replay (`--follow`). When
+        /// false the daemon does not subscribe the client, so a one-shot
+        /// query can't race a freshly-emitted live line into its `tail`
+        /// window.
+        #[serde(default)]
+        follow: bool,
+    },
     /// Cancel a prior subscription. Does not disconnect.
     Unsubscribe,
     /// Restart the named service (kill, wait, respawn).
@@ -138,6 +160,11 @@ pub enum ServerMessage {
     },
     /// A step's state changed.
     StepStatusUpdate { step: String, state: StepState },
+    /// End-of-replay marker for a [`ClientMessage::LogQuery`]. Everything
+    /// before this was history; anything after is live (only sent when the
+    /// query asked to `follow`). Lets the client terminate a one-shot read
+    /// deterministically instead of guessing via idle timeout.
+    LogEnd {},
     /// A non-fatal error or warning the daemon wants the client to surface.
     Notice { level: NoticeLevel, message: String },
     /// Fatal error specific to a Client request (bad service name, etc.).
@@ -396,6 +423,28 @@ mod tests {
         let json = r#"{"kind":"restart","service":"backend","unexpected":42}"#;
         let result: Result<ClientMessage, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn log_query_round_trips_and_defaults_its_filters() {
+        let m: ClientMessage =
+            serde_json::from_str(r#"{"kind":"log_query","services":["web"]}"#).unwrap();
+        assert_eq!(
+            m,
+            ClientMessage::LogQuery {
+                services: vec!["web".into()],
+                since: None,
+                tail: None,
+                follow: false,
+            }
+        );
+        let full = ClientMessage::LogQuery {
+            services: vec![],
+            since: Some(42),
+            tail: Some(200),
+            follow: true,
+        };
+        assert_eq!(json_round_trip(full.clone()), full);
     }
 
     #[test]

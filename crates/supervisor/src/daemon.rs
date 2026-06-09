@@ -695,6 +695,66 @@ fn handle_client_message(
             }
             state.subscriptions.insert(id, services);
         }
+        ClientMessage::LogQuery { services, since, tail, follow } => {
+            let (svcs, steps) = state.snapshot();
+            if let Some(client) = state.clients.get(&id) {
+                let _ = client.send(ServerMessage::Subscribed {
+                    instance: state.instance.clone(),
+                    services: svcs,
+                    steps,
+                });
+                // Replay from the disk history tier so `--since` reaches past
+                // the ring. Only services have streamed logs worth tailing;
+                // steps are diagnostics surfaced via `doctor`.
+                let names: Vec<String> = if services.is_empty() {
+                    state.stack.service.keys().cloned().collect()
+                } else {
+                    services.clone()
+                };
+                let mut merged: Vec<(u64, LogStream, String, String)> = Vec::new();
+                let mut truncated = false;
+                for name in &names {
+                    let (recs, trunc) = state.log_store.read(name, since, None);
+                    truncated |= trunc;
+                    for r in recs {
+                        merged.push((r.ts, r.stream, name.clone(), r.text));
+                    }
+                }
+                merged.sort_by_key(|(ts, _, _, _)| *ts);
+                // Tail-clipping is the caller's own request, not data loss —
+                // it doesn't set the truncation warning.
+                if let Some(tail) = tail {
+                    if merged.len() > tail {
+                        merged.drain(0..merged.len() - tail);
+                    }
+                }
+                if truncated {
+                    let _ = client.send(ServerMessage::Notice {
+                        level: NoticeLevel::Warn,
+                        message: "earlier log history rotated away — window may be \
+                                  incomplete; reproduce to capture more"
+                            .to_string(),
+                    });
+                }
+                for (ts, stream, svc, text) in merged {
+                    let _ = client.send(ServerMessage::LogChunk {
+                        service: svc,
+                        bytes: encode_line(&text),
+                        ts,
+                        stream,
+                    });
+                }
+                // Deterministic end-of-replay marker: the client stops
+                // reading here instead of guessing via idle timeout.
+                let _ = client.send(ServerMessage::LogEnd {});
+            }
+            // Only `--follow` subscribes to live lines; a one-shot query must
+            // not receive lines emitted after the replay (they'd race into
+            // its `tail` window).
+            if follow {
+                state.subscriptions.insert(id, services);
+            }
+        }
         ClientMessage::Unsubscribe => {
             state.subscriptions.remove(&id);
         }

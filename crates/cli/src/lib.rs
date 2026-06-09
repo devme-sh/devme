@@ -108,16 +108,28 @@ pub enum Command {
         #[arg(long, short = 'o')]
         open: bool,
     },
-    /// Tail logs for a service.
+    /// Tail logs for a service (or all services interleaved by time).
     Logs {
-        service: String,
+        /// Service to tail. Omit to interleave every service's logs by time.
+        /// (A step name is rejected with a pointer to `devme doctor` — steps
+        /// have check/provision *output*, not a runtime stream.)
+        service: Option<String>,
         #[arg(long, short)]
         follow: bool,
         /// Show only the last N lines of buffered output before following.
-        /// 0 means "all" (the daemon's full ring). Default 200 — a `docker
-        /// compose logs` of a long-running service is a wall of text.
+        /// 0 means "all". Default 200 — a `docker compose logs` of a
+        /// long-running service is a wall of text.
         #[arg(long, default_value_t = 200)]
         tail: usize,
+        /// Only show lines newer than this: a duration (`30s`, `5m`, `2h`,
+        /// `1d`) or an epoch-ms timestamp. Reaches into disk history, so it
+        /// survives ring eviction and daemon restarts.
+        #[arg(long)]
+        since: Option<String>,
+        /// Emit one JSON object per line — `{ts, service, stream, text}`, ANSI
+        /// stripped — for piping to `jq`. Composes with `--follow`.
+        #[arg(long)]
+        json: bool,
     },
     /// Print a shell completion script. Pipe into your shell's completion
     /// directory: `devme completions fish > ~/.config/fish/completions/devme.fish`.
@@ -319,26 +331,239 @@ pub fn step_state_label(state: &devme_core::StepState) -> &'static str {
     }
 }
 
-/// Format a status snapshot for human consumption — one row per node,
-/// declaration order preserved. Steps come first, then services, matching
-/// the TUI sidebar. Services show their resolved `:PORT` so an agent sees
-/// the worktree's ports at a glance.
-pub fn format_status_text(services: &[ServiceSnapshot], steps: &[StepSnapshot]) -> String {
+/// ANSI escape codes for the status renderer. Emitted only when `color` is
+/// true (a TTY with color enabled); see [`format_status_text`].
+mod ansi {
+    pub const RESET: &str = "\x1b[0m";
+    pub const BOLD: &str = "\x1b[1m";
+    pub const DIM: &str = "\x1b[2m";
+    pub const RED: &str = "\x1b[31m";
+    pub const GREEN: &str = "\x1b[32m";
+    pub const YELLOW: &str = "\x1b[33m";
+    pub const BLUE: &str = "\x1b[34m";
+    pub const CYAN: &str = "\x1b[36m";
+    pub const BRIGHT_RED: &str = "\x1b[91m";
+}
+
+/// Wrap `s` in an ANSI `code`…reset pair, or return it untouched when color
+/// is disabled. Padding must be applied to `s` *before* calling this so the
+/// invisible escape bytes don't throw off column alignment.
+fn paint(color: bool, code: &str, s: &str) -> String {
+    if color {
+        format!("{code}{s}{}", ansi::RESET)
+    } else {
+        s.to_string()
+    }
+}
+
+/// Status glyph + color for a service state. Glyphs are all single terminal
+/// cells so they don't disturb alignment.
+fn service_glyph(state: &devme_core::ServiceState) -> (&'static str, &'static str) {
+    use devme_core::ServiceState as S;
+    match state {
+        S::Running { degraded: false, .. } => ("●", ansi::GREEN),
+        S::Running { degraded: true, .. } => ("◐", ansi::YELLOW),
+        S::Starting => ("◐", ansi::CYAN),
+        S::WaitingOnDependency { .. } => ("◌", ansi::CYAN),
+        S::Restarting { .. } => ("↻", ansi::YELLOW),
+        S::CrashLoop { .. } => ("✗", ansi::BRIGHT_RED),
+        S::Failed { .. } => ("✗", ansi::RED),
+        S::Stopped => ("○", ansi::DIM),
+        S::External { healthy: true } => ("◆", ansi::GREEN),
+        S::External { healthy: false } => ("◆", ansi::RED),
+    }
+}
+
+/// Status glyph + color for a step state.
+fn step_glyph(state: &devme_core::StepState) -> (&'static str, &'static str) {
+    use devme_core::StepState as S;
+    match state {
+        S::Passed => ("✔", ansi::GREEN),
+        S::Failed | S::ProvisionFailed => ("✗", ansi::RED),
+        S::Unknown => ("·", ansi::DIM),
+        S::SkippedThisRun => ("–", ansi::DIM),
+        S::Overridden => ("✔", ansi::YELLOW),
+    }
+}
+
+/// Closing one-liner: an actionable warning when anything is unhealthy,
+/// otherwise a quiet running/passing tally.
+fn status_summary_line(
+    services: &[ServiceSnapshot],
+    steps: &[StepSnapshot],
+    color: bool,
+) -> String {
+    use devme_core::{ServiceState as S, StepState};
+
+    let problems: Vec<&ServiceSnapshot> = services
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.state,
+                S::Failed { .. }
+                    | S::CrashLoop { .. }
+                    | S::Running { degraded: true, .. }
+                    | S::External { healthy: false }
+            )
+        })
+        .collect();
+
+    let step_problems: Vec<&StepSnapshot> = steps
+        .iter()
+        .filter(|s| matches!(s.state, StepState::Failed | StepState::ProvisionFailed))
+        .collect();
+
+    if !problems.is_empty() || !step_problems.is_empty() {
+        let list = step_problems
+            .iter()
+            .map(|s| format!("{} {}", s.name, step_state_label(&s.state)))
+            .chain(problems.iter().map(|s| format!("{} {}", s.name, service_state_label(&s.state))))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Name a concrete next command: logs for a broken service, up to
+        // (re-)provision when only steps are failing.
+        let hint = match problems.first() {
+            Some(svc) => format!("run `devme logs {}`", svc.name),
+            None => "run `devme up` to provision".to_string(),
+        };
+        let body = format!("  ⚠ {list} — {hint}");
+        return paint(color, ansi::YELLOW, &body);
+    }
+
+    let running = services
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.state,
+                S::Running { degraded: false, .. } | S::External { healthy: true }
+            )
+        })
+        .count();
+    let total = services.len();
+
+    let msg = if total == 0 {
+        let passed = steps.iter().filter(|s| matches!(s.state, StepState::Passed)).count();
+        format!("  {passed}/{} steps passed", steps.len())
+    } else if running == total {
+        "  ✔ all services running".to_string()
+    } else {
+        format!("  {running}/{total} services running")
+    };
+    paint(color, ansi::DIM, &msg)
+}
+
+/// Format a status snapshot for human consumption — grouped under `STEPS`
+/// and `SERVICES` headers, declaration order preserved within each, matching
+/// the TUI sidebar. Each row leads with a colored status glyph; services show
+/// a clickable `http://host:PORT` URL plus pid and restart count so an agent
+/// (or human) sees the worktree's live state at a glance. A closing line
+/// surfaces anything unhealthy with the command to dig in. `color` gates all
+/// ANSI; callers pass `false` for pipes / `NO_COLOR` / `--no-color`.
+pub fn format_status_text(
+    services: &[ServiceSnapshot],
+    steps: &[StepSnapshot],
+    color: bool,
+) -> String {
+    use devme_core::ServiceState;
+
+    if services.is_empty() && steps.is_empty() {
+        return "  No services or steps declared in devme.toml.\n".to_string();
+    }
+
+    let host = crate::remote::advertise_host();
+
+    // One name column wide enough for steps and services together, so the two
+    // groups stay vertically aligned.
+    let name_w = steps
+        .iter()
+        .map(|s| s.name.len())
+        .chain(services.iter().map(|s| s.name.len()))
+        .max()
+        .unwrap_or(0);
+    let label_w = steps
+        .iter()
+        .map(|s| step_state_label(&s.state).len())
+        .chain(services.iter().map(|s| service_state_label(&s.state).len()))
+        .max()
+        .unwrap_or(0);
+
     let mut out = String::new();
-    for s in steps {
-        out.push_str(&format!("step    {:<20} {}\n", s.name, step_state_label(&s.state)));
-    }
-    for s in services {
-        let port = s.port.map(|p| format!(":{p}")).unwrap_or_default();
-        let line = format!(
-            "service {:<20} {:<14} {}",
-            s.name,
-            service_state_label(&s.state),
-            port
-        );
-        out.push_str(line.trim_end());
+    out.push('\n');
+
+    if !steps.is_empty() {
+        out.push_str(&paint(color, ansi::DIM, "  STEPS"));
         out.push('\n');
+        for s in steps {
+            let (glyph, gcolor) = step_glyph(&s.state);
+            let label = step_state_label(&s.state);
+            let line = format!(
+                "    {} {}  {}",
+                paint(color, gcolor, glyph),
+                paint(color, ansi::BOLD, &format!("{:<name_w$}", s.name)),
+                paint(color, gcolor, &format!("{label:<label_w$}")),
+            );
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
     }
+
+    if !services.is_empty() {
+        if !steps.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&paint(color, ansi::DIM, "  SERVICES"));
+        out.push('\n');
+        for s in services {
+            let (glyph, gcolor) = service_glyph(&s.state);
+            let label = service_state_label(&s.state);
+
+            let mut detail = String::new();
+            // Prefer the configured URL template (mirrors the TUI's copy/open
+            // resolution); fall back to a plain http URL from the port.
+            let url = match &s.url {
+                Some(t) if !(t.contains("{port}") && s.port.is_none()) => {
+                    let mut u = t.replace("{host}", &host);
+                    if let Some(p) = s.port {
+                        u = u.replace("{port}", &p.to_string());
+                    }
+                    Some(u)
+                }
+                Some(_) => None,
+                None => s.port.map(|p| format!("http://{host}:{p}")),
+            };
+            if let Some(u) = url {
+                detail.push_str(&paint(color, ansi::BLUE, &u));
+            }
+            if let Some(pid) = s.pid
+                && matches!(s.state, ServiceState::Running { .. })
+            {
+                if !detail.is_empty() {
+                    detail.push_str("  ");
+                }
+                detail.push_str(&paint(color, ansi::DIM, &format!("pid {pid}")));
+            }
+            if s.restart_count > 0 {
+                if !detail.is_empty() {
+                    detail.push_str("  ");
+                }
+                detail.push_str(&paint(color, ansi::DIM, &format!("↻{}", s.restart_count)));
+            }
+
+            let line = format!(
+                "    {} {}  {}  {}",
+                paint(color, gcolor, glyph),
+                paint(color, ansi::BOLD, &format!("{:<name_w$}", s.name)),
+                paint(color, gcolor, &format!("{label:<label_w$}")),
+                detail,
+            );
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+    }
+
+    out.push('\n');
+    out.push_str(&status_summary_line(services, steps, color));
+    out.push('\n');
     out
 }
 
@@ -558,9 +783,41 @@ mod tests {
         assert_eq!(
             cli.command,
             Some(Command::Logs {
-                service: "api".into(),
+                service: Some("api".into()),
                 follow: true,
                 tail: 200,
+                since: None,
+                json: false,
+            })
+        );
+    }
+
+    #[test]
+    fn logs_no_service_means_all() {
+        let cli = Cli::parse_from(["devme", "logs"]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Logs {
+                service: None,
+                follow: false,
+                tail: 200,
+                since: None,
+                json: false,
+            })
+        );
+    }
+
+    #[test]
+    fn logs_since_and_json_parse() {
+        let cli = Cli::parse_from(["devme", "logs", "web", "--since", "5m", "--json"]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Logs {
+                service: Some("web".into()),
+                follow: false,
+                tail: 200,
+                since: Some("5m".into()),
+                json: true,
             })
         );
     }
@@ -599,12 +856,13 @@ mod tests {
         ];
         let steps = vec![step("tools", StepState::Passed)];
 
-        let out = format_status_text(&services, &steps);
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 3);
-        assert!(lines[0].starts_with("step    tools"));
-        assert!(lines[1].starts_with("service backend"));
-        assert!(lines[2].starts_with("service db"));
+        let out = format_status_text(&services, &steps, false);
+        // Steps group precedes the services group, declaration order preserved.
+        let tools = out.find("tools").unwrap();
+        let backend = out.find("backend").unwrap();
+        let db = out.find("db").unwrap();
+        assert!(out.find("STEPS").unwrap() < out.find("SERVICES").unwrap());
+        assert!(tools < backend && backend < db, "order wrong: {out}");
     }
 
     #[test]
@@ -618,8 +876,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_snapshot_formats_to_empty_text() {
-        assert_eq!(format_status_text(&[], &[]), "");
+    fn empty_snapshot_prints_a_friendly_note() {
+        let out = format_status_text(&[], &[], false);
+        assert!(out.contains("No services or steps"), "got: {out}");
+        // Nothing declared means nothing to color — no stray escape bytes.
+        assert!(!out.contains('\x1b'), "leaked ANSI: {out:?}");
     }
 
     #[test]
@@ -629,12 +890,68 @@ mod tests {
             ServiceState::Running { degraded: false, started_without: vec![] },
         );
         s.port = Some(8090);
-        let out = format_status_text(&[s], &[step("tools", StepState::Passed)]);
+        let out = format_status_text(&[s], &[step("tools", StepState::Passed)], false);
         assert!(out.contains("running"), "got: {out}");
         assert!(out.contains(":8090"), "port missing: {out}");
+        // The port is rendered as a clickable URL, not a bare `:PORT`.
+        assert!(out.contains("http://"), "url missing: {out}");
         // No raw Debug noise.
         assert!(!out.contains("degraded:"), "leaked Debug: {out}");
         assert!(out.contains("tools") && out.contains("passed"));
+    }
+
+    #[test]
+    fn status_footer_warns_and_points_at_logs_when_unhealthy() {
+        let services = vec![
+            svc("api", ServiceState::Failed { exit_code: Some(1) }),
+            svc("db", ServiceState::Running { degraded: false, started_without: vec![] }),
+        ];
+        let out = format_status_text(&services, &[], false);
+        let footer = out.lines().last().unwrap();
+        assert!(footer.contains("⚠"), "no warning glyph: {out}");
+        assert!(footer.contains("api failed(1)"), "missing failed service: {out}");
+        assert!(footer.contains("devme logs api"), "hint should name the service: {out}");
+    }
+
+    #[test]
+    fn status_footer_warns_on_failed_steps_with_provision_hint() {
+        let steps = vec![step("rust", StepState::Failed)];
+        let out = format_status_text(&[], &steps, false);
+        let footer = out.lines().last().unwrap();
+        assert!(footer.contains("rust failed"), "missing failed step: {out}");
+        assert!(footer.contains("devme up"), "missing provision hint: {out}");
+    }
+
+    #[test]
+    fn status_footer_tallies_when_all_healthy() {
+        let services = vec![
+            svc("api", ServiceState::Running { degraded: false, started_without: vec![] }),
+            svc("db", ServiceState::Running { degraded: false, started_without: vec![] }),
+        ];
+        let out = format_status_text(&services, &[], false);
+        assert!(out.lines().last().unwrap().contains("all services running"), "got: {out}");
+    }
+
+    #[test]
+    fn status_resolves_url_template_over_default_http() {
+        let mut s = svc(
+            "db",
+            ServiceState::Running { degraded: false, started_without: vec![] },
+        );
+        s.port = Some(5432);
+        s.url = Some("postgres://{host}:{port}/dev".into());
+        let out = format_status_text(&[s], &[], false);
+        assert!(out.contains("postgres://localhost:5432/dev"), "got: {out}");
+        assert!(!out.contains("http://"), "template should win: {out}");
+    }
+
+    #[test]
+    fn status_color_wraps_glyphs_in_ansi_and_no_color_stays_plain() {
+        let services = vec![svc("db", ServiceState::Stopped)];
+        let colored = format_status_text(&services, &[], true);
+        assert!(colored.contains('\x1b'), "expected ANSI when color=true");
+        let plain = format_status_text(&services, &[], false);
+        assert!(!plain.contains('\x1b'), "expected no ANSI when color=false");
     }
 
     #[test]
@@ -738,9 +1055,11 @@ mod tests {
         assert_eq!(
             cli.command,
             Some(Command::Logs {
-                service: "api".into(),
+                service: Some("api".into()),
                 follow: true,
                 tail: 200,
+                since: None,
+                json: false,
             })
         );
     }

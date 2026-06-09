@@ -576,6 +576,11 @@ async fn handle(
     let mut framed = Framed::new(stream, FrameCodec);
     let mut events = state.events.subscribe();
     let mut subscribed = false;
+    // Whether live LogChunk broadcasts are forwarded to this client. True by
+    // default (Subscribe-based clients expect streaming); a one-shot
+    // `LogQuery { follow: false }` turns it off so a fresh live line can't
+    // race into its replay window.
+    let mut forward_logs = true;
 
     let result: anyhow::Result<()> = async {
         loop {
@@ -586,6 +591,7 @@ async fn handle(
                     let env: Envelope<ClientMessage> = serde_json::from_slice(&bytes)?;
                     match env.payload {
                         ClientMessage::Subscribe { .. } => {
+                            forward_logs = true;
                             if !subscribed {
                                 subscribed = true;
                                 state.subscribers.fetch_add(1, Ordering::SeqCst);
@@ -623,6 +629,75 @@ async fn handle(
                                 .await?;
                             }
                         }
+                        ClientMessage::LogQuery { services, since, tail, follow } => {
+                            forward_logs = follow;
+                            if !subscribed {
+                                subscribed = true;
+                                state.subscribers.fetch_add(1, Ordering::SeqCst);
+                                state.sub_notify.notify_one();
+                            }
+                            let snap = state.current_snapshot().await;
+                            send_msg(
+                                &mut framed,
+                                ServerMessage::Subscribed {
+                                    instance: info.clone(),
+                                    services: snap,
+                                    steps: vec![],
+                                },
+                            )
+                            .await?;
+                            // Replay from the disk history tier (so `--since`
+                            // reaches past the ring), merged across services
+                            // and ordered by timestamp.
+                            let names: Vec<String> = if services.is_empty() {
+                                state.services.lock().await.keys().cloned().collect()
+                            } else {
+                                services.clone()
+                            };
+                            let mut merged: Vec<(u64, LogStream, String, String)> = Vec::new();
+                            let mut truncated = false;
+                            {
+                                let store = state.log_store.lock().await;
+                                for name in &names {
+                                    let (recs, trunc) = store.read(name, since, None);
+                                    truncated |= trunc;
+                                    for r in recs {
+                                        merged.push((r.ts, r.stream, name.clone(), r.text));
+                                    }
+                                }
+                            }
+                            merged.sort_by_key(|(ts, _, _, _)| *ts);
+                            // Tail-clipping is the caller's own request, not
+                            // data loss — no truncation warning.
+                            if let Some(tail) = tail {
+                                if merged.len() > tail {
+                                    merged.drain(0..merged.len() - tail);
+                                }
+                            }
+                            if truncated {
+                                send_msg(
+                                    &mut framed,
+                                    ServerMessage::Notice {
+                                        level: devme_core::NoticeLevel::Warn,
+                                        message: "earlier log history rotated away — window may \
+                                                  be incomplete; reproduce to capture more"
+                                            .into(),
+                                    },
+                                )
+                                .await?;
+                            }
+                            for (ts, stream, svc, line) in merged {
+                                let bytes = base64::engine::general_purpose::STANDARD
+                                    .encode(line.as_bytes());
+                                send_msg(
+                                    &mut framed,
+                                    ServerMessage::LogChunk { service: svc, bytes, ts, stream },
+                                )
+                                .await?;
+                            }
+                            // Deterministic end-of-replay marker.
+                            send_msg(&mut framed, ServerMessage::LogEnd {}).await?;
+                        }
                         ClientMessage::Unsubscribe => {
                             if subscribed {
                                 subscribed = false;
@@ -653,6 +728,9 @@ async fn handle(
                     }
                 }
                 broadcast = events.recv() => match broadcast {
+                    // Live log lines are gated per-connection (one-shot log
+                    // queries opt out); everything else always flows.
+                    Ok(ServerMessage::LogChunk { .. }) if !forward_logs => continue,
                     Ok(msg) => send_msg(&mut framed, msg).await?,
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,

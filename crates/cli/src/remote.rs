@@ -988,9 +988,11 @@ mod tests {
     fn proxyable_commands_are_daemon_facing_only() {
         assert!(is_proxyable(&Some(C::Status { all: false })));
         assert!(is_proxyable(&Some(C::Logs {
-            service: "api".into(),
+            service: Some("api".into()),
             follow: false,
-            tail: 200
+            tail: 200,
+            since: None,
+            json: false,
         })));
         assert!(is_proxyable(&Some(C::Down { timeout: 10, all: false })));
         // Machine-local / non-daemon commands never proxy.

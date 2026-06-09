@@ -99,7 +99,9 @@ async fn run(cli: Cli) -> i32 {
         Some(Command::Stop { service }) => stop(service).await,
         Some(Command::Restart { service }) => restart(service).await,
         Some(Command::Url { service, open }) => url(service, open).await,
-        Some(Command::Logs { service, follow, tail }) => logs(service, follow, tail).await,
+        Some(Command::Logs { service, follow, tail, since, json }) => {
+            logs(service, follow, tail, since, json).await
+        }
         Some(Command::Completions { shell }) => {
             print_completions(shell);
             Ok(())
@@ -342,24 +344,54 @@ async fn url(service: String, open: bool) -> anyhow::Result<()> {
 
 async fn status(as_json: bool) -> anyhow::Result<()> {
     let sock = socket_path();
-    ensure_daemon(&sock).await?;
+    let cwd = std::env::current_dir()?;
+    // Read-only query: like `logs`, skip the provisioning preflight so
+    // `status` doesn't re-render the "Check dependencies" tree on every call.
+    ensure_daemon_inner(&sock, &cwd).await?;
     let mut client = devme_client::Client::connect(&sock).await?;
     let reply = client
         .request(ClientMessage::Subscribe { services: vec![] })
         .await?;
 
     match reply {
-        ServerMessage::Subscribed { services, steps, .. } => {
+        ServerMessage::Subscribed { services, mut steps, .. } => {
+            overlay_step_checks(&mut steps, &cwd);
             if as_json {
                 println!("{}", format_status_json(&services, &steps));
             } else {
-                print!("{}", format_status_text(&services, &steps));
+                print!("{}", format_status_text(&services, &steps, !no_color()));
             }
             Ok(())
         }
         other => Err(anyhow::anyhow!(
             "daemon replied with unexpected message: {other:?}"
         )),
+    }
+}
+
+/// Fill in step states the daemon hasn't evaluated yet. The daemon only
+/// runs step checks when the graph advances (`up`), so a daemon freshly
+/// spawned by `status` reports every step as `Unknown` ("pending") even
+/// when its check passes right now. Re-run the service-independent checks
+/// quietly and overlay the results; states the daemon *has* established
+/// win, and service-dependent steps stay `Unknown` (only meaningful with
+/// their services up).
+fn overlay_step_checks(steps: &mut [devme_core::StepSnapshot], cwd: &std::path::Path) {
+    use devme_core::StepState;
+    if !steps.iter().any(|s| s.state == StepState::Unknown) {
+        return;
+    }
+    let Ok(toml_str) = std::fs::read_to_string(cwd.join("devme.toml")) else {
+        return;
+    };
+    let Ok(stack) = Stack::parse(&toml_str) else {
+        return;
+    };
+    let results = devme_supervisor::preflight::quiet_check_results(&stack, cwd);
+    for s in steps.iter_mut().filter(|s| s.state == StepState::Unknown) {
+        if let Some((_, passed)) = results.iter().find(|(name, _)| name == &s.name) {
+            s.state = if *passed { StepState::Passed } else { StepState::Failed };
+        }
     }
 }
 
@@ -637,17 +669,35 @@ async fn restart(service: String) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn logs(service: String, follow: bool, tail: usize) -> anyhow::Result<()> {
-    // Repo-scoped services are owned by the shared supervisor — the instance
-    // daemon only health-checks them and holds no log buffer. Route the logs
-    // request to the shared socket so `devme logs proxy` works from any
-    // worktree instead of silently showing nothing.
+async fn logs(
+    service: Option<String>,
+    follow: bool,
+    tail: usize,
+    since: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let since_ms = match since.as_deref() {
+        Some(s) => Some(parse_since(s)?),
+        None => None,
+    };
+    // `--tail 0` means "everything".
+    let tail_opt = if tail == 0 { None } else { Some(tail) };
+
     let cwd = std::env::current_dir()?;
-    let is_repo_scoped = std::fs::read_to_string(cwd.join("devme.toml"))
-        .ok()
-        .and_then(|t| Stack::parse(&t).ok())
-        .and_then(|s| s.service.get(&service).map(|svc| svc.scope == devme_core::Scope::Repo))
-        .unwrap_or(false);
+
+    // Routing: a *named* repo-scoped service is owned by the shared supervisor
+    // (the instance daemon only health-checks it and holds no log buffer), so
+    // route there. The instance daemon owns everything else and the
+    // all-services view. (A repo service still needs to be named explicitly to
+    // appear; the all-services view shows the instance daemon's services.)
+    let is_repo_scoped = match &service {
+        Some(name) => std::fs::read_to_string(cwd.join("devme.toml"))
+            .ok()
+            .and_then(|t| Stack::parse(&t).ok())
+            .and_then(|s| s.service.get(name).map(|svc| svc.scope == devme_core::Scope::Repo))
+            .unwrap_or(false),
+        None => false,
+    };
 
     let sock = if is_repo_scoped {
         let shared = devme_config::paths::shared_socket(&cwd)?;
@@ -655,81 +705,84 @@ async fn logs(service: String, follow: bool, tail: usize) -> anyhow::Result<()> 
         shared
     } else {
         let s = socket_path();
-        ensure_daemon(&s).await?;
+        // Read-only query: connect (spawning the daemon only if absent) but
+        // skip the provisioning preflight — otherwise every `logs` call
+        // re-renders the "Check dependencies" tree to stderr, which reads as
+        // "logs is dumping the dependency check".
+        ensure_daemon_inner(&s, &cwd).await?;
         s
     };
     let mut client = devme_client::Client::connect(&sock).await?;
 
-    // Confirm the requested name is actually known to the daemon — otherwise
-    // we'd silently sit waiting for logs that can never arrive.
+    let services_arg = match &service {
+        Some(name) => vec![name.clone()],
+        None => vec![],
+    };
     let snap = client
-        .request(ClientMessage::Subscribe {
-            services: vec![service.clone()],
+        .request(ClientMessage::LogQuery {
+            services: services_arg,
+            since: since_ms,
+            tail: tail_opt,
+            follow,
         })
         .await?;
-    let known = match &snap {
-        ServerMessage::Subscribed { services, steps, .. } => {
-            services.iter().any(|s| s.name == service)
-                || steps.iter().any(|s| s.name == service)
+
+    // Validate a named target against the snapshot. A step is redirected to
+    // `doctor` — steps have check/provision *output*, not a runtime stream, and
+    // dumping it here is the "logs build shows the dependency tree" bug. An
+    // unknown name errors instead of silently waiting for logs that never come.
+    if let (Some(name), ServerMessage::Subscribed { services, steps, .. }) = (&service, &snap) {
+        let is_service = services.iter().any(|s| &s.name == name);
+        let is_step = steps.iter().any(|s| &s.name == name);
+        if !is_service && is_step {
+            return Err(anyhow::anyhow!(
+                "{name:?} is a step, not a service — its check/provision output lives in \
+                 `devme doctor {name}`, not the log stream"
+            ));
         }
-        _ => false,
-    };
-    if !known {
-        return Err(anyhow::anyhow!(
-            "no service or step named {service:?} in devme.toml"
-        ));
+        if !is_service && !is_step {
+            return Err(anyhow::anyhow!("no service or step named {name:?} in devme.toml"));
+        }
     }
 
-    // Drain buffered lines from the daemon's ring. We can't tell from the
-    // wire alone when replay ends, so we read with a short idle timeout
-    // and call the first miss "replay done". The replay buffer goes into
-    // a Vec rather than straight to stdout so `--tail N` can drop the
-    // older lines before printing.
-    let drain_idle = std::time::Duration::from_millis(80);
-    let mut buffered: Vec<String> = Vec::new();
+    // Single-service mode filters to that service; all-services mode accepts
+    // every chunk (the daemon broadcasts all of them).
+    let want = |s: &str| service.as_deref().map(|n| n == s).unwrap_or(true);
+
+    // Drain the disk-backed replay up to the daemon's LogEnd marker. The
+    // generous timeout is only a safety net against a daemon that dies
+    // mid-replay; the marker is what normally terminates the loop.
+    let drain_max = std::time::Duration::from_secs(10);
+    let mut printed_any = false;
     loop {
-        match tokio::time::timeout(drain_idle, client.next_event()).await {
-            Ok(Ok(Some(ServerMessage::LogChunk { service: s, bytes, .. })))
-                if s == service =>
-            {
-                if let Ok(decoded) =
-                    base64::engine::general_purpose::STANDARD.decode(bytes.as_bytes())
-                    && let Ok(text) = String::from_utf8(decoded)
-                {
-                    for line in text.split('\n') {
-                        let line = line.trim_end_matches('\r');
-                        if !line.is_empty() {
-                            buffered.push(line.to_string());
-                        }
-                    }
-                }
+        match tokio::time::timeout(drain_max, client.next_event()).await {
+            Ok(Ok(Some(ServerMessage::LogChunk { service: s, bytes, ts, stream }))) if want(&s) => {
+                emit_log(&s, ts, stream, &bytes, json);
+                printed_any = true;
+            }
+            Ok(Ok(Some(ServerMessage::LogEnd {}))) => break, // replay finished
+            Ok(Ok(Some(ServerMessage::Notice { message, .. }))) => {
+                // Truncation marker etc. — to stderr so it never pollutes the
+                // (possibly JSON) stdout stream.
+                eprintln!("devme: {message}");
             }
             Ok(Ok(Some(_))) => {}
-            Ok(Ok(None)) | Ok(Err(_)) => return Ok(()),
-            Err(_) => break, // idle — replay finished
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => return Ok(()),
         }
-    }
-    // Apply --tail: 0 = unlimited (docker-compose semantics).
-    let printed_any = !buffered.is_empty();
-    let skip = if tail == 0 {
-        0
-    } else {
-        buffered.len().saturating_sub(tail)
-    };
-    for line in buffered.iter().skip(skip) {
-        print_prefixed(&service, line);
     }
 
     if !follow {
         if !printed_any {
-            eprintln!("devme: no buffered logs for {service:?} yet (try --follow to wait)");
+            let what = service.as_deref().unwrap_or("any service");
+            eprintln!("devme: no logs for {what} yet (try --follow to wait)");
         }
         return Ok(());
     }
 
     // --follow: keep streaming new lines indefinitely. Ctrl-C exits cleanly.
     if !printed_any {
-        eprintln!("devme: tailing {service:?} (Ctrl-C to stop)");
+        let what = service.as_deref().unwrap_or("all services");
+        eprintln!("devme: tailing {what} (Ctrl-C to stop)");
     }
     let interrupt = tokio::signal::ctrl_c();
     let mut pinned_interrupt = std::pin::pin!(interrupt);
@@ -737,19 +790,101 @@ async fn logs(service: String, follow: bool, tail: usize) -> anyhow::Result<()> 
         tokio::select! {
             _ = &mut pinned_interrupt => return Ok(()),
             msg = client.next_event() => match msg? {
-                Some(ServerMessage::LogChunk { service: s, bytes, .. }) if s == service => {
-                    if let Ok(decoded) =
-                        base64::engine::general_purpose::STANDARD.decode(bytes.as_bytes())
-                        && let Ok(text) = String::from_utf8(decoded)
-                    {
-                        print_prefixed(&service, &text);
-                    }
+                Some(ServerMessage::LogChunk { service: s, bytes, ts, stream }) if want(&s) => {
+                    emit_log(&s, ts, stream, &bytes, json);
                 }
                 Some(ServerMessage::Goodbye { .. }) | None => return Ok(()),
                 _ => {}
             }
         }
     }
+}
+
+/// Decode and print one log chunk — either prefixed text or an NDJSON record
+/// (`{ts, service, stream, text}`, ANSI stripped) for piping to `jq`.
+fn emit_log(service: &str, ts: u64, stream: devme_core::LogStream, bytes: &str, json: bool) {
+    let decoded = match base64::engine::general_purpose::STANDARD.decode(bytes.as_bytes()) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let text = String::from_utf8_lossy(&decoded);
+    for line in text.split('\n') {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        if json {
+            let obj = serde_json::json!({
+                "ts": ts,
+                "service": service,
+                "stream": stream,
+                "text": strip_ansi(line),
+            });
+            println!("{obj}");
+        } else {
+            print_prefixed(service, line);
+        }
+    }
+}
+
+/// Parse a `--since` value into an epoch-ms floor. Accepts a duration relative
+/// to now (`30s`, `5m`, `2h`, `1d`) or a bare epoch-ms timestamp.
+fn parse_since(s: &str) -> anyhow::Result<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("empty --since");
+    }
+    // Bare digits → absolute epoch-ms timestamp.
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        return s
+            .parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("invalid --since timestamp {s:?}"));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let (num, unit) = s.split_at(s.len() - 1);
+    let n: u64 = num
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid --since {s:?}; use 30s, 5m, 2h, 1d or epoch-ms"))?;
+    let ms = match unit {
+        "s" => n * 1_000,
+        "m" => n * 60_000,
+        "h" => n * 3_600_000,
+        "d" => n * 86_400_000,
+        _ => anyhow::bail!("invalid --since unit in {s:?}; use s, m, h or d"),
+    };
+    Ok(now.saturating_sub(ms))
+}
+
+/// Strip ANSI escape sequences (color/cursor) — noise for an agent reading
+/// `--json`. Drops `ESC [ … <final-byte>` and lone `ESC x` pairs.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    while let Some(&c2) = chars.peek() {
+                        chars.next();
+                        if c2.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 async fn doctor(tail: usize) -> anyhow::Result<()> {
@@ -1408,4 +1543,44 @@ fn socket_path() -> std::path::PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     devme_config::paths::supervisor_socket(&cwd)
         .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/devme.sock"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_since_accepts_durations() {
+        // 30s before "now" should be ~30_000 ms below now; assert the delta.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let got = parse_since("30s").unwrap();
+        let delta = now.saturating_sub(got);
+        assert!((29_000..=31_000).contains(&delta), "delta was {delta}");
+        // Units scale as expected, measured against a single `now`.
+        assert!(parse_since("5m").unwrap() < parse_since("30s").unwrap());
+        assert!(parse_since("2h").unwrap() < parse_since("5m").unwrap());
+        assert!(parse_since("1d").unwrap() < parse_since("2h").unwrap());
+    }
+
+    #[test]
+    fn parse_since_accepts_bare_epoch_ms() {
+        assert_eq!(parse_since("1730000000000").unwrap(), 1_730_000_000_000);
+    }
+
+    #[test]
+    fn parse_since_rejects_garbage() {
+        assert!(parse_since("soon").is_err());
+        assert!(parse_since("5y").is_err());
+        assert!(parse_since("").is_err());
+    }
+
+    #[test]
+    fn strip_ansi_removes_color_keeps_text() {
+        assert_eq!(strip_ansi("\x1b[32mok\x1b[0m done"), "ok done");
+        assert_eq!(strip_ansi("plain"), "plain");
+        assert_eq!(strip_ansi("\x1b[2K\x1b[0Gprogress"), "progress");
+    }
 }
