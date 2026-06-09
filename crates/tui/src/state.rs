@@ -3110,6 +3110,37 @@ mod tests {
     }
 
     #[test]
+    fn git_refresh_relabels_on_branch_checkout() {
+        // The worktree row starts labelled "test"; a background refresh that
+        // reports a new branch re-labels it in place and updates the counts.
+        let mut s = TuiState::default();
+        s.apply(snapshot_msg(&["api"]));
+        let idx = s.find_instance("test-id").unwrap();
+        assert_eq!(s.instances()[idx], "test");
+
+        s.apply_git_refresh("test-id", Some("feature/x".into()), Some((2, 0)));
+        assert_eq!(s.instances()[idx], "feature/x");
+        assert_eq!(s.instance_ahead_behind(idx), Some((2, 0)));
+
+        // Switching to a branch with no upstream clears the stale counts but
+        // still re-labels.
+        s.apply_git_refresh("test-id", Some("main".into()), None);
+        assert_eq!(s.instances()[idx], "main");
+        assert_eq!(s.instance_ahead_behind(idx), None);
+    }
+
+    #[test]
+    fn git_refresh_keeps_label_when_branch_unknown() {
+        // A detached HEAD / transient git failure (branch = None) must not
+        // blank the last-known label.
+        let mut s = TuiState::default();
+        s.apply(snapshot_msg(&["api"]));
+        let idx = s.find_instance("test-id").unwrap();
+        s.apply_git_refresh("test-id", None, None);
+        assert_eq!(s.instances()[idx], "test");
+    }
+
+    #[test]
     fn subscribed_message_populates_services_and_selects_first() {
         let mut s = TuiState::default();
         s.apply(snapshot_msg(&["db", "backend"]));

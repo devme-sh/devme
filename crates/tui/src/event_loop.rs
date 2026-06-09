@@ -20,12 +20,16 @@ use crate::worktree::{AutoSpawner, WorktreeEvent};
 const LOG_PAGE: usize = 20;
 const MOUSE_SCROLL_LINES: usize = 3;
 
+// 1002 = button-event tracking: reports press, release, AND motion *while a
+// button is held* (drag). Plain 1000 reports press/release only — no drag
+// events — so divider/scrollbar dragging never fired under it. 1006 = SGR
+// extended coordinates (so columns past 223 still report).
 fn enable_mouse(w: &mut impl std::io::Write) -> std::io::Result<()> {
-    w.write_all(b"\x1b[?1000h\x1b[?1006h")
+    w.write_all(b"\x1b[?1002h\x1b[?1006h")
 }
 
 fn disable_mouse(w: &mut impl std::io::Write) -> std::io::Result<()> {
-    w.write_all(b"\x1b[?1000l\x1b[?1006l")
+    w.write_all(b"\x1b[?1002l\x1b[?1006l")
 }
 
 /// Launch the TUI. Must be called from within a tokio runtime.
@@ -276,7 +280,9 @@ async fn run(
                         // else cancels.
                         _ if state.quit_confirm_visible() => match k.code {
                             // Press `q` again (or s/y/Enter) to stop every
-                            // service, then quit (like `devme down`).
+                            // service in every stack, then quit (like `devme
+                            // down --all` — the TUI started them all, so it
+                            // stops them all).
                             KeyCode::Char('q')
                             | KeyCode::Char('s')
                             | KeyCode::Char('y')
@@ -284,7 +290,7 @@ async fn run(
                                 if !no_shutdown
                                     && let Ok(cwd) = std::env::current_dir()
                                 {
-                                    crate::worktree::shutdown_current_and_shared(&cwd).await;
+                                    crate::worktree::shutdown_all(&cwd).await;
                                 }
                                 return Ok(());
                             }
@@ -537,10 +543,10 @@ async fn run(
                                         if !no_shutdown
                                             && let Ok(cwd) = std::env::current_dir()
                                         {
-                                            // Stop this stack + the shared
-                                            // services (sibling-safe), exactly
-                                            // like `devme down`.
-                                            crate::worktree::shutdown_current_and_shared(&cwd).await;
+                                            // Stop every stack the TUI started
+                                            // + the shared services, exactly
+                                            // like `devme down --all`.
+                                            crate::worktree::shutdown_all(&cwd).await;
                                         }
                                         return Ok(());
                                     }

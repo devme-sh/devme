@@ -842,7 +842,7 @@ mod tests {
             follow: false,
             tail: 200
         })));
-        assert!(is_proxyable(&Some(C::Down { timeout: 10 })));
+        assert!(is_proxyable(&Some(C::Down { timeout: 10, all: false })));
         // Machine-local / non-daemon commands never proxy.
         assert!(!is_proxyable(&Some(C::Config { action: None })));
         assert!(!is_proxyable(&Some(C::Remote { action: None })));

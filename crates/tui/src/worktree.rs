@@ -683,18 +683,30 @@ pub async fn shutdown_shared_if_last(cwd: &Path) -> bool {
     false
 }
 
-/// Graceful "quit this stack" used by the TUI's `q`: stop the current
-/// worktree's own services, then — sibling-safe — the repo-shared services
-/// too. Mirrors `devme down`. Each `Shutdown` is sent over a fresh awaited
-/// connection (not the discovery channel, which the writer task would drop on
-/// process exit), so delivery is guaranteed before the TUI returns.
-pub async fn shutdown_current_and_shared(cwd: &Path) {
-    if let Ok(sock) = devme_config::paths::supervisor_socket(cwd)
-        && let Ok(mut client) = Client::connect(&sock).await
-    {
-        let _ = client.send(ClientMessage::Shutdown).await;
+/// Graceful "quit everything" used by the TUI's `q`: stop *every* worktree's
+/// stack in the repo, then the repo-shared services. The TUI autospawns a
+/// daemon for every worktree (see [`AutoSpawner::bind`]), so quitting it stops
+/// every one it started rather than orphaning the siblings — the repo-wide
+/// twin of `devme down --all`. Each `Shutdown` goes over a fresh awaited
+/// connection (not the discovery channel, whose writer task drops on process
+/// exit), so delivery is guaranteed; we don't drain the replies, keeping `q`
+/// snappy (the daemons stop their services on their own). Best-effort:
+/// worktrees with no running daemon are skipped.
+pub async fn shutdown_all(cwd: &Path) {
+    for wt in list_worktrees(cwd) {
+        if let Ok(sock) = devme_config::paths::supervisor_socket(&wt.path)
+            && let Ok(mut client) = Client::connect(&sock).await
+        {
+            let _ = client.send(ClientMessage::Shutdown).await;
+        }
     }
-    shutdown_shared_if_last(cwd).await;
+    // Every instance daemon has been told to stop, so the shared services are
+    // free to stop unconditionally (no sibling can still be relying on them).
+    if let Ok(shared_sock) = devme_config::paths::shared_socket(cwd)
+        && let Ok(mut shared) = Client::connect(&shared_sock).await
+    {
+        let _ = shared.send(ClientMessage::Shutdown).await;
+    }
 }
 
 /// Re-spawn the repo-shared daemon and an instance daemon for every worktree

@@ -70,12 +70,19 @@ pub enum Command {
         #[arg(long, default_value_t = 30, requires = "wait")]
         timeout: u64,
     },
-    /// Shut down this instance's supervisor.
+    /// Shut down this worktree's supervisor (and the repo-shared services,
+    /// if no sibling worktree is still using them). Use `--all` to stop
+    /// every worktree's stack in the repo.
     Down {
         /// Seconds to wait for graceful service stops before SIGKILL.
         /// Matches `docker compose down -t`.
         #[arg(long, short = 't', default_value_t = 10)]
         timeout: u64,
+        /// Stop every worktree of the repo, not just the current one — then
+        /// the repo-shared services. The repo-wide counterpart to the
+        /// current-worktree default, mirroring `devme status --all`.
+        #[arg(long)]
+        all: bool,
     },
     /// Print a snapshot of current service status.
     Status {

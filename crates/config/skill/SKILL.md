@@ -86,7 +86,7 @@ Rules:
 | `devme logs <svc> --tail N` | Last N lines of a service |
 | `devme url <svc> [-o]` | Print a service's URL; `-o` opens it in the browser |
 | `devme start/stop/restart <svc>` | Lifecycle a single service |
-| `devme up -d` / `up -y` / `down` | Start all detached / start running `prompt` provisions unattended (CI) / stop all |
+| `devme up -d` / `up -y` / `down [--all]` | Start all detached / start running `prompt` provisions unattended (CI) / stop this worktree's stack (`--all` = every worktree, like `status --all`) |
 | `devme worktree add <branch> [path]` | New worktree (+branch), runs `[stack] on_create`, ready for `devme up`. Default path `<repo>-<branch-leaf>` |
 | `devme worktree rm <target>` | Stop stack, run `on_destroy`, `git worktree remove`. Target by path/dir/branch; `-f` forces dirty |
 | `devme config [set <k> <v>] [check]` | Show / set global config; `check` lints `devme.toml` (`--json`, non-zero on errors) |
@@ -96,6 +96,6 @@ Rules:
 
 ### Notes
 
-- **Worktree-aware.** Each git worktree runs its own supervisor, slot, and ports. `doctor`/`status`/`logs`/`url` act on the worktree you're in — just call them. `devme status --all` shows every worktree's ports; `devme url <svc>` gives a ready link without guessing the slot.
+- **Worktree-aware.** Each git worktree runs its own supervisor, slot, and ports. `up`/`down`/`doctor`/`status`/`logs`/`url` act on the worktree you're in — just call them. `devme down --all` stops every worktree's stack (and the shared services); `devme status --all` shows every worktree's ports; `devme url <svc>` gives a ready link without guessing the slot.
 - **Restart cascades.** Services have dependency ordering; restarting a DB can cascade to dependents.
 - **Remote is remote-primary.** The supervisor, stack, and TUI run on `remote.host`; the laptop syncs files (Mutagen `two-way-safe` — a conflict *halts* the sync). It syncs the **main** worktree only; create worktrees on the host. While a sync is live, daemon commands (`status`, `logs`, `up`, `doctor`, `url`, …) auto-run on the remote — `devme logs api` streams the host's logs, and `devme url` rewrites to a laptop-reachable host. Run `devme remote doctor` before the first attach; if `devme remote status` shows conflicts the sync is halted — fix them first.

@@ -91,7 +91,7 @@ async fn run(cli: Cli) -> i32 {
                 status(cli.json).await
             }
         }
-        Some(Command::Down { timeout }) => down(timeout).await,
+        Some(Command::Down { timeout, all }) => down(timeout, all).await,
         Some(Command::Up { services, detach, wait, timeout }) => {
             up(services, detach, wait, timeout).await
         }
@@ -119,14 +119,81 @@ async fn run(cli: Cli) -> i32 {
     }
 }
 
-async fn down(timeout_secs: u64) -> anyhow::Result<()> {
+async fn down(timeout_secs: u64, all: bool) -> anyhow::Result<()> {
+    if all {
+        return down_all(timeout_secs).await;
+    }
+
     let sock = socket_path();
-    let mut client = match devme_client::Client::connect(&sock).await {
-        Ok(c) => c,
-        Err(_) => {
-            println!("devme: no daemon running");
-            return Ok(());
+    if !teardown_daemon(&sock, timeout_secs, None).await? {
+        println!("devme: no daemon running");
+        return Ok(());
+    }
+
+    // Shared (`scope = "repo"`) services — postgres, proxy — live in the
+    // shared supervisor, which other worktrees may be using. Tear it down too
+    // only when no other worktree still has a running daemon, so `devme down`
+    // is a complete stop in the common single-worktree case but doesn't yank
+    // a shared Postgres out from under a sibling worktree. (`down --all` stops
+    // it unconditionally — by then nothing is left to use it.)
+    if let Ok(cwd) = std::env::current_dir()
+        && devme_tui::worktree::shutdown_shared_if_last(&cwd).await
+    {
+        println!(" ✔ Shared services            Stopped");
+    }
+    Ok(())
+}
+
+/// `devme down --all`: stop every worktree's stack in the repo, then the
+/// repo-shared services. The repo-wide counterpart to the current-worktree
+/// default, scoped like `devme status --all` — and the CLI twin of the TUI's
+/// quit, which (because it autospawns every worktree) also stops them all.
+async fn down_all(timeout_secs: u64) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let reports = devme_tui::worktree::gather_worktree_reports(&cwd).await;
+
+    let mut any = false;
+    for r in &reports {
+        // Only worktrees with a live daemon have anything to stop.
+        if r.services.is_none() {
+            continue;
         }
+        let Ok(sock) = devme_config::paths::supervisor_socket(&r.path) else {
+            continue;
+        };
+        if teardown_daemon(&sock, timeout_secs, Some(&r.label)).await? {
+            any = true;
+        }
+    }
+
+    // Every instance daemon is down now, so the shared services are free to
+    // stop unconditionally (no sibling can still be relying on them).
+    if let Ok(shared_sock) = devme_config::paths::shared_socket(&cwd)
+        && let Ok(mut shared) = devme_client::Client::connect(&shared_sock).await
+    {
+        let _ = shared.send(ClientMessage::Shutdown).await;
+        println!(" ✔ Shared services            Stopped");
+        any = true;
+    }
+
+    if !any {
+        println!("devme: no daemons running");
+    }
+    Ok(())
+}
+
+/// Stop one instance daemon at `sock`, rendering docker-compose-style
+/// checkmarks as each service stops. `label`, when set, prefixes the section
+/// header so `--all` shows which worktree is being torn down. Returns `false`
+/// when no daemon was listening (nothing to stop).
+async fn teardown_daemon(
+    sock: &std::path::Path,
+    timeout_secs: u64,
+    label: Option<&str>,
+) -> anyhow::Result<bool> {
+    let mut client = match devme_client::Client::connect(sock).await {
+        Ok(c) => c,
+        Err(_) => return Ok(false),
     };
 
     // Snapshot first so we know what we're tearing down. The daemon emits
@@ -161,7 +228,10 @@ async fn down(timeout_secs: u64) -> anyhow::Result<()> {
         .collect();
 
     let total = live.len();
-    println!("[+] Stopping {total}/{total}");
+    match label {
+        Some(l) => println!("[+] Stopping {l} ({total}/{total})"),
+        None => println!("[+] Stopping {total}/{total}"),
+    }
 
     client.send(ClientMessage::Shutdown).await?;
 
@@ -174,7 +244,7 @@ async fn down(timeout_secs: u64) -> anyhow::Result<()> {
             eprintln!(
                 "devme: timeout after {timeout_secs}s — some services may still be running"
             );
-            return Ok(());
+            return Ok(true);
         }
         match tokio::time::timeout(remaining, client.next_event()).await {
             Ok(Ok(Some(ServerMessage::StatusUpdate {
@@ -192,7 +262,7 @@ async fn down(timeout_secs: u64) -> anyhow::Result<()> {
                 eprintln!(
                     "devme: timeout after {timeout_secs}s — some services may still be running"
                 );
-                return Ok(());
+                return Ok(true);
             }
         }
     }
@@ -204,19 +274,7 @@ async fn down(timeout_secs: u64) -> anyhow::Result<()> {
             println!(" ✔ Service {name:<20}  Stopped   {elapsed:>5.1}s");
         }
     }
-
-    // Shared (`scope = "repo"`) services — postgres, proxy — live in the
-    // shared supervisor, which other worktrees may be using. Tear it down too
-    // only when no other worktree still has a running daemon, so `devme down`
-    // is a complete stop in the common single-worktree case but doesn't yank
-    // a shared Postgres out from under a sibling worktree. The same helper
-    // backs the TUI's `q`.
-    if let Ok(cwd) = std::env::current_dir()
-        && devme_tui::worktree::shutdown_shared_if_last(&cwd).await
-    {
-        println!(" ✔ Shared services            Stopped");
-    }
-    Ok(())
+    Ok(true)
 }
 
 /// Cross-worktree status (`--all`): every worktree of the repo with its slot
