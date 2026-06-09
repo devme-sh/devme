@@ -125,6 +125,12 @@ struct ResolvedService {
     name: String,
     cmd: String,
     env: Vec<(String, String)>,
+    /// Resolved listen port (slot 0), surfaced in status snapshots so the TUI
+    /// can show it and the open/copy-URL actions have something to act on.
+    port: Option<u16>,
+    /// Copy/open URL template (`{host}`/`{port}` placeholders) — see
+    /// [`devme_config::Service::url_template`].
+    url: Option<String>,
     /// Interpolated teardown command run on shutdown before signalling.
     stop: Option<String>,
 }
@@ -187,6 +193,8 @@ fn resolve_repo_services(stack: &Stack, cwd: &std::path::Path) -> Vec<ResolvedSe
             name: name.clone(),
             cmd,
             env,
+            port: svc.port.map(|spec| spec.resolve(0)),
+            url: svc.url_template(),
             stop,
         });
     }
@@ -286,7 +294,7 @@ impl SharedState {
         // Spawn each repo-scoped service. Failures are surfaced as Failed
         // snapshots rather than killing the whole daemon, because partial
         // availability is more useful than nothing at all.
-        for ResolvedService { name, cmd, env, stop } in services {
+        for ResolvedService { name, cmd, env, port, url, stop } in services {
             let env_slice: Vec<(&str, &str)> =
                 env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
             match ChildProcess::spawn_parts::<&str>(cmd, cwd, &env_slice) {
@@ -303,7 +311,8 @@ impl SharedState {
                         name: name.clone(),
                         state: ServiceState::Running { degraded: false, started_without: vec![] },
                         pid: Some(pid),
-                        port: None,
+                        port: *port,
+                        url: url.clone(),
                         restart_count: 0,
                     };
                     services_map.lock().await.insert(

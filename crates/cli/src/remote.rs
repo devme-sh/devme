@@ -15,6 +15,11 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use devme_config::{GlobalConfig, paths, remote};
 
+/// Mutagen label devme stamps on every sync it creates, so `devme remote
+/// wake` can flush *only* devme-managed sessions.
+const DEVME_LABEL: &str = "managed-by=devme";
+const DEVME_LABEL_SELECTOR: &str = "managed-by=devme";
+
 /// Everything a `devme remote` action needs, resolved once from global
 /// config + the current repo.
 struct Resolved {
@@ -30,6 +35,8 @@ struct Resolved {
     root: String,
     /// Browser-reachable host for service URLs (Tailscale name etc.).
     url_host: String,
+    /// Ensure the remote stack is up (`devme up -d`) before attaching.
+    up_on_attach: bool,
     ignores: Vec<String>,
 }
 
@@ -61,8 +68,42 @@ fn resolve(cwd: &Path) -> Result<Resolved> {
         attach: r.attach_or_default().to_string(),
         root,
         url_host,
+        up_on_attach: r.up_on_attach_or_default(),
         ignores: r.ignores(),
     })
+}
+
+// --- advertise host (VPS-side `devme url`) ----------------------------------
+
+/// This machine's own Tailscale MagicDNS name (`vps.goose-viper.ts.net`), or
+/// `None` if the `tailscale` CLI is absent / not up. Best-effort: any failure
+/// is just "no autodetected name", never an error. The trailing dot Tailscale
+/// appends to the FQDN is trimmed so it slots straight into a URL authority.
+fn tailscale_self_dns() -> Option<String> {
+    let out = Command::new("tailscale").args(["status", "--json"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let name = v.get("Self")?.get("DNSName")?.as_str()?;
+    let name = name.trim().trim_end_matches('.');
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The host `devme url` should advertise for a service on *this* machine.
+/// Resolves `$DEVME_URL_HOST` (exported by the laptop's attach templates) →
+/// `remote.advertise_host` (`"auto"` autodetects the Tailscale name) →
+/// `localhost`. Lets an agent in a herdr pane on the VPS hand back a
+/// laptop-reachable URL instead of an unreachable loopback one.
+pub fn advertise_host() -> String {
+    let env = std::env::var("DEVME_URL_HOST").ok();
+    let configured = GlobalConfig::load().remote.advertise_host;
+    // Only pay for the Tailscale lookup when the config actually asks for it.
+    let tailscale = (configured.as_deref().map(str::trim) == Some(remote::ADVERTISE_AUTO))
+        .then(tailscale_self_dns)
+        .flatten();
+    remote::pick_advertise_host(env.as_deref(), configured.as_deref(), tailscale.as_deref())
+        .unwrap_or_else(|| "localhost".to_string())
 }
 
 // --- mutagen wrappers -------------------------------------------------------
@@ -112,6 +153,8 @@ fn sync_create(r: &Resolved) -> Result<()> {
         "create".into(),
         format!("--name={}", r.session),
         format!("--sync-mode={}", r.sync_mode),
+        // Label so `devme remote wake` can flush only devme-managed syncs.
+        format!("--label={DEVME_LABEL}"),
         // Git bookkeeping that flaps during remote commits — never sync it.
         "--ignore=.git/index.lock".into(),
     ];
@@ -172,6 +215,29 @@ fn ssh_check(host: &str, remote_cmd: &str) -> (bool, String) {
             (o.status.success(), s.trim().to_string())
         }
         Err(e) => (false, e.to_string()),
+    }
+}
+
+/// Ensure the stack is running on the remote before we attach, by shelling
+/// `devme up -d` over SSH. Idempotent (an already-running stack is a no-op
+/// reconcile) and **non-fatal**: the supervisor owns the stack's lifetime, so
+/// even if this fails the attach session may still be useful — we warn and
+/// continue rather than abort. The `-d` detach is what keeps the stack alive
+/// under the supervisor (not inside the herdr/ssh session you're attaching).
+fn remote_up(r: &Resolved) {
+    let cmd = format!("cd {} && devme up -d", shell_quote(&r.remote_path));
+    eprintln!("devme remote: ensuring stack is up on {} …", r.host);
+    let status = Command::new("ssh")
+        .args(["-o", "BatchMode=yes", &r.host])
+        .arg(&cmd)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => eprintln!(
+            "devme remote: warning: remote `devme up -d` exited {} (attaching anyway)",
+            s.code().map(|c| c.to_string()).unwrap_or_else(|| "by signal".into())
+        ),
+        Err(e) => eprintln!("devme remote: warning: couldn't start remote stack: {e} (attaching anyway)"),
     }
 }
 
@@ -236,8 +302,11 @@ fn forwarded_args() -> Vec<String> {
 /// numbers) pass through unquoted. The `'\''` escape is also valid in fish,
 /// so this is safe whatever login shell the remote uses.
 fn shell_quote(s: &str) -> String {
+    // `~` is allowed unquoted so a remote path like `~/development/foo` keeps
+    // its tilde expansion (single-quoting would make the remote shell `cd`
+    // into a literal `~` directory).
     let simple = !s.is_empty()
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || "_./:=-".contains(c));
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || "_./:=-~".contains(c));
     if simple {
         s.to_string()
     } else {
@@ -255,8 +324,17 @@ fn remote_devme_cmd(r: &Resolved, args: &[String]) -> String {
 /// Stream a command through to the remote with an inherited TTY (so `logs
 /// -f`, `up` foreground, and Ctrl-C all behave).
 fn proxy_passthrough(r: &Resolved) -> i32 {
+    use std::io::IsTerminal;
     let cmd = remote_devme_cmd(r, &forwarded_args());
-    let status = Command::new("ssh").args(["-t", &r.host]).arg(&cmd).status();
+    let mut ssh = Command::new("ssh");
+    // Allocate a remote TTY only when we have one locally — so interactive
+    // streaming (`logs -f`, foreground `up`) works, but captured/piped output
+    // (agents, scripts) doesn't trip ssh's "pseudo-terminal will not be
+    // allocated" warning.
+    if std::io::stdin().is_terminal() {
+        ssh.arg("-t");
+    }
+    let status = ssh.arg(&r.host).arg(&cmd).status();
     match status {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => {
@@ -307,7 +385,15 @@ pub fn run(cwd: &Path) -> Result<()> {
     ensure_mutagen_daemon();
     ensure_sync(&r)?;
 
-    let cmd = remote::expand_attach(&r.attach, &r.host, &r.remote_path, &r.session);
+    // Bring the stack up under the supervisor before attaching, so herdr/ssh
+    // attaches land in a project whose dev server is already running (and that
+    // keeps running when you detach). `tui`/`tmux` would start it themselves,
+    // but `up -d` first is idempotent and makes the herdr/ssh presets work too.
+    if r.up_on_attach {
+        remote_up(&r);
+    }
+
+    let cmd = remote::expand_attach(&r.attach, &r.host, &r.remote_path, &r.session, &r.url_host);
     eprintln!("devme remote: attaching ({}) → {}", r.attach, r.host);
     // Hand the terminal to a real shell so all quoting in the attach template
     // is honored and a full-screen remote TUI gets the inherited TTY.
@@ -370,6 +456,121 @@ pub fn flush(cwd: &Path) -> Result<()> {
     sync_flush(&r.session)?;
     eprintln!("devme remote: flushed {}", r.session);
     Ok(())
+}
+
+/// `devme remote wake`: force an immediate reconcile of **every** devme-
+/// managed sync. This is what the wake hook runs so changes the remote made
+/// while the laptop slept come down right away instead of on the next poll.
+/// Best-effort and quiet — safe to call when no syncs exist.
+pub fn wake() -> Result<()> {
+    if !mutagen_available() {
+        return Ok(());
+    }
+    ensure_mutagen_daemon();
+    let _ = Command::new("mutagen")
+        .args(["sync", "flush", "--label-selector", DEVME_LABEL_SELECTOR])
+        .status();
+    // Proactively flag any sync that halted on conflict while the laptop slept,
+    // so the silent two-way-safe halt surfaces the moment you're back instead
+    // of the next time you happen to run a devme command.
+    let n = devme_conflict_total();
+    if n > 0 {
+        eprintln!("devme remote: ⚠ {n} conflict(s) across devme syncs — run `devme remote conflicts`");
+        notify(&format!("{n} sync conflict(s) after wake — run `devme remote conflicts`"));
+    }
+    Ok(())
+}
+
+const WAKE_BEGIN: &str = "# >>> devme wake-hook >>>";
+const WAKE_END: &str = "# <<< devme wake-hook <<<";
+
+/// `devme remote wake-hook [--uninstall]`: wire `devme remote wake` into the
+/// OS wake event. On macOS this uses sleepwatcher's `~/.wakeup` convention
+/// (`brew install sleepwatcher`); the hook is a marked block so install /
+/// uninstall are idempotent and never disturb the user's other wake scripts.
+pub fn wake_hook(uninstall: bool) -> Result<()> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| anyhow!("HOME is not set"))?;
+    let path = home.join(".wakeup");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+
+    if uninstall {
+        if !existing.contains(WAKE_BEGIN) {
+            eprintln!("devme remote: no wake-hook installed");
+            return Ok(());
+        }
+        let cleaned = strip_marked_block(&existing);
+        std::fs::write(&path, cleaned).context("updating ~/.wakeup")?;
+        eprintln!("devme remote: wake-hook removed from {}", path.display());
+        return Ok(());
+    }
+
+    if existing.contains(WAKE_BEGIN) {
+        eprintln!("devme remote: wake-hook already installed in {}", path.display());
+        return Ok(());
+    }
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    if content.is_empty() {
+        content.push_str("#!/bin/sh\n");
+    }
+    content.push_str(&format!(
+        "{WAKE_BEGIN}\ncommand -v devme >/dev/null 2>&1 && devme remote wake >/dev/null 2>&1\n{WAKE_END}\n"
+    ));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).context("creating home dir for ~/.wakeup")?;
+    }
+    std::fs::write(&path, content).context("writing ~/.wakeup")?;
+    // sleepwatcher requires the script be executable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&path) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o755);
+            let _ = std::fs::set_permissions(&path, perms);
+        }
+    }
+    eprintln!("devme remote: wake-hook installed in {}", path.display());
+    if !sleepwatcher_present() {
+        eprintln!(
+            "  note: install + start sleepwatcher so it fires:\n    brew install sleepwatcher && brew services start sleepwatcher"
+        );
+    }
+    Ok(())
+}
+
+/// Remove the `# >>> devme wake-hook >>>` … `# <<< … <<<` block, leaving the
+/// rest of the file untouched.
+fn strip_marked_block(content: &str) -> String {
+    let mut out = String::new();
+    let mut skipping = false;
+    for line in content.lines() {
+        if line.trim() == WAKE_BEGIN {
+            skipping = true;
+            continue;
+        }
+        if line.trim() == WAKE_END {
+            skipping = false;
+            continue;
+        }
+        if !skipping {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn sleepwatcher_present() -> bool {
+    Command::new("sh")
+        .args(["-c", "command -v sleepwatcher"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// `devme remote status`: conflict-aware sync state. Silent Mutagen halts on
@@ -451,6 +652,140 @@ fn sync_status_fields(session: &str) -> (Option<String>, Option<u64>) {
     }
 }
 
+/// `devme remote conflicts`: surface a halted two-way-safe sync loudly. Lists
+/// the conflicting paths, the full Mutagen alpha/beta detail, and the safe
+/// ways to resolve — the git-mergetool-style *visibility* that turns a silent
+/// halt into something actionable. (Auto-picking a winner is intentionally
+/// not done here: Mutagen OSS has no per-file winner, and a blind take-a-side
+/// can clobber overnight remote work — resolve explicitly.)
+pub fn conflicts(cwd: &Path, json: bool) -> Result<()> {
+    let r = resolve(cwd)?;
+    require_mutagen()?;
+
+    if !sync_exists(&r.session) {
+        if json {
+            let v = serde_json::json!({
+                "session": r.session, "exists": false, "conflicts": 0, "paths": [],
+            });
+            println!("{}", serde_json::to_string_pretty(&v)?);
+        } else {
+            println!("no live-sync for this project (run `devme remote` to start one)");
+        }
+        return Ok(());
+    }
+
+    let count = sync_status_fields(&r.session).1.unwrap_or(0);
+    let paths = conflict_paths(&r.session);
+
+    if json {
+        let v = serde_json::json!({
+            "session": r.session,
+            "exists": true,
+            "host": r.host,
+            "remote_path": r.remote_path,
+            "conflicts": count,
+            "paths": paths,
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+
+    if count == 0 {
+        println!("no conflicts — sync is healthy ({})", r.session);
+        return Ok(());
+    }
+
+    println!("⚠ {count} conflict(s) — two-way-safe sync is HALTED until resolved.\n");
+    if paths.is_empty() {
+        println!("  (couldn't enumerate paths on this Mutagen version — see the detail below)\n");
+    } else {
+        println!("conflicting paths:");
+        for p in &paths {
+            println!("  • {p}");
+        }
+        println!();
+    }
+    // Full per-endpoint detail (the alpha/beta versions) verbatim.
+    let _ = Command::new("mutagen").args(["sync", "list", "--long", &r.session]).status();
+    println!("\nresolve by making the two sides agree, then re-sync:");
+    println!("  • keep the LAPTOP copy:  re-save (`touch`) the file locally, then `devme remote flush`");
+    println!("  • keep the REMOTE copy:  delete the local copy, then `devme remote flush`");
+    println!("                           (the remote — primary — version syncs back down)");
+    println!("  • inspect the remote:    ssh {} 'cd {} && …'", r.host, r.remote_path);
+    println!("\nThe whole tree (including .git) is synced, so genuine code divergence");
+    println!("can also be settled with normal git on either side.");
+    Ok(())
+}
+
+/// Conflicting paths in a session, parsed best-effort from Mutagen via a Go
+/// template (one path per line across both sides of every conflict). Returns
+/// an empty vec on any hiccup — the caller still has the raw `--long` detail
+/// and the conflict count. The sync-root conflict has an empty path and is
+/// reported as `<sync root>`.
+fn conflict_paths(session: &str) -> Vec<String> {
+    let template = "{{range .}}{{range .Conflicts}}{{range .AlphaChanges}}{{.Path}}\n{{end}}{{range .BetaChanges}}{{.Path}}\n{{end}}{{end}}{{end}}";
+    let out = Command::new("mutagen")
+        .args(["sync", "list", session, "--template", template])
+        .output();
+    let Ok(o) = out else { return Vec::new() };
+    if !o.status.success() {
+        return Vec::new();
+    }
+    let s = String::from_utf8_lossy(&o.stdout);
+    let mut seen = std::collections::BTreeSet::new();
+    for line in s.lines() {
+        let p = line.trim();
+        seen.insert(if p.is_empty() { "<sync root>".to_string() } else { p.to_string() });
+    }
+    seen.into_iter().collect()
+}
+
+/// Total conflict count across every devme-managed sync (best-effort, 0 on any
+/// hiccup). Used by `wake` to proactively flag an overnight halt.
+fn devme_conflict_total() -> u64 {
+    let out = Command::new("mutagen")
+        .args([
+            "sync",
+            "list",
+            "--label-selector",
+            DEVME_LABEL_SELECTOR,
+            "--template",
+            "{{range .}}{{len .Conflicts}}\n{{end}}",
+        ])
+        .output();
+    let Ok(o) = out else { return 0 };
+    if !o.status.success() {
+        return 0;
+    }
+    String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<u64>().ok())
+        .sum()
+}
+
+/// Best-effort desktop notification (macOS only). A no-op elsewhere or if the
+/// notifier is missing — the terminal output is the real contract; the OS
+/// toast just means a sync that halted while the laptop slept doesn't go
+/// unnoticed until the next time you happen to run a devme command.
+fn notify(message: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let via_tn = Command::new("terminal-notifier")
+            .args(["-title", "devme", "-message", message])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !via_tn {
+            let script = format!("display notification {message:?} with title \"devme\"");
+            let _ = Command::new("osascript").args(["-e", &script]).output();
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = message;
+    }
+}
+
 /// Does the project's `devme.toml` declare any Docker-backed services? Used
 /// to decide whether the remote-Docker doctor check is even relevant.
 fn local_stack_needs_docker(root: &Path) -> bool {
@@ -482,9 +817,21 @@ mod tests {
         assert_eq!(shell_quote("--tail"), "--tail");
         assert_eq!(shell_quote("200"), "200");
         assert_eq!(shell_quote("svc-1.2/x:y=z"), "svc-1.2/x:y=z");
+        // Tilde paths pass through so remote `cd ~/…` still expands.
+        assert_eq!(shell_quote("~/development/api-abc"), "~/development/api-abc");
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
         assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn strip_marked_block_removes_only_the_devme_block() {
+        let content = "#!/bin/sh\nuser-line\n# >>> devme wake-hook >>>\ndevme remote wake\n# <<< devme wake-hook <<<\nother\n";
+        let out = strip_marked_block(content);
+        assert!(out.contains("user-line"));
+        assert!(out.contains("other"));
+        assert!(!out.contains("devme remote wake"));
+        assert!(!out.contains("devme wake-hook"));
     }
 
     #[test]

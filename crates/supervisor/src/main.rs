@@ -43,6 +43,17 @@ fn real_main() -> anyhow::Result<()> {
         }
     }
 
+    // Whether this stack has any repo-scoped (now `external`) services. If so,
+    // their lifecycle is owned by the shared supervisor — which this daemon
+    // must make sure is running, otherwise nothing ever spawns proxy/postgres
+    // and every dependent here waits forever. The TUI / `devme up` also try to
+    // ensure it, but doing it here too makes the daemon self-healing: it's the
+    // one process guaranteed to be alive whenever this stack's services run, so
+    // a fire-and-forget front-end attempt that raced or failed silently can't
+    // leave the stack wedged. See ADR-0007.
+    let has_external = stack.service.values().any(|s| s.external);
+    let cwd_for_shared = cwd.clone();
+
     devme_config::validate(&stack).map_err(|errors| {
         let joined = errors
             .iter()
@@ -92,6 +103,15 @@ fn real_main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
     let result = runtime.block_on(async move {
+        // Make sure the shared supervisor (owner of repo-scoped services) is up
+        // before we start health-probing its services. Non-fatal: a transient
+        // failure shouldn't stop this daemon from coming up, and the probe loop
+        // will pick the services up once the shared daemon is healthy.
+        if has_external
+            && let Err(e) = devme_supervisor::spawn::ensure_shared_daemon(&cwd_for_shared).await
+        {
+            eprintln!("devme-supervisor: shared supervisor not started: {e}");
+        }
         // bind must run inside the tokio runtime — UnixListener registers
         // with the reactor at creation time.
         let server = DaemonServer::bind_with_instance(&sock_path, stack, slot, instance)?;

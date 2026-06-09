@@ -207,6 +207,30 @@ fn git_branch_name(cwd: &Path) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+/// The worktree's current branch (`git rev-parse --abbrev-ref HEAD`), or
+/// `None` on a detached HEAD, a non-repo dir, or git failure. The async
+/// sibling of the sync [`git_branch_name`] above: the TUI's periodic refresh
+/// calls this off the render thread so checking out a different branch
+/// re-labels the sidebar row in place.
+pub async fn git_branch(cwd: &str) -> Option<String> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8(out.stdout).ok()?;
+    let trimmed = branch.trim();
+    if trimmed.is_empty() || trimmed == "HEAD" {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 /// Commits the worktree's branch is ahead/behind its upstream, as
 /// `(ahead, behind)`. `None` when there's no upstream, the dir isn't a git
 /// repo, or git fails. Run off the render thread (it shells out to git).
@@ -332,8 +356,15 @@ fn ensure_docker_for(path: &Path) {
     }
 }
 
-/// Run the `[stack] on_create` script if this worktree hasn't been
-/// initialized yet. A `.devme-initialized` marker file prevents re-running.
+/// Run the `[stack] on_create` script once per worktree, if one is defined.
+/// A `.devme-initialized` marker prevents re-running it.
+///
+/// Most stacks need no `on_create` at all: per-worktree setup (deps, DB
+/// clone, migrations) is better expressed as `[step]` check/provision, which
+/// is idempotent and reality-based (re-runs if you delete the artifact) — a
+/// marker only records that a command *ran*, not that its result still
+/// exists. So when there's no `on_create`, we write no marker: nothing to
+/// gate, and no stray `.devme-initialized` litters the worktree.
 fn run_on_create_if_needed(path: &Path) {
     use devme_config::Stack;
 
@@ -349,10 +380,8 @@ fn run_on_create_if_needed(path: &Path) {
     };
     let cmd = match stack.stack.as_ref().and_then(|s| s.on_create.as_ref()) {
         Some(c) => c.clone(),
-        None => {
-            let _ = std::fs::write(&marker, "");
-            return;
-        }
+        // No on_create → nothing to run once, so don't drop a marker.
+        None => return,
     };
     tracing::info!(worktree = %path.display(), "running on_create script");
     let status = std::process::Command::new("sh")
@@ -498,6 +527,95 @@ pub async fn remove_worktree(
     })
 }
 
+/// Report from `devme worktree add`.
+#[derive(Debug, Clone)]
+pub struct AddReport {
+    /// Canonical path of the new worktree.
+    pub path: PathBuf,
+    /// Branch checked out (or created) in it.
+    pub branch: String,
+    /// True when the branch didn't exist and was created (`-b`).
+    pub created_branch: bool,
+    /// Whether an `[stack] on_create` hook was present (and thus run).
+    pub on_create_ran: bool,
+}
+
+/// Create a git worktree for `branch` — creating the branch if it doesn't
+/// exist — then fire the repo's `[stack] on_create` hook in it. The
+/// deterministic counterpart to [`remove_worktree`]: an agent calls this to
+/// get a worktree whose per-worktree setup (db clone, deps) has already run.
+///
+/// `dest` overrides the default path, which is a sibling of the main
+/// worktree named `<main-basename>-<branch-leaf>` (e.g. main `…/devme` +
+/// branch `feat/x` → `…/devme-x`).
+pub fn add_worktree(cwd: &Path, branch: &str, dest: Option<&str>) -> anyhow::Result<AddReport> {
+    let worktrees = list_worktrees_detailed(cwd);
+    let main = main_root(&worktrees).unwrap_or_else(|| cwd.to_path_buf());
+
+    let path = match dest {
+        Some(d) => {
+            let p = PathBuf::from(d);
+            if p.is_absolute() { p } else { cwd.join(p) }
+        }
+        None => {
+            let leaf = branch.rsplit('/').next().unwrap_or(branch);
+            let base = main.file_name().and_then(|n| n.to_str()).unwrap_or("worktree");
+            main.parent().unwrap_or(&main).join(format!("{base}-{leaf}"))
+        }
+    };
+
+    if path.exists() {
+        anyhow::bail!("destination already exists: {}", path.display());
+    }
+
+    let created_branch = !branch_exists(cwd, branch);
+
+    // `git worktree add -b <new> <path>` creates the branch; `git worktree
+    // add <path> <existing>` checks one out.
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(cwd).args(["worktree", "add"]);
+    if created_branch {
+        cmd.arg("-b").arg(branch).arg(&path);
+    } else {
+        cmd.arg(&path).arg(branch);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| anyhow::anyhow!("running git worktree add: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let detail = if stderr.trim().is_empty() { "(no stderr)" } else { stderr.trim() };
+        anyhow::bail!("git worktree add failed: {detail}");
+    }
+
+    let canon = std::fs::canonicalize(&path).unwrap_or(path);
+    // Fire on_create deterministically (symmetry with rm's on_destroy).
+    let on_create_ran = stack_declares_on_create(&canon);
+    run_on_create_if_needed(&canon);
+
+    Ok(AddReport { path: canon, branch: branch.to_string(), created_branch, on_create_ran })
+}
+
+/// Does a local branch named `branch` already exist?
+fn branch_exists(cwd: &Path, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Whether the worktree's `devme.toml` declares an `[stack] on_create` hook.
+fn stack_declares_on_create(path: &Path) -> bool {
+    std::fs::read_to_string(path.join("devme.toml"))
+        .ok()
+        .and_then(|s| devme_config::Stack::parse(&s).ok())
+        .and_then(|stack| stack.stack)
+        .is_some_and(|meta| meta.on_create.is_some())
+}
+
 /// One worktree's status for the cross-worktree `devme status --all` view.
 #[derive(Debug, Clone)]
 pub struct WorktreeReport {
@@ -577,6 +695,23 @@ pub async fn shutdown_current_and_shared(cwd: &Path) {
         let _ = client.send(ClientMessage::Shutdown).await;
     }
     shutdown_shared_if_last(cwd).await;
+}
+
+/// Re-spawn the repo-shared daemon and an instance daemon for every worktree
+/// that has a `devme.toml` — the same pass [`AutoSpawner::bind`] runs at
+/// startup. Used by the TUI's stopped-state `u` key to bring the stack back
+/// after a `devme down` without leaving the dashboard: once the daemons bind,
+/// the discovery [`Registry`](crate::discovery::Registry) reattaches and the
+/// event loop sends each its `Start`, exactly like a fresh launch. Best-effort
+/// — per-worktree failures are logged, never surfaced (the TUI owns the
+/// terminal).
+pub async fn start_all(cwd: &Path) {
+    if let Err(e) = ensure_shared_daemon(cwd).await {
+        tracing::debug!(error = %e, "shared supervisor not started (may have no repo-scoped services)");
+    }
+    for wt in list_worktrees(cwd) {
+        ensure_for(&wt.path).await;
+    }
 }
 
 /// One-shot snapshot of a worktree's instance daemon. `None` if no daemon is

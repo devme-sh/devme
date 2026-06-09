@@ -25,6 +25,7 @@
 //! across stack switches. Services live in the tabs row of the main pane, not
 //! the sidebar (which would duplicate them).
 
+use crate::keymap;
 use ansi_to_tui::IntoText;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -32,16 +33,20 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-    Tabs, Wrap,
+    Wrap,
 };
 
-use crate::state::TuiState;
+use crate::state::{ClickTarget, TuiState};
 use crate::theme::{self, Palette};
 use devme_core::{ServiceState, StepState};
 
 /// Render `state` into `frame`'s full area.
 pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     let area = frame.area();
+
+    // Rebuild the click hit-map from scratch each frame. Modes that don't draw
+    // the sidebar/tabs (copy, zoom) simply leave it empty, so clicks no-op.
+    state.begin_frame_hits();
 
     if state.copy_mode() {
         render_copy_mode(frame, area, state);
@@ -50,6 +55,13 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
 
     if state.zoom() {
         render_zoom(frame, area, state);
+        return;
+    }
+
+    // Parked after an external `devme down`: a full-screen "all stopped" hero
+    // instead of the live dashboard. Stays until a `devme up` reattaches.
+    if state.stopped() {
+        render_stopped(frame, area, state);
         return;
     }
 
@@ -64,9 +76,12 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     } else {
         let outer = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(22), Constraint::Min(0)])
+            .constraints([Constraint::Length(state.sidebar_width()), Constraint::Min(0)])
             .split(vertical[0]);
         render_sidebar(frame, outer[0], state);
+        // The main pane's left border (first column of outer[1]) is the visual
+        // divider; record it so a click/drag there resizes the sidebar.
+        state.set_sidebar_divider(outer[1].x, vertical[0].y, vertical[0].height, area.width);
         outer[1]
     };
     render_main(frame, main_area, state);
@@ -85,10 +100,123 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
         render_quit_confirm(frame, area, state);
     } else if state.settings_visible() {
         render_settings_overlay(frame, area, state);
+    } else if state.notifications_visible() {
+        render_notifications_overlay(frame, area, state);
     } else if state.help_visible() {
         render_help_overlay(frame, area);
     }
 }
+
+/// Notifications-history modal (`n`): the durable scrollback of every toast
+/// raised this session, newest first, each with a relative timestamp. The
+/// corner toasts auto-expire, so this lets the user catch up on anything they
+/// missed — an open/copy result, a crash, a config warning.
+fn render_notifications_overlay(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
+    use crate::state::ToastKind;
+    let p = *state.palette();
+    let len = state.notifications().len();
+
+    let w = 64u16.min(area.width.saturating_sub(4));
+    let h = 18u16.min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let modal = Rect { x, y, width: w, height: h };
+
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .title(Span::styled(
+            " notifications ",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(p.accent))
+        .style(Style::default().bg(p.panel_bg));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    if inner.height == 0 {
+        return;
+    }
+
+    if len == 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " no notifications yet",
+                Style::default().fg(p.subtext0),
+            ))),
+            inner,
+        );
+        return;
+    }
+
+    // Reserve the last row for a footer; render the rest newest first, with a
+    // scroll window derived from the cursor so the selection is always visible.
+    let list_rows = (inner.height.saturating_sub(1) as usize).max(1);
+    let cursor = state.notif_cursor().min(len - 1);
+    let offset = if cursor < list_rows { 0 } else { cursor - list_rows + 1 };
+
+    // Build owned rows (`(line, display_index, selected)`) in one immutable
+    // borrow of the history, so the borrow ends before we push click regions.
+    let body_budget_base = inner.width as usize;
+    let rows: Vec<(Line<'static>, usize, bool)> = {
+        let history = state.notifications();
+        history
+            .iter()
+            .rev()
+            .enumerate()
+            .skip(offset)
+            .take(list_rows)
+            .map(|(d, toast)| {
+                let selected = d == cursor;
+                let dot_color = match toast.kind {
+                    ToastKind::Failed => p.red,
+                    ToastKind::Ready => p.green,
+                    ToastKind::Info => p.accent,
+                };
+                let age = toast.age_label();
+                let title = theme::truncate(&toast.title, 12);
+                let body_budget =
+                    body_budget_base.saturating_sub(title.chars().count() + age.chars().count() + 5);
+                let title_style = Style::default().fg(p.text).add_modifier(Modifier::BOLD);
+                let line = Line::from(vec![
+                    Span::styled("● ", Style::default().fg(dot_color)),
+                    Span::styled(format!("{age:>4} "), Style::default().fg(p.overlay0)),
+                    Span::styled(title, title_style),
+                    Span::styled(
+                        format!(" {}", theme::truncate(&toast.body, body_budget)),
+                        Style::default().fg(p.subtext0),
+                    ),
+                ]);
+                (line, d, selected)
+            })
+            .collect()
+    };
+
+    // Paint each row into its own rect (full-width highlight for the cursor)
+    // and register it as a click-to-copy target.
+    for (i, (line, d, selected)) in rows.into_iter().enumerate() {
+        let ry = inner.y + i as u16;
+        let row = Rect { x: inner.x, y: ry, width: inner.width, height: 1 };
+        let para = if selected {
+            Paragraph::new(line).style(Style::default().bg(p.surface0))
+        } else {
+            Paragraph::new(line)
+        };
+        frame.render_widget(para, row);
+        state.push_click_region(inner.x, ry, inner.width, 1, ClickTarget::Notif(d));
+    }
+
+    // Footer: cursor position + the keys this modal owns.
+    let footer = Line::from(vec![Span::styled(
+        format!(" {} of {}   j/k select · c copy · Y all · n/esc close", cursor + 1, len),
+        Style::default().fg(p.overlay0),
+    )]);
+    frame.render_widget(
+        Paragraph::new(footer),
+        Rect { y: inner.y + inner.height - 1, height: 1, ..inner },
+    );
+}
+
 
 /// Stack of auto-expiring toasts in the top-right of the main pane.
 fn render_toasts(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -403,12 +531,94 @@ fn render_zoom(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
     frame.render_widget(footer, layout[2]);
 }
 
-/// Small centred "really quit?" modal, shown when `tui.confirm_quit` is on and
-/// the user asks to quit (which would stop every service).
+/// Full-screen "everything stopped" hero, shown after an external `devme
+/// down` (or a quit elsewhere) drains every daemon. Rather than exit, the TUI
+/// stays as a durable dashboard and parks here until a `devme up` repopulates
+/// it. A centred card states the situation and the two ways forward — `u` to
+/// bring the stack back up in place, `q` to leave — and toasts still surface
+/// on top so the `u` → "starting…" feedback is visible during the relaunch.
+fn render_stopped(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
+    let p = *state.palette();
+
+    // Dim full-screen backdrop so the card reads as the single focus.
+    frame.render_widget(
+        Block::default().style(Style::default().bg(p.surface_dim)),
+        area,
+    );
+
+    let w = 54u16.min(area.width.saturating_sub(4));
+    let h = 16u16.min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let card = Rect { x, y, width: w, height: h };
+
+    frame.render_widget(Clear, card);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(p.surface1))
+        .style(Style::default().bg(p.panel_bg));
+    let inner = block.inner(card);
+    frame.render_widget(block, card);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let repo = state.stopped_repo().unwrap_or("This stack").to_string();
+    let badge = Style::default().fg(p.mauve);
+    let dim = |s: String| Span::styled(s, Style::default().fg(p.overlay0));
+    let body = |s: &'static str| Span::styled(s, Style::default().fg(p.subtext0));
+    let chip = |k: &'static str| {
+        Span::styled(
+            format!(" {k} "),
+            Style::default()
+                .fg(p.panel_bg)
+                .bg(p.accent)
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+
+    // A small framed power badge — a deliberate "off" mark, not an error.
+    let lines: Vec<Line> = vec![
+        Line::default(),
+        Line::from(Span::styled("╭─────╮", badge)),
+        Line::from(vec![
+            Span::styled("│  ", badge),
+            Span::styled("⏻", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("  │", badge),
+        ]),
+        Line::from(Span::styled("╰─────╯", badge)),
+        Line::default(),
+        Line::from(Span::styled(
+            "All services stopped",
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+        )),
+        Line::default(),
+        Line::from(dim(format!("{repo} was shut down via devme down."))),
+        Line::from(dim("The dashboard is still live.".into())),
+        Line::default(),
+        Line::from(vec![chip("u"), body("  start the stack again")]),
+        Line::from(vec![chip("q"), body("  quit devme")]),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .alignment(ratatui::layout::Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        inner,
+    );
+
+    // Toasts on top so the "starting…" ack (and any late crash notice) shows.
+    render_toasts(frame, area, state);
+}
+
+/// Small centred quit modal offering a choice: stop every service and quit,
+/// or detach (leave services running — the remote stack stays up under
+/// `devme remote`). Shown on `q` when `tui.confirm_quit` is on (the default).
 fn render_quit_confirm(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let p = *state.palette();
-    let w = 44u16.min(area.width.saturating_sub(4));
-    let h = 6u16.min(area.height.saturating_sub(2));
+    let w = 52u16.min(area.width.saturating_sub(4));
+    let h = 7u16.min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let modal = Rect { x, y, width: w, height: h };
@@ -426,16 +636,20 @@ fn render_quit_confirm(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let inner = block.inner(modal);
     frame.render_widget(block, modal);
 
+    let bold = |c| Style::default().fg(c).add_modifier(Modifier::BOLD);
     let lines = vec![
-        Line::from(Span::styled(
-            "Quit devme and stop every service?",
-            Style::default().fg(p.text),
-        )),
+        Line::from(Span::styled("Quit the TUI — and the services?", Style::default().fg(p.text))),
         Line::default(),
         Line::from(vec![
-            Span::styled(" y ", Style::default().fg(p.red).add_modifier(Modifier::BOLD)),
-            Span::styled("quit   ", Style::default().fg(p.overlay0)),
-            Span::styled("n/Esc ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(" q ", bold(p.red)),
+            Span::styled("stop all & quit", Style::default().fg(p.overlay0)),
+        ]),
+        Line::from(vec![
+            Span::styled(" d ", bold(p.accent)),
+            Span::styled("detach — leave services running", Style::default().fg(p.overlay0)),
+        ]),
+        Line::from(vec![
+            Span::styled(" Esc ", bold(p.accent)),
             Span::styled("cancel", Style::default().fg(p.overlay0)),
         ]),
     ];
@@ -469,75 +683,71 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             Span::styled(")", Style::default().fg(Color::DarkGray)),
         ])
     } else {
-        Line::from(vec![
-            Span::styled("? ", key),
-            Span::styled("help  ", dim),
-            Span::styled("hl ", key),
-            Span::styled("svc  ", dim),
-            Span::styled("jk ", key),
-            Span::styled("stack  ", dim),
-            Span::styled("S/s/r ", key),
-            Span::styled("start/stop/restart  ", dim),
-            Span::styled("o ", key),
-            Span::styled("open  ", dim),
-            Span::styled("q ", key),
-            Span::styled("quit", dim),
-        ])
+        // Generated from the keymap: every binding flagged `footer` shows here,
+        // in declaration order, so the bar can't drift from the bindings.
+        let mut spans = Vec::new();
+        for (i, hint) in keymap::footer_hints().enumerate() {
+            let sep = if i + 1 < keymap::footer_hints().count() { "  " } else { "" };
+            spans.push(Span::styled(format!("{} ", hint.keys), key));
+            spans.push(Span::styled(format!("{}{sep}", hint.label), dim));
+        }
+        Line::from(spans)
     };
     let centre = Paragraph::new(centre_line)
         .alignment(ratatui::layout::Alignment::Center);
 
-    let (running, starting, stopped, failed) = aggregate_states(state);
-    let right_spans = vec![
-        Span::styled(format!(" ●{running} "), Style::default().fg(p.green)),
-        Span::styled(format!("◌{starting} "), Style::default().fg(p.yellow)),
-        Span::styled(format!("○{stopped} "), Style::default().fg(p.overlay0)),
-        Span::styled(format!("✗{failed}"), Style::default().fg(p.red)),
-        // Right-edge margin so the glyphs don't kiss the terminal border.
-        Span::raw("  "),
-    ];
-    let right = Paragraph::new(Line::from(right_spans))
-        .alignment(ratatui::layout::Alignment::Right);
-
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(24),
-            Constraint::Min(0),
-            Constraint::Length(22),
-        ])
+        .constraints([Constraint::Length(24), Constraint::Min(0)])
         .split(area);
     frame.render_widget(left, cols[0]);
     frame.render_widget(centre, cols[1]);
-    frame.render_widget(right, cols[2]);
-}
-
-fn aggregate_states(state: &TuiState) -> (usize, usize, usize, usize) {
-    let mut running = 0;
-    let mut starting = 0;
-    let mut stopped = 0;
-    let mut failed = 0;
-    for s in state.services() {
-        match &s.state {
-            ServiceState::Running { .. } | ServiceState::External { healthy: true } => {
-                running += 1
-            }
-            ServiceState::Starting
-            | ServiceState::Restarting { .. }
-            | ServiceState::WaitingOnDependency { .. } => starting += 1,
-            ServiceState::Failed { .. } | ServiceState::CrashLoop { .. } => failed += 1,
-            ServiceState::Stopped | ServiceState::External { healthy: false } => stopped += 1,
-        }
-    }
-    (running, starting, stopped, failed)
 }
 
 fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
-    // Centered modal, sized to the longest key-binding line. Wide enough
-    // to read at a glance, narrow enough that the underlying layout is
-    // still partly visible around it.
+    let key = |k: &str| {
+        Span::styled(
+            format!(" {k:<13}"),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )
+    };
+    let desc = |d: &str| Span::styled(d.to_string(), Style::default().fg(Color::Gray));
+    let section = |title: &str| {
+        Line::from(vec![Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )])
+    };
+
+    // Generated from the keymap so every bound action is documented and the
+    // overlay can't drift from what the event loop actually dispatches.
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, sec) in keymap::Section::ORDER.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::default());
+        }
+        lines.push(section(sec.title()));
+        for b in keymap::BINDINGS.iter().filter(|b| b.section == *sec) {
+            lines.push(Line::from(vec![key(b.keys), desc(b.desc)]));
+        }
+    }
+
+    // Mouse behaviors have no keybinding (the terminal/emulator handles them),
+    // so they live in their own section sourced from the keymap rather than
+    // among the action-backed bindings above.
+    lines.push(Line::default());
+    lines.push(section("mouse"));
+    for note in keymap::MOUSE_NOTES {
+        lines.push(Line::from(vec![key(note.label), desc(note.desc)]));
+    }
+
+    // Centered modal, sized to fit the generated content (so adding a binding
+    // never silently clips a row), clamped to the available area. Wide enough
+    // to read at a glance, narrow enough that the layout shows around it.
     let w = 56u16.min(area.width.saturating_sub(4));
-    let h = 28u16.min(area.height.saturating_sub(2));
+    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let modal = Rect { x, y, width: w, height: h };
@@ -560,49 +770,6 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
     let inner = block.inner(modal);
     frame.render_widget(block, modal);
 
-    let key = |k: &'static str| {
-        Span::styled(
-            format!(" {k:<10}"),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        )
-    };
-    let desc = |d: &'static str| Span::styled(d, Style::default().fg(Color::Gray));
-    let section = |title: &'static str| {
-        Line::from(vec![Span::styled(
-            title,
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )])
-    };
-
-    let lines: Vec<Line> = vec![
-        section("navigation"),
-        Line::from(vec![key("←→ / hl"), desc("service tab")]),
-        Line::from(vec![key("↑↓ / jk"), desc("stack")]),
-        Line::from(vec![key("`"), desc("collapse / expand sidebar")]),
-        Line::default(),
-        section("log viewport"),
-        Line::from(vec![key("b / space"), desc("page up / down")]),
-        Line::from(vec![key("J / K"), desc("scroll one line")]),
-        Line::from(vec![key("g / G"), desc("top / live tail")]),
-        Line::from(vec![key("y / Y"), desc("copy visible / all logs")]),
-        Line::from(vec![key("p"), desc("copy debug prompt to clipboard")]),
-        Line::from(vec![key("v"), desc("copy mode (select text)")]),
-        Line::from(vec![key("z"), desc("zoom logs (fullscreen)")]),
-        Line::from(vec![key("wheel"), desc("scroll")]),
-        Line::default(),
-        section("service actions"),
-        Line::from(vec![key("S"), desc("start selected")]),
-        Line::from(vec![key("s"), desc("stop selected")]),
-        Line::from(vec![key("r"), desc("restart selected")]),
-        Line::default(),
-        section("session"),
-        Line::from(vec![key(","), desc("settings")]),
-        Line::from(vec![key("D"), desc("detach (keep services running)")]),
-        Line::from(vec![key("q / Esc"), desc("quit (stops everything)")]),
-        Line::from(vec![key("?"), desc("toggle this overlay")]),
-    ];
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -818,9 +985,10 @@ fn render_stack_row(
 
 /// The dim secondary line for stack `i`: "2/3 up" plus git ↑ahead ↓behind.
 fn stack_secondary(p: &Palette, state: &TuiState, i: usize) -> Vec<Span<'static>> {
+    use crate::state::StackSummary;
     let mut spans = vec![Span::raw("   ")];
     match state.instance_service_summary(i) {
-        Some((up, total)) => {
+        StackSummary::Counted { up, total } => {
             let color = if up == total {
                 p.green
             } else if up > 0 {
@@ -830,7 +998,19 @@ fn stack_secondary(p: &Palette, state: &TuiState, i: usize) -> Vec<Span<'static>
             };
             spans.push(Span::styled(format!("{up}/{total} up"), Style::default().fg(color)));
         }
-        None => spans.push(Span::styled("no daemon", Style::default().fg(p.surface1))),
+        StackSummary::SharedOnly => {
+            spans.push(Span::styled("shared only", Style::default().fg(p.overlay0)));
+        }
+        StackSummary::NoDaemon => {
+            // Steady-state, a worktree has no daemon because it has no
+            // devme.toml — say so plainly rather than the jargon "no daemon".
+            let label = if state.instance_is_placeholder(i) {
+                "no devme.toml"
+            } else {
+                "no daemon"
+            };
+            spans.push(Span::styled(label, Style::default().fg(p.surface1)));
+        }
     }
     if let Some((ahead, behind)) = state.instance_ahead_behind(i) {
         if ahead > 0 {
@@ -856,13 +1036,18 @@ fn render_stacks_pane(p: &Palette, frame: &mut Frame<'_>, area: Rect, state: &mu
 
     let content_top = area.y + 1;
     let content_h = area.height.saturating_sub(1);
-    // Reserve the bottom for the shared row (blank + 2 lines) when present.
-    let shared_reserve: u16 = if has_shared { 3 } else { 0 };
+    // Reserve the bottom for the shared section when present: a divider rule,
+    // a "shared" header, and the 2-line shared row.
+    let shared_reserve: u16 = if has_shared { 4 } else { 0 };
     let stack_h = content_h.saturating_sub(shared_reserve);
     let visible = ((stack_h / 2) as usize).max(1);
 
     state.ensure_stack_visible(visible);
     let scroll = state.sidebar_scroll();
+
+    // Clickable rows are accumulated here and flushed to `state` after the
+    // immutable `labels` borrow ends (can't call `&mut` methods mid-loop).
+    let mut regions: Vec<(u16, ClickTarget)> = Vec::new();
 
     let labels = state.instances();
     let mut y = content_top;
@@ -876,6 +1061,7 @@ fn render_stacks_pane(p: &Palette, frame: &mut Frame<'_>, area: Rect, state: &mu
         let label = label.to_string();
         let secondary = stack_secondary(p, state, i);
         render_stack_row(p, frame, Rect { y, height: 2, ..area }, dot, &label, secondary, is_selected);
+        regions.push((y, ClickTarget::Stack(i)));
         y += 2;
     }
 
@@ -889,14 +1075,27 @@ fn render_stacks_pane(p: &Palette, frame: &mut Frame<'_>, area: Rect, state: &mu
             )),
             Rect { y, height: 1, ..area },
         );
+        y += 1;
     }
 
     if has_shared {
-        let sy = area.y + area.height - 2;
-        let svc_names: Vec<&str> = state.shared_services().iter().map(|s| s.name.as_str()).collect();
-        let label = format!("shared ({})", svc_names.join(", "));
-        let dot = health_dot(p, state.shared_health());
+        // The shared section flows directly beneath the stacks (a divider rule
+        // + "shared" header set it off — mirroring the tabs' "shared" separator
+        // and the "tools" section). A one-row gap keeps it off the last stack.
+        // `stack_h`'s reserve guarantees these 4 rows fit above `tools`.
+        let sy = (y + 1).min(stack_bottom);
+        // Dotted rule (echoing the `┊` in the tabs' shared separator) so the
+        // shared section reads as distinct from the solid-ruled `tools` below.
+        let divider = "┈".repeat(area.width as usize);
+        frame.render_widget(
+            Paragraph::new(Span::styled(divider, Style::default().fg(p.surface1))),
+            Rect { y: sy, height: 1, ..area },
+        );
+        section_header(p, frame, Rect { y: sy + 1, height: 1, ..area }, "shared");
+
         let svcs = state.shared_services();
+        let label = svcs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ");
+        let dot = health_dot(p, state.shared_health());
         let up = svcs
             .iter()
             .filter(|s| {
@@ -915,7 +1114,14 @@ fn render_stacks_pane(p: &Palette, frame: &mut Frame<'_>, area: Rect, state: &mu
             format!("   {up}/{} up", svcs.len()),
             Style::default().fg(color),
         )];
-        render_stack_row(p, frame, Rect { y: sy, height: 2, ..area }, dot, &label, secondary, shared_active);
+        render_stack_row(p, frame, Rect { y: sy + 2, height: 2, ..area }, dot, &label, secondary, shared_active);
+        regions.push((sy + 2, ClickTarget::Shared));
+    }
+
+    // `labels`/`svcs` borrows are done — flush the recorded rows. Each stack
+    // row is the full sidebar width, two rows tall.
+    for (ry, target) in regions {
+        state.push_click_region(area.x, ry, area.width, 2, target);
     }
 }
 
@@ -1003,16 +1209,20 @@ fn format_main_title(state: &TuiState) -> Line<'_> {
         format!(" devme v{version} "),
         Style::default().fg(p.mauve).add_modifier(Modifier::BOLD),
     )];
-    spans.push(Span::styled(
-        format!("• {running}/{count} running"),
-        Style::default().fg(if running == count && count > 0 {
-            p.green
-        } else if running > 0 {
-            p.yellow
-        } else {
-            p.overlay0
-        }),
-    ));
+    // A stack that owns no services has nothing to count — the placeholder tab
+    // already explains why, so "0/0 running" would just be noise.
+    if count > 0 {
+        spans.push(Span::styled(
+            format!("• {running}/{count} running"),
+            Style::default().fg(if running == count {
+                p.green
+            } else if running > 0 {
+                p.yellow
+            } else {
+                p.overlay0
+            }),
+        ));
+    }
     if failed > 0 {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
@@ -1024,9 +1234,10 @@ fn format_main_title(state: &TuiState) -> Line<'_> {
     Line::from(spans)
 }
 
-fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
     let p = *state.palette();
-    if state.services().is_empty() {
+    let tabs = state.tab_services();
+    if tabs.is_empty() {
         let text = if state.current_instance_is_placeholder() {
             format!(
                 "no devme.toml in {} — add one to start services",
@@ -1043,44 +1254,133 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         return;
     }
     let spinner = state.spinner_frame();
-    let titles: Vec<Line> = state
-        .services()
-        .iter()
-        .map(|s| {
-            Line::from(vec![
-                Span::styled(
-                    service_dot(&s.state, spinner).to_string(),
-                    Style::default().fg(service_color(&p, &s.state)),
-                ),
-                Span::raw(" "),
-                Span::styled(s.name.clone(), Style::default()),
-            ])
-        })
-        .collect();
-    let selected = state
-        .services()
-        .iter()
-        .position(|s| {
-            state
-                .selected_service()
-                .map(|sel| sel.name == s.name)
-                .unwrap_or(false)
-        })
-        .unwrap_or(0);
-    let tabs = Tabs::new(titles)
-        .select(selected)
-        .highlight_style(
-            Style::default()
-                .fg(p.text)
-                .bg(p.surface0)
-                .add_modifier(Modifier::BOLD),
-        )
-        .divider(Span::styled(" │ ", Style::default().fg(p.surface1)))
-        .padding(" ", " ");
-    frame.render_widget(tabs, area);
+    let sel_idx = state.selected_tab_index();
+    // The first repo-scoped service starts the "shared" group; the divider in
+    // front of it is labelled so the trailing tabs read as not-owned.
+    let first_shared = tabs.iter().position(|t| t.is_shared());
+
+    // Build the row left-to-right, tracking each tab's column span so we can
+    // scroll the row horizontally to keep the selected tab on screen.
+    let mut spans: Vec<Span> = Vec::new();
+    let mut col: usize = 0;
+    let mut sel_range: Option<(usize, usize)> = None;
+    // (tab index, start col, end col) in content coordinates, before the
+    // horizontal scroll is applied — turned into screen click regions below.
+    let mut tab_spans: Vec<(usize, usize, usize)> = Vec::new();
+    let push = |spans: &mut Vec<Span>, col: &mut usize, text: String, style: Style| {
+        *col += text.chars().count();
+        spans.push(Span::styled(text, style));
+    };
+
+    for (i, t) in tabs.iter().enumerate() {
+        if i > 0 {
+            if Some(i) == first_shared {
+                let div = Style::default().fg(p.surface1);
+                push(&mut spans, &mut col, "  ┊ ".into(), div);
+                push(
+                    &mut spans,
+                    &mut col,
+                    "shared".into(),
+                    Style::default().fg(p.overlay0).add_modifier(Modifier::ITALIC),
+                );
+                push(&mut spans, &mut col, " ┊  ".into(), div);
+            } else {
+                push(&mut spans, &mut col, " │ ".into(), Style::default().fg(p.surface1));
+            }
+        }
+        let is_sel = i == sel_idx;
+        // Placeholder has no backing service: a warn glyph + dim italic label.
+        let (dot, dot_color, name_fg, italic) = match &t.snapshot {
+            Some(s) => (
+                service_dot(&s.state, spinner).to_string(),
+                service_color(&p, &s.state),
+                // Shared tabs read dimmer than owned ones so the eye groups them.
+                if t.is_shared() { p.subtext0 } else { p.text },
+                false,
+            ),
+            None => ("⚠".to_string(), p.yellow, p.overlay0, true),
+        };
+        let (pad, dot_style, mut name_style) = if is_sel {
+            (
+                Style::default().bg(p.surface0),
+                Style::default().fg(dot_color).bg(p.surface0).add_modifier(Modifier::BOLD),
+                Style::default().fg(p.text).bg(p.surface0).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (
+                Style::default(),
+                Style::default().fg(dot_color),
+                Style::default().fg(name_fg),
+            )
+        };
+        if italic {
+            name_style = name_style.add_modifier(Modifier::ITALIC);
+        }
+        let start = col;
+        push(&mut spans, &mut col, " ".into(), pad);
+        push(&mut spans, &mut col, dot, dot_style);
+        push(&mut spans, &mut col, " ".into(), pad);
+        push(&mut spans, &mut col, t.label.clone(), name_style);
+        push(&mut spans, &mut col, " ".into(), pad);
+        if is_sel {
+            sel_range = Some((start, col));
+        }
+        tab_spans.push((i, start, col));
+    }
+
+    // Scroll just enough that the selected tab's right edge is on screen (and,
+    // since a tab is far narrower than the pane, its whole label with it).
+    let total = col;
+    let avail = area.width as usize;
+    let scroll_x = match sel_range {
+        Some((_, end)) if total > avail && end > avail => (end - avail).min(total - avail),
+        _ => 0,
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).scroll((0, scroll_x as u16)),
+        area,
+    );
+
+    // Edge markers when the row is clipped, so it's clear it continues.
+    let marker = Style::default().fg(p.overlay0);
+    if scroll_x > 0 {
+        frame.render_widget(
+            Paragraph::new(Span::styled("‹", marker)),
+            Rect { width: 1, ..area },
+        );
+    }
+    if total.saturating_sub(scroll_x) > avail {
+        frame.render_widget(
+            Paragraph::new(Span::styled("›", marker)),
+            Rect { x: area.x + area.width.saturating_sub(1), width: 1, ..area },
+        );
+    }
+
+    // Record each visible tab as a click region. Content cols are shifted left
+    // by `scroll_x` and clipped to the pane, mirroring the rendered Paragraph.
+    for (i, s, e) in tab_spans {
+        let vs = s.max(scroll_x);
+        let ve = e.min(scroll_x + avail);
+        if vs >= ve {
+            continue; // scrolled out of view
+        }
+        let sx = area.x + (vs - scroll_x) as u16;
+        let w = (ve - vs) as u16;
+        state.push_click_region(sx, area.y, w, area.height, ClickTarget::Tab(i));
+    }
 }
 
 fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
+    // The placeholder tab has no logs — it explains why the worktree owns no
+    // services and points at the shared tabs.
+    if state.selected_tab_is_placeholder() {
+        let p = *state.palette();
+        let msg = Paragraph::new(Text::from(state.placeholder_explanation()))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(p.overlay0).italic());
+        frame.render_widget(msg, area);
+        return;
+    }
     let (svc_name, svc_state) = match state.selected_service() {
         Some(s) => (s.name.clone(), s.state.clone()),
         None => {
@@ -1150,6 +1450,9 @@ fn render_log_viewport(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) 
     // ratio of `viewport / content_length` implicitly through its render.
     if let Some(sb_area) = sb_area {
         let content_length = logs.len();
+        // Record the track so a click/drag on it can scroll (last use of
+        // `logs` is here, so the &mut borrow below is free under NLL).
+        state.set_scrollbar_hit(sb_area.x, sb_area.y, sb_area.height, content_length, viewport);
         let sb_position = if offset == 0 {
             content_length
         } else {
@@ -1344,8 +1647,20 @@ mod tests {
             state,
             pid: None,
             port: None,
+            url: None,
             restart_count: 0,
         }
+    }
+
+    #[test]
+    fn stopped_state_renders_hero_card() {
+        let mut state = TuiState::default();
+        state.enter_stopped(Some("kpi-dash".into()));
+        let text = render_to_text(&mut state, 80, 24);
+        assert!(text.contains("All services stopped"), "missing title:\n{text}");
+        assert!(text.contains("kpi-dash"), "missing repo name:\n{text}");
+        assert!(text.contains("start the stack again"), "missing start hint:\n{text}");
+        assert!(text.contains("quit devme"), "missing quit hint:\n{text}");
     }
 
     #[test]
@@ -1390,6 +1705,186 @@ mod tests {
         let i_be = tab_line.find("backend").unwrap();
         let i_fe = tab_line.find("frontend").unwrap();
         assert!(i_db < i_be && i_be < i_fe);
+    }
+
+    #[test]
+    fn shared_services_render_as_trailing_group_on_a_stack() {
+        let mut state = TuiState::default();
+        // Shared daemon first so the instance's stubs are recognised as shared.
+        state.apply(ServerMessage::Subscribed {
+            instance: InstanceInfo {
+                id: "shared::repo".into(),
+                label: "shared".into(),
+                cwd: "/tmp/a".into(),
+            },
+            services: vec![
+                svc("postgres", ServiceState::Stopped),
+                svc("redis", ServiceState::Stopped),
+            ],
+            steps: vec![],
+        });
+        state.apply(ServerMessage::Subscribed {
+            instance: InstanceInfo {
+                id: "inst".into(),
+                label: "feature/a".into(),
+                cwd: "/tmp/a".into(),
+            },
+            services: vec![
+                svc("api", ServiceState::Stopped),
+                svc("web", ServiceState::Stopped),
+                svc("postgres", ServiceState::Stopped),
+                svc("redis", ServiceState::Stopped),
+            ],
+            steps: vec![],
+        });
+
+        let text = render_to_text(&mut state, 100, 14);
+        // Owned services, the shared-group label, and shared services all on
+        // the tab row — shared sorted last, behind the labelled divider.
+        let tab_line = text
+            .lines()
+            .find(|l| l.contains("api") && l.contains("postgres"))
+            .unwrap_or_else(|| panic!("no tab row with owned + shared services:\n{text}"));
+        let i_web = tab_line.find("web").unwrap();
+        let i_shared = tab_line.find("shared").unwrap();
+        let i_pg = tab_line.find("postgres").unwrap();
+        let i_redis = tab_line.find("redis").unwrap();
+        assert!(
+            i_web < i_shared && i_shared < i_pg && i_pg < i_redis,
+            "expected owned · 'shared' label · shared services, got:\n{tab_line}"
+        );
+    }
+
+    #[test]
+    fn worktree_without_devme_toml_shows_placeholder_tab_and_explanation() {
+        let mut state = TuiState::default();
+        state.apply(ServerMessage::Subscribed {
+            instance: InstanceInfo {
+                id: "shared::repo".into(),
+                label: "shared".into(),
+                cwd: "/tmp/a".into(),
+            },
+            services: vec![
+                svc("proxy", ServiceState::Stopped),
+                svc("postgres", ServiceState::Stopped),
+            ],
+            steps: vec![],
+        });
+        // Discovered worktree, no devme.toml → placeholder row, no daemon.
+        state.add_placeholder_instance("inst", "feature/x", "/tmp/a");
+
+        let text = render_to_text(&mut state, 100, 14);
+        let tab_line = text
+            .lines()
+            .find(|l| l.contains("proxy"))
+            .unwrap_or_else(|| panic!("no tab row:\n{text}"));
+        let i_label = tab_line
+            .find("no devme.toml")
+            .unwrap_or_else(|| panic!("placeholder label missing:\n{tab_line}"));
+        let i_proxy = tab_line.find("proxy").unwrap();
+        let i_pg = tab_line.find("postgres").unwrap();
+        assert!(
+            i_label < i_proxy && i_proxy < i_pg,
+            "placeholder tab should lead, then shared services:\n{tab_line}"
+        );
+        // The viewport explains the empty state rather than showing logs.
+        assert!(
+            text.contains("add one to start services"),
+            "placeholder explanation missing from viewport:\n{text}"
+        );
+        // A worktree that owns nothing shows no "N/N running" count in the
+        // title — the placeholder tab already explains the empty state.
+        assert!(
+            !text.contains("running"),
+            "title should omit the count for a stack that owns no services:\n{text}"
+        );
+    }
+
+    #[test]
+    fn title_shows_count_when_stack_owns_services() {
+        let mut state = TuiState::default();
+        state.apply(ServerMessage::Subscribed {
+            instance: test_instance(),
+            services: vec![svc("api", ServiceState::Stopped)],
+            steps: vec![],
+        });
+        let text = render_to_text(&mut state, 100, 14);
+        assert!(text.contains("0/1 running"), "count missing:\n{text}");
+    }
+
+    #[test]
+    fn sidebar_groups_shared_services_under_a_header() {
+        let mut state = TuiState::default();
+        state.apply(ServerMessage::Subscribed {
+            instance: InstanceInfo {
+                id: "shared::repo".into(),
+                label: "shared".into(),
+                cwd: "/tmp/a".into(),
+            },
+            services: vec![
+                svc("proxy", ServiceState::Stopped),
+                svc("postgres", ServiceState::Stopped),
+            ],
+            steps: vec![],
+        });
+        state.apply(ServerMessage::Subscribed {
+            instance: test_instance(),
+            services: vec![svc("api", ServiceState::Stopped)],
+            steps: vec![],
+        });
+        let text = render_to_text(&mut state, 100, 16);
+        let lines: Vec<&str> = text.lines().collect();
+        // The shared row lists its services joined — unique to the sidebar
+        // (the tab row shows them as separate tabs).
+        let row_idx = lines
+            .iter()
+            .position(|l| l.contains("proxy, postgres"))
+            .unwrap_or_else(|| panic!("shared services row missing from sidebar:\n{text}"));
+        // Directly above: a "shared" header, and a divider rule above that.
+        assert!(
+            lines[row_idx - 1].contains("shared"),
+            "expected a 'shared' header just above the shared row:\n{text}"
+        );
+        assert!(
+            lines[row_idx - 2].contains('┈'),
+            "expected a dotted divider rule above the shared header:\n{text}"
+        );
+        // With a single stack, the shared section flows just beneath it — in
+        // the upper half of the sidebar, not pinned to the bottom.
+        assert!(
+            row_idx < lines.len() / 2,
+            "shared section should sit just beneath the stacks, not at the bottom (row {row_idx} of {}):\n{text}",
+            lines.len()
+        );
+    }
+
+    #[test]
+    fn tab_row_scrolls_to_keep_selected_tab_visible() {
+        let mut state = TuiState::default();
+        let names = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+        ];
+        state.apply(ServerMessage::Subscribed {
+            instance: test_instance(),
+            services: names
+                .iter()
+                .map(|n| svc(n, ServiceState::Stopped))
+                .collect(),
+            steps: vec![],
+        });
+        // Select the last tab — it sits well off the right edge of a narrow pane.
+        for _ in 0..names.len() - 1 {
+            state.select_next_service();
+        }
+        let text = render_to_text(&mut state, 60, 14);
+        let tab_line = text
+            .lines()
+            .find(|l| l.contains("hotel"))
+            .unwrap_or_else(|| panic!("selected (last) tab must be visible:\n{text}"));
+        // Scrolled, so the row shows a left-overflow marker and the first tab
+        // has been clipped away.
+        assert!(tab_line.contains('‹'), "left overflow marker expected:\n{tab_line}");
+        assert!(!tab_line.contains("alpha"), "first tab should be clipped:\n{tab_line}");
     }
 
     #[test]
@@ -1497,26 +1992,6 @@ mod tests {
     }
 
     #[test]
-    fn footer_shows_health_summary_glyphs() {
-        let mut state = TuiState::default();
-        state.apply(ServerMessage::Subscribed {
-            instance: test_instance(),
-            services: vec![
-                svc("a", ServiceState::Running { degraded: false, started_without: vec![] }),
-                svc("b", ServiceState::Running { degraded: false, started_without: vec![] }),
-                svc("c", ServiceState::Stopped),
-                svc("d", ServiceState::Failed { exit_code: Some(1) }),
-            ],
-            steps: vec![],
-        });
-        let text = render_to_text(&mut state, 140, 14);
-        let last = text.lines().last().unwrap_or("");
-        assert!(last.contains("●2"), "expected 2 running in footer: {last}");
-        assert!(last.contains("○1"), "expected 1 stopped in footer: {last}");
-        assert!(last.contains("✗1"), "expected 1 failed in footer: {last}");
-    }
-
-    #[test]
     fn help_overlay_renders_when_toggled() {
         let mut state = TuiState::default();
         let text = render_to_text(&mut state, 100, 30);
@@ -1527,6 +2002,40 @@ mod tests {
         state.toggle_help();
         let text = render_to_text(&mut state, 100, 30);
         assert!(!text.contains("toggle this overlay"), "overlay should hide again");
+    }
+
+    #[test]
+    fn notifications_overlay_renders_history_when_toggled() {
+        let mut state = TuiState::default();
+        state.notify("open", "https://example.test opened");
+        // Use a durable (non-"copy") notification — copy acks are transient and
+        // wouldn't land in the history the modal renders.
+        state.notify("logs", "copied 12 log lines");
+
+        // The corner toasts still show their bodies while live, so the modal's
+        // own footer ("… of N … n/esc close") is the reliable discriminator.
+        let text = render_to_text(&mut state, 100, 30);
+        assert!(!text.contains("n/esc close"), "modal leaked when hidden:\n{text}");
+
+        state.toggle_notifications();
+        let text = render_to_text(&mut state, 100, 30);
+        assert!(text.contains("notifications"), "modal title missing:\n{text}");
+        assert!(text.contains("copied 12 log lines"), "newest entry missing:\n{text}");
+        assert!(text.contains("example.test opened"), "older entry missing:\n{text}");
+        assert!(text.contains("of 2"), "scroll footer missing:\n{text}");
+        assert!(text.contains("c copy"), "copy affordance missing from footer:\n{text}");
+
+        state.close_notifications();
+        let text = render_to_text(&mut state, 100, 30);
+        assert!(!text.contains("n/esc close"), "modal should hide again:\n{text}");
+    }
+
+    #[test]
+    fn notifications_overlay_handles_empty_history() {
+        let mut state = TuiState::default();
+        state.toggle_notifications();
+        let text = render_to_text(&mut state, 100, 30);
+        assert!(text.contains("no notifications yet"), "empty state missing:\n{text}");
     }
 
     #[test]
@@ -1542,6 +2051,7 @@ mod tests {
                 },
                 pid: Some(1234),
                 port: Some(5432),
+                url: Some("{host}:{port}".into()),
                 restart_count: 0,
             }],
             steps: vec![],

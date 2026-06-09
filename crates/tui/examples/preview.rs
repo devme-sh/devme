@@ -35,6 +35,7 @@ fn main() {
                 },
                 pid: Some(12345),
                 port: Some(5432),
+                url: Some("{host}:{port}".into()),
                 restart_count: 0,
             },
             ServiceSnapshot {
@@ -42,6 +43,7 @@ fn main() {
                 state: ServiceState::Starting,
                 pid: Some(12346),
                 port: Some(8080),
+                url: Some("http://{host}:{port}".into()),
                 restart_count: 0,
             },
             ServiceSnapshot {
@@ -49,6 +51,7 @@ fn main() {
                 state: ServiceState::Stopped,
                 pid: None,
                 port: None,
+                url: None,
                 restart_count: 0,
             },
             ServiceSnapshot {
@@ -58,6 +61,7 @@ fn main() {
                 },
                 pid: None,
                 port: None,
+                url: Some("{host}:{port}".into()),
                 restart_count: 3,
             },
         ],

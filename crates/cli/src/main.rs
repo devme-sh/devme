@@ -105,7 +105,7 @@ async fn run(cli: Cli) -> i32 {
             Ok(())
         }
         Some(Command::Doctor { tail }) => doctor(tail).await,
-        Some(Command::Config { action }) => config_cmd(action),
+        Some(Command::Config { action }) => config_cmd(action, cli.json),
         Some(Command::Worktree { action }) => worktree_cmd(action, cli.json).await,
         Some(Command::Remote { action }) => remote_cmd(action, cli.json),
         Some(Command::Skill { action }) => skill_cmd(action, cli.json),
@@ -266,7 +266,12 @@ async fn url(service: String, open: bool) -> anyhow::Result<()> {
     let port = svc
         .port
         .ok_or_else(|| anyhow::anyhow!("service {service:?} has no port to build a URL from"))?;
-    let url = format!("http://localhost:{port}");
+    // Advertise a reachable host: on the VPS (with `remote.advertise_host` or
+    // `$DEVME_URL_HOST` set) this hands back a laptop-reachable link instead of
+    // `localhost`, so an agent in a herdr pane can print a clickable URL. On a
+    // plain laptop it stays `localhost`. See remote::advertise_host.
+    let host = devme_cli::remote::advertise_host();
+    let url = format!("http://{host}:{port}");
     println!("{url}");
     if !open {
         return Ok(());
@@ -795,10 +800,11 @@ async fn doctor(tail: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn config_cmd(action: Option<ConfigAction>) -> anyhow::Result<()> {
+fn config_cmd(action: Option<ConfigAction>, json: bool) -> anyhow::Result<()> {
     use devme_config::GlobalConfig;
 
     match action {
+        Some(ConfigAction::Check) => return config_check(json),
         None => {
             let (cfg, warning) = GlobalConfig::load_checked();
             if let Some(w) = warning {
@@ -835,9 +841,112 @@ fn config_cmd(action: Option<ConfigAction>) -> anyhow::Result<()> {
     }
 }
 
+/// `devme config check` — static analysis of this project's `devme.toml`:
+/// parse, then [`validate`] (fatal errors: cycles, unknown deps, …) and
+/// [`lint`] (advisories: a web service with no openable `url`, a literal
+/// `{port}`, …). Built for agents: clean JSON with `--json`, and a non-zero
+/// exit whenever there are errors so a script can gate on it.
+fn config_check(json: bool) -> anyhow::Result<()> {
+    use devme_config::{Stack, lint, validate};
+
+    let path = std::env::current_dir()?.join("devme.toml");
+    let toml_str = std::fs::read_to_string(&path)
+        .map_err(|_| anyhow::anyhow!("no devme.toml in {}", path.display()))?;
+
+    // A parse failure is terminal — nothing to validate/lint against.
+    let stack = match Stack::parse(&toml_str) {
+        Ok(s) => s,
+        Err(e) => {
+            if json {
+                let v = serde_json::json!({
+                    "ok": false,
+                    "parse_error": e.to_string(),
+                    "errors": [],
+                    "warnings": [],
+                });
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                println!("✗ devme.toml failed to parse:\n  {e}");
+            }
+            return Err(anyhow::anyhow!("config has a parse error"));
+        }
+    };
+
+    let errors: Vec<String> = match validate(&stack) {
+        Ok(()) => Vec::new(),
+        Err(errs) => errs.iter().map(|e| e.to_string()).collect(),
+    };
+    let warnings = lint(&stack);
+
+    if json {
+        let v = serde_json::json!({
+            "ok": errors.is_empty(),
+            "errors": errors,
+            "warnings": warnings
+                .iter()
+                .map(|l| serde_json::json!({
+                    "target": l.target,
+                    "message": l.message,
+                    "hint": l.hint,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        for e in &errors {
+            println!("✗ {e}");
+        }
+        for l in &warnings {
+            println!("⚠ {}", l.message);
+            println!("  fix: {}", l.hint);
+        }
+        if errors.is_empty() && warnings.is_empty() {
+            println!("✓ devme.toml looks good — no errors or warnings");
+        } else {
+            println!(
+                "\n{} error(s), {} warning(s)",
+                errors.len(),
+                warnings.len()
+            );
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("{} config error(s)", errors.len()))
+    }
+}
+
 /// `devme worktree …` — worktree lifecycle coordinated with devme.
 async fn worktree_cmd(action: WorktreeAction, json: bool) -> anyhow::Result<()> {
     match action {
+        WorktreeAction::Add { branch, path } => {
+            let cwd = std::env::current_dir()?;
+            let report =
+                devme_tui::worktree::add_worktree(&cwd, &branch, path.as_deref())?;
+            if json {
+                let value = serde_json::json!({
+                    "path": report.path.display().to_string(),
+                    "branch": report.branch,
+                    "created_branch": report.created_branch,
+                    "on_create_ran": report.on_create_ran,
+                });
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                println!("Created worktree {}", report.path.display());
+                info!(
+                    "  branch: {}{}",
+                    report.branch,
+                    if report.created_branch { " (new)" } else { "" }
+                );
+                if report.on_create_ran {
+                    info!("  ran on_create hook");
+                }
+                info!("  start it: cd {} && devme up -d", report.path.display());
+            }
+            Ok(())
+        }
         WorktreeAction::Rm { target, force } => {
             let cwd = std::env::current_dir()?;
             let report = devme_tui::worktree::remove_worktree(&cwd, &target, force).await?;
@@ -882,9 +991,12 @@ fn remote_cmd(action: Option<RemoteAction>, json: bool) -> anyhow::Result<()> {
         None => devme_cli::remote::run(&cwd),
         Some(RemoteAction::Doctor) => devme_cli::remote::doctor(&cwd, json),
         Some(RemoteAction::Status) => devme_cli::remote::status(&cwd, json),
+        Some(RemoteAction::Conflicts) => devme_cli::remote::conflicts(&cwd, json),
         Some(RemoteAction::Sync) => devme_cli::remote::sync(&cwd),
         Some(RemoteAction::Flush) => devme_cli::remote::flush(&cwd),
         Some(RemoteAction::Stop) => devme_cli::remote::stop(&cwd),
+        Some(RemoteAction::Wake) => devme_cli::remote::wake(),
+        Some(RemoteAction::WakeHook { uninstall }) => devme_cli::remote::wake_hook(uninstall),
     }
 }
 

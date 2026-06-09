@@ -126,12 +126,13 @@ pub enum Command {
         #[arg(long, default_value_t = 50)]
         tail: usize,
     },
-    /// View or change devme global settings.
+    /// View or change devme global settings, or lint this project's config.
     ///
     /// `devme config` — list all settings.
     /// `devme config get <key>` — print the value of a setting.
     /// `devme config set <key> <value>` — set a value.
     /// `devme config unset <key>` — remove a value.
+    /// `devme config check` — validate and lint this project's `devme.toml`.
     Config {
         #[command(subcommand)]
         action: Option<ConfigAction>,
@@ -155,6 +156,7 @@ pub enum Command {
     /// `devme remote` — ensure the live-sync, then attach.
     /// `devme remote doctor` — preflight the local + remote setup.
     /// `devme remote status` — conflict-aware sync state.
+    /// `devme remote conflicts` — list halted-sync conflicts + how to resolve.
     /// `devme remote sync` — reconcile without attaching.
     /// `devme remote flush` — force an immediate reconcile (e.g. on wake).
     /// `devme remote stop` — terminate the live-sync.
@@ -180,6 +182,18 @@ pub enum Command {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum WorktreeAction {
+    /// Create a worktree for a branch (creating the branch if needed), then
+    /// run the `[stack] on_create` hook in it — so an agent gets a
+    /// ready-to-use worktree whose per-worktree setup has already run. By
+    /// default the path is a sibling of the main worktree named
+    /// `<repo>-<branch-leaf>`; pass one to override.
+    Add {
+        /// Branch to check out (or create) in the new worktree.
+        branch: String,
+        /// Optional destination path (default: `<repo>-<branch-leaf>` next to
+        /// the main worktree).
+        path: Option<String>,
+    },
     /// Remove a worktree: stop its instance stack, run the `[stack]
     /// on_destroy` hook (resolved against its slot/branch while the worktree
     /// still exists), then `git worktree remove` it. This is the
@@ -203,12 +217,25 @@ pub enum RemoteAction {
     Doctor,
     /// Show the live-sync's conflict-aware state for this project.
     Status,
+    /// List unresolved sync conflicts (two-way-safe halts on conflict): the
+    /// paths involved, the full alpha/beta detail, and how to resolve them.
+    Conflicts,
     /// Reconcile the live-sync now without attaching.
     Sync,
     /// Force an immediate reconcile (e.g. right after the laptop wakes).
     Flush,
     /// Terminate the live-sync. The remote files stay; the live link stops.
     Stop,
+    /// Reconcile every devme-managed sync now. Run by the wake-hook so changes
+    /// the remote made while the laptop slept come down immediately.
+    Wake,
+    /// Install (or `--uninstall`) the OS wake hook that runs `devme remote
+    /// wake` on resume — macOS sleepwatcher's `~/.wakeup`.
+    WakeHook {
+        /// Remove the hook instead of installing it.
+        #[arg(long)]
+        uninstall: bool,
+    },
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -241,6 +268,10 @@ pub enum ConfigAction {
     Set { key: String, value: String },
     /// Remove a value (reset to default).
     Unset { key: String },
+    /// Validate and lint this project's `devme.toml`: report parse/validation
+    /// errors (fatal) and advisory warnings (e.g. a web service that won't
+    /// open because it has no `url`). Exits non-zero if any errors are found.
+    Check,
 }
 
 /// Compact, human-friendly label for a service state — the noisy `Debug`
@@ -530,6 +561,7 @@ mod tests {
             state,
             pid: None,
             port: None,
+            url: None,
             restart_count: 0,
         }
     }
@@ -722,6 +754,12 @@ mod tests {
     }
 
     #[test]
+    fn config_check_parses() {
+        let cli = Cli::parse_from(["devme", "config", "check"]);
+        assert_eq!(cli.command, Some(Command::Config { action: Some(ConfigAction::Check) }));
+    }
+
+    #[test]
     fn worktree_rm_parses_with_target() {
         let cli = Cli::parse_from(["devme", "worktree", "rm", "IWP-86"]);
         assert_eq!(
@@ -765,13 +803,57 @@ mod tests {
         for (arg, expected) in [
             ("doctor", RemoteAction::Doctor),
             ("status", RemoteAction::Status),
+            ("conflicts", RemoteAction::Conflicts),
             ("sync", RemoteAction::Sync),
             ("flush", RemoteAction::Flush),
             ("stop", RemoteAction::Stop),
+            ("wake", RemoteAction::Wake),
         ] {
             let cli = Cli::parse_from(["devme", "remote", arg]);
             assert_eq!(cli.command, Some(Command::Remote { action: Some(expected) }));
         }
+    }
+
+    #[test]
+    fn remote_wake_hook_parses_install_and_uninstall() {
+        let cli = Cli::parse_from(["devme", "remote", "wake-hook"]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Remote { action: Some(RemoteAction::WakeHook { uninstall: false }) })
+        );
+        let cli = Cli::parse_from(["devme", "remote", "wake-hook", "--uninstall"]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Remote { action: Some(RemoteAction::WakeHook { uninstall: true }) })
+        );
+    }
+
+    #[test]
+    fn local_flag_is_global() {
+        let cli = Cli::parse_from(["devme", "--local", "status"]);
+        assert!(cli.local);
+        assert_eq!(cli.command, Some(Command::Status { all: false }));
+    }
+
+    #[test]
+    fn worktree_add_parses_with_optional_path() {
+        let cli = Cli::parse_from(["devme", "worktree", "add", "feat/x"]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Worktree {
+                action: WorktreeAction::Add { branch: "feat/x".into(), path: None }
+            })
+        );
+        let cli = Cli::parse_from(["devme", "worktree", "add", "feat/x", "../wt-x"]);
+        assert_eq!(
+            cli.command,
+            Some(Command::Worktree {
+                action: WorktreeAction::Add {
+                    branch: "feat/x".into(),
+                    path: Some("../wt-x".into())
+                }
+            })
+        );
     }
 
     #[test]

@@ -126,6 +126,13 @@ pub struct ServiceSnapshot {
     pub state: ServiceState,
     pub pid: Option<u32>,
     pub port: Option<u16>,
+    /// Copy/open URL template (`{host}`/`{port}` placeholders) for the
+    /// open/copy-URL actions, or `None` when there's nothing to point at. See
+    /// `Service::url_template`. Carried only in the `Subscribed` snapshot — it
+    /// derives from static config, so `StatusUpdate` need not repeat it; the
+    /// client patches port/state onto the existing entry and keeps this.
+    #[serde(default)]
+    pub url: Option<String>,
     pub restart_count: u32,
 }
 
@@ -270,6 +277,7 @@ mod tests {
                     state: ServiceState::Running { degraded: false, started_without: vec![] },
                     pid: Some(12345),
                     port: Some(8080),
+                    url: Some("http://{host}:{port}".into()),
                     restart_count: 0,
                 }],
                 steps: vec![StepSnapshot { name: "gcloud".into(), state: StepState::Passed }],

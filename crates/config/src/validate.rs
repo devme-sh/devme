@@ -27,6 +27,77 @@ pub fn validate(stack: &Stack) -> Result<(), Vec<ConfigError>> {
     if errors.is_empty() { Ok(()) } else { Err(errors) }
 }
 
+/// A non-fatal advisory: the config parses and [`validate`]s, but something
+/// looks likely-unintended. Unlike [`ConfigError`], a lint never blocks
+/// `devme up` — it surfaces only through `devme config check`, to catch the
+/// class of mistake that otherwise only bites at runtime (a frontend that
+/// won't open, a `{port}` left literal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lint {
+    /// The step/service the advisory is about.
+    pub target: String,
+    /// What looks wrong, in one line.
+    pub message: String,
+    /// Concrete fix.
+    pub hint: String,
+}
+
+/// Run every lint pass over a parsed [`Stack`]. Advisory only — the result is
+/// always returned (never an error), and an empty vec means "nothing to flag".
+pub fn lint(stack: &Stack) -> Vec<Lint> {
+    let mut lints = Vec::new();
+    check_ambiguous_openability(stack, &mut lints);
+    check_port_placeholder_without_port(stack, &mut lints);
+    lints
+}
+
+/// A service with a port but neither a `url` nor a health check is ambiguous:
+/// devme can't tell a web server (browser-openable) from a database (copy a
+/// bare `host:port`). It defaults to the latter, so a frontend silently
+/// refuses to open. Declaring *either* signal removes the ambiguity — this is
+/// the lint that closes the "open says not a web URL" footgun.
+fn check_ambiguous_openability(stack: &Stack, lints: &mut Vec<Lint>) {
+    for (name, svc) in &stack.service {
+        if svc.external {
+            continue; // external services already require health (validated).
+        }
+        if svc.port.is_some() && svc.url.is_none() && svc.health.is_none() {
+            lints.push(Lint {
+                target: name.clone(),
+                message: format!(
+                    "service '{name}' has a port but no `url` and no health check — \
+                     devme can't tell whether it's browser-openable, so the TUI's `o` \
+                     (open) copies a bare host:port instead of opening a browser"
+                ),
+                hint: "add `url = \"http://{host}:{port}\"` for a web server, \
+                       or a health check (e.g. `health = { tcp = \"localhost:{port}\" }`) \
+                       for a database / TCP service"
+                    .into(),
+            });
+        }
+    }
+}
+
+/// `{port}` in a command with no `port` declared is passed through literally —
+/// the process gets the string `{port}`, not a number. Almost always a missing
+/// `port = { … }`.
+fn check_port_placeholder_without_port(stack: &Stack, lints: &mut Vec<Lint>) {
+    for (name, svc) in &stack.service {
+        if svc.port.is_none() && svc.cmd.contains("{port}") {
+            lints.push(Lint {
+                target: name.clone(),
+                message: format!(
+                    "service '{name}' uses `{{port}}` in its command but declares no \
+                     `port` — the placeholder is passed through literally"
+                ),
+                hint: "add `port = { base = <default>, slot_offset = 10 }` \
+                       (or `{ fixed = <n> }`)"
+                    .into(),
+            });
+        }
+    }
+}
+
 fn check_name_collisions(stack: &Stack, errors: &mut Vec<ConfigError>) {
     for name in stack.step.keys() {
         if stack.service.contains_key(name) {
@@ -382,6 +453,66 @@ health = { tcp = "localhost:5432" }
         let s = parse("schema_version = 99");
         let errs = validate(&s).unwrap_err();
         assert!(matches!(errs.as_slice(), [ConfigError::UnsupportedSchemaVersion { found: 99, expected: 1 }]));
+    }
+
+    #[test]
+    fn lint_flags_web_service_without_url_or_health() {
+        // The motivating case: a Vite-style dev server, port but no url/health.
+        let s = parse(r#"
+schema_version = 1
+
+[service.frontend]
+cmd = "npm run dev"
+port = { base = 5173, slot_offset = 10 }
+"#);
+        let lints = lint(&s);
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].target, "frontend");
+        assert!(lints[0].message.contains("browser-openable"));
+        assert!(lints[0].hint.contains("url ="));
+    }
+
+    #[test]
+    fn lint_silent_when_url_declared() {
+        let s = parse(r#"
+schema_version = 1
+
+[service.frontend]
+cmd = "npm run dev"
+port = { base = 5173, slot_offset = 10 }
+url = "http://{host}:{port}"
+"#);
+        assert!(lint(&s).is_empty());
+    }
+
+    #[test]
+    fn lint_silent_when_health_declared() {
+        // A tcp health check is a clear "this is a TCP/db service" signal — not
+        // ambiguous, so no nudge.
+        let s = parse(r#"
+schema_version = 1
+
+[service.db]
+cmd = "docker run postgres"
+port = { fixed = 5432 }
+health = { tcp = "localhost:{port}" }
+"#);
+        assert!(lint(&s).is_empty());
+    }
+
+    #[test]
+    fn lint_flags_port_placeholder_without_port_spec() {
+        let s = parse(r#"
+schema_version = 1
+
+[service.api]
+cmd = "serve --port {port}"
+url = "http://{host}:{port}"
+"#);
+        let lints = lint(&s);
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].target, "api");
+        assert!(lints[0].message.contains("{port}"));
     }
 
     #[test]

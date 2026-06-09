@@ -197,6 +197,8 @@ impl GlobalConfig {
             "remote.sync_mode" => self.remote.sync_mode.clone(),
             "remote.attach" => self.remote.attach.clone(),
             "remote.url_host" => self.remote.url_host.clone(),
+            "remote.advertise_host" => self.remote.advertise_host.clone(),
+            "remote.up_on_attach" => self.remote.up_on_attach.map(|b| b.to_string()),
             "remote.default" => self.remote.default.map(|b| b.to_string()),
             _ => None,
         }
@@ -258,6 +260,16 @@ impl GlobalConfig {
                 self.remote.url_host = Some(value.to_string());
                 Ok(())
             }
+            "remote.advertise_host" => {
+                self.remote.advertise_host = Some(value.to_string());
+                Ok(())
+            }
+            "remote.up_on_attach" => {
+                let b = parse_bool(value)
+                    .ok_or_else(|| format!("remote.up_on_attach expects true/false, got: {value}"))?;
+                self.remote.up_on_attach = Some(b);
+                Ok(())
+            }
             "remote.default" => {
                 let b = parse_bool(value)
                     .ok_or_else(|| format!("remote.default expects true/false, got: {value}"))?;
@@ -314,6 +326,14 @@ impl GlobalConfig {
                 self.remote.url_host = None;
                 Ok(())
             }
+            "remote.advertise_host" => {
+                self.remote.advertise_host = None;
+                Ok(())
+            }
+            "remote.up_on_attach" => {
+                self.remote.up_on_attach = None;
+                Ok(())
+            }
             "remote.default" => {
                 self.remote.default = None;
                 Ok(())
@@ -335,6 +355,8 @@ impl GlobalConfig {
             ("remote.sync_mode", "Mutagen sync mode (two-way-safe/two-way-resolved)"),
             ("remote.attach", "Attach command after sync: preset (tui/ssh/tmux/herdr) or a raw template"),
             ("remote.url_host", "Host for service URLs over a live remote (default: remote.host, e.g. a Tailscale name)"),
+            ("remote.advertise_host", "Host THIS machine puts in `devme url` output when it runs the stack (a hostname or \"auto\" for its Tailscale name). Set on the remote/VPS."),
+            ("remote.up_on_attach", "Ensure the remote stack is up (devme up -d) before attaching (true/false, default true)"),
             ("remote.default", "Make bare `devme` behave as `devme remote` (true/false)"),
         ]
     }
@@ -385,9 +407,11 @@ fn parse_bool(value: &str) -> Option<bool> {
 /// string-typed `hints.skills`) is quoted.
 fn render_toml_value(key: &str, value: &str) -> String {
     match key {
-        "skill.auto_update" | "tui.confirm_quit" | "tui.toasts" | "remote.default" => {
-            value.to_string()
-        }
+        "skill.auto_update"
+        | "tui.confirm_quit"
+        | "tui.toasts"
+        | "remote.up_on_attach"
+        | "remote.default" => value.to_string(),
         _ => format!("\"{value}\""),
     }
 }

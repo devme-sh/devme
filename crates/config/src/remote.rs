@@ -77,6 +77,22 @@ pub struct RemoteConfig {
     /// remote resolves to `http://<url_host>:<port>` instead of localhost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url_host: Option<String>,
+    /// Host that *this* machine advertises in `devme url` output when it's the
+    /// one running the stack (e.g. the VPS). Lets an agent in a herdr pane on
+    /// the host hand back a laptop-reachable link instead of `localhost`. A
+    /// hostname, or the literal `"auto"` to read the machine's own Tailscale
+    /// MagicDNS name. Deliberately distinct from `url_host` (which the *laptop*
+    /// uses to rewrite a proxied URL): a laptop never sets `advertise_host`, so
+    /// plain local `devme url` is never silently rewritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advertise_host: Option<String>,
+    /// When attaching to the remote (bare `devme` / `devme remote`), first
+    /// ensure the stack is up on the host (`devme up -d`) so the dev server is
+    /// already running under the supervisor before you land in herdr/ssh/tui.
+    /// Default true. The supervisor — not the attach session — owns the
+    /// stack's lifetime, so it survives detach and the laptop sleeping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up_on_attach: Option<bool>,
     /// When true, bare `devme` behaves as `devme remote` — the project is
     /// remote-first, so opening it attaches to the remote stack's TUI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,6 +107,8 @@ impl RemoteConfig {
             && self.attach.is_none()
             && self.ignore.is_empty()
             && self.url_host.is_none()
+            && self.advertise_host.is_none()
+            && self.up_on_attach.is_none()
             && self.default.is_none()
     }
 
@@ -118,6 +136,12 @@ impl RemoteConfig {
 
     pub fn attach_or_default(&self) -> &str {
         self.attach.as_deref().unwrap_or(DEFAULT_ATTACH)
+    }
+
+    /// Whether attaching should first ensure the remote stack is up. Default
+    /// true — landing in herdr/ssh with a dead stack is the wrong default.
+    pub fn up_on_attach_or_default(&self) -> bool {
+        self.up_on_attach.unwrap_or(true)
     }
 
     /// The effective ignore list — the configured one, or [`DEFAULT_IGNORES`].
@@ -198,11 +222,20 @@ pub fn sync_session_name(local_root: &Path) -> String {
 /// - `ssh` — a bare login shell in the project dir (zero-dep, no persistence).
 /// - `tmux` — `devme tui` inside a persistent tmux session, re-attachable.
 /// - `herdr` — attach a herdr remote session (the herdr setup is the user's).
-pub fn expand_attach(attach: &str, host: &str, remote_path: &str, name: &str) -> String {
+pub fn expand_attach(
+    attach: &str,
+    host: &str,
+    remote_path: &str,
+    name: &str,
+    url_host: &str,
+) -> String {
+    // `env VAR=val cmd` (not `VAR=val cmd`) so it works under fish too, which
+    // has no inline assignment syntax. `DEVME_URL_HOST` lets the remote TUI's
+    // copy-URL keybind hand back a laptop-reachable (Tailscale) URL.
     let template = match attach {
-        "tui" => "ssh -t {host} 'cd {remote_path} && exec devme tui'",
+        "tui" => "ssh -t {host} 'cd {remote_path} && exec env DEVME_URL_HOST={url_host} devme tui'",
         "ssh" => "ssh -t {host} 'cd {remote_path} && exec $SHELL'",
-        "tmux" => "ssh -t {host} 'tmux new -A -s {name} -c {remote_path} devme tui'",
+        "tmux" => "ssh -t {host} 'tmux new -A -s {name} -c {remote_path} env DEVME_URL_HOST={url_host} devme tui'",
         "herdr" => "herdr --remote {host} --session {name}",
         raw => raw,
     };
@@ -210,6 +243,41 @@ pub fn expand_attach(attach: &str, host: &str, remote_path: &str, name: &str) ->
         .replace("{host}", host)
         .replace("{remote_path}", remote_path)
         .replace("{name}", name)
+        .replace("{url_host}", url_host)
+}
+
+/// Sentinel `advertise_host` value meaning "autodetect this machine's own
+/// Tailscale MagicDNS name." Keeps devme network-agnostic: Tailscale is an
+/// opt-in autodetect, never a hard dependency.
+pub const ADVERTISE_AUTO: &str = "auto";
+
+/// Pick the host `devme url` should advertise on the machine running the
+/// stack, from already-resolved inputs (pure, so it's unit-tested). Priority:
+///
+/// 1. `env` — `$DEVME_URL_HOST`, exported by the laptop's attach templates so
+///    a URL copied inside the remote TUI is laptop-reachable.
+/// 2. `configured` — `remote.advertise_host`; the literal `"auto"` defers to
+///    `tailscale` (which the caller looks up only in that case).
+///
+/// `None` means "no host to advertise — fall back to `localhost`". Whitespace
+/// and empty strings are treated as absent so a blank config never wins.
+pub fn pick_advertise_host(
+    env: Option<&str>,
+    configured: Option<&str>,
+    tailscale: Option<&str>,
+) -> Option<String> {
+    fn clean(s: &str) -> Option<String> {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    }
+    if let Some(e) = env.and_then(clean) {
+        return Some(e);
+    }
+    match configured.map(str::trim) {
+        Some(ADVERTISE_AUTO) => tailscale.and_then(clean),
+        Some(other) => clean(other),
+        None => None,
+    }
 }
 
 /// Rewrite a local URL's host to `url_host` so a `http://localhost:<port>`
@@ -234,6 +302,40 @@ mod tests {
         assert_eq!(cfg.sync_mode_or_default(), "two-way-safe");
         assert_eq!(cfg.attach_or_default(), "tui");
         assert_eq!(cfg.ignores(), DEFAULT_IGNORES);
+        // up_on_attach defaults on — landing in herdr with a dead stack is wrong.
+        assert!(cfg.up_on_attach_or_default());
+    }
+
+    #[test]
+    fn advertise_host_priority_env_then_config_then_auto() {
+        // env (DEVME_URL_HOST from the attach template) wins outright.
+        assert_eq!(
+            pick_advertise_host(Some("env.host"), Some("cfg.host"), Some("ts.host")).as_deref(),
+            Some("env.host")
+        );
+        // No env → explicit config is used verbatim.
+        assert_eq!(
+            pick_advertise_host(None, Some("cfg.host"), Some("ts.host")).as_deref(),
+            Some("cfg.host")
+        );
+        // "auto" defers to the autodetected Tailscale name.
+        assert_eq!(
+            pick_advertise_host(None, Some("auto"), Some("vps.goose-viper.ts.net")).as_deref(),
+            Some("vps.goose-viper.ts.net")
+        );
+        // "auto" but Tailscale unavailable → None (caller uses localhost).
+        assert_eq!(pick_advertise_host(None, Some("auto"), None), None);
+        // Nothing configured → None, so a plain laptop `devme url` is untouched.
+        assert_eq!(pick_advertise_host(None, None, None), None);
+        // Blanks are treated as absent.
+        assert_eq!(pick_advertise_host(Some("  "), Some("  "), Some("ts")), None);
+    }
+
+    #[test]
+    fn up_on_attach_round_trips() {
+        let cfg = RemoteConfig { up_on_attach: Some(false), ..Default::default() };
+        assert!(!cfg.up_on_attach_or_default());
+        assert!(!cfg.is_empty());
     }
 
     #[test]
@@ -295,22 +397,25 @@ mod tests {
 
     #[test]
     fn attach_tui_preset_runs_devme_tui_remotely() {
-        let cmd = expand_attach("tui", "vps", "~/development/api-abc", "devme-api");
+        let cmd = expand_attach("tui", "vps", "~/development/api-abc", "devme-api", "vps");
         assert!(cmd.contains("ssh -t vps"));
         assert!(cmd.contains("cd ~/development/api-abc"));
-        assert!(cmd.contains("exec devme tui"));
+        assert!(cmd.contains("exec env DEVME_URL_HOST=vps devme tui"));
     }
 
     #[test]
     fn attach_presets_cover_persistence_options() {
-        assert!(expand_attach("ssh", "vps", "/p", "n").contains("exec $SHELL"));
-        assert!(expand_attach("tmux", "vps", "/p", "n").contains("tmux new -A -s n"));
-        assert!(expand_attach("herdr", "vps", "/p", "sess").contains("herdr --remote vps --session sess"));
+        assert!(expand_attach("ssh", "vps", "/p", "n", "vps").contains("exec $SHELL"));
+        assert!(expand_attach("tmux", "vps", "/p", "n", "vps").contains("tmux new -A -s n"));
+        assert!(
+            expand_attach("herdr", "vps", "/p", "sess", "vps")
+                .contains("herdr --remote vps --session sess")
+        );
     }
 
     #[test]
     fn attach_raw_template_substitutes_placeholders() {
-        let cmd = expand_attach("mosh {host} -- tmux a -t {name}", "box", "/p", "proj");
+        let cmd = expand_attach("mosh {host} -- tmux a -t {name}", "box", "/p", "proj", "box");
         assert_eq!(cmd, "mosh box -- tmux a -t proj");
     }
 

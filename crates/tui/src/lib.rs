@@ -6,6 +6,7 @@
 //! consumes.
 
 pub mod discovery;
+pub mod keymap;
 pub mod render;
 pub mod state;
 pub mod theme;

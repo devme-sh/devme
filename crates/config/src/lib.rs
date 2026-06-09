@@ -30,4 +30,4 @@ pub use remote::RemoteConfig;
 pub use service::Service;
 pub use stack::{SCHEMA_VERSION, Stack, StackMeta};
 pub use step::Step;
-pub use validate::validate;
+pub use validate::{Lint, lint, validate};

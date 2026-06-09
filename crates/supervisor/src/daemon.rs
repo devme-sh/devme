@@ -245,7 +245,7 @@ impl DaemonState {
             .stack
             .service
             .iter()
-            .map(|(name, _)| {
+            .map(|(name, svc)| {
                 let rec = self.children.get(name);
                 // restart_count persists across crash/restart cycles, so a
                 // momentarily-Failed service still shows its accumulated
@@ -257,6 +257,7 @@ impl DaemonState {
                     state: self.current_service_state(name),
                     pid: rec.map(|r| r.pid),
                     port: rec.and_then(|r| r.port),
+                    url: svc.url_template(),
                     restart_count: count,
                 }
             })
