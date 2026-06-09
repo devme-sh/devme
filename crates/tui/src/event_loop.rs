@@ -78,6 +78,10 @@ pub async fn launch(no_shutdown: bool) -> anyhow::Result<()> {
     if let Some(warning) = cfg_warning {
         state.push_config_warning(warning);
     }
+    // When attached over `devme remote`, the whole session lives on the remote
+    // host — record it so the sidebar can badge it and the info modal can lead
+    // with the host (so its remote path/slot read as remote).
+    state.set_remote_host(is_remote_tui().then(service_url_host));
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -589,7 +593,11 @@ async fn run(
                                     } else {
                                         crate::worktree::slot_for_cwd(state.current_instance_cwd())
                                     };
-                                    state.open_stack_info(slot);
+                                    // On a remote TUI the path/slot are the
+                                    // remote host's — surface the host so they
+                                    // read as remote (and it's copyable to ssh).
+                                    let remote_host = state.remote_host().map(str::to_string);
+                                    state.open_stack_info(slot, remote_host);
                                 }
                                 Action::Settings => state.open_settings(),
                                 Action::Notifications => state.toggle_notifications(),

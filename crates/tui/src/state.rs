@@ -458,6 +458,10 @@ pub enum ClickTarget {
     Shared,
     /// Select the service tab at this index in [`TuiState::tab_services`].
     Tab(usize),
+    /// Scroll the (overflowing) tab row left — the `‹` edge marker.
+    TabScrollLeft,
+    /// Scroll the (overflowing) tab row right — the `›` edge marker.
+    TabScrollRight,
     /// Copy the notification at this display index (newest-first) in the
     /// notifications-history modal.
     Notif(usize),
@@ -648,6 +652,11 @@ pub struct TuiState {
     /// The stack-info modal (`i`), when open. Identity + status for the focused
     /// stack, with per-field copy.
     stack_info: Option<StackInfoState>,
+    /// The reachable hostname when this whole TUI is attached to a remote stack
+    /// (over `devme remote`, which exports `DEVME_URL_HOST`). `None` for a local
+    /// session. Drives the sidebar remote badge and the info modal's Host row —
+    /// the entire session is remote or local, never a per-stack mix.
+    remote_host: Option<String>,
     /// Horizontal scroll offset (columns) of the service-tab row, for when the
     /// tabs overflow the pane. Driven manually by the mouse wheel over the row;
     /// the renderer also nudges it to keep the *selected* tab in view when the
@@ -703,6 +712,7 @@ impl Default for TuiState {
             stopped: false,
             stopped_repo: None,
             stack_info: None,
+            remote_host: None,
             tab_scroll: 0,
             tab_ctx: None,
             tab_row: None,
@@ -1899,6 +1909,20 @@ impl TuiState {
             .collect()
     }
 
+    // ── remote session ──────────────────────────────────────────────────
+
+    /// Record the reachable hostname for a remote-attached TUI (set once at
+    /// startup from `DEVME_URL_HOST`). `None` leaves it local.
+    pub fn set_remote_host(&mut self, host: Option<String>) {
+        self.remote_host = host;
+    }
+
+    /// The remote host this TUI is attached to, or `None` when local. Drives
+    /// the sidebar remote badge and the info modal's Host row.
+    pub fn remote_host(&self) -> Option<&str> {
+        self.remote_host.as_deref()
+    }
+
     // ── stack-info modal ────────────────────────────────────────────────
 
     /// Open the stack-info modal for the focused stack. `slot` is the port
@@ -1952,10 +1976,10 @@ impl TuiState {
         }
 
         let Some(idx) = self.selected_instance else {
-            return (String::new(), fields);
+            return (String::new(), Vec::new());
         };
         let Some(inst) = self.instances.get(idx) else {
-            return (String::new(), fields);
+            return (String::new(), Vec::new());
         };
         let title = inst.info.label.clone();
         fields.push(copyable("Branch", inst.info.label.clone()));
@@ -2319,6 +2343,13 @@ impl TuiState {
         self.tab_scroll = (self.tab_scroll as isize + delta).max(0) as usize;
     }
 
+    /// Columns to move per click on a ‹ › edge arrow — half the visible tab
+    /// width (a "page"), so a couple of clicks sweep the whole row while still
+    /// leaving context. Falls back to a small step before the first render.
+    fn tab_page_step(&self) -> usize {
+        self.tab_row.map(|(_, _, w, _)| (w as usize / 2).max(4)).unwrap_or(8)
+    }
+
     /// The tab context rendered last frame, for detecting selection changes.
     pub fn tab_ctx(&self) -> Option<(usize, usize)> {
         self.tab_ctx
@@ -2382,6 +2413,15 @@ impl TuiState {
             }
             ClickTarget::Tab(i) => {
                 self.set_active_selected_service(Some(i));
+            }
+            // The ‹ › edge markers page the overflowing tab row sideways.
+            ClickTarget::TabScrollLeft => {
+                let step = self.tab_page_step();
+                self.scroll_tabs(-(step as isize));
+            }
+            ClickTarget::TabScrollRight => {
+                let step = self.tab_page_step();
+                self.scroll_tabs(step as isize);
             }
             // Notification rows are clickable only while the modal is open,
             // which routes through `notif_copy_at` (it copies, with a side
@@ -3456,7 +3496,7 @@ mod tests {
         s.apply(snapshot_msg(&["api"]));
         s.apply_git_refresh("test-id", Some("feature/x".into()), Some((1, 2)));
 
-        s.open_stack_info(Some(3));
+        s.open_stack_info(Some(3), None);
         let info = s.stack_info().expect("modal open");
         assert_eq!(info.title, "feature/x");
         // Branch, Path, Slot, Status, Instance id — Status is info-only.
@@ -3475,10 +3515,26 @@ mod tests {
     }
 
     #[test]
+    fn stack_info_leads_with_host_on_remote() {
+        let mut s = TuiState::default();
+        s.apply(snapshot_msg(&["api"]));
+        s.open_stack_info(Some(3), Some("vps.tail123.ts.net".into()));
+        let info = s.stack_info().expect("modal open");
+        // Host leads the rows and the cursor starts on it.
+        assert_eq!(info.fields[0].label, "Host");
+        assert_eq!(s.stack_info_field("Host").as_deref(), Some("vps.tail123.ts.net"));
+        assert_eq!(s.stack_info_selected_value().as_deref(), Some("vps.tail123.ts.net"));
+        // A local TUI (no host) has no Host row.
+        s.close_stack_info();
+        s.open_stack_info(Some(3), None);
+        assert!(s.stack_info().unwrap().fields.iter().all(|f| f.label != "Host"));
+    }
+
+    #[test]
     fn stack_info_cursor_skips_info_only_rows() {
         let mut s = TuiState::default();
         s.apply(snapshot_msg(&["api"]));
-        s.open_stack_info(None); // no slot → Branch, Path, Status, Instance id
+        s.open_stack_info(None, None); // no slot → Branch, Path, Status, Instance id
 
         // Down past Path lands on Instance id, hopping over the Status row.
         s.stack_info_move(1); // Path
@@ -4157,6 +4213,24 @@ mod tests {
         // No Goodbye was sent — instance remains, so we keep watching.
         assert!(s.has_instance("A"));
         assert!(!s.all_daemons_shut_down());
+    }
+
+    #[test]
+    fn clicking_tab_scroll_arrows_pages_the_row() {
+        // Stand in for the renderer having registered the ‹ › arrow regions on
+        // a laid-out, overflowing tab row (width 20).
+        let mut s = TuiState::default();
+        s.set_tab_row(0, 0, 20, 2);
+        s.push_click_region(0, 0, 1, 2, ClickTarget::TabScrollLeft);
+        s.push_click_region(19, 0, 1, 2, ClickTarget::TabScrollRight);
+
+        assert_eq!(s.tab_scroll(), 0);
+        assert!(s.click_at(19, 0), "› is a hit");
+        let after_right = s.tab_scroll();
+        assert!(after_right > 0, "clicking › pages the row right");
+
+        assert!(s.click_at(0, 0), "‹ is a hit");
+        assert!(s.tab_scroll() < after_right, "clicking ‹ pages the row back left");
     }
 
     #[test]

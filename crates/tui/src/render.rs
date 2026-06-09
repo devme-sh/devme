@@ -1050,6 +1050,36 @@ fn health_dot(p: &Palette, health: crate::state::StackHealth) -> (&'static str, 
     }
 }
 
+/// Shorten a remote host for the sidebar badge: drop any `user@`, keep the
+/// first DNS label (`vps.tail069899.ts.net` → `vps`), capped so a long name
+/// can't crowd the sidebar.
+fn short_host(host: &str) -> String {
+    let after_at = host.rsplit('@').next().unwrap_or(host);
+    let first = after_at.split('.').next().unwrap_or(after_at);
+    theme::truncate(first, 14)
+}
+
+/// The stacks-section header with a right-aligned remote badge (`⇅ host`),
+/// shown when the TUI is attached to a remote stack so the whole sidebar
+/// clearly reads as living on another host. The `⇅` echoes the sync that
+/// `devme remote` runs; the host names which box. Falls back to the plain
+/// `section_header` locally.
+fn render_stacks_header_remote(p: &Palette, frame: &mut Frame<'_>, area: Rect, host: &str) {
+    if area.height == 0 {
+        return;
+    }
+    let width = area.width as usize;
+    let badge = format!("⇅ {} ", short_host(host));
+    let left = " stacks";
+    let pad = width.saturating_sub(left.chars().count() + badge.chars().count());
+    let line = Line::from(vec![
+        Span::styled(left, Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD)),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(badge, Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+    ]);
+    frame.render_widget(Paragraph::new(line), Rect { height: 1, ..area });
+}
+
 /// Header label for a sidebar section — a quiet lowercase tag, herdr-style.
 fn section_header(p: &Palette, frame: &mut Frame<'_>, area: Rect, label: &str) {
     if area.height == 0 {
@@ -1093,7 +1123,9 @@ fn render_stack_row(
     } else {
         Style::default().fg(p.subtext0)
     };
-    let max_name = (area.width as usize).saturating_sub(4);
+    // Prefix is 3 columns (" " + dot + " "); reserve only those so the name
+    // can fill to the sidebar's edge instead of clipping a char early.
+    let max_name = (area.width as usize).saturating_sub(3);
     let name_line = Line::from(vec![
         Span::raw(" "),
         Span::styled(dot.0, Style::default().fg(dot.1)),
@@ -1156,7 +1188,12 @@ fn render_stacks_pane(p: &Palette, frame: &mut Frame<'_>, area: Rect, state: &mu
     if area.height == 0 {
         return;
     }
-    section_header(p, frame, area, "stacks");
+    // When attached to a remote stack, badge the header so it's unmistakable
+    // the whole sidebar lives on another host; otherwise a plain header.
+    match state.remote_host() {
+        Some(host) => render_stacks_header_remote(p, frame, area, host),
+        None => section_header(p, frame, area, "stacks"),
+    }
 
     let selected = state.selected_instance_index();
     let shared_active = state.shared_selected();
@@ -1272,7 +1309,10 @@ fn render_tools_pane(p: &Palette, frame: &mut Frame<'_>, area: Rect, state: &Tui
         if y >= bottom {
             return;
         }
-        let max_name = (area.width as usize).saturating_sub(4);
+        // Row prefix is 3 columns (" " + glyph + " "), so the label may use the
+        // remaining width — reserving 4 left a blank trailing column and clipped
+        // names one char early.
+        let max_name = (area.width as usize).saturating_sub(3);
         let line = Line::from(vec![
             Span::raw(" "),
             Span::styled(
@@ -1357,6 +1397,15 @@ fn format_main_title(state: &TuiState) -> Line<'_> {
         spans.push(Span::styled(
             format!("• {failed} failed"),
             Style::default().fg(p.red),
+        ));
+    }
+    // Remote marker in the always-visible title bar so remoteness survives a
+    // collapsed sidebar (where the `⇅ host` header badge is hidden).
+    if let Some(host) = state.remote_host() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("⇅ {}", short_host(host)),
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
         ));
     }
     spans.push(Span::raw(" "));
@@ -1499,32 +1548,52 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
         area,
     );
 
-    // Edge markers when the row is clipped, so it's clear it continues.
-    let marker = Style::default().fg(p.overlay0);
-    if scroll_x > 0 {
+    // Edge markers when the row is clipped, so it's clear it continues — and
+    // clickable: each pages the row sideways. Drawn in the accent colour (and a
+    // hand cursor on hover, since they're click regions) so they read as
+    // controls. Registered *before* the tab regions below so they win the
+    // hit-test on the cell they share with an edge tab (click_at takes the
+    // first matching region).
+    let marker = Style::default().fg(p.accent).add_modifier(Modifier::BOLD);
+    let show_left = scroll_x > 0;
+    let show_right = total.saturating_sub(scroll_x) > avail;
+    if show_left {
         frame.render_widget(
             Paragraph::new(Span::styled("‹", marker)),
             Rect { width: 1, ..area },
         );
+        state.push_click_region(area.x, area.y, 1, area.height, ClickTarget::TabScrollLeft);
     }
-    if total.saturating_sub(scroll_x) > avail {
+    if show_right {
+        let rx = area.x + area.width.saturating_sub(1);
         frame.render_widget(
             Paragraph::new(Span::styled("›", marker)),
-            Rect { x: area.x + area.width.saturating_sub(1), width: 1, ..area },
+            Rect { x: rx, width: 1, ..area },
         );
+        state.push_click_region(rx, area.y, 1, area.height, ClickTarget::TabScrollRight);
     }
 
     // Record each visible tab as a click region. Content cols are shifted left
-    // by `scroll_x` and clipped to the pane, mirroring the rendered Paragraph.
+    // by `scroll_x` and clipped to the pane, mirroring the rendered Paragraph —
+    // and kept clear of the one-cell edge arrows so those stay clickable.
+    let left_guard = if show_left { area.x + 1 } else { area.x };
+    let right_guard = if show_right {
+        area.x + area.width.saturating_sub(1)
+    } else {
+        area.x + area.width
+    };
     for (i, s, e) in tab_spans {
         let vs = s.max(scroll_x);
         let ve = e.min(scroll_x + avail);
         if vs >= ve {
             continue; // scrolled out of view
         }
-        let sx = area.x + (vs - scroll_x) as u16;
-        let w = (ve - vs) as u16;
-        state.push_click_region(sx, area.y, w, area.height, ClickTarget::Tab(i));
+        let sx = (area.x + (vs - scroll_x) as u16).max(left_guard);
+        let ex = (area.x + (ve - scroll_x) as u16).min(right_guard);
+        if sx >= ex {
+            continue; // entirely under an edge arrow
+        }
+        state.push_click_region(sx, area.y, ex - sx, area.height, ClickTarget::Tab(i));
     }
 }
 
@@ -2251,6 +2320,28 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_badges_remote_host() {
+        let mut state = TuiState::default();
+        state.apply(ServerMessage::Subscribed {
+            instance: InstanceInfo { id: "id".into(), label: "main".into(), cwd: "/srv/app".into() },
+            services: vec![],
+            steps: vec![],
+        });
+
+        // Local: a plain header, no badge.
+        let text = render_to_text(&mut state, 100, 20);
+        assert!(!text.contains("⇅"), "remote badge leaked locally:\n{text}");
+
+        // Remote: the stacks header gains a `⇅ <short host>` badge.
+        state.set_remote_host(Some("vps.tail069899.ts.net".into()));
+        let text = render_to_text(&mut state, 100, 20);
+        assert!(text.contains("⇅"), "remote badge missing:\n{text}");
+        assert!(text.contains("vps"), "short host missing from badge:\n{text}");
+        // The long DNS suffix is dropped — only the first label shows.
+        assert!(!text.contains("tail069899"), "badge should shorten the host:\n{text}");
+    }
+
+    #[test]
     fn stack_info_overlay_renders_fields_when_open() {
         let mut state = TuiState::default();
         state.apply(ServerMessage::Subscribed {
@@ -2273,7 +2364,7 @@ mod tests {
         let text = render_to_text(&mut state, 100, 30);
         assert!(!text.contains("Instance id"), "modal leaked when hidden:\n{text}");
 
-        state.open_stack_info(Some(2));
+        state.open_stack_info(Some(2), None);
         let text = render_to_text(&mut state, 100, 30);
         assert!(text.contains("feature/x"), "branch/title missing:\n{text}");
         assert!(text.contains("/tmp/wt-x"), "worktree path missing:\n{text}");
@@ -2333,6 +2424,87 @@ mod tests {
         let text = render_to_text(&mut state, 100, 20);
         assert!(text.contains("listening on :8080"), "missing first log line:\n{text}");
         assert!(text.contains("GET /health 200"), "missing second log line:\n{text}");
+    }
+
+    #[test]
+    fn scrollbar_hidden_when_logs_fit_but_shown_when_they_overflow() {
+        let enc = |t: &str| base64::engine::general_purpose::STANDARD.encode(t.as_bytes());
+
+        // A handful of lines fits in the viewport — no thumb should render.
+        // (ratatui draws nothing when there's nothing to scroll; a stale model
+        // here used to size the thumb at ~half the track regardless.)
+        let mut fits = TuiState::default();
+        fits.apply(ServerMessage::Subscribed {
+            instance: test_instance(),
+            services: vec![svc("api", ServiceState::Stopped)],
+            steps: vec![],
+        });
+        for i in 0..3 {
+            fits.apply(ServerMessage::LogChunk {
+                service: "api".into(),
+                bytes: enc(&format!("line {i}")),
+                ts: i as u64,
+            });
+        }
+        let text = render_to_text(&mut fits, 100, 20);
+        assert!(!text.contains('┃'), "scrollbar thumb shown when logs fit:\n{text}");
+
+        // Far more lines than the viewport — the thumb must appear.
+        let mut overflow = TuiState::default();
+        overflow.apply(ServerMessage::Subscribed {
+            instance: test_instance(),
+            services: vec![svc("api", ServiceState::Stopped)],
+            steps: vec![],
+        });
+        for i in 0..200 {
+            overflow.apply(ServerMessage::LogChunk {
+                service: "api".into(),
+                bytes: enc(&format!("line {i}")),
+                ts: i as u64,
+            });
+        }
+        let text = render_to_text(&mut overflow, 100, 20);
+        assert!(text.contains('┃'), "scrollbar thumb missing when logs overflow:\n{text}");
+    }
+
+    #[test]
+    fn tools_label_uses_reclaimed_prefix_column() {
+        // The row prefix is 3 columns (" " + glyph + " "). At the 28-col default
+        // sidebar (less a 1-col right gutter → 27 content), the label budget is
+        // 27 - 3 = 24. A 24-char name must render whole — reserving 4 used to
+        // clip it one char early.
+        let name = "abcdefghij_klmnop_qrstuv"; // 24 chars
+        assert_eq!(name.chars().count(), 24);
+        let mut state = TuiState::default();
+        state.apply(ServerMessage::Subscribed {
+            instance: test_instance(),
+            services: vec![svc("api", ServiceState::Stopped)],
+            steps: vec![StepSnapshot {
+                name: name.into(),
+                state: StepState::Passed,
+            }],
+        });
+        let text = render_to_text(&mut state, 100, 24);
+        assert!(
+            text.contains(name),
+            "tool label clipped despite fitting the sidebar:\n{text}"
+        );
+    }
+
+    #[test]
+    fn title_bar_marks_remote() {
+        let mut state = TuiState::default();
+        state.apply(ServerMessage::Subscribed {
+            instance: InstanceInfo { id: "id".into(), label: "main".into(), cwd: "/srv/app".into() },
+            services: vec![],
+            steps: vec![],
+        });
+        // Collapse the sidebar so the header badge is gone — the title must
+        // still carry the remote marker.
+        state.toggle_sidebar();
+        state.set_remote_host(Some("vps.tail069899.ts.net".into()));
+        let text = render_to_text(&mut state, 100, 20);
+        assert!(text.contains("⇅ vps"), "title-bar remote marker missing:\n{text}");
     }
 
     #[test]
