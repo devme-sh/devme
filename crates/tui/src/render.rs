@@ -1396,8 +1396,14 @@ fn stack_secondary(p: &Palette, state: &TuiState, i: usize) -> Vec<Span<'static>
         StackSummary::NoDaemon => {
             // Steady-state, a worktree has no daemon because it has no
             // devme.toml — say so plainly rather than the jargon "no daemon".
+            // A registration whose path is absent (worktree created on
+            // another machine) gets its own label: a devme.toml wouldn't help.
             let label = if state.instance_is_placeholder(i) {
-                "no devme.toml"
+                if state.instance_missing_on_host(i) {
+                    "not on this host"
+                } else {
+                    "no devme.toml"
+                }
             } else {
                 "no daemon"
             };
@@ -1720,10 +1726,17 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
     let tabs = state.tab_services();
     if tabs.is_empty() {
         let text = if state.current_instance_is_placeholder() {
-            format!(
-                "no devme.toml in {} — add one to start services",
-                state.current_instance_cwd()
-            )
+            if state.current_instance_missing_on_host() {
+                format!(
+                    "worktree {} doesn't exist on this host — created on another machine?",
+                    state.current_instance_cwd()
+                )
+            } else {
+                format!(
+                    "no devme.toml in {} — add one to start services",
+                    state.current_instance_cwd()
+                )
+            }
         } else {
             "no services declared in devme.toml".to_string()
         };
@@ -2392,7 +2405,8 @@ mod tests {
             steps: vec![],
         });
         // Discovered worktree, no devme.toml → placeholder row, no daemon.
-        state.add_placeholder_instance("inst", "feature/x", "/tmp/a");
+        // (Existing cwd, so the label isn't the missing-on-host one.)
+        state.add_placeholder_instance("inst", "feature/x", "/tmp");
 
         let text = render_to_text(&mut state, 100, 14);
         let tab_line = text

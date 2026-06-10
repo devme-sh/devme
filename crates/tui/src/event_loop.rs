@@ -1098,7 +1098,7 @@ mod tests {
             services: vec![running("proxy"), running("postgres")],
             steps: vec![],
         });
-        state.add_placeholder_instance("inst", "feature/x", "/tmp/a");
+        state.add_placeholder_instance("inst", "feature/x", "/tmp");
 
         let prompt = build_debug_prompt(&state);
         // The owned side is empty, but the shared deps are folded in (flagged).
