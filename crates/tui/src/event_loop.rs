@@ -136,11 +136,29 @@ async fn run(
     anim.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Background git refresh, fanned out to a detached task so a slow `git`
     // never stalls the UI; results flow back over this channel as
-    // `(instance id, current branch, ahead/behind)`. The branch keeps the
-    // sidebar label in sync when a worktree checks out a different branch.
-    type GitRefresh = (String, Option<String>, Option<(usize, usize)>);
+    // `(instance id, current branch, ahead/behind, merged, dirty)`. The
+    // branch keeps the sidebar label in sync when a worktree checks out a
+    // different branch; merged/dirty drive the `✓ merged` badge and the
+    // removal modal's warnings.
+    type GitRefresh = (
+        String,
+        Option<String>,
+        Option<(usize, usize)>,
+        Option<bool>,
+        Option<bool>,
+    );
     let (git_tx, mut git_rx) = mpsc::unbounded_channel::<GitRefresh>();
     let mut git_refresh = tokio::time::interval(std::time::Duration::from_secs(5));
+    // PR lookups ride a separate, much slower cadence (gh is a network call):
+    // every PR_EVERY_TICKS git ticks, plus immediately when the info modal
+    // opens. Results: `(instance id, pr)`.
+    const PR_EVERY_TICKS: u64 = 12; // × 5s = every minute
+    let mut git_tick: u64 = 0;
+    let (pr_tx, mut pr_rx) =
+        mpsc::unbounded_channel::<(String, Option<crate::worktree::PrInfo>)>();
+    // Worktree add/remove run async (a removal stops a daemon, gated on a
+    // 10s grace); their outcomes come back here.
+    let (wt_op_tx, mut wt_op_rx) = mpsc::unbounded_channel::<WorktreeOp>();
 
     loop {
         terminal.draw(|f| render(f, state))?;
@@ -366,13 +384,48 @@ async fn run(
                             }
                             _ => {}
                         },
+                        // Worktree-removal confirmation: y/Enter remove, f
+                        // force-remove (discards uncommitted changes), Esc/n
+                        // cancel. `begin_worktree_remove` swallows confirms
+                        // while a removal is already running.
+                        _ if state.worktree_remove_visible() => match k.code {
+                            KeyCode::Char('y') | KeyCode::Enter => {
+                                spawn_worktree_removal(state, false, &wt_op_tx);
+                            }
+                            KeyCode::Char('f') => {
+                                spawn_worktree_removal(state, true, &wt_op_tx);
+                            }
+                            KeyCode::Char('n') | KeyCode::Char('q') | KeyCode::Esc => {
+                                state.close_worktree_remove()
+                            }
+                            _ => {}
+                        },
+                        // New-worktree prompt: type a branch name, Enter
+                        // creates, Esc cancels. Plain chars feed the input, so
+                        // main-view keys can't fire underneath.
+                        _ if state.worktree_add_visible() => match k.code {
+                            KeyCode::Enter => spawn_worktree_add(state, &wt_op_tx),
+                            KeyCode::Esc => state.close_worktree_add(),
+                            KeyCode::Backspace => state.worktree_add_backspace(),
+                            KeyCode::Char(c)
+                                if !k.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                state.worktree_add_input(c)
+                            }
+                            _ => {}
+                        },
                         // Stack-info modal: j/k (or arrows) move between
                         // copyable fields; c/Enter copy the highlighted one;
                         // b/w jump-copy the branch / worktree path directly.
                         // A copy is the terminal action — it closes the modal
                         // (like copy-mode's `y`), so the toast is the only thing
-                        // left on screen. i/Esc/q close without copying.
+                        // left on screen. x hands off to the removal
+                        // confirmation. i/Esc/q close without copying.
                         _ if state.stack_info_visible() => match k.code {
+                            KeyCode::Char('x') => {
+                                state.close_stack_info();
+                                try_open_worktree_remove(state);
+                            }
                             KeyCode::Up | KeyCode::Char('k') => state.stack_info_move(-1),
                             KeyCode::Down | KeyCode::Char('j') => state.stack_info_move(1),
                             KeyCode::Char('c') | KeyCode::Enter => {
@@ -624,7 +677,23 @@ async fn run(
                                     // read as remote (and it's copyable to ssh).
                                     let remote_host = state.remote_host().map(str::to_string);
                                     state.open_stack_info(slot, remote_host);
+                                    // Kick a fresh PR lookup so the modal's
+                                    // "checking…" resolves in seconds (the
+                                    // periodic cadence is a minute).
+                                    if !state.shared_selected()
+                                        && let Some(inst) = state.current_instance()
+                                    {
+                                        let id = inst.info.id.clone();
+                                        let cwd = inst.info.cwd.clone();
+                                        let tx = pr_tx.clone();
+                                        tokio::spawn(async move {
+                                            let pr = crate::worktree::pr_for_branch(&cwd).await;
+                                            let _ = tx.send((id, pr));
+                                        });
+                                    }
                                 }
+                                Action::AddWorktree => state.open_worktree_add(),
+                                Action::RemoveWorktree => try_open_worktree_remove(state),
                                 Action::Settings => state.open_settings(),
                                 Action::Notifications => state.toggle_notifications(),
                                 // Re-read global.toml (`R`, vs lowercase `r` =
@@ -788,6 +857,11 @@ async fn run(
                 Some(WorktreeEvent::Discovered { id, label, cwd }) => {
                     state.add_placeholder_instance(id, label, cwd);
                 }
+                // The autospawner reaped a vanished worktree (its supervisor
+                // and slot claim are already handled) — drop the row.
+                Some(WorktreeEvent::Removed { id }) => {
+                    state.remove_instance_by_id(&id);
+                }
                 None => {}
             },
             _ = anim.tick() => {
@@ -796,6 +870,13 @@ async fn run(
             _ = git_refresh.tick() => {
                 let pairs = state.instance_id_cwd_pairs();
                 let tx = git_tx.clone();
+                // Every PR_EVERY_TICKS-th pass also refreshes PR state (a
+                // network call, so much rarer than the local git checks).
+                // Firing on the first tick means the merged badge can use the
+                // PR signal soon after startup.
+                let fetch_prs = git_tick.is_multiple_of(PR_EVERY_TICKS);
+                git_tick += 1;
+                let prs = fetch_prs.then(|| pr_tx.clone());
                 tokio::spawn(async move {
                     for (id, cwd) in pairs {
                         // Always report the branch (even when there's no
@@ -803,17 +884,147 @@ async fn run(
                         // ahead/behind rides along when an upstream exists.
                         let branch = crate::worktree::git_branch(&cwd).await;
                         let ahead_behind = crate::worktree::git_ahead_behind(&cwd).await;
-                        let _ = tx.send((id, branch, ahead_behind));
+                        // Merged only makes sense for a linked worktree's
+                        // branch — the main worktree's default branch is
+                        // trivially an ancestor of itself.
+                        let merged = match &branch {
+                            Some(b) if !crate::worktree::is_main_worktree(&cwd) => {
+                                crate::worktree::git_branch_merged(&cwd, b).await
+                            }
+                            _ => None,
+                        };
+                        let dirty = crate::worktree::git_dirty(&cwd).await;
+                        let _ = tx.send((id.clone(), branch, ahead_behind, merged, dirty));
+                        if let Some(prs) = &prs {
+                            let pr = crate::worktree::pr_for_branch(&cwd).await;
+                            let _ = prs.send((id, pr));
+                        }
                     }
                 });
             }
             git = git_rx.recv() => {
-                if let Some((id, branch, ahead_behind)) = git {
+                if let Some((id, branch, ahead_behind, merged, dirty)) = git {
                     state.apply_git_refresh(&id, branch, ahead_behind);
+                    state.apply_git_worktree_status(&id, merged, dirty);
                 }
             }
+            pr = pr_rx.recv() => {
+                if let Some((id, pr)) = pr {
+                    state.apply_pr_info(&id, pr);
+                }
+            }
+            op = wt_op_rx.recv() => match op {
+                Some(WorktreeOp::Removed { id, result }) => match result {
+                    Ok(msg) => {
+                        state.close_worktree_remove();
+                        state.remove_instance_by_id(&id);
+                        state.notify("worktree", msg);
+                    }
+                    // Keep the modal up with the error — the user can retry
+                    // with `f` (force) or Esc out.
+                    Err(e) => state.worktree_remove_failed(e),
+                },
+                Some(WorktreeOp::Added(result)) => match result {
+                    Ok(msg) => {
+                        state.close_worktree_add();
+                        // The sidebar row arrives via the autospawner's
+                        // Discovered event; nothing to insert here.
+                        state.notify("worktree", msg);
+                    }
+                    Err(e) => state.worktree_add_failed(e),
+                },
+                None => {}
+            },
         }
     }
+}
+
+/// Outcome of an async worktree add/remove, sent back to the event loop.
+enum WorktreeOp {
+    Removed {
+        /// Instance id whose sidebar row to drop on success.
+        id: String,
+        result: Result<String, String>,
+    },
+    Added(Result<String, String>),
+}
+
+/// Guards + open for the worktree-removal confirmation (`x`, also reachable
+/// from the info modal). Vetoes targets where removal is impossible (the
+/// shared row, the main worktree) or self-destructive (the worktree this TUI
+/// is running in — git would yank the process's own cwd), with a toast
+/// saying why. Everything that passes still goes through the confirmation
+/// modal: removal is never one keypress.
+fn try_open_worktree_remove(state: &mut TuiState) {
+    if state.shared_selected() {
+        state.notify("worktree", "shared services aren't a worktree");
+        return;
+    }
+    let cwd = state.current_instance_cwd().to_string();
+    if cwd.is_empty() {
+        return;
+    }
+    if crate::worktree::is_main_worktree(&cwd) {
+        state.notify("worktree", "main worktree — can't be removed");
+        return;
+    }
+    let own = std::env::current_dir()
+        .ok()
+        .and_then(|d| std::fs::canonicalize(d).ok());
+    if own.is_some() && own == std::fs::canonicalize(&cwd).ok() {
+        state.notify("worktree", "this is the worktree the TUI runs in");
+        return;
+    }
+    state.open_worktree_remove();
+}
+
+/// Confirm pressed in the removal modal: mark it busy and run the mechanical
+/// teardown (stop stack → `git worktree remove` → release slot) off-thread.
+/// `force` discards uncommitted changes — only offered explicitly (`f`).
+fn spawn_worktree_removal(
+    state: &mut TuiState,
+    force: bool,
+    tx: &mpsc::UnboundedSender<WorktreeOp>,
+) {
+    let Some((id, path)) = state.begin_worktree_remove() else {
+        return;
+    };
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let anchor = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let result = crate::worktree::remove_worktree(&anchor, &path, force)
+            .await
+            .map(|r| {
+                let branch = r
+                    .branch
+                    .map(|b| format!(" — branch {b} kept"))
+                    .unwrap_or_default();
+                format!("removed {}{branch}", r.path.display())
+            })
+            .map_err(|e| e.to_string());
+        let _ = tx.send(WorktreeOp::Removed { id, result });
+    });
+}
+
+/// Enter pressed in the new-worktree prompt: create a worktree for the typed
+/// branch (creating the branch if needed) next to the main worktree. The
+/// autospawner's watcher discovers it and adds the sidebar row.
+fn spawn_worktree_add(state: &mut TuiState, tx: &mpsc::UnboundedSender<WorktreeOp>) {
+    let Some(branch) = state.begin_worktree_add() else {
+        return;
+    };
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+            crate::worktree::add_worktree(&cwd, &branch, None)
+                .map(|r| format!("created {} on {}", r.path.display(), r.branch))
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap_or_else(|_| Err("worktree add task panicked".into()));
+        let _ = tx.send(WorktreeOp::Added(result));
+    });
 }
 
 /// Apply a settings-overlay edit (`dir` = +1 next / -1 prev) and write it

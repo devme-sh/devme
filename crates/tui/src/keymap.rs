@@ -44,6 +44,9 @@ pub enum Action {
     RestartService,
     OpenUrl,
     CopyUrl,
+    // worktrees
+    AddWorktree,
+    RemoveWorktree,
     // session
     StackInfo,
     Settings,
@@ -60,14 +63,16 @@ pub enum Section {
     Navigation,
     LogViewport,
     ServiceActions,
+    Worktrees,
     Session,
 }
 
 impl Section {
-    pub const ORDER: [Section; 4] = [
+    pub const ORDER: [Section; 5] = [
         Section::Navigation,
         Section::LogViewport,
         Section::ServiceActions,
+        Section::Worktrees,
         Section::Session,
     ];
 
@@ -76,6 +81,7 @@ impl Section {
             Section::Navigation => "navigation",
             Section::LogViewport => "log viewport",
             Section::ServiceActions => "service actions",
+            Section::Worktrees => "worktrees",
             Section::Session => "session",
         }
     }
@@ -254,10 +260,25 @@ pub const BINDINGS: &[Binding] = &[
             label: "open",
         }),
     },
+    // worktrees
+    Binding {
+        keys: "w",
+        desc: "new worktree (prompts for branch)",
+        section: Section::Worktrees,
+        actions: &[Action::AddWorktree],
+        footer: None,
+    },
+    Binding {
+        keys: "x",
+        desc: "remove selected worktree (confirms)",
+        section: Section::Worktrees,
+        actions: &[Action::RemoveWorktree],
+        footer: None,
+    },
     // session
     Binding {
         keys: "i",
-        desc: "stack info (copy branch / path / slot)",
+        desc: "stack info (branch / path / slot / PR)",
         section: Section::Session,
         actions: &[Action::StackInfo],
         footer: None,
@@ -338,6 +359,8 @@ pub const ALL_ACTIONS: &[Action] = &[
     Action::RestartService,
     Action::OpenUrl,
     Action::CopyUrl,
+    Action::AddWorktree,
+    Action::RemoveWorktree,
     Action::StackInfo,
     Action::Settings,
     Action::Notifications,
@@ -376,6 +399,8 @@ fn exhaustive_marker(a: Action) {
         | Action::RestartService
         | Action::OpenUrl
         | Action::CopyUrl
+        | Action::AddWorktree
+        | Action::RemoveWorktree
         | Action::StackInfo
         | Action::Settings
         | Action::Notifications
@@ -418,6 +443,9 @@ pub fn resolve(k: &KeyEvent) -> Option<Action> {
         (KeyCode::Char('r'), false) => RestartService,
         (KeyCode::Char('o'), false) => OpenUrl,
         (KeyCode::Char('c'), false) => CopyUrl,
+        // worktrees
+        (KeyCode::Char('w'), false) => AddWorktree,
+        (KeyCode::Char('x'), false) => RemoveWorktree,
         // session
         (KeyCode::Char('i'), false) => StackInfo,
         (KeyCode::Char(','), false) => Settings,
@@ -466,7 +494,7 @@ mod tests {
         let code = |kc: KeyCode| KeyEvent::new(kc, KeyModifiers::NONE);
 
         let mut events: Vec<KeyEvent> = Vec::new();
-        for c in "lhjkbfgGJKyYpvzSsrociqD,nR?` ".chars() {
+        for c in "lhjkbfgGJKyYpvzSsrociqDwx,nR?` ".chars() {
             events.push(plain(c));
         }
         for c in ['u', 'd', 'c'] {

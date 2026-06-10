@@ -99,6 +99,10 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
         render_port_conflict_dialog(frame, area, dlg);
     } else if let Some(dlg) = state.skill_dialog() {
         render_skill_dialog(frame, area, dlg);
+    } else if state.worktree_remove_visible() {
+        render_worktree_remove_dialog(frame, area, state);
+    } else if state.worktree_add_visible() {
+        render_worktree_add_dialog(frame, area, state);
     } else if state.quit_confirm_visible() {
         render_quit_confirm(frame, area, state);
     } else if state.settings_visible() {
@@ -922,6 +926,158 @@ fn render_quit_confirm(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// The always-on confirmation before a worktree removal (`x`). Echoes what
+/// the user is about to lose (path, branch, merged status, PR) and the one
+/// genuinely destructive case — uncommitted changes — in red. The branch and
+/// its commits survive removal, and the modal says so.
+fn render_worktree_remove_dialog(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let Some(dlg) = state.worktree_remove() else {
+        return;
+    };
+    let p = *state.palette();
+    let dim = Style::default().fg(p.overlay0);
+    let bold = |c| Style::default().fg(c).add_modifier(Modifier::BOLD);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("Remove worktree ", Style::default().fg(p.text)),
+        Span::styled(dlg.path.clone(), bold(p.text)),
+        Span::styled("?", Style::default().fg(p.text)),
+    ]));
+    lines.push(Line::default());
+    if let Some(branch) = &dlg.branch {
+        let (merged_label, merged_color) = if dlg.merged {
+            ("merged", p.green)
+        } else {
+            ("NOT merged", p.peach)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("branch {branch} — "), dim),
+            Span::styled(merged_label, bold(merged_color)),
+        ]));
+    }
+    if let Some(pr) = &dlg.pr {
+        lines.push(Line::from(Span::styled(
+            format!("PR #{} {} — {}", pr.number, pr.state.to_lowercase(), pr.title),
+            dim,
+        )));
+    }
+    match dlg.dirty {
+        Some(true) => lines.push(Line::from(Span::styled(
+            "uncommitted changes — f discards them",
+            bold(p.red),
+        ))),
+        _ => lines.push(Line::from(Span::styled(
+            "branch and commits are kept — only the directory goes",
+            dim,
+        ))),
+    }
+    if let Some(err) = &dlg.error {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(err.clone(), bold(p.red))));
+    }
+    lines.push(Line::default());
+    if dlg.busy {
+        lines.push(Line::from(Span::styled("removing…", bold(p.accent))));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(" y ", bold(p.red)),
+            Span::styled("remove  ", dim),
+            Span::styled(" f ", bold(p.red)),
+            Span::styled("force  ", dim),
+            Span::styled(" Esc ", bold(p.accent)),
+            Span::styled("cancel", dim),
+        ]));
+    }
+
+    let content_w = lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.chars().count()).sum::<usize>())
+        .max()
+        .unwrap_or(40);
+    let w = ((content_w as u16) + 4).clamp(44, area.width.saturating_sub(4));
+    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let modal = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .title(Span::styled(
+            " remove worktree ",
+            Style::default()
+                .fg(p.panel_bg)
+                .bg(p.red)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(p.red))
+        .style(Style::default().bg(p.panel_bg));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+/// The new-worktree branch prompt (`w`): one input line, Enter creates a
+/// worktree (and branch, if new) next to the main worktree.
+fn render_worktree_add_dialog(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let Some(dlg) = state.worktree_add() else {
+        return;
+    };
+    let p = *state.palette();
+    let dim = Style::default().fg(p.overlay0);
+    let bold = |c| Style::default().fg(c).add_modifier(Modifier::BOLD);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("branch: ", dim),
+        Span::styled(dlg.input.clone(), bold(p.text)),
+        Span::styled("▏", Style::default().fg(p.accent)),
+    ]));
+    if let Some(err) = &dlg.error {
+        lines.push(Line::from(Span::styled(err.clone(), bold(p.red))));
+    }
+    lines.push(Line::default());
+    if dlg.busy {
+        lines.push(Line::from(Span::styled("creating…", bold(p.accent))));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled(" Enter ", bold(p.accent)),
+            Span::styled("create  ", dim),
+            Span::styled(" Esc ", bold(p.accent)),
+            Span::styled("cancel", dim),
+        ]));
+    }
+
+    let w = 52u16.min(area.width.saturating_sub(4));
+    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let modal = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .title(Span::styled(
+            " new worktree ",
+            Style::default()
+                .fg(p.panel_bg)
+                .bg(p.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(p.accent))
+        .style(Style::default().bg(p.panel_bg));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
 // ── footer / sidebar ────────────────────────────────────────────────────────
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -1417,6 +1573,11 @@ fn stack_secondary(p: &Palette, state: &TuiState, i: usize) -> Vec<Span<'static>
                 Style::default().fg(p.peach),
             ));
         }
+    }
+    // Branch landed (merge or merged PR) and nothing uncommitted: this
+    // worktree is safe to remove (`x`).
+    if state.instance_safe_to_remove(i) {
+        spans.push(Span::styled(" ✓merged", Style::default().fg(p.green)));
     }
     spans
 }
@@ -2650,20 +2811,26 @@ mod tests {
 
     #[test]
     fn help_overlay_renders_when_toggled() {
+        // 44 rows: tall enough for the full overlay (5 sections + mouse
+        // notes), whose last line is the one asserted on.
         let mut state = TuiState::default();
-        let text = render_to_text(&mut state, 100, 30);
+        let text = render_to_text(&mut state, 100, 44);
         assert!(
             !text.contains("toggle this overlay"),
             "overlay leaked when hidden"
         );
         state.toggle_help();
-        let text = render_to_text(&mut state, 100, 30);
+        let text = render_to_text(&mut state, 100, 44);
         assert!(
             text.contains("toggle this overlay"),
             "overlay help text missing"
         );
+        assert!(
+            text.contains("remove selected worktree"),
+            "worktrees section missing from overlay"
+        );
         state.toggle_help();
-        let text = render_to_text(&mut state, 100, 30);
+        let text = render_to_text(&mut state, 100, 44);
         assert!(
             !text.contains("toggle this overlay"),
             "overlay should hide again"

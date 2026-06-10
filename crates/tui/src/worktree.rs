@@ -24,7 +24,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use devme_client::Client;
-use devme_config::{InterpContext, Stack, interpolate};
 use devme_core::{ClientMessage, ServerMessage, ServiceSnapshot};
 use devme_slot_allocator::SlotAllocator;
 use devme_supervisor::spawn::{ensure_daemon, ensure_shared_daemon};
@@ -54,6 +53,14 @@ pub enum WorktreeEvent {
         label: String,
         /// Canonical worktree path.
         cwd: String,
+    },
+    /// A previously-known worktree's directory vanished (removed via the
+    /// TUI, `devme worktree rm`, or a bare `git worktree remove`). The
+    /// autospawner has already reaped its supervisor and slot claim; the
+    /// TUI drops the sidebar row.
+    Removed {
+        /// The vanished worktree's `paths::instance_id(path)`.
+        id: String,
     },
 }
 
@@ -130,10 +137,16 @@ impl AutoSpawner {
         let _ = std::fs::create_dir_all(&worktrees_dir);
 
         let (fs_tx, mut fs_rx) = mpsc::unbounded_channel::<()>();
+        // Remove events matter too: a `git worktree remove` deletes the
+        // admin dir under worktrees/, and the re-scan is what reaps the
+        // vanished worktree's supervisor + slot.
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             if let Ok(ev) = res {
                 use notify::EventKind;
-                if matches!(ev.kind, EventKind::Create(_) | EventKind::Modify(_)) {
+                if matches!(
+                    ev.kind,
+                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+                ) {
                     let _ = fs_tx.send(());
                 }
             }
@@ -149,18 +162,41 @@ impl AutoSpawner {
         // (which writes several files) doesn't fan out into many scans.
         let cwd_w = cwd.to_path_buf();
         let events_w = events.clone();
+        let initial_known: Vec<PathBuf> = initial.iter().map(|w| w.path.clone()).collect();
         tokio::spawn(async move {
             // Each fresh worktree needs its own root watcher so that
             // `devme.toml` later appearing fires a re-scan. Kept alive
             // by being moved into the task.
             let mut per_worktree_watchers: Vec<RecommendedWatcher> = Vec::new();
-            let mut known_paths: Vec<PathBuf> = Vec::new();
+            // Seeded with the startup scan so a worktree present at launch
+            // is reaped if it vanishes later — not just ones added at
+            // runtime.
+            let mut known_paths: Vec<PathBuf> = initial_known;
             while fs_rx.recv().await.is_some() {
                 while tokio::time::timeout(Duration::from_millis(200), fs_rx.recv())
                     .await
                     .is_ok()
                 {}
-                for wt in list_worktrees(&cwd_w) {
+                let current = list_worktrees(&cwd_w);
+                // Reap worktrees whose directory vanished: stop the orphaned
+                // supervisor, release the slot claim, drop the sidebar row.
+                // Removal is mechanical — there is no teardown hook — so a
+                // bare `git worktree remove` gets exactly the same cleanup
+                // as the TUI/CLI paths.
+                known_paths.retain(|known| {
+                    if current.iter().any(|wt| &wt.path == known) {
+                        return true;
+                    }
+                    let _ = events_w.send(WorktreeEvent::Removed {
+                        id: devme_config::paths::instance_id(known),
+                    });
+                    let gone = known.clone();
+                    tokio::spawn(async move {
+                        reap_worktree(&gone).await;
+                    });
+                    false
+                });
+                for wt in current {
                     if !known_paths.contains(&wt.path) {
                         known_paths.push(wt.path.clone());
                         emit_discovered(&events_w, &wt.path);
@@ -257,6 +293,136 @@ pub async fn git_ahead_behind(cwd: &str) -> Option<(usize, usize)> {
     Some((ahead, behind))
 }
 
+/// Run `git -C cwd <args>` and return trimmed stdout on success.
+async fn git_out(cwd: &str, args: &[&str]) -> Option<String> {
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8(out.stdout).ok()?.trim().to_string())
+}
+
+/// True when `cwd` is the repo's *main* worktree (its git dir IS the common
+/// dir, rather than an admin dir under `worktrees/`). The TUI uses this to
+/// refuse removal up front and to skip the merged badge — the default branch
+/// is trivially "merged" into itself.
+pub fn is_main_worktree(cwd: &str) -> bool {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["rev-parse", "--git-dir", "--git-common-dir"])
+        .output();
+    let Ok(out) = out else { return false };
+    if !out.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    match (lines.next(), lines.next()) {
+        (Some(git_dir), Some(common)) => git_dir == common,
+        _ => false,
+    }
+}
+
+/// The ref to test "merged" against: `origin/<default>` when origin/HEAD is
+/// set, else a local `main`/`master` if one exists. `None` when the repo has
+/// no recognisable default branch.
+async fn default_branch_ref(cwd: &str) -> Option<String> {
+    if let Some(r) = git_out(cwd, &["rev-parse", "--abbrev-ref", "origin/HEAD"]).await
+        && !r.is_empty()
+    {
+        return Some(r);
+    }
+    for candidate in ["main", "master"] {
+        let refname = format!("refs/heads/{candidate}");
+        if git_out(cwd, &["rev-parse", "--verify", "--quiet", &refname])
+            .await
+            .is_some()
+        {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+/// Whether `branch` is an ancestor of the repo's default branch — i.e. its
+/// commits have landed (a regular merge or fast-forward). `None` when there's
+/// no default branch to compare against, `branch` *is* the default branch, or
+/// git fails. Squash/rebase merges are invisible to this check — that's what
+/// the PR-state signal (see [`pr_for_branch`]) covers.
+pub async fn git_branch_merged(cwd: &str, branch: &str) -> Option<bool> {
+    let target = default_branch_ref(cwd).await?;
+    if target == branch || target.strip_prefix("origin/") == Some(branch) {
+        return None;
+    }
+    let out = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["merge-base", "--is-ancestor", branch, &target])
+        .output()
+        .await
+        .ok()?;
+    match out.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether the worktree has uncommitted or untracked changes — the one thing
+/// a removal actually destroys (`git worktree remove` refuses such a tree
+/// without `--force`). `None` on git failure.
+pub async fn git_dirty(cwd: &str) -> Option<bool> {
+    git_out(cwd, &["status", "--porcelain"])
+        .await
+        .map(|s| !s.is_empty())
+}
+
+/// The PR associated with a worktree's branch, if `gh` can name one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrInfo {
+    pub number: u64,
+    /// `OPEN` / `MERGED` / `CLOSED`, as reported by `gh`.
+    pub state: String,
+    pub title: String,
+    pub url: String,
+}
+
+impl PrInfo {
+    pub fn is_merged(&self) -> bool {
+        self.state.eq_ignore_ascii_case("merged")
+    }
+}
+
+/// Look up the PR for the worktree's current branch via `gh pr view`. `None`
+/// when `gh` is missing/unauthenticated or no PR exists. A network call —
+/// only ever run off the render thread, on the slow refresh cadence or when
+/// the info modal opens.
+pub async fn pr_for_branch(cwd: &str) -> Option<PrInfo> {
+    let out = tokio::process::Command::new("gh")
+        .args(["pr", "view", "--json", "number,state,title,url"])
+        .current_dir(cwd)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    Some(PrInfo {
+        number: v.get("number")?.as_u64()?,
+        state: v.get("state")?.as_str()?.to_string(),
+        title: v.get("title")?.as_str()?.to_string(),
+        url: v.get("url")?.as_str()?.to_string(),
+    })
+}
+
 /// Watch a single worktree's root non-recursively. When `devme.toml`
 /// appears, re-run `ensure_for(path)` — that's the moment a
 /// previously-empty worktree becomes runnable.
@@ -321,7 +487,6 @@ async fn ensure_for(path: &Path) {
     if !path.join("devme.toml").exists() {
         return;
     }
-    run_on_create_if_needed(path);
     ensure_docker_for(path);
     let Ok(sock) = devme_config::paths::supervisor_socket(path) else {
         return;
@@ -364,80 +529,15 @@ fn ensure_docker_for(path: &Path) {
     }
 }
 
-/// Run the `[stack] on_create` script once per worktree, if one is defined.
-/// A `.devme-initialized` marker prevents re-running it.
-///
-/// Most stacks need no `on_create` at all: per-worktree setup (deps, DB
-/// clone, migrations) is better expressed as `[step]` check/provision, which
-/// is idempotent and reality-based (re-runs if you delete the artifact) — a
-/// marker only records that a command *ran*, not that its result still
-/// exists. So when there's no `on_create`, we write no marker: nothing to
-/// gate, and no stray `.devme-initialized` litters the worktree.
-fn run_on_create_if_needed(path: &Path) {
-    use devme_config::Stack;
-
-    let marker = path.join(".devme-initialized");
-    if marker.exists() {
-        return;
+/// Mechanical cleanup after a worktree directory vanished: stop its orphaned
+/// supervisor (best-effort — there may be none) and release its slot claim.
+/// Shared by [`remove_worktree`] and the autospawner's reaper, so a bare
+/// `git worktree remove` converges to the same end state as the devme paths.
+async fn reap_worktree(path: &Path) {
+    let _ = stop_instance(path).await;
+    if let Ok(registry) = devme_config::paths::slot_registry() {
+        let _ = SlotAllocator::open(&registry).release(&devme_config::paths::instance_id(path));
     }
-    let Ok(toml_str) = std::fs::read_to_string(path.join("devme.toml")) else {
-        return;
-    };
-    let Ok(stack) = Stack::parse(&toml_str) else {
-        return;
-    };
-    let cmd = match stack.stack.as_ref().and_then(|s| s.on_create.as_ref()) {
-        Some(c) => c.clone(),
-        // No on_create → nothing to run once, so don't drop a marker.
-        None => return,
-    };
-    tracing::info!(worktree = %path.display(), "running on_create script");
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&cmd)
-        .current_dir(path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    match status {
-        Ok(s) if s.success() => {
-            let _ = std::fs::write(&marker, "");
-            tracing::info!(worktree = %path.display(), "on_create completed");
-        }
-        Ok(s) => {
-            tracing::warn!(worktree = %path.display(), exit = ?s.code(), "on_create failed");
-        }
-        Err(e) => {
-            tracing::warn!(worktree = %path.display(), error = %e, "on_create spawn failed");
-        }
-    }
-}
-
-/// Run an already-interpolated `[stack] on_destroy` command — the low-level
-/// execution primitive, symmetric to [`run_on_create_if_needed`]. Intended
-/// for dropping per-worktree resources (e.g. a cloned database).
-///
-/// `cmd` must already be interpolated by the caller: by the time a worktree
-/// is removed its directory — and the slot/`{branch}` context the command
-/// needs — is gone, so resolution happens *before* removal. `run_dir` is
-/// where the command executes; the worktree path no longer exists, so
-/// callers pass a still-present directory (the repo's main worktree).
-///
-/// [`remove_worktree`] is the orchestrator that resolves the command, tears
-/// the worktree down, and calls this. The `devme worktree rm` subcommand is
-/// the user-facing entry point; a bare `git worktree remove` bypasses devme
-/// and runs no hook.
-pub fn run_on_destroy(cmd: &str, run_dir: &Path) -> std::io::Result<std::process::ExitStatus> {
-    tracing::info!(run_dir = %run_dir.display(), "running on_destroy script");
-    std::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(run_dir)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
 }
 
 /// What [`remove_worktree`] did — for the CLI to report (human or `--json`).
@@ -451,9 +551,6 @@ pub struct RemovalReport {
     pub slot: Option<u8>,
     /// Whether an instance supervisor was found and shut down.
     pub instance_stopped: bool,
-    /// `None` if the stack declared no `on_destroy`; `Some(true)` if the hook
-    /// ran and exited 0; `Some(false)` if it ran and failed.
-    pub on_destroy_ran: Option<bool>,
 }
 
 /// One worktree as reported by `git worktree list --porcelain`.
@@ -465,15 +562,15 @@ struct WorktreeMeta {
     is_main: bool,
 }
 
-/// Tear down and remove a worktree, firing its `[stack] on_destroy` hook —
-/// the deterministic counterpart to [`run_on_create_if_needed`].
+/// Tear down and remove a worktree — purely mechanical: stop the instance
+/// stack, `git worktree remove`, release the slot claim. No hooks run;
+/// slot-scoped resources are reclaimed when the slot is reused (the matching
+/// provision step converges them).
 ///
-/// Because the command and its `{slot}`/`{branch}` context vanish with the
-/// worktree, the order matters: resolve everything *first* (while the
-/// directory and slot claim still exist), then stop the instance, then
-/// `git worktree remove`, and only run `on_destroy` once removal succeeds —
-/// so a failed/aborted removal never drops a database out from under a
-/// worktree that's still on disk.
+/// The branch is untouched: its ref and reflog live in the main repo, so
+/// every commit stays reachable. The only destructive part is uncommitted
+/// changes in the working directory, which is why `git worktree remove`
+/// refuses a dirty tree unless `force` is set.
 ///
 /// `cwd` anchors the `git worktree list` lookup. `target` matches by
 /// absolute/relative path, directory name, or branch name.
@@ -493,24 +590,12 @@ pub async fn remove_worktree(
     let path = resolved.path;
     let branch = resolved.branch;
 
-    // 1. Resolve on_destroy + slot WHILE the worktree (devme.toml + slot
-    //    claim) still exists. Interpolation failure here aborts before
-    //    anything is torn down.
-    let on_destroy = read_on_destroy(&path);
+    // Read the slot before removal (for the report), stop this worktree's
+    // instance stack (best-effort). Shared (repo) services keep running —
+    // other worktrees may depend on them.
     let slot = slot_for(&path);
-    let resolved_cmd = match &on_destroy {
-        Some(cmd) => Some(interpolate_on_destroy(cmd, &path, slot, branch.as_deref())?),
-        None => None,
-    };
-
-    // 2. Stop this worktree's instance stack (best-effort). Shared (repo)
-    //    services keep running — other worktrees may depend on them, and the
-    //    hook (e.g. `dropdb`) usually targets one of them.
     let instance_stopped = stop_instance(&path).await;
 
-    // 3. Remove the worktree. Pick a run dir for the hook that survives the
-    //    removal (the main worktree), before the dir is gone.
-    let run_dir = main_root(&worktrees).unwrap_or_else(|| cwd.to_path_buf());
     git_worktree_remove(cwd, &path, force)?;
 
     // Release the slot claim now the worktree is gone (best-effort; the
@@ -519,19 +604,11 @@ pub async fn remove_worktree(
         let _ = SlotAllocator::open(&registry).release(&devme_config::paths::instance_id(&path));
     }
 
-    // 4. Removal succeeded — fire the hook.
-    let on_destroy_ran = resolved_cmd.map(|cmd| {
-        run_on_destroy(&cmd, &run_dir)
-            .map(|s| s.success())
-            .unwrap_or(false)
-    });
-
     Ok(RemovalReport {
         path,
         branch,
         slot,
         instance_stopped,
-        on_destroy_ran,
     })
 }
 
@@ -544,14 +621,13 @@ pub struct AddReport {
     pub branch: String,
     /// True when the branch didn't exist and was created (`-b`).
     pub created_branch: bool,
-    /// Whether an `[stack] on_create` hook was present (and thus run).
-    pub on_create_ran: bool,
 }
 
 /// Create a git worktree for `branch` — creating the branch if it doesn't
-/// exist — then fire the repo's `[stack] on_create` hook in it. The
-/// deterministic counterpart to [`remove_worktree`]: an agent calls this to
-/// get a worktree whose per-worktree setup (db clone, deps) has already run.
+/// exist. The mechanical counterpart to [`remove_worktree`]. No setup hook
+/// runs here: the worktree converges on its first `devme up` (the TUI's
+/// autospawner picks it up automatically), with `[step]` check/provision
+/// doing any per-worktree setup.
 ///
 /// `dest` overrides the default path, which is a sibling of the main
 /// worktree named `<main-basename>-<branch-leaf>` (e.g. main `…/devme` +
@@ -606,15 +682,10 @@ pub fn add_worktree(cwd: &Path, branch: &str, dest: Option<&str>) -> anyhow::Res
     }
 
     let canon = std::fs::canonicalize(&path).unwrap_or(path);
-    // Fire on_create deterministically (symmetry with rm's on_destroy).
-    let on_create_ran = stack_declares_on_create(&canon);
-    run_on_create_if_needed(&canon);
-
     Ok(AddReport {
         path: canon,
         branch: branch.to_string(),
         created_branch,
-        on_create_ran,
     })
 }
 
@@ -632,15 +703,6 @@ fn branch_exists(cwd: &Path, branch: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
-}
-
-/// Whether the worktree's `devme.toml` declares an `[stack] on_create` hook.
-fn stack_declares_on_create(path: &Path) -> bool {
-    std::fs::read_to_string(path.join("devme.toml"))
-        .ok()
-        .and_then(|s| devme_config::Stack::parse(&s).ok())
-        .and_then(|stack| stack.stack)
-        .is_some_and(|meta| meta.on_create.is_some())
 }
 
 /// One worktree's status for the cross-worktree `devme status --all` view.
@@ -845,15 +907,9 @@ fn resolve_target(worktrees: &[WorktreeMeta], target: &str) -> anyhow::Result<Wo
     }
 }
 
-/// The repo's main worktree path, used as a still-present cwd for the hook.
+/// The repo's main worktree path (the first `git worktree list` entry).
 fn main_root(worktrees: &[WorktreeMeta]) -> Option<PathBuf> {
     worktrees.iter().find(|w| w.is_main).map(|w| w.path.clone())
-}
-
-/// Read `[stack] on_destroy` from a worktree's `devme.toml`, if present.
-fn read_on_destroy(path: &Path) -> Option<String> {
-    let toml = std::fs::read_to_string(path.join("devme.toml")).ok()?;
-    Stack::parse(&toml).ok()?.stack.and_then(|m| m.on_destroy)
 }
 
 /// The slot the worktree rooted at `cwd` currently holds, by path string —
@@ -873,32 +929,6 @@ fn slot_for(path: &Path) -> Option<u8> {
         .iter()
         .find(|c| c.instance_id == id)
         .map(|c| c.slot.as_u8())
-}
-
-/// Interpolate `{slot}`/`{worktree}`/`{branch}` into the `on_destroy`
-/// command. `{slot}` is only present when a claim was found — a command that
-/// references it without one fails here (so we never run a half-resolved
-/// `dropdb`).
-fn interpolate_on_destroy(
-    cmd: &str,
-    path: &Path,
-    slot: Option<u8>,
-    branch: Option<&str>,
-) -> anyhow::Result<String> {
-    let mut ctx = InterpContext::new()
-        .set("worktree", path.display().to_string())
-        .set("branch", branch.unwrap_or_default());
-    if let Some(s) = slot {
-        ctx.insert("slot", s.to_string());
-    }
-    interpolate(cmd, &ctx).map_err(|e| {
-        anyhow::anyhow!(
-            "cannot resolve on_destroy for {}: {e}\n\
-             (hint: {{slot}} needs the worktree's stack to have an active slot \
-             claim — start it first, or drop the resource manually)",
-            path.display()
-        )
-    })
 }
 
 /// Shut down a worktree's instance supervisor (services + daemon).
@@ -1018,19 +1048,6 @@ mod tests {
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
-    }
-
-    #[test]
-    fn run_on_destroy_executes_interpolated_command() {
-        // The execution primitive for the on_destroy hook: it runs an
-        // already-interpolated shell command in the given directory. Here
-        // we stand in for `dropdb optoscale_slot3` with a marker write.
-        let dir = tempfile::tempdir().unwrap();
-        let marker = dir.path().join("destroyed-slot3");
-        let cmd = format!("touch {}", marker.to_string_lossy());
-        let status = run_on_destroy(&cmd, dir.path()).unwrap();
-        assert!(status.success());
-        assert!(marker.exists(), "on_destroy command did not run");
     }
 
     #[test]
@@ -1170,8 +1187,10 @@ mod tests {
     }
 
     #[test]
-    fn remove_worktree_runs_on_destroy_then_removes() {
-        // on_destroy touches a marker in the run dir (the main worktree).
+    fn remove_worktree_removes_mechanically() {
+        // A deprecated on_destroy in the config must parse fine but never
+        // execute — removal is mechanical (stop, git worktree remove,
+        // release slot).
         let toml = "schema_version = 1\n\n[stack]\non_destroy = \"touch destroyed.marker\"\n";
         let Some((root, main, linked)) = setup_linked_worktree("happy", "feature/foo", Some(toml))
         else {
@@ -1181,10 +1200,10 @@ mod tests {
         let report = block_on(remove_worktree(&main, "linked", false)).unwrap();
 
         assert!(!linked.exists(), "worktree dir should be removed");
-        assert_eq!(report.on_destroy_ran, Some(true));
+        assert_eq!(report.branch.as_deref(), Some("feature/foo"));
         assert!(
-            main.join("destroyed.marker").exists(),
-            "on_destroy didn't run in main root"
+            !main.join("destroyed.marker").exists(),
+            "deprecated on_destroy hook must not run"
         );
         assert!(!report.instance_stopped, "no daemon was running");
 
@@ -1204,22 +1223,27 @@ mod tests {
     }
 
     #[test]
-    fn remove_worktree_fails_closed_when_slot_unresolved() {
-        // on_destroy needs {slot}, but a fresh temp worktree holds no slot
-        // claim → resolution must fail and leave the worktree on disk.
-        let toml = "schema_version = 1\n\n[stack]\non_destroy = \"dropdb slot{slot}\"\n";
-        let Some((root, main, linked)) =
-            setup_linked_worktree("slotfail", "feature/foo", Some(toml))
+    fn remove_worktree_refuses_dirty_tree_without_force() {
+        // Uncommitted work is the one thing removal destroys — git refuses
+        // a dirty tree without --force, and we surface that instead of
+        // silently discarding changes.
+        let Some((root, main, linked)) = setup_linked_worktree("dirty", "feature/foo", None)
         else {
             return;
         };
+        std::fs::write(linked.join("wip.txt"), b"uncommitted").unwrap();
 
         let err = block_on(remove_worktree(&main, "linked", false)).unwrap_err();
-        assert!(err.to_string().contains("on_destroy"), "got: {err}");
         assert!(
-            linked.exists(),
-            "worktree must remain when on_destroy can't resolve"
+            err.to_string().contains("git worktree remove failed"),
+            "got: {err}"
         );
+        assert!(linked.exists(), "dirty worktree must remain without force");
+
+        // --force discards it.
+        let report = block_on(remove_worktree(&main, "linked", true)).unwrap();
+        assert!(!linked.exists());
+        assert_eq!(report.branch.as_deref(), Some("feature/foo"));
 
         let _ = std::fs::remove_dir_all(&root);
     }

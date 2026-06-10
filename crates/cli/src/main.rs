@@ -1339,7 +1339,6 @@ async fn worktree_cmd(action: WorktreeAction, json: bool) -> anyhow::Result<()> 
                     "path": report.path.display().to_string(),
                     "branch": report.branch,
                     "created_branch": report.created_branch,
-                    "on_create_ran": report.on_create_ran,
                 });
                 println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
@@ -1349,9 +1348,6 @@ async fn worktree_cmd(action: WorktreeAction, json: bool) -> anyhow::Result<()> 
                     report.branch,
                     if report.created_branch { " (new)" } else { "" }
                 );
-                if report.on_create_ran {
-                    info!("  ran on_create hook");
-                }
                 info!("  start it: cd {} && devme up -d", report.path.display());
             }
             Ok(())
@@ -1365,26 +1361,18 @@ async fn worktree_cmd(action: WorktreeAction, json: bool) -> anyhow::Result<()> 
                     "branch": report.branch,
                     "slot": report.slot,
                     "instance_stopped": report.instance_stopped,
-                    "on_destroy_ran": report.on_destroy_ran,
                 });
                 println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 println!("Removed worktree {}", report.path.display());
                 if let Some(b) = &report.branch {
-                    info!("  branch: {b}");
+                    info!("  branch: {b} (kept — `git branch -d {b}` to delete)");
                 }
                 if let Some(s) = report.slot {
-                    info!("  slot:   {s}");
+                    info!("  slot:   {s} (released)");
                 }
                 if report.instance_stopped {
                     info!("  stopped instance stack");
-                }
-                match report.on_destroy_ran {
-                    Some(true) => info!("  ran on_destroy hook"),
-                    Some(false) => {
-                        eprintln!("devme: on_destroy hook failed (worktree was still removed)")
-                    }
-                    None => {}
                 }
             }
             Ok(())

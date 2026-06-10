@@ -52,7 +52,43 @@ pub fn lint(stack: &Stack) -> Vec<Lint> {
     let mut lints = Vec::new();
     check_ambiguous_openability(stack, &mut lints);
     check_port_placeholder_without_port(stack, &mut lints);
+    check_deprecated_worktree_hooks(stack, &mut lints);
     lints
+}
+
+/// `on_create`/`on_destroy` are deprecated and never executed: per-worktree
+/// setup is a `[step]` (check + provision converges any worktree on first
+/// `devme up`), and removal is mechanical (stop, `git worktree remove`,
+/// release slot). Still parsed so old configs don't break — but flag them, or
+/// the author will keep believing the hook runs.
+fn check_deprecated_worktree_hooks(stack: &Stack, lints: &mut Vec<Lint>) {
+    let Some(meta) = &stack.stack else { return };
+    if meta.on_create.is_some() {
+        lints.push(Lint {
+            target: "stack.on_create".into(),
+            message: "`on_create` is deprecated and no longer executed — \
+                      new worktrees converge via `[step]` check/provision on \
+                      their first `devme up` instead"
+                .into(),
+            hint: "move the command into a `[step.setup]` with \
+                   `check = \"test -e <artifact>\"` and `provision = \"<command>\"`"
+                .into(),
+        });
+    }
+    if meta.on_destroy.is_some() {
+        lints.push(Lint {
+            target: "stack.on_destroy".into(),
+            message: "`on_destroy` is deprecated and no longer executed — \
+                      worktree removal is mechanical (stop stack, `git worktree \
+                      remove`, release slot); slot-scoped resources are reclaimed \
+                      when the slot is reused"
+                .into(),
+            hint: "make the matching provision step idempotent (e.g. \
+                   `dropdb --if-exists app_slot{slot} && createdb app_slot{slot}`) \
+                   so a reused slot starts clean"
+                .into(),
+        });
+    }
 }
 
 /// A service with a port but neither a `url` nor a health check is ambiguous:
@@ -567,6 +603,27 @@ url = "http://{host}:{port}"
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].target, "api");
         assert!(lints[0].message.contains("{port}"));
+    }
+
+    #[test]
+    fn lint_flags_deprecated_worktree_hooks() {
+        // The hooks still parse (back-compat) but never run — the lint is the
+        // only signal the author gets.
+        let s = parse(
+            r#"
+schema_version = 1
+
+[stack]
+on_create = "npm install"
+on_destroy = "dropdb app_slot{slot}"
+"#,
+        );
+        assert!(validate(&s).is_ok(), "deprecated hooks must still parse");
+        let lints = lint(&s);
+        let targets: Vec<_> = lints.iter().map(|l| l.target.as_str()).collect();
+        assert!(targets.contains(&"stack.on_create"), "{targets:?}");
+        assert!(targets.contains(&"stack.on_destroy"), "{targets:?}");
+        assert!(lints.iter().all(|l| l.message.contains("deprecated")));
     }
 
     #[test]

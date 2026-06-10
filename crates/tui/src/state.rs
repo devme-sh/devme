@@ -49,6 +49,20 @@ pub struct InstanceData {
     /// in the background. `None` until the first git query lands (or when the
     /// branch has no upstream).
     pub git_ahead_behind: Option<(usize, usize)>,
+    /// Whether the branch's commits have landed on the repo's default branch
+    /// (`merge-base --is-ancestor`), refreshed in the background. `None` until
+    /// known, for the main worktree, or when undeterminable. Squash merges are
+    /// invisible here — `pr` covers those.
+    pub git_merged: Option<bool>,
+    /// Whether the worktree has uncommitted/untracked changes — the one thing
+    /// removal destroys. `None` until the first refresh lands.
+    pub git_dirty: Option<bool>,
+    /// The branch's PR as last reported by `gh` (fetched on a slow cadence and
+    /// when the info modal opens). `None` = no PR found (or `gh` unavailable).
+    pub pr: Option<crate::worktree::PrInfo>,
+    /// True once a `gh` lookup has completed at least once — distinguishes
+    /// "no PR" from "haven't checked yet" in the info modal.
+    pub pr_checked: bool,
 }
 
 impl InstanceData {
@@ -61,7 +75,18 @@ impl InstanceData {
             logs: HashMap::new(),
             log_scroll: HashMap::new(),
             git_ahead_behind: None,
+            git_merged: None,
+            git_dirty: None,
+            pr: None,
+            pr_checked: false,
         }
+    }
+
+    /// The merged signal for badges and the removal prompt: true when either
+    /// the local ancestor check or the PR state says the branch has landed.
+    /// (The PR signal is what catches squash/rebase merges.)
+    fn merged(&self) -> bool {
+        self.git_merged == Some(true) || self.pr.as_ref().is_some_and(|pr| pr.is_merged())
     }
 }
 
@@ -531,8 +556,8 @@ pub struct StackInfoField {
 
 /// The stack-info modal (`i`): identity + status for the focused stack, with
 /// per-field copy. Built once when the modal opens so a slow allocator read
-/// (for the slot) stays off the render path. Extensible: custom per-stack
-/// commands would render as a second section of action rows here.
+/// (for the slot) stays off the render path — then rebuilt in place when an
+/// async PR lookup lands (see [`TuiState::apply_pr_info`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StackInfoState {
     /// Heading — the branch/stack name (or "shared services").
@@ -540,6 +565,42 @@ pub struct StackInfoState {
     pub fields: Vec<StackInfoField>,
     /// Cursor as an index into `fields`, always resting on a copyable row.
     pub cursor: usize,
+    /// The instance this modal describes (`None` for the shared row), so a
+    /// late-arriving PR result can refresh the open modal in place.
+    pub instance_id: Option<String>,
+    /// The slot captured at open time, reused on refresh (the allocator read
+    /// stays off the render path).
+    pub slot: Option<u8>,
+}
+
+/// The always-on confirmation modal for removing a worktree (`x`). Snapshot
+/// of everything the user needs to decide: merged status, dirtiness, PR. The
+/// teardown itself runs async; `busy`/`error` carry its progress back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeRemoveDialog {
+    pub instance_id: String,
+    pub path: String,
+    pub branch: Option<String>,
+    /// Merged signal (local ancestor check OR PR state) at open time.
+    pub merged: bool,
+    /// Uncommitted/untracked changes present? `None` = not yet known.
+    pub dirty: Option<bool>,
+    pub pr: Option<crate::worktree::PrInfo>,
+    /// True while the removal task runs — keys are swallowed except Esc.
+    pub busy: bool,
+    /// A failed removal's message, shown in the modal (e.g. dirty tree
+    /// without force).
+    pub error: Option<String>,
+}
+
+/// The branch-name prompt for creating a worktree from the TUI (`w`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorktreeAddDialog {
+    /// Branch name being typed.
+    pub input: String,
+    /// True while `git worktree add` runs.
+    pub busy: bool,
+    pub error: Option<String>,
 }
 
 /// Default sidebar width in columns. Wide enough for stack names + a health
@@ -659,6 +720,11 @@ pub struct TuiState {
     /// The stack-info modal (`i`), when open. Identity + status for the focused
     /// stack, with per-field copy.
     stack_info: Option<StackInfoState>,
+    /// The worktree-removal confirmation modal (`x`), when open. Always shown
+    /// before a removal — never a silent teardown.
+    worktree_remove: Option<WorktreeRemoveDialog>,
+    /// The new-worktree branch prompt (`w`), when open.
+    worktree_add: Option<WorktreeAddDialog>,
     /// The reachable hostname when this whole TUI is attached to a remote stack
     /// (over `devme remote`, which exports `DEVME_URL_HOST`). `None` for a local
     /// session. Drives the sidebar remote badge and the info modal's Host row —
@@ -719,6 +785,8 @@ impl Default for TuiState {
             stopped: false,
             stopped_repo: None,
             stack_info: None,
+            worktree_remove: None,
+            worktree_add: None,
             remote_host: None,
             tab_scroll: 0,
             tab_ctx: None,
@@ -880,6 +948,8 @@ impl TuiState {
         self.zoom = false;
         self.copy_mode = false;
         self.stack_info = None;
+        self.worktree_remove = None;
+        self.worktree_add = None;
     }
 
     /// Leave the stopped state — a daemon reattached (a fresh `devme up`), so
@@ -1941,6 +2011,53 @@ impl TuiState {
         }
     }
 
+    /// Record the background merged/dirty checks for the instance with `id`.
+    /// `None` values are kept verbatim (they mean "undeterminable", not
+    /// "unchanged") so a branch switch clears a stale merged flag.
+    pub fn apply_git_worktree_status(
+        &mut self,
+        id: &str,
+        merged: Option<bool>,
+        dirty: Option<bool>,
+    ) {
+        if let Some(idx) = self.find_instance(id) {
+            self.instances[idx].git_merged = merged;
+            self.instances[idx].git_dirty = dirty;
+        }
+    }
+
+    /// Record a completed `gh pr view` lookup for the instance with `id`
+    /// (`None` = no PR / gh unavailable). If the stack-info modal is open on
+    /// that instance, rebuild it in place so the PR rows appear without
+    /// reopening.
+    pub fn apply_pr_info(&mut self, id: &str, pr: Option<crate::worktree::PrInfo>) {
+        let Some(idx) = self.find_instance(id) else {
+            return;
+        };
+        self.instances[idx].pr = pr;
+        self.instances[idx].pr_checked = true;
+        if let Some(info) = &self.stack_info
+            && info.instance_id.as_deref() == Some(id)
+        {
+            let slot = info.slot;
+            self.open_stack_info(slot, self.remote_host.clone());
+        }
+    }
+
+    /// True when the stack at `idx` reads as merged (locally or via its PR)
+    /// — drives the sidebar `✓ merged` badge and the info modal's prompt.
+    pub fn instance_merged(&self, idx: usize) -> bool {
+        self.instances.get(idx).is_some_and(|i| i.merged())
+    }
+
+    /// Merged *and* nothing uncommitted to lose: the badge-worthy "safe to
+    /// remove" signal.
+    pub fn instance_safe_to_remove(&self, idx: usize) -> bool {
+        self.instances
+            .get(idx)
+            .is_some_and(|i| i.merged() && i.git_dirty != Some(true))
+    }
+
     /// (id, cwd) pairs for every instance — the background git refresher
     /// iterates these.
     pub fn instance_id_cwd_pairs(&self) -> Vec<(String, String)> {
@@ -1979,11 +2096,25 @@ impl TuiState {
         if fields.is_empty() {
             return;
         }
-        let cursor = fields.iter().position(|f| f.copyable).unwrap_or(0);
+        let instance_id = if self.shared_selected {
+            None
+        } else {
+            self.current_instance().map(|i| i.info.id.clone())
+        };
+        // Keep the cursor where it was when this is an in-place refresh (a PR
+        // result landing on the open modal) — don't yank it back to the top.
+        let cursor = match &self.stack_info {
+            Some(prev) if prev.instance_id == instance_id => {
+                prev.cursor.min(fields.len().saturating_sub(1))
+            }
+            _ => fields.iter().position(|f| f.copyable).unwrap_or(0),
+        };
         self.stack_info = Some(StackInfoState {
             title,
             fields,
             cursor,
+            instance_id,
+            slot,
         });
     }
 
@@ -2038,6 +2169,50 @@ impl TuiState {
             copyable: false,
         });
         fields.push(copyable("Instance id", inst.info.id.clone()));
+
+        let info = |label: &'static str, value: String| StackInfoField {
+            label,
+            value,
+            copyable: false,
+        };
+        // PR rows: what gh last reported. "checking…" until the first lookup
+        // lands (the modal refreshes in place — see `apply_pr_info`).
+        match (&inst.pr, inst.pr_checked) {
+            (Some(pr), _) => {
+                fields.push(info(
+                    "PR",
+                    format!("#{} {} — {}", pr.number, pr.state.to_lowercase(), pr.title),
+                ));
+                fields.push(copyable("PR URL", pr.url.clone()));
+            }
+            (None, true) => fields.push(info("PR", "none found".into())),
+            (None, false) => fields.push(info("PR", "checking…".into())),
+        }
+        // Merged + removal prompt. Merged = local ancestor check OR PR state,
+        // so squash merges count. Dirty trumps the invitation — removal would
+        // destroy the uncommitted work.
+        let dirty = inst.git_dirty == Some(true);
+        let merged_label = if inst.merged() {
+            match (dirty, inst.git_merged) {
+                (true, _) => "yes — but uncommitted changes present".to_string(),
+                (false, Some(true)) => "yes — safe to remove".to_string(),
+                // Locally not an ancestor, but the PR is merged (squash).
+                (false, _) => "yes (via PR) — safe to remove".to_string(),
+            }
+        } else if inst.git_merged == Some(false) {
+            "no".to_string()
+        } else {
+            "unknown".to_string()
+        };
+        fields.push(info("Merged", merged_label));
+        let remove_hint = if dirty {
+            "x — confirm modal (dirty: force needed)".to_string()
+        } else if inst.merged() {
+            "x — merged, prompt to remove".to_string()
+        } else {
+            "x — confirm modal".to_string()
+        };
+        fields.push(info("Remove", remove_hint));
         (title, fields)
     }
 
@@ -2123,6 +2298,135 @@ impl TuiState {
             .iter()
             .find(|f| f.label == label && f.copyable)
             .map(|f| f.value.clone())
+    }
+
+    // ── worktree remove / add dialogs ───────────────────────────────────
+
+    /// Drop the sidebar row for a vanished worktree (the autospawner's
+    /// reaper or a completed TUI removal). No-op when the row is already
+    /// gone.
+    pub fn remove_instance_by_id(&mut self, id: &str) {
+        self.remove_instance(id);
+    }
+
+    /// Open the removal confirmation for the focused stack, snapshotting its
+    /// merged/dirty/PR state. The caller has already vetoed the shared row,
+    /// the main worktree, and the TUI's own cwd. Returns false when there's
+    /// nothing sensible to remove.
+    pub fn open_worktree_remove(&mut self) -> bool {
+        if self.shared_selected {
+            return false;
+        }
+        let Some(idx) = self.selected_instance else {
+            return false;
+        };
+        let Some(inst) = self.instances.get(idx) else {
+            return false;
+        };
+        self.worktree_remove = Some(WorktreeRemoveDialog {
+            instance_id: inst.info.id.clone(),
+            path: inst.info.cwd.clone(),
+            branch: Some(inst.info.label.clone()).filter(|l| !l.is_empty()),
+            merged: inst.merged(),
+            dirty: inst.git_dirty,
+            pr: inst.pr.clone(),
+            busy: false,
+            error: None,
+        });
+        true
+    }
+
+    pub fn worktree_remove(&self) -> Option<&WorktreeRemoveDialog> {
+        self.worktree_remove.as_ref()
+    }
+
+    pub fn worktree_remove_visible(&self) -> bool {
+        self.worktree_remove.is_some()
+    }
+
+    pub fn close_worktree_remove(&mut self) {
+        self.worktree_remove = None;
+    }
+
+    /// Mark the removal in-flight (confirm pressed); clears a previous error
+    /// so a retry reads clean. Returns `(instance_id, path)` to tear down, or
+    /// `None` if no dialog is open / it's already running.
+    pub fn begin_worktree_remove(&mut self) -> Option<(String, String)> {
+        let dlg = self.worktree_remove.as_mut()?;
+        if dlg.busy {
+            return None;
+        }
+        dlg.busy = true;
+        dlg.error = None;
+        Some((dlg.instance_id.clone(), dlg.path.clone()))
+    }
+
+    /// Surface a failed removal in the (still open) dialog so the user can
+    /// force or cancel.
+    pub fn worktree_remove_failed(&mut self, message: impl Into<String>) {
+        if let Some(dlg) = self.worktree_remove.as_mut() {
+            dlg.busy = false;
+            dlg.error = Some(message.into());
+        }
+    }
+
+    /// Open the new-worktree branch prompt.
+    pub fn open_worktree_add(&mut self) {
+        self.worktree_add = Some(WorktreeAddDialog::default());
+    }
+
+    pub fn worktree_add(&self) -> Option<&WorktreeAddDialog> {
+        self.worktree_add.as_ref()
+    }
+
+    pub fn worktree_add_visible(&self) -> bool {
+        self.worktree_add.is_some()
+    }
+
+    pub fn close_worktree_add(&mut self) {
+        self.worktree_add = None;
+    }
+
+    /// Append a typed character to the branch prompt. Branch-name characters
+    /// only — git refnames can't hold spaces/control chars, so the prompt
+    /// filters rather than letting `git worktree add` fail later.
+    pub fn worktree_add_input(&mut self, c: char) {
+        if let Some(dlg) = self.worktree_add.as_mut()
+            && !dlg.busy
+            && (c.is_alphanumeric() || "-_./".contains(c))
+        {
+            dlg.input.push(c);
+            dlg.error = None;
+        }
+    }
+
+    pub fn worktree_add_backspace(&mut self) {
+        if let Some(dlg) = self.worktree_add.as_mut()
+            && !dlg.busy
+        {
+            dlg.input.pop();
+            dlg.error = None;
+        }
+    }
+
+    /// Mark the add in-flight (Enter pressed) and return the branch name, or
+    /// `None` when the input is empty / already running.
+    pub fn begin_worktree_add(&mut self) -> Option<String> {
+        let dlg = self.worktree_add.as_mut()?;
+        if dlg.busy || dlg.input.trim().is_empty() {
+            return None;
+        }
+        dlg.busy = true;
+        dlg.error = None;
+        Some(dlg.input.trim().to_string())
+    }
+
+    /// Surface a failed `git worktree add` in the (still open) prompt.
+    pub fn worktree_add_failed(&mut self, message: impl Into<String>) {
+        if let Some(dlg) = self.worktree_add.as_mut() {
+            dlg.busy = false;
+            dlg.error = Some(message.into());
+        }
     }
 
     // ── settings overlay ────────────────────────────────────────────────
@@ -2463,6 +2767,8 @@ impl TuiState {
             || self.port_conflict.is_some()
             || self.notif_visible
             || self.stack_info.is_some()
+            || self.worktree_remove.is_some()
+            || self.worktree_add.is_some()
     }
 
     /// Apply a left-click at screen `(col, row)` to the recorded hit map.
@@ -3652,9 +3958,25 @@ mod tests {
         s.open_stack_info(Some(3), None);
         let info = s.stack_info().expect("modal open");
         assert_eq!(info.title, "feature/x");
-        // Branch, Path, Slot, Status, Instance id — Status is info-only.
+        // Status / PR / Merged / Remove are info-only; the rest copy.
         let labels: Vec<_> = info.fields.iter().map(|f| f.label).collect();
-        assert_eq!(labels, ["Branch", "Path", "Slot", "Status", "Instance id"]);
+        assert_eq!(
+            labels,
+            [
+                "Branch",
+                "Path",
+                "Slot",
+                "Status",
+                "Instance id",
+                "PR",
+                "Merged",
+                "Remove"
+            ]
+        );
+        // No gh lookup has landed yet → the PR row reads as pending.
+        let pr = info.fields.iter().find(|f| f.label == "PR").unwrap();
+        assert!(!pr.copyable);
+        assert_eq!(pr.value, "checking…");
         assert_eq!(s.stack_info_field("Branch").as_deref(), Some("feature/x"));
         assert_eq!(s.stack_info_field("Path").as_deref(), Some("/tmp/test"));
         assert_eq!(s.stack_info_field("Slot").as_deref(), Some("3"));
@@ -3716,6 +4038,94 @@ mod tests {
 
         s.close_stack_info();
         assert!(!s.stack_info_visible());
+    }
+
+    fn pr(state: &str) -> crate::worktree::PrInfo {
+        crate::worktree::PrInfo {
+            number: 42,
+            state: state.into(),
+            title: "Add x".into(),
+            url: "https://github.com/x/y/pull/42".into(),
+        }
+    }
+
+    #[test]
+    fn merged_badge_requires_landed_branch_and_clean_tree() {
+        let mut s = TuiState::default();
+        s.apply(snapshot_msg(&["api"]));
+        let idx = s.find_instance("test-id").unwrap();
+        // Nothing known yet → no badge.
+        assert!(!s.instance_safe_to_remove(idx));
+        // Locally merged + clean → badge.
+        s.apply_git_worktree_status("test-id", Some(true), Some(false));
+        assert!(s.instance_safe_to_remove(idx));
+        // Dirty pulls the badge even when merged — removal would destroy work.
+        s.apply_git_worktree_status("test-id", Some(true), Some(true));
+        assert!(!s.instance_safe_to_remove(idx));
+        // Not an ancestor locally, but the PR is MERGED (a squash merge) →
+        // still counts as landed.
+        s.apply_git_worktree_status("test-id", Some(false), Some(false));
+        assert!(!s.instance_safe_to_remove(idx));
+        s.apply_pr_info("test-id", Some(pr("MERGED")));
+        assert!(s.instance_merged(idx));
+        assert!(s.instance_safe_to_remove(idx));
+    }
+
+    #[test]
+    fn pr_result_refreshes_open_stack_info_in_place() {
+        let mut s = TuiState::default();
+        s.apply(snapshot_msg(&["api"]));
+        s.open_stack_info(Some(1), None);
+        // The async gh lookup lands while the modal is open → rows update.
+        s.apply_pr_info("test-id", Some(pr("OPEN")));
+        let info = s.stack_info().expect("modal still open");
+        let row = info.fields.iter().find(|f| f.label == "PR").unwrap();
+        assert!(row.value.contains("#42 open"), "{}", row.value);
+        assert_eq!(
+            s.stack_info_field("PR URL").as_deref(),
+            Some("https://github.com/x/y/pull/42")
+        );
+        // A checked-but-absent PR reads as such (not "checking…").
+        s.apply_pr_info("test-id", None);
+        let info = s.stack_info().unwrap();
+        let row = info.fields.iter().find(|f| f.label == "PR").unwrap();
+        assert_eq!(row.value, "none found");
+    }
+
+    #[test]
+    fn worktree_remove_dialog_confirm_failure_retry() {
+        let mut s = TuiState::default();
+        s.apply(snapshot_msg(&["api"]));
+        assert!(s.open_worktree_remove());
+        let (id, path) = s.begin_worktree_remove().expect("confirm starts removal");
+        assert_eq!(id, "test-id");
+        assert_eq!(path, "/tmp/test");
+        // While busy a second confirm is swallowed (no double-removal).
+        assert!(s.begin_worktree_remove().is_none());
+        // A failure (e.g. dirty tree without force) keeps the modal up with
+        // the error and re-arms confirm for a forced retry.
+        s.worktree_remove_failed("git worktree remove failed: dirty");
+        assert!(s.worktree_remove_visible());
+        assert!(s.begin_worktree_remove().is_some());
+        s.close_worktree_remove();
+        assert!(!s.worktree_remove_visible());
+    }
+
+    #[test]
+    fn worktree_add_prompt_filters_to_refname_chars() {
+        let mut s = TuiState::default();
+        s.open_worktree_add();
+        for c in "feat/x y!".chars() {
+            s.worktree_add_input(c);
+        }
+        // Space and '!' are dropped — git refnames can't hold them.
+        assert_eq!(s.worktree_add().unwrap().input, "feat/xy");
+        s.worktree_add_backspace();
+        assert_eq!(s.begin_worktree_add().as_deref(), Some("feat/x"));
+        // Busy swallows a re-enter.
+        assert!(s.begin_worktree_add().is_none());
+        s.worktree_add_failed("branch exists");
+        assert!(s.begin_worktree_add().is_some(), "failure re-arms Enter");
     }
 
     #[test]

@@ -34,14 +34,30 @@ SMOKE_DIR="$(mktemp -d /tmp/devme-tui-smoke.XXXXXX)"
 cp "$SMOKE_SRC/devme.toml" "$SMOKE_DIR/"
 git -C "$SMOKE_DIR" init -q
 
+# Isolate HOME too: the user's real global config can redirect the whole run
+# (`remote.default = true` would live-sync the fixture to their VPS and run
+# the stack there). A throwaway HOME keeps the smoke local and hermetic.
+# Suppress the skill-install prompt a fresh HOME would otherwise raise — it's
+# modal and would swallow the keys this script sends (the skill modals have
+# their own smoke: skill-modal-smoke.sh).
+SMOKE_HOME="$SMOKE_DIR/home"
+mkdir -p "$SMOKE_HOME/.config/devme"
+# NB: hints.skills is a string field, not a bool — `false` unquoted fails the
+# whole config parse and the prompt comes back.
+printf '[hints]\nskills = "false"\n' > "$SMOKE_HOME/.config/devme/config.toml"
+
 cleanup() {
   tmux kill-session -t "$SESSION" 2>/dev/null || true
-  (cd "$SMOKE_DIR" && "$DEVME" down >/dev/null 2>&1) || true
+  (cd "$SMOKE_DIR" && HOME="$SMOKE_HOME" XDG_CONFIG_HOME="$SMOKE_HOME/.config" \
+    "$DEVME" down >/dev/null 2>&1) || true
   rm -rf "$SMOKE_DIR"
 }
 trap cleanup EXIT
 
-tmux new-session -d -s "$SESSION" -x 120 -y 30 "cd $SMOKE_DIR && $DEVME"
+# XDG_CONFIG_HOME outranks HOME in devme's config lookup and survives into
+# the tmux pane from the user's shell — pin both.
+tmux new-session -d -s "$SESSION" -x 120 -y 30 \
+  "cd $SMOKE_DIR && HOME=$SMOKE_HOME XDG_CONFIG_HOME=$SMOKE_HOME/.config $DEVME"
 # Long enough for the daemon to spawn and for tick (10 lines/s) to overflow
 # the ~24-row viewport, so page-up in step 2 has somewhere to scroll to.
 sleep 5

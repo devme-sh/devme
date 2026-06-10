@@ -61,9 +61,13 @@ pub struct StackMeta {
     /// Default `restart` policy for any Service that doesn't specify its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_restart: Option<RestartPolicy>,
-    /// Shell command to run once when a new worktree is created
-    /// (`git worktree add`). Typical use: install deps, copy config.
-    /// A `.devme-initialized` marker file prevents re-running.
+    /// **Deprecated — parsed for compatibility, never executed.** Per-worktree
+    /// setup belongs in `[step]` check/provision instead: a step is idempotent
+    /// and reality-based (it re-runs when the artifact it checks for is gone),
+    /// so any worktree converges on its first `devme up` — no creation event,
+    /// no marker file. The field stays declared only because `StackMeta` is
+    /// `deny_unknown_fields`: existing configs must keep parsing. `devme
+    /// config check` flags it with a migration hint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_create: Option<String>,
 
@@ -74,21 +78,14 @@ pub struct StackMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_file: Option<String>,
 
-    /// Shell command to run when a worktree is being removed. The symmetric
-    /// counterpart of [`on_create`](Self::on_create) — intended for tearing
-    /// down per-worktree resources (e.g. dropping a cloned database).
-    /// Interpolated with `{slot}`, `{worktree}`, and `{branch}`.
-    ///
-    /// Invoked by `devme worktree rm <target>`, which resolves the command
-    /// against the worktree's slot/branch *before* removal (the context is
-    /// gone afterwards), stops the instance stack, runs `git worktree
-    /// remove`, then fires this hook from the main worktree. See
-    /// `crates/tui/src/worktree.rs` (`remove_worktree` / `run_on_destroy`).
-    ///
-    /// NOTE: a *bare* `git worktree remove` bypasses devme and runs no hook
-    /// — devme has no always-on per-repo daemon observing removals, so the
-    /// deterministic `devme worktree rm` path is the supported way to fire
-    /// `on_destroy`.
+    /// **Deprecated — parsed for compatibility, never executed.** Worktree
+    /// removal is purely mechanical: devme stops the instance supervisor,
+    /// runs `git worktree remove`, and releases the port slot. Per-worktree
+    /// resources sized by `{slot}` come from a bounded pool, so an orphan is
+    /// reclaimed the next time any worktree converges on that slot — no
+    /// teardown hook needed. Kept declared (like
+    /// [`on_create`](Self::on_create)) only so `deny_unknown_fields` doesn't
+    /// break existing configs; `devme config check` flags it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_destroy: Option<String>,
 }

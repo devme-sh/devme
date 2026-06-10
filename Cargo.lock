@@ -504,6 +504,7 @@ dependencies = [
  "notify",
  "ratatui",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
