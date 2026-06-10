@@ -248,6 +248,64 @@ pub fn expand_attach(
         .replace("{url_host}", url_host)
 }
 
+// --- herdr preset preparation ------------------------------------------------
+
+/// POSIX single-quote a shell argument. Simple tokens (service names, flags,
+/// numbers) pass through unquoted. The `'\''` escape is also valid in fish,
+/// so this is safe whatever login shell the remote uses.
+pub fn shell_quote(s: &str) -> String {
+    // `~` is allowed unquoted so a remote path like `~/development/foo` keeps
+    // its tilde expansion (single-quoting would make the remote shell `cd`
+    // into a literal `~` directory).
+    let simple = !s.is_empty()
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || "_./:=-~".contains(c));
+    if simple {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+/// Shell command that lists the named herdr session's workspaces (JSON on
+/// stdout). Doubles as the cheapest "is the session server running?" probe —
+/// herdr exits non-zero when the session's socket is absent.
+pub fn herdr_list_cmd(session: &str) -> String {
+    format!("env HERDR_SESSION={} herdr workspace list", shell_quote(session))
+}
+
+/// Shell command that starts the named herdr session server headless on the
+/// remote, detached from the ssh connection that launches it, with the
+/// project directory as its process cwd.
+pub fn herdr_server_start_cmd(session: &str, remote_path: &str) -> String {
+    format!(
+        "cd {} && env HERDR_SESSION={} sh -c 'nohup herdr server >/dev/null 2>&1 &'",
+        shell_quote(remote_path),
+        shell_quote(session)
+    )
+}
+
+/// Shell command that creates a workspace rooted at the project directory in
+/// the named herdr session, so the first attach opens in the project instead
+/// of the login dir.
+pub fn herdr_workspace_create_cmd(session: &str, remote_path: &str, label: &str) -> String {
+    format!(
+        "env HERDR_SESSION={} herdr workspace create --cwd {} --label {}",
+        shell_quote(session),
+        shell_quote(remote_path),
+        shell_quote(label)
+    )
+}
+
+/// Number of workspaces in a `herdr workspace list` response, or `None` when
+/// the output isn't the JSON shape we expect (herdr missing/old, error text).
+/// `None` and `Some(0)` are deliberately distinct: only a *confirmed* empty
+/// session gets a workspace seeded.
+pub fn herdr_workspace_count(output: &str) -> Option<u64> {
+    let line = output.lines().find(|l| l.trim_start().starts_with('{'))?;
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    Some(v.get("result")?.get("workspaces")?.as_array()?.len() as u64)
+}
+
 /// Sentinel `advertise_host` value meaning "autodetect this machine's own
 /// Tailscale MagicDNS name." Keeps devme network-agnostic: Tailscale is an
 /// opt-in autodetect, never a hard dependency.
@@ -530,6 +588,46 @@ mod tests {
             "box",
         );
         assert_eq!(cmd, "mosh box -- tmux a -t proj");
+    }
+
+    #[test]
+    fn shell_quote_passes_simple_tokens_and_quotes_the_rest() {
+        assert_eq!(shell_quote("api"), "api");
+        assert_eq!(shell_quote("--tail"), "--tail");
+        assert_eq!(shell_quote("200"), "200");
+        assert_eq!(shell_quote("svc-1.2/x:y=z"), "svc-1.2/x:y=z");
+        // Tilde paths pass through so remote `cd ~/…` still expands.
+        assert_eq!(shell_quote("~/development/api-abc"), "~/development/api-abc");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn herdr_commands_target_the_named_session() {
+        assert_eq!(
+            herdr_list_cmd("devme-api-abc"),
+            "env HERDR_SESSION=devme-api-abc herdr workspace list"
+        );
+        let start = herdr_server_start_cmd("devme-api-abc", "~/development/api-abc");
+        assert!(start.starts_with("cd ~/development/api-abc && "), "got {start}");
+        assert!(start.contains("env HERDR_SESSION=devme-api-abc"));
+        assert!(start.contains("nohup herdr server"));
+        let create = herdr_workspace_create_cmd("s", "~/dev/x", "My App");
+        assert!(create.contains("--cwd ~/dev/x"), "got {create}");
+        assert!(create.contains("--label 'My App'"), "got {create}");
+    }
+
+    #[test]
+    fn herdr_workspace_count_parses_cli_json_only() {
+        let one = r#"{"id":"cli:workspace:list","result":{"type":"workspace_list","workspaces":[{"workspace_id":"w1"}]}}"#;
+        assert_eq!(herdr_workspace_count(one), Some(1));
+        let empty = r#"{"id":"x","result":{"type":"workspace_list","workspaces":[]}}"#;
+        assert_eq!(herdr_workspace_count(empty), Some(0));
+        // Error text / no JSON → None, which the caller treats as "don't touch".
+        assert_eq!(herdr_workspace_count("Error: Os { code: 2, kind: NotFound }"), None);
+        assert_eq!(herdr_workspace_count(""), None);
+        assert_eq!(herdr_workspace_count(r#"{"result":{}}"#), None);
     }
 
     #[test]

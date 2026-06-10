@@ -6,8 +6,10 @@
 //!   and is unit-tested there.
 //! - **This module** is the imperative half: it shells out to `mutagen`
 //!   (sync sessions — *not* the daemon, which the OS keeps alive) and `ssh`
-//!   (reachability + the attach command). devme stays decoupled from herdr:
-//!   the attach command is an opaque, user-owned template.
+//!   (reachability + the attach command). The attach command stays an
+//!   opaque, user-owned template; the shipped `herdr` preset additionally
+//!   gets its remote session seeded (server + project-rooted workspace)
+//!   before attach so it opens in the project dir, not `~`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,7 +19,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use devme_config::{GlobalConfig, paths, remote};
-use devme_config::remote::SyncHealth;
+use devme_config::remote::{SyncHealth, shell_quote};
 
 /// How often the background watcher polls the sync's health while an attached
 /// `devme remote` session runs in the foreground.
@@ -326,12 +328,20 @@ fn ssh_check(host: &str, remote_cmd: &str) -> (bool, String) {
 /// continue rather than abort. The `-d` detach is what keeps the stack alive
 /// under the supervisor (not inside the herdr/ssh session you're attaching).
 fn remote_up(r: &Resolved) {
+    use std::io::IsTerminal;
     let cmd = format!("cd {} && devme up -d", shell_quote(&r.remote_path));
     eprintln!("devme remote: ensuring stack is up on {} …", r.host);
-    let status = Command::new("ssh")
-        .args(["-o", "BatchMode=yes", &r.host])
-        .arg(&cmd)
-        .status();
+    let mut ssh = Command::new("ssh");
+    ssh.args(["-o", "BatchMode=yes"]);
+    // Allocate a remote TTY when we have one locally, so first-run prompts —
+    // the ADR-0014 env wizard, preflight provisioning — are interactive and
+    // run to completion *before* the attach takes over the screen. Without it
+    // the remote `devme up` sees a non-tty stdin, prints a wizard it can't
+    // drive, and the attach immediately paints over it.
+    if std::io::stdin().is_terminal() {
+        ssh.arg("-t");
+    }
+    let status = ssh.arg(&r.host).arg(&cmd).status();
     match status {
         Ok(s) if s.success() => {}
         Ok(s) => eprintln!(
@@ -339,6 +349,54 @@ fn remote_up(r: &Resolved) {
             s.code().map(|c| c.to_string()).unwrap_or_else(|| "by signal".into())
         ),
         Err(e) => eprintln!("devme remote: warning: couldn't start remote stack: {e} (attaching anyway)"),
+    }
+}
+
+// --- herdr preset preparation -------------------------------------------------
+
+/// Prepare the remote herdr session so the first attach opens in the project
+/// directory. herdr creates a fresh session's first workspace at *attach*
+/// time with the server's cwd (the SSH login dir, i.e. `~`) — so for the
+/// shipped `herdr` preset devme pre-starts the session server and seeds a
+/// workspace rooted at the project via herdr's socket-API CLI. A session
+/// that already has workspaces is left untouched (it's the user's
+/// arrangement). Best-effort throughout: any failure falls through to a
+/// plain attach — worst case herdr opens in `~`, the pre-seed behavior.
+fn herdr_prepare(r: &Resolved) {
+    let list_cmd = remote::herdr_list_cmd(&r.session);
+    let (mut ok, mut out) = ssh_check(&r.host, &list_cmd);
+    if !ok {
+        // No session server yet — start one headless, rooted at the project,
+        // then poll briefly for its socket. If herdr isn't installed on the
+        // remote this times out and the attach surfaces the real error.
+        let start = remote::herdr_server_start_cmd(&r.session, &r.remote_path);
+        let _ = ssh_check(&r.host, &start);
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(300));
+            (ok, out) = ssh_check(&r.host, &list_cmd);
+            if ok {
+                break;
+            }
+        }
+        if !ok {
+            return;
+        }
+    }
+    // Only a *confirmed* empty session gets seeded — `None` (unexpected
+    // output shape) must not create workspaces in a session we misread.
+    if remote::herdr_workspace_count(&out) != Some(0) {
+        return;
+    }
+    let label = r
+        .local_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("devme")
+        .to_string();
+    let create = remote::herdr_workspace_create_cmd(&r.session, &r.remote_path, &label);
+    let (created, _) = ssh_check(&r.host, &create);
+    if created {
+        eprintln!("devme remote: opened herdr workspace at {}", r.remote_path);
     }
 }
 
@@ -397,22 +455,6 @@ pub fn maybe_proxy(command: &Option<crate::Command>) -> Option<i32> {
 /// `--local` (a local-only escape hatch the remote shouldn't see).
 fn forwarded_args() -> Vec<String> {
     std::env::args().skip(1).filter(|a| a != "--local").collect()
-}
-
-/// POSIX single-quote a shell argument. Simple tokens (service names, flags,
-/// numbers) pass through unquoted. The `'\''` escape is also valid in fish,
-/// so this is safe whatever login shell the remote uses.
-fn shell_quote(s: &str) -> String {
-    // `~` is allowed unquoted so a remote path like `~/development/foo` keeps
-    // its tilde expansion (single-quoting would make the remote shell `cd`
-    // into a literal `~` directory).
-    let simple = !s.is_empty()
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || "_./:=-~".contains(c));
-    if simple {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', "'\\''"))
-    }
 }
 
 /// Build the remote command: `cd <remote_path> && devme <args…>`.
@@ -492,6 +534,12 @@ pub fn run(cwd: &Path) -> Result<()> {
     // but `up -d` first is idempotent and makes the herdr/ssh presets work too.
     if r.up_on_attach {
         remote_up(&r);
+    }
+
+    // The herdr preset gets its remote session seeded (server + project-
+    // rooted workspace) so the attach lands in the project dir, not `~`.
+    if r.attach == "herdr" {
+        herdr_prepare(&r);
     }
 
     let cmd = remote::expand_attach(&r.attach, &r.host, &r.remote_path, &r.session, &r.url_host);
@@ -1106,19 +1154,6 @@ pub fn doctor(cwd: &Path, json: bool) -> Result<()> {
 mod tests {
     use super::*;
     use crate::Command as C;
-
-    #[test]
-    fn shell_quote_passes_simple_tokens_and_quotes_the_rest() {
-        assert_eq!(shell_quote("api"), "api");
-        assert_eq!(shell_quote("--tail"), "--tail");
-        assert_eq!(shell_quote("200"), "200");
-        assert_eq!(shell_quote("svc-1.2/x:y=z"), "svc-1.2/x:y=z");
-        // Tilde paths pass through so remote `cd ~/…` still expands.
-        assert_eq!(shell_quote("~/development/api-abc"), "~/development/api-abc");
-        assert_eq!(shell_quote("a b"), "'a b'");
-        assert_eq!(shell_quote("it's"), "'it'\\''s'");
-        assert_eq!(shell_quote(""), "''");
-    }
 
     #[test]
     fn strip_marked_block_removes_only_the_devme_block() {
