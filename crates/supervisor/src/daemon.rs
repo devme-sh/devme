@@ -118,6 +118,10 @@ enum InternalEvent {
         step: String,
         line: String,
     },
+    /// The daemon's worktree directory was deleted out from under it (e.g.
+    /// `git worktree remove`, or a herdr/agent tool removing the checkout).
+    /// Triggers self-shutdown so the daemon doesn't linger as an orphan.
+    WorktreeVanished,
 }
 
 struct ChildRecord {
@@ -431,6 +435,9 @@ impl DaemonServer {
         } = self;
 
         tokio::spawn(accept_loop(listener, accept_tx));
+        // Self-exit guard: if this worktree's directory is removed while the
+        // daemon runs, terminate rather than linger as a discoverable orphan.
+        tokio::spawn(worktree_watchdog(instance.cwd.clone(), internal_tx.clone()));
 
         let result = run_event_loop(internal_tx, internal_rx, stack, slot, instance).await;
         // Best-effort socket cleanup. The next bind() also removes a stale
@@ -499,6 +506,39 @@ async fn handle_connection(
         }
     }
     let _ = internal_tx.send(InternalEvent::ClientDisconnected { id });
+}
+
+/// How often the watchdog checks that the daemon's worktree still exists.
+const WORKTREE_WATCH_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Poll the daemon's worktree directory; once it's been gone for two
+/// consecutive checks (a single miss could be a transient atomic-rename swap),
+/// signal the event loop to shut down. Without this, a worktree removed out
+/// from under a running daemon leaves the daemon serving a now-dead path: its
+/// socket stays bound, so the TUI's discovery keeps listing a worktree that no
+/// longer exists and offers a removal the `git worktree` layer can't resolve.
+///
+/// `cwd` is the canonicalised absolute worktree root (from [`InstanceInfo`]),
+/// so the check is independent of the process's own (possibly deleted) cwd. An
+/// empty or relative path (test daemons) isn't a real worktree to guard.
+async fn worktree_watchdog(cwd: String, tx: mpsc::UnboundedSender<InternalEvent>) {
+    let path = std::path::PathBuf::from(&cwd);
+    if cwd.is_empty() || path.is_relative() {
+        return;
+    }
+    let mut misses = 0u8;
+    loop {
+        tokio::time::sleep(WORKTREE_WATCH_INTERVAL).await;
+        if path.exists() {
+            misses = 0;
+            continue;
+        }
+        misses += 1;
+        if misses >= 2 {
+            let _ = tx.send(InternalEvent::WorktreeVanished);
+            return;
+        }
+    }
 }
 
 async fn accept_loop(listener: UnixListener, internal_tx: mpsc::UnboundedSender<InternalEvent>) {
@@ -573,6 +613,7 @@ fn process_event(
             state.subscriptions.remove(&id);
         }
         InternalEvent::ClientMessage { id, msg } => handle_client_message(state, id, msg, tx),
+        InternalEvent::WorktreeVanished => handle_worktree_vanished(state),
         InternalEvent::ProcessLine {
             service,
             generation,
@@ -650,6 +691,25 @@ fn process_event(
     }
 }
 
+/// The daemon's worktree directory was removed. Graceful per-service `stop`
+/// hooks can't run — they'd `cd` into a path that's gone — so hard-kill every
+/// child's process group directly (cwd-independent) and tear down. Clearing
+/// the child map with `shutting_down` set makes the event loop broadcast
+/// Goodbye and exit, which unlinks the socket, so discovery stops listing this
+/// dead worktree. Idempotent: a second signal during shutdown is a no-op.
+fn handle_worktree_vanished(state: &mut DaemonState) {
+    if state.shutting_down {
+        return;
+    }
+    let names: Vec<String> = state.children.keys().cloned().collect();
+    for name in names {
+        if let Some(rec) = state.children.remove(&name) {
+            send_sigkill(rec.pid);
+        }
+    }
+    state.shutting_down = true;
+}
+
 fn handle_auto_restart(
     state: &mut DaemonState,
     service: String,
@@ -703,7 +763,12 @@ fn handle_client_message(
             }
             state.subscriptions.insert(id, services);
         }
-        ClientMessage::LogQuery { services, since, tail, follow } => {
+        ClientMessage::LogQuery {
+            services,
+            since,
+            tail,
+            follow,
+        } => {
             let (svcs, steps) = state.snapshot();
             if let Some(client) = state.clients.get(&id) {
                 let _ = client.send(ServerMessage::Subscribed {
@@ -1647,6 +1712,107 @@ cmd = "true"
         send_msg(&mut conn, ClientMessage::Shutdown).await;
         let _ = recv_msg(&mut conn).await; // Goodbye
         let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+
+    #[tokio::test]
+    async fn daemon_self_exits_when_its_worktree_is_removed() {
+        // The socket lives outside the worktree (matching the real layout:
+        // sockets are under $XDG_RUNTIME_DIR), so deleting the worktree dir
+        // doesn't take the socket with it — the daemon must notice on its own.
+        let sock_dir = TempDir::new().unwrap();
+        let sock = sock_dir.path().join("d.sock");
+        let worktree = TempDir::new().unwrap();
+        let worktree_path = std::fs::canonicalize(worktree.path()).unwrap();
+
+        let instance = InstanceInfo {
+            id: "wt".into(),
+            label: "wt".into(),
+            cwd: worktree_path.display().to_string(),
+        };
+        let server = DaemonServer::bind_with_instance(
+            &sock,
+            make_stack(
+                r#"
+schema_version = 1
+
+[service.tick]
+cmd = "sleep 30"
+"#,
+            ),
+            Slot::ZERO,
+            instance,
+        )
+        .unwrap();
+        let task = tokio::spawn(server.serve());
+
+        let mut conn = connect(&sock).await;
+        send_msg(&mut conn, ClientMessage::Subscribe { services: vec![] }).await;
+        let _ = recv_msg(&mut conn).await;
+        send_msg(
+            &mut conn,
+            ClientMessage::Start {
+                service: "tick".into(),
+                skip_deps: false,
+            },
+        )
+        .await;
+
+        // Remove the worktree out from under the running daemon.
+        drop(worktree);
+        assert!(!worktree_path.exists());
+
+        // The watchdog (3s interval, 2 misses) should drive the daemon to
+        // exit; serve() then returns and unlinks the socket. Generous bound.
+        let exited = tokio::time::timeout(Duration::from_secs(12), task).await;
+        assert!(
+            exited.is_ok(),
+            "daemon did not self-exit after worktree removal"
+        );
+        assert!(!sock.exists(), "socket should be unlinked on exit");
+    }
+
+    #[test]
+    fn worktree_vanished_clears_children_and_marks_shutdown() {
+        // Fast unit-level check of the handler: a live child is SIGKILLed, the
+        // map is cleared, and shutdown is armed so the event loop will exit.
+        let mut state = DaemonState::new(
+            Arc::new(make_stack(
+                "schema_version = 1\n[service.x]\ncmd = \"true\"\n",
+            )),
+            Slot::ZERO,
+            InstanceInfo {
+                id: "i".into(),
+                label: "i".into(),
+                cwd: "/nonexistent/worktree".into(),
+            },
+        );
+        // A real, reapable child so send_sigkill has a live pid to act on.
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        state.children.insert(
+            "x".into(),
+            ChildRecord {
+                generation: 1,
+                pid,
+                port: None,
+                restart_count: 0,
+            },
+        );
+
+        handle_worktree_vanished(&mut state);
+        assert!(state.shutting_down);
+        assert!(state.children.is_empty());
+
+        // Second call is a no-op (idempotent).
+        handle_worktree_vanished(&mut state);
+        assert!(state.children.is_empty());
+
+        // The child was signalled; reap it so the test leaves nothing behind.
+        let mut child = child;
+        let _ = child.wait();
     }
 
     #[tokio::test]
