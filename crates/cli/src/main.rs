@@ -284,7 +284,20 @@ async fn teardown_daemon(
 /// read-only — never spawns one — so a stopped worktree just shows as such.
 async fn status_all(as_json: bool) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
-    let reports = devme_tui::worktree::gather_worktree_reports(&cwd).await;
+    let mut reports = devme_tui::worktree::gather_worktree_reports(&cwd).await;
+    // Repo-scoped services are owned by the shared supervisor, not the
+    // per-worktree daemons — overlay its snapshot so the shared column shows
+    // a real state + port instead of whatever each instance last probed.
+    if let Some(stack) = std::fs::read_to_string(cwd.join("devme.toml"))
+        .ok()
+        .and_then(|t| Stack::parse(&t).ok())
+    {
+        for r in reports.iter_mut() {
+            if let Some(services) = &mut r.services {
+                overlay_shared_services(services, &stack, &cwd).await;
+            }
+        }
+    }
     if as_json {
         let worktrees: Vec<serde_json::Value> = reports
             .iter()
@@ -301,7 +314,7 @@ async fn status_all(as_json: bool) -> anyhow::Result<()> {
             .collect();
         println!("{}", serde_json::json!({ "worktrees": worktrees }));
     } else {
-        print!("{}", format_status_all(&reports));
+        print!("{}", format_status_all(&reports, !no_color()));
     }
     Ok(())
 }
@@ -590,7 +603,7 @@ async fn up(
             msg = client.next_event() => {
                 let m = match msg? {
                     Some(m) => m,
-                    None => return Ok(()),
+                    None => break,
                 };
                 match m {
                     ServerMessage::LogChunk { service, bytes, .. } => {
@@ -609,12 +622,25 @@ async fn up(
                     ServerMessage::Notice { level, message } => {
                         info!("[devme {level:?}] {message}");
                     }
-                    ServerMessage::Goodbye { .. } => return Ok(()),
+                    ServerMessage::Goodbye { .. } => break,
                     _ => {}
                 }
             }
         }
     }
+
+    // Ctrl-C on a foreground `up` is a full stop, like `devme down`: also
+    // stop the repo-shared services unless a sibling worktree still has a
+    // live daemon. Gated on `stopping` so a daemon crash (not a requested
+    // stop) leaves the shared supervisor alone. Without this the shared
+    // supervisor lingers after ^C while `status` reads "everything stopped".
+    if stopping
+        && let Ok(cwd) = std::env::current_dir()
+        && devme_tui::worktree::shutdown_shared_if_last(&cwd).await
+    {
+        info!(" ✔ Shared services            Stopped");
+    }
+    Ok(())
 }
 
 /// Block on StatusUpdate stream until every service in `snapshot` is in a

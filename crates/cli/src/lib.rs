@@ -314,7 +314,7 @@ pub fn service_state_label(state: &devme_core::ServiceState) -> String {
         S::Starting => "starting".into(),
         S::Running { degraded: false, .. } => "running".into(),
         S::Running { degraded: true, .. } => "degraded".into(),
-        S::WaitingOnDependency { .. } => "waiting".into(),
+        S::WaitingOnDependency { blocked_by } => format!("waiting on {blocked_by}"),
         S::Restarting { attempt } => format!("restarting({attempt})"),
         S::CrashLoop { .. } => "crash-loop".into(),
         S::Failed { exit_code: Some(c) } => format!("failed({c})"),
@@ -598,10 +598,14 @@ pub fn format_status_text(
 }
 
 /// Format the cross-worktree status (`devme status --all`) as an aligned
-/// table: one row per worktree, one column per service (its resolved port),
-/// plus the slot. A leading `*` marks the current worktree; a worktree with
-/// no running daemon shows `(not running)`.
-pub fn format_status_all(reports: &[devme_tui::worktree::WorktreeReport]) -> String {
+/// matrix: one row per worktree, one column per service. Each cell is the
+/// service's state glyph fused to its resolved port (`●8080` = running on
+/// 8080, `◌` = still waiting on a dependency, `·` = not present), so a
+/// glance across a row shows both *where* and *whether* everything runs —
+/// matching the per-worktree `status` look. A leading `*` (bold) marks the
+/// current worktree; a worktree with no running daemon shows
+/// `(not running)`. `color` gates ANSI exactly like [`format_status_text`].
+pub fn format_status_all(reports: &[devme_tui::worktree::WorktreeReport], color: bool) -> String {
     use devme_tui::worktree::WorktreeReport;
     if reports.is_empty() {
         return "no worktrees found\n".to_string();
@@ -619,25 +623,45 @@ pub fn format_status_all(reports: &[devme_tui::worktree::WorktreeReport]) -> Str
         }
     }
 
+    // Pad by chars, not bytes — the state glyphs are multi-byte UTF-8 but
+    // render as a single terminal cell, so byte-based `{:<w$}` would
+    // misalign every column after a glyph.
+    let pad = |s: &str, w: usize| -> String {
+        let mut out = s.to_string();
+        out.extend(std::iter::repeat_n(
+            ' ',
+            w.saturating_sub(s.chars().count()),
+        ));
+        out
+    };
+
     let label_of = |r: &WorktreeReport| -> String {
         let mark = if r.is_cwd { "* " } else { "  " };
         format!("{mark}{}", r.label)
     };
-    let cell = |r: &WorktreeReport, name: &str| -> String {
-        match &r.services {
-            None => "-".to_string(),
-            Some(svcs) => svcs
-                .iter()
-                .find(|s| s.name == name)
-                .and_then(|s| s.port)
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "-".to_string()),
+    // Cell text + color: glyph fused to the resolved port. A service with no
+    // live port (stopped, or still waiting) is just its glyph; a service the
+    // worktree doesn't declare is a dim `·`.
+    let cell = |r: &WorktreeReport, name: &str| -> (String, &'static str) {
+        let Some(svcs) = &r.services else {
+            return ("·".into(), ansi::DIM);
+        };
+        match svcs.iter().find(|s| s.name == name) {
+            None => ("·".into(), ansi::DIM),
+            Some(s) => {
+                let (glyph, gcolor) = service_glyph(&s.state);
+                let txt = match s.port {
+                    Some(p) => format!("{glyph}{p}"),
+                    None => glyph.to_string(),
+                };
+                (txt, gcolor)
+            }
         }
     };
 
     let label_w = reports
         .iter()
-        .map(|r| label_of(r).len())
+        .map(|r| label_of(r).chars().count())
         .chain(std::iter::once("WORKTREE".len()))
         .max()
         .unwrap();
@@ -647,37 +671,58 @@ pub fn format_status_all(reports: &[devme_tui::worktree::WorktreeReport]) -> Str
         .map(|name| {
             reports
                 .iter()
-                .map(|r| cell(r, name).len())
+                .map(|r| cell(r, name).0.chars().count())
                 .max()
                 .unwrap_or(0)
-                .max(name.len())
+                .max(name.chars().count())
         })
         .collect();
 
-    let mut rows: Vec<String> = Vec::new();
+    let mut out = String::new();
+    out.push('\n');
+
     // Header.
-    let mut header = format!("{:<label_w$}  {:<slot_w$}", "WORKTREE", "SLOT");
+    let mut header = format!("  {}  {}", pad("WORKTREE", label_w), pad("SLOT", slot_w));
     for (name, w) in svc_names.iter().zip(&col_w) {
-        header.push_str(&format!("  {name:<w$}", w = *w));
+        header.push_str("  ");
+        header.push_str(&pad(name, *w));
     }
-    rows.push(header);
+    out.push_str(&paint(color, ansi::DIM, header.trim_end()));
+    out.push('\n');
+
     // One row per worktree.
     for r in reports {
         let slot = r.slot.map(|s| s.to_string()).unwrap_or_else(|| "-".into());
-        let mut row = format!("{:<label_w$}  {:<slot_w$}", label_of(r), slot);
+        let label = pad(&label_of(r), label_w);
+        let label = if r.is_cwd {
+            paint(color, ansi::BOLD, &label)
+        } else {
+            label
+        };
+        let mut row = format!("  {label}  {}", pad(&slot, slot_w));
         if r.services.is_none() {
-            row.push_str("  (not running)");
+            row.push_str("  ");
+            row.push_str(&paint(color, ansi::DIM, "(not running)"));
         } else {
             for (name, w) in svc_names.iter().zip(&col_w) {
-                row.push_str(&format!("  {:<w$}", cell(r, name), w = *w));
+                let (txt, gcolor) = cell(r, name);
+                row.push_str("  ");
+                row.push_str(&paint(color, gcolor, &pad(&txt, *w)));
             }
         }
-        rows.push(row);
+        out.push_str(row.trim_end());
+        out.push('\n');
     }
 
-    let mut out = String::new();
-    for row in rows {
-        out.push_str(row.trim_end());
+    // Legend — the glyphs are the whole point of the matrix, so say what
+    // they mean.
+    if reports.iter().any(|r| r.services.is_some()) {
+        out.push('\n');
+        out.push_str(&paint(
+            color,
+            ansi::DIM,
+            "  ● running  ◐ starting  ◌ waiting  ○ stopped  ✗ failed",
+        ));
         out.push('\n');
     }
     out
@@ -1067,11 +1112,20 @@ mod tests {
                 services: None,
             },
         ];
-        let out = format_status_all(&reports);
+        let out = format_status_all(&reports, false);
         assert!(out.contains("WORKTREE") && out.contains("SLOT") && out.contains("backend"));
-        assert!(out.contains("8080") && out.contains("8090"), "ports missing: {out}");
+        assert!(
+            out.contains("●8080") && out.contains("●8090"),
+            "glyph+port cells missing: {out}"
+        );
         assert!(out.contains("* feat/foo"), "cwd marker missing: {out}");
         assert!(out.contains("(not running)"), "stopped worktree row missing: {out}");
+        assert!(out.contains("● running"), "legend missing: {out}");
+        // color=false must leave no escape bytes behind.
+        assert!(!out.contains('\x1b'), "leaked ANSI: {out:?}");
+
+        let colored = format_status_all(&reports, true);
+        assert!(colored.contains('\x1b'), "expected ANSI when color=true");
     }
 
     #[test]

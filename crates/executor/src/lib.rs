@@ -223,6 +223,38 @@ impl Executor {
             Some(NodeStatus::Service(_)) => DepStatus::Pending,
         }
     }
+
+    /// True while the graph is actively advancing: some node is in a
+    /// non-terminal state — a step check/provision is running, a service is
+    /// starting or restarting, or an external is still being probed.
+    fn run_in_flight(&self) -> bool {
+        self.nodes.values().any(|n| {
+            matches!(
+                n,
+                NodeStatus::Step(StepState::Unknown)
+                    | NodeStatus::Service(
+                        ServiceState::Starting
+                            | ServiceState::Restarting { .. }
+                            | ServiceState::External { healthy: false }
+                    )
+            )
+        })
+    }
+
+    /// For a node the run hasn't reached yet, the first required dependency
+    /// holding it back. `Some` only while the graph is actively advancing —
+    /// on an idle daemon (nothing started, or everything settled) untouched
+    /// services still read as plain Stopped, not "waiting".
+    pub fn blocked_by(&self, name: &str) -> Option<String> {
+        if self.nodes.contains_key(name) || !self.run_in_flight() {
+            return None;
+        }
+        self.graph
+            .dependencies(name)
+            .iter()
+            .find(|dep| dep.required && self.dep_status(&dep.name) != DepStatus::Satisfied)
+            .map(|dep| dep.name.clone())
+    }
 }
 
 #[cfg(test)]
@@ -232,6 +264,45 @@ mod tests {
 
     fn graph(toml_str: &str) -> Graph {
         Graph::from_stack(&Stack::parse(toml_str).expect("parse"))
+    }
+
+    #[test]
+    fn unreached_service_reports_blocking_dep_only_while_run_in_flight() {
+        let mut e = Executor::new(graph(
+            r#"
+schema_version = 1
+
+[step.migrate]
+check = "true"
+
+[service.api]
+cmd = "serve"
+depends_on = ["migrate"]
+
+[service.web]
+cmd = "serve"
+depends_on = ["api"]
+"#,
+        ));
+        // Idle daemon: nothing in flight, unreached services are just Stopped.
+        assert_eq!(e.blocked_by("api"), None);
+
+        // Start → migrate's check is running; api/web are waiting, not stopped.
+        e.handle(Event::Start);
+        assert_eq!(e.blocked_by("api").as_deref(), Some("migrate"));
+        assert_eq!(e.blocked_by("web").as_deref(), Some("api"));
+
+        // migrate passes → api gets its own entry (Starting); web still waits.
+        e.handle(Event::StepCheckCompleted {
+            name: "migrate".into(),
+            passed: true,
+        });
+        assert_eq!(e.blocked_by("api"), None);
+        assert_eq!(e.blocked_by("web").as_deref(), Some("api"));
+
+        // api healthy → web starts; nothing is left waiting.
+        e.handle(Event::ServiceHealthy { name: "api".into() });
+        assert_eq!(e.blocked_by("web"), None);
     }
 
     #[test]
