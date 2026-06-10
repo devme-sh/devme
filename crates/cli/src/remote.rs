@@ -36,6 +36,32 @@ const REMIND_AFTER_POLLS: u32 = 6;
 const DEVME_LABEL: &str = "managed-by=devme";
 const DEVME_LABEL_SELECTOR: &str = "managed-by=devme";
 
+/// Global CLI flags that shape `devme remote`'s interactive behavior,
+/// passed down from the top-level parse so the remote side honors the same
+/// contract as local commands.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunFlags {
+    /// `--no-input`: never prompt. No remote TTY is allocated and the flag
+    /// is forwarded to the remote `devme up -d`, so a needed env wizard
+    /// fails closed (exit 2) instead of hanging an agent.
+    pub no_input: bool,
+    /// `--yes`: forwarded to the remote `devme up -d` so prompt-trust
+    /// provisions are promoted to auto on the host too.
+    pub yes: bool,
+    /// `-q`: suppress informational stderr lines locally and forward `-q`
+    /// to the remote `devme up -d`. Errors and problems still print.
+    pub quiet: bool,
+}
+
+/// Both stdin *and* stdout are terminals — the bar for allocating a remote
+/// pty. stdin alone isn't enough: with stdout piped (`devme logs --json |
+/// jq`) a pty would CRLF-mangle every line and merge remote stderr into the
+/// pipe, so clean output wins over interactivity.
+fn stdio_is_tty() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
 /// Everything a `devme remote` action needs, resolved once from global
 /// config + the current repo.
 struct Resolved {
@@ -91,35 +117,11 @@ fn resolve(cwd: &Path) -> Result<Resolved> {
 
 // --- advertise host (VPS-side `devme url`) ----------------------------------
 
-/// This machine's own Tailscale MagicDNS name (`vps.goose-viper.ts.net`), or
-/// `None` if the `tailscale` CLI is absent / not up. Best-effort: any failure
-/// is just "no autodetected name", never an error. The trailing dot Tailscale
-/// appends to the FQDN is trimmed so it slots straight into a URL authority.
-fn tailscale_self_dns() -> Option<String> {
-    let out = Command::new("tailscale").args(["status", "--json"]).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    let name = v.get("Self")?.get("DNSName")?.as_str()?;
-    let name = name.trim().trim_end_matches('.');
-    (!name.is_empty()).then(|| name.to_string())
-}
-
-/// The host `devme url` should advertise for a service on *this* machine.
-/// Resolves `$DEVME_URL_HOST` (exported by the laptop's attach templates) →
-/// `remote.advertise_host` (`"auto"` autodetects the Tailscale name) →
-/// `localhost`. Lets an agent in a herdr pane on the VPS hand back a
-/// laptop-reachable URL instead of an unreachable loopback one.
+/// The host `devme url` should advertise for a service on *this* machine —
+/// see [`devme_config::remote::advertise_host`] (shared with the TUI, which
+/// needs the same resolution for its copy/open keybinds).
 pub fn advertise_host() -> String {
-    let env = std::env::var("DEVME_URL_HOST").ok();
-    let configured = GlobalConfig::load().remote.advertise_host;
-    // Only pay for the Tailscale lookup when the config actually asks for it.
-    let tailscale = (configured.as_deref().map(str::trim) == Some(remote::ADVERTISE_AUTO))
-        .then(tailscale_self_dns)
-        .flatten();
-    remote::pick_advertise_host(env.as_deref(), configured.as_deref(), tailscale.as_deref())
-        .unwrap_or_else(|| "localhost".to_string())
+    remote::advertise_host()
 }
 
 // --- mutagen wrappers -------------------------------------------------------
@@ -160,8 +162,10 @@ fn sync_exists(session: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Create the two-way sync. `.git` is synced (shared-state, model 1a) but the
-/// `index.lock` churn is always ignored regardless of the user's ignore list.
+/// Create the two-way sync. `.git` is synced (shared-state, model 1a) but
+/// git's transient bookkeeping ([`remote::GIT_ALWAYS_IGNORES`]: lock files,
+/// `gc.pid`, per-machine worktree metadata) is always ignored regardless of
+/// the user's ignore list.
 fn sync_create(r: &Resolved) -> Result<()> {
     let local = r.local_root.to_string_lossy().to_string();
     let mut args: Vec<String> = vec![
@@ -171,9 +175,10 @@ fn sync_create(r: &Resolved) -> Result<()> {
         format!("--sync-mode={}", r.sync_mode),
         // Label so `devme remote wake` can flush only devme-managed syncs.
         format!("--label={DEVME_LABEL}"),
-        // Git bookkeeping that flaps during remote commits — never sync it.
-        "--ignore=.git/index.lock".into(),
     ];
+    for ig in remote::GIT_ALWAYS_IGNORES {
+        args.push(format!("--ignore={ig}"));
+    }
     for ig in &r.ignores {
         args.push(format!("--ignore={ig}"));
     }
@@ -204,13 +209,27 @@ fn sync_flush(session: &str) -> Result<()> {
 /// Ensure the sync exists; create + flush (wait for the initial pass) on
 /// first run so the remote has the files before we attach. Returns whether
 /// it was freshly created.
-fn ensure_sync(r: &Resolved) -> Result<bool> {
+fn ensure_sync(r: &Resolved, quiet: bool) -> Result<bool> {
     if sync_exists(&r.session) {
         return Ok(false);
     }
-    eprintln!("devme remote: starting live-sync {} → {}", r.local_root.display(), r.beta);
+    // Refuse to sync a directory that isn't a project. Outside a git repo
+    // `main_worktree_root` falls back to the bare cwd, so without this guard
+    // a stray `devme remote` in $HOME would live-sync the entire home
+    // directory to the host.
+    if !r.local_root.join("devme.toml").exists() && !r.local_root.join(".git").exists() {
+        bail!(
+            "refusing to live-sync {}: no devme.toml and not a git repository\n  `devme remote` syncs this directory wholesale — run it from a project root",
+            r.local_root.display()
+        );
+    }
+    if !quiet {
+        eprintln!("devme remote: starting live-sync {} → {}", r.local_root.display(), r.beta);
+    }
     sync_create(r)?;
-    eprintln!("devme remote: waiting for initial sync…");
+    if !quiet {
+        eprintln!("devme remote: waiting for initial sync…");
+    }
     sync_flush(&r.session)?;
     Ok(true)
 }
@@ -239,49 +258,107 @@ fn interruptible_sleep(stop: &AtomicBool, total: Duration) {
     }
 }
 
+/// How often the watcher checks the synced open-request file. Much snappier
+/// than the health poll — a keypress is waiting on it — and it's only a
+/// local `read_to_string` of a usually-absent file, so the fast lane is
+/// nearly free.
+const OPEN_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Health checks (which shell out to `mutagen`) run every N fast ticks:
+/// 20 × 250ms = the original 5s cadence of [`SYNC_WATCH_INTERVAL`].
+const HEALTH_EVERY_TICKS: u32 =
+    (SYNC_WATCH_INTERVAL.as_millis() / OPEN_POLL_INTERVAL.as_millis()) as u32;
+
+/// Handle one tick of the open-on-laptop fast lane: if the synced request
+/// file holds a request newer than `last_seq`, open it in the local browser
+/// (loopback hosts rewritten to the laptop-reachable one) and delete the
+/// file — the deletion syncs back, making the request one-shot. Returns the
+/// new high-water seq.
+fn poll_open_request(file: &Path, url_host: &str, last_seq: u64) -> u64 {
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return last_seq;
+    };
+    let Some((seq, url)) = remote::parse_open_request(&text) else {
+        return last_seq;
+    };
+    if seq <= last_seq {
+        return last_seq;
+    }
+    let url = remote::rewrite_url_host(&url, url_host);
+    let _ = devme_config::browser::open_url(&url);
+    let _ = std::fs::remove_file(file);
+    seq
+}
+
+/// The seq already in the request file when the watcher starts — anything
+/// at or below it is stale (from a previous session) and must not pop a
+/// browser on attach.
+fn open_request_baseline(file: &Path) -> u64 {
+    std::fs::read_to_string(file)
+        .ok()
+        .and_then(|t| remote::parse_open_request(&t))
+        .map(|(seq, _)| seq)
+        .unwrap_or(0)
+}
+
 /// Spawn a laptop-side background watcher for the duration of an attached
-/// remote session. It polls the sync's health and, **edge-triggered**, fires a
-/// desktop notification when health changes (a silent two-way-safe halt on
-/// conflict being the case that matters), plus one reminder if a problem
-/// persists. It deliberately does **not** print to stderr: the attached remote
-/// TUI owns this terminal, so writing to it would corrupt the display — the
+/// remote session. Two jobs on one thread:
+///
+/// - **Sync health** (every ~5s): edge-triggered desktop notification when
+///   health changes (a silent two-way-safe halt on conflict being the case
+///   that matters), plus one reminder if a problem persists.
+/// - **Open-on-laptop** (every 250ms): when the remote TUI's `o` writes an
+///   open request into the synced project, open it in the *local* browser.
+///
+/// It deliberately does **not** print to stderr: the attached remote TUI
+/// owns this terminal, so writing to it would corrupt the display — the
 /// post-detach summary (printed once the terminal is ours again) is the
-/// on-screen channel. Returns a stop flag + join handle; the caller flips the
-/// flag and joins after the attach command returns.
-fn spawn_sync_watcher(session: String) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+/// on-screen channel. Returns a stop flag + join handle; the caller flips
+/// the flag and joins after the attach command returns.
+fn spawn_sync_watcher(
+    session: String,
+    open_file: PathBuf,
+    url_host: String,
+) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = stop.clone();
     let handle = std::thread::spawn(move || {
         let mut last: Option<SyncHealth> = None;
         let mut polls_in_problem = 0u32;
         let mut reminded = false;
+        let mut last_seq = open_request_baseline(&open_file);
+        let mut tick: u32 = 0;
         while !stop_thread.load(Ordering::Relaxed) {
-            let (exists, status, conflicts) = observe_sync(&session);
-            let health = remote::classify_sync(exists, status.as_deref(), conflicts);
-            match remote::sync_transition_message(last, health, conflicts) {
-                Some(msg) => {
-                    // A real transition — announce and reset the nag timer.
-                    notify(&msg);
-                    polls_in_problem = 0;
-                    reminded = false;
-                }
-                None => {
-                    // Steady state. Nag once if we've been stuck in a problem.
-                    if matches!(health, SyncHealth::Conflict | SyncHealth::Down) {
-                        polls_in_problem += 1;
-                        if polls_in_problem >= REMIND_AFTER_POLLS && !reminded {
-                            if let Some(msg) =
-                                remote::sync_transition_message(None, health, conflicts)
-                            {
-                                notify(&msg);
+            last_seq = poll_open_request(&open_file, &url_host, last_seq);
+
+            if tick.is_multiple_of(HEALTH_EVERY_TICKS) {
+                let (exists, status, conflicts) = observe_sync(&session);
+                let health = remote::classify_sync(exists, status.as_deref(), conflicts);
+                match remote::sync_transition_message(last, health, conflicts) {
+                    Some(msg) => {
+                        // A real transition — announce and reset the nag timer.
+                        notify(&msg);
+                        polls_in_problem = 0;
+                        reminded = false;
+                    }
+                    None => {
+                        // Steady state. Nag once if we've been stuck in a problem.
+                        if matches!(health, SyncHealth::Conflict | SyncHealth::Down) {
+                            polls_in_problem += 1;
+                            if polls_in_problem >= REMIND_AFTER_POLLS && !reminded {
+                                if let Some(msg) =
+                                    remote::sync_transition_message(None, health, conflicts)
+                                {
+                                    notify(&msg);
+                                }
+                                reminded = true;
                             }
-                            reminded = true;
                         }
                     }
                 }
+                last = Some(health);
             }
-            last = Some(health);
-            interruptible_sleep(&stop_thread, SYNC_WATCH_INTERVAL);
+            tick = tick.wrapping_add(1);
+            interruptible_sleep(&stop_thread, OPEN_POLL_INTERVAL);
         }
     });
     (stop, handle)
@@ -289,13 +366,18 @@ fn spawn_sync_watcher(session: String) -> (Arc<AtomicBool>, std::thread::JoinHan
 
 /// Print a one-line sync summary to stderr — used once the terminal is back in
 /// our hands after a detach, so the closing state is visible even on hosts
-/// without desktop notifications.
-fn print_sync_summary(session: &str) {
+/// without desktop notifications. Under `-q` a healthy close is silent, but a
+/// problem (conflict / down) always prints — quiet suppresses information,
+/// not warnings.
+fn print_sync_summary(session: &str, quiet: bool) {
     let (exists, status, conflicts) = observe_sync(session);
     if !exists {
         return; // sync was stopped/terminated — nothing to summarise.
     }
     let health = remote::classify_sync(exists, status.as_deref(), conflicts);
+    if quiet && health == SyncHealth::Healthy {
+        return;
+    }
     eprintln!(
         "devme remote: {}",
         remote::sync_status_line(health, conflicts, status.as_deref())
@@ -327,18 +409,33 @@ fn ssh_check(host: &str, remote_cmd: &str) -> (bool, String) {
 /// even if this fails the attach session may still be useful — we warn and
 /// continue rather than abort. The `-d` detach is what keeps the stack alive
 /// under the supervisor (not inside the herdr/ssh session you're attaching).
-fn remote_up(r: &Resolved) {
-    use std::io::IsTerminal;
-    let cmd = format!("cd {} && devme up -d", shell_quote(&r.remote_path));
-    eprintln!("devme remote: ensuring stack is up on {} …", r.host);
+fn remote_up(r: &Resolved, flags: RunFlags) {
+    // Forward the interactivity contract to the host: with `--no-input` the
+    // remote env wizard fails closed instead of prompting; `-y`/`-q` behave
+    // as they would locally.
+    let mut up = String::from("devme up -d");
+    if flags.no_input {
+        up.push_str(" --no-input");
+    }
+    if flags.yes {
+        up.push_str(" -y");
+    }
+    if flags.quiet {
+        up.push_str(" -q");
+    }
+    let cmd = format!("cd {} && {up}", shell_quote(&r.remote_path));
+    if !flags.quiet {
+        eprintln!("devme remote: ensuring stack is up on {} …", r.host);
+    }
     let mut ssh = Command::new("ssh");
     ssh.args(["-o", "BatchMode=yes"]);
-    // Allocate a remote TTY when we have one locally, so first-run prompts —
-    // the ADR-0014 env wizard, preflight provisioning — are interactive and
-    // run to completion *before* the attach takes over the screen. Without it
-    // the remote `devme up` sees a non-tty stdin, prints a wizard it can't
-    // drive, and the attach immediately paints over it.
-    if std::io::stdin().is_terminal() {
+    // Allocate a remote TTY when both stdio ends are terminals (a piped
+    // stdout must stay CRLF-free) and prompting is allowed, so first-run
+    // prompts — the ADR-0014 env wizard, preflight provisioning — are
+    // interactive and run to completion *before* the attach takes over the
+    // screen. Without it the remote `devme up` sees a non-tty stdin, prints
+    // a wizard it can't drive, and the attach immediately paints over it.
+    if !flags.no_input && stdio_is_tty() {
         ssh.arg("-t");
     }
     let status = ssh.arg(&r.host).arg(&cmd).status();
@@ -362,14 +459,21 @@ fn remote_up(r: &Resolved) {
 /// that already has workspaces is left untouched (it's the user's
 /// arrangement). Best-effort throughout: any failure falls through to a
 /// plain attach — worst case herdr opens in `~`, the pre-seed behavior.
-fn herdr_prepare(r: &Resolved) {
+fn herdr_prepare(r: &Resolved, quiet: bool) {
     let list_cmd = remote::herdr_list_cmd(&r.session);
     let (mut ok, mut out) = ssh_check(&r.host, &list_cmd);
     if !ok {
+        // A failed list is either "no session server yet" or "herdr not
+        // installed" — one cheap probe distinguishes them, so a missing
+        // binary fails fast instead of paying the full start-and-poll only
+        // to time out (the attach then surfaces the real error).
+        let (present, _) = ssh_check(&r.host, "command -v herdr");
+        if !present {
+            return;
+        }
         // No session server yet — start one headless, rooted at the project,
-        // then poll briefly for its socket. If herdr isn't installed on the
-        // remote this times out and the attach surfaces the real error.
-        let start = remote::herdr_server_start_cmd(&r.session, &r.remote_path);
+        // then poll briefly for its socket.
+        let start = remote::herdr_server_start_cmd(&r.session, &r.remote_path, &r.url_host);
         let _ = ssh_check(&r.host, &start);
         for _ in 0..10 {
             std::thread::sleep(Duration::from_millis(300));
@@ -395,7 +499,7 @@ fn herdr_prepare(r: &Resolved) {
         .to_string();
     let create = remote::herdr_workspace_create_cmd(&r.session, &r.remote_path, &label);
     let (created, _) = ssh_check(&r.host, &create);
-    if created {
+    if created && !quiet {
         eprintln!("devme remote: opened herdr workspace at {}", r.remote_path);
     }
 }
@@ -467,14 +571,13 @@ fn remote_devme_cmd(r: &Resolved, args: &[String]) -> String {
 /// Stream a command through to the remote with an inherited TTY (so `logs
 /// -f`, `up` foreground, and Ctrl-C all behave).
 fn proxy_passthrough(r: &Resolved) -> i32 {
-    use std::io::IsTerminal;
     let cmd = remote_devme_cmd(r, &forwarded_args());
     let mut ssh = Command::new("ssh");
-    // Allocate a remote TTY only when we have one locally — so interactive
-    // streaming (`logs -f`, foreground `up`) works, but captured/piped output
-    // (agents, scripts) doesn't trip ssh's "pseudo-terminal will not be
-    // allocated" warning.
-    if std::io::stdin().is_terminal() {
+    // Allocate a remote TTY only when stdin *and* stdout are terminals — so
+    // interactive streaming (`logs -f`, foreground `up`) works, but piped
+    // output (`logs --json | jq`, agents, scripts) stays clean: a pty would
+    // CRLF-translate every line and merge remote stderr into stdout.
+    if stdio_is_tty() {
         ssh.arg("-t");
     }
     let status = ssh.arg(&r.host).arg(&cmd).status();
@@ -522,34 +625,41 @@ fn proxy_url(r: &Resolved, service: &str, open: bool) -> i32 {
 /// `devme remote` (default): ensure the sync session, then attach to the
 /// remote environment. The attach command (default `tui`) is what brings up
 /// / streams the remote stack; the synced files are already in place.
-pub fn run(cwd: &Path) -> Result<()> {
+pub fn run(cwd: &Path, flags: RunFlags) -> Result<()> {
     let r = resolve(cwd)?;
     require_mutagen()?;
     ensure_mutagen_daemon();
-    ensure_sync(&r)?;
+    ensure_sync(&r, flags.quiet)?;
 
     // Bring the stack up under the supervisor before attaching, so herdr/ssh
     // attaches land in a project whose dev server is already running (and that
     // keeps running when you detach). `tui`/`tmux` would start it themselves,
     // but `up -d` first is idempotent and makes the herdr/ssh presets work too.
     if r.up_on_attach {
-        remote_up(&r);
+        remote_up(&r, flags);
     }
 
     // The herdr preset gets its remote session seeded (server + project-
     // rooted workspace) so the attach lands in the project dir, not `~`.
     if r.attach == "herdr" {
-        herdr_prepare(&r);
+        herdr_prepare(&r, flags.quiet);
     }
 
     let cmd = remote::expand_attach(&r.attach, &r.host, &r.remote_path, &r.session, &r.url_host);
-    eprintln!("devme remote: attaching ({}) → {}", r.attach, r.host);
+    if !flags.quiet {
+        eprintln!("devme remote: attaching ({}) → {}", r.attach, r.host);
+    }
 
     // Watch the sync in the background for the life of the session: a two-way-
     // safe halt on conflict is silent and laptop-side, so the remote TUI you're
     // attached to can't show it. The watcher notifies (desktop) on a health
     // change; it stays off stderr so it can't corrupt the remote TUI's screen.
-    let (stop, watcher) = spawn_sync_watcher(r.session.clone());
+    // It also services open-on-laptop requests from the remote TUI's `o` key.
+    let (stop, watcher) = spawn_sync_watcher(
+        r.session.clone(),
+        r.local_root.join(remote::OPEN_URL_FILE),
+        r.url_host.clone(),
+    );
 
     // Hand the terminal to a real shell so all quoting in the attach template
     // is honored and a full-screen remote TUI gets the inherited TTY.
@@ -565,7 +675,7 @@ pub fn run(cwd: &Path) -> Result<()> {
     stop.store(true, Ordering::Relaxed);
     let _ = watcher.join();
     let _ = sync_flush(&r.session);
-    print_sync_summary(&r.session);
+    print_sync_summary(&r.session, flags.quiet);
 
     if !status.success() {
         // A non-zero exit here is usually just the user quitting the remote
@@ -579,20 +689,52 @@ pub fn run(cwd: &Path) -> Result<()> {
 
 /// `devme remote sync`: ensure + flush the sync without attaching. Handy from
 /// a wake hook or a script.
-pub fn sync(cwd: &Path) -> Result<()> {
+pub fn sync(cwd: &Path, quiet: bool) -> Result<()> {
     let r = resolve(cwd)?;
     require_mutagen()?;
     ensure_mutagen_daemon();
-    if !ensure_sync(&r)? {
+    if !ensure_sync(&r, quiet)? {
         sync_flush(&r.session)?;
     }
-    eprintln!("devme remote: synced {} ⇄ {}", r.local_root.display(), r.beta);
+    if !quiet {
+        eprintln!("devme remote: synced {} ⇄ {}", r.local_root.display(), r.beta);
+    }
+    Ok(())
+}
+
+/// `devme remote toggle`: flip `remote.default` in the global config — the
+/// switch that decides whether bare `devme` is local-first (opens the local
+/// TUI) or remote-first (behaves as `devme remote`). A shortcut for
+/// `devme config set remote.default true|false`.
+pub fn toggle(quiet: bool) -> Result<()> {
+    let mut cfg = GlobalConfig::load();
+    let enabled = !cfg.remote.is_default();
+    cfg.remote.default = Some(enabled);
+    cfg.save().context("saving global config")?;
+    if enabled {
+        // The missing-host hint always prints (quiet suppresses information,
+        // not warnings): remote-by-default with no host silently stays local,
+        // which is exactly the surprise this message preempts.
+        match cfg.remote.host.as_deref().filter(|h| !h.trim().is_empty()) {
+            Some(host) => {
+                if !quiet {
+                    eprintln!("devme remote: default = remote — bare `devme` now syncs + attaches to {host}");
+                }
+            }
+            None => {
+                eprintln!("devme remote: default = remote — but no host is set, so bare `devme` stays local");
+                eprintln!("  set one: devme config set remote.host <ssh-target>");
+            }
+        }
+    } else if !quiet {
+        eprintln!("devme remote: default = local — bare `devme` opens the local TUI");
+    }
     Ok(())
 }
 
 /// `devme remote stop`: terminate the sync session (the remote files stay;
 /// the live link stops).
-pub fn stop(cwd: &Path) -> Result<()> {
+pub fn stop(cwd: &Path, quiet: bool) -> Result<()> {
     let r = resolve(cwd)?;
     require_mutagen()?;
     if !sync_exists(&r.session) {
@@ -606,20 +748,24 @@ pub fn stop(cwd: &Path) -> Result<()> {
     if !status.success() {
         bail!("`mutagen sync terminate` failed");
     }
-    eprintln!("devme remote: stopped live-sync for {}", r.remote_path);
+    if !quiet {
+        eprintln!("devme remote: stopped live-sync for {}", r.remote_path);
+    }
     Ok(())
 }
 
 /// `devme remote flush`: force an immediate reconcile (e.g. right after the
 /// laptop wakes), instead of waiting for the next watch/poll cycle.
-pub fn flush(cwd: &Path) -> Result<()> {
+pub fn flush(cwd: &Path, quiet: bool) -> Result<()> {
     let r = resolve(cwd)?;
     require_mutagen()?;
     if !sync_exists(&r.session) {
         bail!("no live-sync for this project — start one with `devme remote`");
     }
     sync_flush(&r.session)?;
-    eprintln!("devme remote: flushed {}", r.session);
+    if !quiet {
+        eprintln!("devme remote: flushed {}", r.session);
+    }
     Ok(())
 }
 
@@ -1051,8 +1197,9 @@ pub fn doctor(cwd: &Path, json: bool) -> Result<()> {
 
         // 4. Remote root writable (created if absent).
         let root = &r.root;
+        let rootq = shell_quote(root);
         let (root_ok, root_detail) =
-            ssh_check(&r.host, &format!("mkdir -p {root} && test -w {root} && echo ok"));
+            ssh_check(&r.host, &format!("mkdir -p {rootq} && test -w {rootq} && echo ok"));
         checks.push(Check {
             name: "remote root writable",
             ok: root_ok,

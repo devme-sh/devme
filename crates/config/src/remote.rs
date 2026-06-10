@@ -217,6 +217,11 @@ pub fn sync_session_name(local_root: &Path) -> String {
 /// expands to its template; anything else is treated as a raw template and
 /// has its `{host}` / `{remote_path}` / `{name}` placeholders substituted.
 ///
+/// Preset substitutions are backslash-escaped so a root with spaces (or any
+/// shell-special character) survives both the local `sh -c` and the remote
+/// login shell. Raw templates substitute **verbatim** — the user owns their
+/// template's quoting, and escaping under their quotes would corrupt it.
+///
 /// Presets:
 /// - `tui` — `devme tui` is the whole session, full-screen on the remote.
 /// - `ssh` — a bare login shell in the project dir (zero-dep, no persistence).
@@ -241,12 +246,26 @@ pub fn expand_attach(
         "herdr" => "herdr --remote {host} --session {name}",
         raw => raw,
     };
+    let escape: fn(&str) -> String = if ATTACH_PRESETS.contains(&attach) {
+        backslash_escape
+    } else {
+        str::to_string
+    };
     template
-        .replace("{host}", host)
-        .replace("{remote_path}", remote_path)
-        .replace("{name}", name)
-        .replace("{url_host}", url_host)
+        .replace("{host}", &escape(host))
+        .replace("{remote_path}", &escape(remote_path))
+        .replace("{name}", &escape(name))
+        .replace("{url_host}", &escape(url_host))
 }
+
+/// Paths inside `.git` that are never synced, regardless of the user's
+/// ignore list. Lock files and `gc.pid` flap during normal git activity on
+/// either side and would halt a two-way-safe sync. `.git/worktrees` is
+/// per-machine metadata: worktree checkouts live *outside* the synced root,
+/// so syncing their registrations would make a `git worktree prune` on one
+/// side destroy the other side's worktrees.
+pub const GIT_ALWAYS_IGNORES: &[&str] =
+    &[".git/**/*.lock", ".git/gc.pid", ".git/worktrees"];
 
 // --- herdr preset preparation ------------------------------------------------
 
@@ -266,6 +285,25 @@ pub fn shell_quote(s: &str) -> String {
     }
 }
 
+/// Backslash-escape a token for a shell command line. Unlike [`shell_quote`]
+/// this survives substitution *inside* a single-quoted template region: the
+/// backslashes pass through the outer quoting as literals and are unescaped
+/// by whichever shell finally parses the token — the local `sh -c`, or the
+/// remote login shell (POSIX shells and fish both unescape `\x` to `x`).
+/// A leading `~` stays bare so tilde expansion still happens.
+pub fn backslash_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || "_./:=-~@".contains(c) {
+            out.push(c);
+        } else {
+            out.push('\\');
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Shell command that lists the named herdr session's workspaces (JSON on
 /// stdout). Doubles as the cheapest "is the session server running?" probe —
 /// herdr exits non-zero when the session's socket is absent.
@@ -275,24 +313,32 @@ pub fn herdr_list_cmd(session: &str) -> String {
 
 /// Shell command that starts the named herdr session server headless on the
 /// remote, detached from the ssh connection that launches it, with the
-/// project directory as its process cwd.
-pub fn herdr_server_start_cmd(session: &str, remote_path: &str) -> String {
+/// project directory as its process cwd. `DEVME_URL_HOST` is injected so
+/// every pane the server spawns inherits it — that's how a `devme tui`
+/// inside a herdr pane knows it's remote and which host to build service
+/// URLs from (herdr owns the SSH, so devme can't inject per-connection env
+/// the way the ssh/tmux presets do).
+pub fn herdr_server_start_cmd(session: &str, remote_path: &str, url_host: &str) -> String {
     format!(
-        "cd {} && env HERDR_SESSION={} sh -c 'nohup herdr server >/dev/null 2>&1 &'",
+        "cd {} && env HERDR_SESSION={} DEVME_URL_HOST={} sh -c 'nohup herdr server >/dev/null 2>&1 &'",
         shell_quote(remote_path),
-        shell_quote(session)
+        shell_quote(session),
+        shell_quote(url_host)
     )
 }
 
 /// Shell command that creates a workspace rooted at the project directory in
 /// the named herdr session, so the first attach opens in the project instead
-/// of the login dir.
+/// of the login dir. Guarded server-side: the create only runs if the session
+/// *still* has no workspaces at that instant, so two concurrent `devme
+/// remote` invocations can't double-seed. The cwd/label are backslash-escaped
+/// because they sit inside the `sh -c '…'` single quotes.
 pub fn herdr_workspace_create_cmd(session: &str, remote_path: &str, label: &str) -> String {
     format!(
-        "env HERDR_SESSION={} herdr workspace create --cwd {} --label {}",
+        "env HERDR_SESSION={} sh -c 'herdr workspace list 2>/dev/null | grep -q workspace_id || herdr workspace create --cwd {} --label {}'",
         shell_quote(session),
-        shell_quote(remote_path),
-        shell_quote(label)
+        backslash_escape(remote_path),
+        backslash_escape(label)
     )
 }
 
@@ -304,6 +350,45 @@ pub fn herdr_workspace_count(output: &str) -> Option<u64> {
     let line = output.lines().find(|l| l.trim_start().starts_with('{'))?;
     let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
     Some(v.get("result")?.get("workspaces")?.as_array()?.len() as u64)
+}
+
+// --- open-on-laptop forwarding ------------------------------------------------
+
+/// One-shot "open this URL on the laptop" request file, relative to the
+/// synced project root. The remote TUI writes it when `o` is pressed on a
+/// remote stack; the live-sync carries it down; the laptop-side `devme
+/// remote` watcher opens the URL in the local browser and deletes the file
+/// (the deletion syncs back, so it's self-cleaning and never committed).
+pub const OPEN_URL_FILE: &str = ".devme/open-url.json";
+
+/// Serialize an open-on-laptop request. `seq` must be monotonic per writer
+/// (wall-clock millis) so the watcher can tell a fresh request from the one
+/// it already handled.
+pub fn open_request_json(seq: u64, url: &str) -> String {
+    serde_json::json!({
+        "schema_version": 1,
+        "seq": seq,
+        "url": url,
+    })
+    .to_string()
+}
+
+/// Parse an open-on-laptop request into `(seq, url)`. Returns `None` for
+/// unknown schema versions, malformed JSON, or — deliberately — any URL that
+/// isn't plain `http(s)`: this file arrives over the sync from another
+/// machine, and the laptop opens it sight unseen, so `file://` and friends
+/// are refused at the parse boundary.
+pub fn parse_open_request(text: &str) -> Option<(u64, String)> {
+    let v: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    if v.get("schema_version")?.as_u64()? != 1 {
+        return None;
+    }
+    let seq = v.get("seq")?.as_u64()?;
+    let url = v.get("url")?.as_str()?;
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return None;
+    }
+    Some((seq, url.to_string()))
 }
 
 /// Sentinel `advertise_host` value meaning "autodetect this machine's own
@@ -340,13 +425,57 @@ pub fn pick_advertise_host(
     }
 }
 
+/// This machine's own Tailscale MagicDNS name (`vps.goose-viper.ts.net`), or
+/// `None` if the `tailscale` CLI is absent / not up. Best-effort: any failure
+/// is just "no autodetected name", never an error. The trailing dot Tailscale
+/// appends to the FQDN is trimmed so it slots straight into a URL authority.
+pub fn tailscale_self_dns() -> Option<String> {
+    let out = std::process::Command::new("tailscale")
+        .args(["status", "--json"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let name = v.get("Self")?.get("DNSName")?.as_str()?;
+    let name = name.trim().trim_end_matches('.');
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The host this machine should advertise in service URLs when it's the one
+/// running the stack. Resolves `$DEVME_URL_HOST` (exported by the laptop's
+/// attach templates / the herdr session server env) → `remote.advertise_host`
+/// (`"auto"` autodetects the Tailscale name) → `localhost`. Lets `devme url`
+/// and the remote TUI hand back a laptop-reachable URL instead of an
+/// unreachable loopback one.
+pub fn advertise_host() -> String {
+    let env = std::env::var("DEVME_URL_HOST").ok();
+    let configured = crate::GlobalConfig::load().remote.advertise_host;
+    // Only pay for the Tailscale lookup when the config actually asks for it.
+    let tailscale = (configured.as_deref().map(str::trim) == Some(ADVERTISE_AUTO))
+        .then(tailscale_self_dns)
+        .flatten();
+    pick_advertise_host(env.as_deref(), configured.as_deref(), tailscale.as_deref())
+        .unwrap_or_else(|| "localhost".to_string())
+}
+
 /// Rewrite a local URL's host to `url_host` so a `http://localhost:<port>`
 /// from the remote daemon becomes reachable from the laptop (e.g. over
-/// Tailscale). Only the loopback authority is swapped; the port and path are
-/// preserved.
+/// Tailscale). Only a *leading* loopback authority is swapped — never a
+/// loopback URL embedded later in the string (a `?redirect=http://localhost:…`
+/// query param stays untouched); the port and path are preserved.
 pub fn rewrite_url_host(url: &str, url_host: &str) -> String {
-    url.replace("//localhost:", &format!("//{url_host}:"))
-        .replace("//127.0.0.1:", &format!("//{url_host}:"))
+    for scheme in ["http://", "https://"] {
+        if let Some(rest) = url.strip_prefix(scheme) {
+            for loopback in ["localhost:", "127.0.0.1:"] {
+                if let Some(tail) = rest.strip_prefix(loopback) {
+                    return format!("{scheme}{url_host}:{tail}");
+                }
+            }
+        }
+    }
+    url.to_string()
 }
 
 // --- live-sync health (laptop-side watcher) ---------------------------------
@@ -588,6 +717,17 @@ mod tests {
             "box",
         );
         assert_eq!(cmd, "mosh box -- tmux a -t proj");
+        // Raw templates substitute verbatim — the user owns the quoting, so
+        // a spacey value is *not* escaped under their template.
+        let raw = expand_attach("ssh {host} 'cd \"{remote_path}\"'", "box", "/my dev/p", "n", "box");
+        assert!(raw.contains("cd \"/my dev/p\""), "got {raw}");
+    }
+
+    #[test]
+    fn attach_presets_escape_spacey_values() {
+        let cmd = expand_attach("tui", "vps", "~/my dev/api-1", "devme-api", "vps");
+        // Escaped for the remote shell, inside the local single quotes.
+        assert!(cmd.contains("cd ~/my\\ dev/api-1"), "got {cmd}");
     }
 
     #[test]
@@ -609,13 +749,42 @@ mod tests {
             herdr_list_cmd("devme-api-abc"),
             "env HERDR_SESSION=devme-api-abc herdr workspace list"
         );
-        let start = herdr_server_start_cmd("devme-api-abc", "~/development/api-abc");
+        let start = herdr_server_start_cmd("devme-api-abc", "~/development/api-abc", "vps.ts.net");
         assert!(start.starts_with("cd ~/development/api-abc && "), "got {start}");
-        assert!(start.contains("env HERDR_SESSION=devme-api-abc"));
+        // DEVME_URL_HOST rides into the server env so every pane inherits it.
+        assert!(start.contains("env HERDR_SESSION=devme-api-abc DEVME_URL_HOST=vps.ts.net"));
         assert!(start.contains("nohup herdr server"));
         let create = herdr_workspace_create_cmd("s", "~/dev/x", "My App");
         assert!(create.contains("--cwd ~/dev/x"), "got {create}");
-        assert!(create.contains("--label 'My App'"), "got {create}");
+        // Backslash-escaped (not single-quoted): the value sits inside the
+        // `sh -c '…'` quotes, where embedded single quotes would break out.
+        assert!(create.contains("--label My\\ App"), "got {create}");
+        // Server-side guard against concurrent double-seeding.
+        assert!(create.contains("grep -q workspace_id ||"), "got {create}");
+    }
+
+    #[test]
+    fn open_request_round_trips_and_refuses_non_http() {
+        let json = open_request_json(42, "http://vps:3000/app");
+        assert_eq!(parse_open_request(&json), Some((42, "http://vps:3000/app".into())));
+        let json = open_request_json(7, "https://vps:8443");
+        assert_eq!(parse_open_request(&json), Some((7, "https://vps:8443".into())));
+        // The laptop opens this sight unseen — refuse non-web schemes.
+        assert_eq!(parse_open_request(&open_request_json(1, "file:///etc/passwd")), None);
+        assert_eq!(parse_open_request(&open_request_json(1, "javascript:alert(1)")), None);
+        // Unknown schema / garbage → None.
+        assert_eq!(parse_open_request(r#"{"schema_version":2,"seq":1,"url":"http://x"}"#), None);
+        assert_eq!(parse_open_request("not json"), None);
+        assert_eq!(parse_open_request(""), None);
+    }
+
+    #[test]
+    fn backslash_escape_survives_single_quoted_templates() {
+        assert_eq!(backslash_escape("~/development/api-abc"), "~/development/api-abc");
+        assert_eq!(backslash_escape("dev@10.0.0.1"), "dev@10.0.0.1");
+        assert_eq!(backslash_escape("a b"), "a\\ b");
+        assert_eq!(backslash_escape("it's"), "it\\'s");
+        assert_eq!(backslash_escape("a$b"), "a\\$b");
     }
 
     #[test]
@@ -656,6 +825,16 @@ mod tests {
         assert_eq!(
             rewrite_url_host("http://example.com:80", "vps"),
             "http://example.com:80"
+        );
+        // Only the *leading* authority is rewritten — an embedded loopback
+        // URL (query param) is not touched.
+        assert_eq!(
+            rewrite_url_host("http://localhost:8090/?next=http://localhost:3000", "vps"),
+            "http://vps:8090/?next=http://localhost:3000"
+        );
+        assert_eq!(
+            rewrite_url_host("http://example.com/?next=http://localhost:3000", "vps"),
+            "http://example.com/?next=http://localhost:3000"
         );
     }
 

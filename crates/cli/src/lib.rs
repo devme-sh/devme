@@ -185,6 +185,7 @@ pub enum Command {
     /// `devme remote sync` — reconcile without attaching.
     /// `devme remote flush` — force an immediate reconcile (e.g. on wake).
     /// `devme remote stop` — terminate the live-sync.
+    /// `devme remote toggle` — flip whether bare `devme` defaults to remote.
     Remote {
         #[command(subcommand)]
         action: Option<RemoteAction>,
@@ -259,6 +260,9 @@ pub enum RemoteAction {
     /// Reconcile every devme-managed sync now. Run by the wake-hook so changes
     /// the remote made while the laptop slept come down immediately.
     Wake,
+    /// Toggle whether bare `devme` defaults to remote. Shortcut for
+    /// `devme config set remote.default true|false`.
+    Toggle,
     /// Install (or `--uninstall`) the OS wake hook that runs `devme remote
     /// wake` on resume — macOS sleepwatcher's `~/.wakeup`.
     WakeHook {
@@ -1301,6 +1305,7 @@ mod tests {
             ("flush", RemoteAction::Flush),
             ("stop", RemoteAction::Stop),
             ("wake", RemoteAction::Wake),
+            ("toggle", RemoteAction::Toggle),
         ] {
             let cli = Cli::parse_from(["devme", "remote", arg]);
             assert_eq!(cli.command, Some(Command::Remote { action: Some(expected) }));

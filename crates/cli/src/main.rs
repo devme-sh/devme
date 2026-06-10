@@ -82,8 +82,15 @@ async fn run(cli: Cli) -> i32 {
         return code;
     }
 
+    // The global interactivity flags, packaged once for the remote paths.
+    let remote_flags = devme_cli::remote::RunFlags {
+        no_input: cli.no_input,
+        yes: cli.yes,
+        quiet: cli.quiet,
+    };
+
     let result = match cli.command {
-        None => return launch_default(cli.local).await,
+        None => return launch_default(cli.local, remote_flags).await,
         Some(Command::Status { all }) => {
             if all {
                 status_all(cli.json).await
@@ -109,7 +116,7 @@ async fn run(cli: Cli) -> i32 {
         Some(Command::Doctor { name, tail }) => doctor(name, tail).await,
         Some(Command::Config { action }) => config_cmd(action, cli.json),
         Some(Command::Worktree { action }) => worktree_cmd(action, cli.json).await,
-        Some(Command::Remote { action }) => remote_cmd(action, cli.json),
+        Some(Command::Remote { action }) => remote_cmd(action, cli.json, remote_flags),
         Some(Command::Skill { action }) => skill_cmd(action, cli.json),
     };
     match result {
@@ -1387,17 +1394,22 @@ async fn worktree_cmd(action: WorktreeAction, json: bool) -> anyhow::Result<()> 
 
 /// `devme remote …` — live-sync + attach to a remote dev host. Shells out
 /// to `mutagen`/`ssh`, so it's synchronous (no devme daemon involved).
-fn remote_cmd(action: Option<RemoteAction>, json: bool) -> anyhow::Result<()> {
+fn remote_cmd(
+    action: Option<RemoteAction>,
+    json: bool,
+    flags: devme_cli::remote::RunFlags,
+) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     match action {
-        None => devme_cli::remote::run(&cwd),
+        None => devme_cli::remote::run(&cwd, flags),
         Some(RemoteAction::Doctor) => devme_cli::remote::doctor(&cwd, json),
         Some(RemoteAction::Status { watch }) => devme_cli::remote::status(&cwd, json, watch),
         Some(RemoteAction::Conflicts) => devme_cli::remote::conflicts(&cwd, json),
-        Some(RemoteAction::Sync) => devme_cli::remote::sync(&cwd),
-        Some(RemoteAction::Flush) => devme_cli::remote::flush(&cwd),
-        Some(RemoteAction::Stop) => devme_cli::remote::stop(&cwd),
+        Some(RemoteAction::Sync) => devme_cli::remote::sync(&cwd, flags.quiet),
+        Some(RemoteAction::Flush) => devme_cli::remote::flush(&cwd, flags.quiet),
+        Some(RemoteAction::Stop) => devme_cli::remote::stop(&cwd, flags.quiet),
         Some(RemoteAction::Wake) => devme_cli::remote::wake(),
+        Some(RemoteAction::Toggle) => devme_cli::remote::toggle(flags.quiet),
         Some(RemoteAction::WakeHook { uninstall }) => devme_cli::remote::wake_hook(uninstall),
     }
 }
@@ -1421,12 +1433,12 @@ fn print_completions(shell: Shell) {
 /// the project is remote-first, so this behaves as `devme remote` — ensure
 /// the live-sync, then attach to the remote stack's TUI. Otherwise it opens
 /// the local TUI. `--local` forces the local TUI regardless.
-async fn launch_default(force_local: bool) -> i32 {
+async fn launch_default(force_local: bool, flags: devme_cli::remote::RunFlags) -> i32 {
     if !force_local {
         let cfg = devme_config::GlobalConfig::load();
         if cfg.remote.is_default() && cfg.remote.host.is_some() {
             return match std::env::current_dir() {
-                Ok(cwd) => match devme_cli::remote::run(&cwd) {
+                Ok(cwd) => match devme_cli::remote::run(&cwd, flags) {
                     Ok(()) => 0,
                     Err(e) => {
                         eprintln!("devme: {e}");

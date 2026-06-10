@@ -503,7 +503,14 @@ async fn run(
                                     // browser, with a toast so it's never a
                                     // silent no-op. Only web (`http(s)://`)
                                     // services are openable; a database's bare
-                                    // `host:port` is copied instead.
+                                    // `host:port` is copied instead. On a
+                                    // remote TUI the browser must open on the
+                                    // *laptop*, not this headless host — the
+                                    // open request rides the live-sync down
+                                    // (see `remote::OPEN_URL_FILE`) and the
+                                    // laptop-side `devme remote` watcher opens
+                                    // it locally.
+                                    let remote = is_remote_tui();
                                     let sel = state
                                         .selected_service()
                                         .map(|s| (s.name.clone(), s.url.clone(), s.port));
@@ -512,15 +519,15 @@ async fn run(
                                         Some((name, None, _)) => {
                                             state.notify("open", format!("{name} has no URL"));
                                         }
-                                        // On a remote TUI the browser would open
-                                        // on the headless host, not the laptop —
-                                        // point the user at `c` (copy) instead,
-                                        // which rides OSC 52 back.
-                                        Some((_, Some(_), _)) if is_remote_tui() => {
-                                            state.notify("open", "remote stack — press c to copy the URL");
-                                        }
                                         Some((name, Some(tmpl), port)) => {
-                                            match resolve_service_url(&tmpl, port, "localhost") {
+                                            // Remote: build the URL with the
+                                            // laptop-reachable host, same as `c`.
+                                            let host = if remote {
+                                                service_url_host()
+                                            } else {
+                                                "localhost".to_string()
+                                            };
+                                            match resolve_service_url(&tmpl, port, &host) {
                                                 None => state.notify(
                                                     "open",
                                                     format!("{name} has no port yet"),
@@ -529,12 +536,31 @@ async fn run(
                                                     if url.starts_with("http://")
                                                         || url.starts_with("https://") =>
                                                 {
-                                                    match devme_config::browser::open_url(&url) {
-                                                        Ok(()) => state.notify("open", url),
-                                                        Err(e) => state.notify(
-                                                            "open",
-                                                            format!("couldn't open: {e}"),
-                                                        ),
+                                                    if remote {
+                                                        match write_open_request(
+                                                            state.current_instance_cwd(),
+                                                            &url,
+                                                        ) {
+                                                            Ok(()) => state.notify(
+                                                                "open",
+                                                                format!("→ laptop: {url}"),
+                                                            ),
+                                                            Err(e) => state.notify(
+                                                                "open",
+                                                                format!(
+                                                                    "couldn't reach laptop ({e}) — press c to copy"
+                                                                ),
+                                                            ),
+                                                        }
+                                                    } else {
+                                                        match devme_config::browser::open_url(&url)
+                                                        {
+                                                            Ok(()) => state.notify("open", url),
+                                                            Err(e) => state.notify(
+                                                                "open",
+                                                                format!("couldn't open: {e}"),
+                                                            ),
+                                                        }
                                                     }
                                                 }
                                                 // No scheme → not browser-openable
@@ -831,15 +857,13 @@ fn run_port_remediation(action: &crate::state::PortConflictAction) -> Result<Str
     }
 }
 
-/// Host to build service URLs from. When the TUI runs on a remote host
-/// (attached via `devme remote`), `DEVME_URL_HOST` is injected with the
-/// browser-reachable name (e.g. a Tailscale MagicDNS name) so a copied URL
-/// works from the laptop; locally it's unset and we fall back to localhost.
+/// Host to build service URLs from. When the TUI runs on a remote host,
+/// this is the browser-reachable name (e.g. a Tailscale MagicDNS name) so a
+/// copied/opened URL works from the laptop. Resolution is shared with
+/// `devme url`: `$DEVME_URL_HOST` (injected by the attach templates and the
+/// herdr session server env) → `remote.advertise_host` config → localhost.
 fn service_url_host() -> String {
-    std::env::var("DEVME_URL_HOST")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "localhost".to_string())
+    devme_config::remote::advertise_host()
 }
 
 /// Fill a service URL template's `{host}`/`{port}` placeholders. Returns
@@ -856,11 +880,38 @@ fn resolve_service_url(template: &str, port: Option<u16>, host: &str) -> Option<
     Some(url)
 }
 
-/// True when this TUI is the remote stack's TUI, attached over SSH (devme
-/// injects `DEVME_URL_HOST`). Opening a browser here would land on the
-/// headless host, so `o` redirects the user to `c` (copy) instead.
+/// True when this TUI is the remote stack's TUI, attached from a laptop.
+/// Opening a browser here would land on the headless host, so `o` forwards
+/// the open to the laptop instead. Two signals, either suffices:
+///
+/// - `DEVME_URL_HOST` env — injected by the ssh/tmux attach templates and
+///   the herdr session server's environment.
+/// - `remote.advertise_host` config — set only on machines that *host*
+///   remote stacks (a laptop never sets it), so it catches panes whose
+///   environment devme didn't shape (a herdr server the user started
+///   themselves, brew services, …).
 fn is_remote_tui() -> bool {
     std::env::var_os("DEVME_URL_HOST").is_some_and(|v| !v.is_empty())
+        || devme_config::GlobalConfig::load()
+            .remote
+            .advertise_host
+            .is_some_and(|h| !h.trim().is_empty())
+}
+
+/// Ask the laptop to open `url`: write the one-shot request file into the
+/// project root, where the live-sync carries it to the laptop and the
+/// `devme remote` watcher opens + deletes it. The wall-clock-millis seq lets
+/// the watcher distinguish a fresh request from one it already served.
+fn write_open_request(instance_cwd: &str, url: &str) -> std::io::Result<()> {
+    let seq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(1);
+    let path = std::path::Path::new(instance_cwd).join(devme_config::remote::OPEN_URL_FILE);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, devme_config::remote::open_request_json(seq, url))
 }
 
 /// Toast body for a log-copy action, pluralised. `scope` is "visible"/"all".
