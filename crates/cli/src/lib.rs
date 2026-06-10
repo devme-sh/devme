@@ -728,6 +728,27 @@ pub fn format_status_all(reports: &[devme_tui::worktree::WorktreeReport], color:
     out
 }
 
+/// Resolve each service's `url` template (`{host}`/`{port}`) in place, so
+/// `status --json` hands agents a ready-to-use URL instead of a template.
+/// A template that needs `{port}` while the service has none resolved
+/// (stopped, never started) becomes `None` — half-resolved strings are
+/// worse than absent ones. The human renderer re-resolving an already
+/// resolved URL is a no-op, so callers can run this unconditionally.
+pub fn resolve_service_urls(services: &mut [ServiceSnapshot], host: &str) {
+    for s in services {
+        let Some(t) = &s.url else { continue };
+        if t.contains("{port}") && s.port.is_none() {
+            s.url = None;
+            continue;
+        }
+        let mut u = t.replace("{host}", host);
+        if let Some(p) = s.port {
+            u = u.replace("{port}", &p.to_string());
+        }
+        s.url = Some(u);
+    }
+}
+
 /// Format a status snapshot as JSON. Stable shape:
 /// `{ "services": [...], "steps": [...] }`.
 pub fn format_status_json(
@@ -938,6 +959,35 @@ mod tests {
         let db = out.find("db").unwrap();
         assert!(out.find("STEPS").unwrap() < out.find("SERVICES").unwrap());
         assert!(tools < backend && backend < db, "order wrong: {out}");
+    }
+
+    #[test]
+    fn resolve_service_urls_fills_templates_and_drops_unresolvable() {
+        let running = ServiceState::Running { degraded: false, started_without: vec![] };
+        let mut services = vec![
+            {
+                let mut s = svc("api", running.clone());
+                s.port = Some(8080);
+                s.url = Some("http://{host}:{port}/docs".into());
+                s
+            },
+            {
+                // Port template but no resolved port (stopped) → url dropped.
+                let mut s = svc("web", ServiceState::Stopped);
+                s.url = Some("http://{host}:{port}".into());
+                s
+            },
+            {
+                // No template at all → untouched.
+                let mut s = svc("ext", running);
+                s.url = Some("https://example.test".into());
+                s
+            },
+        ];
+        resolve_service_urls(&mut services, "localhost");
+        assert_eq!(services[0].url.as_deref(), Some("http://localhost:8080/docs"));
+        assert_eq!(services[1].url, None);
+        assert_eq!(services[2].url.as_deref(), Some("https://example.test"));
     }
 
     #[test]

@@ -86,7 +86,7 @@ Rules:
 | Command | Purpose |
 |---------|---------|
 | `devme doctor [<name>] [--tail N]` | JSON error digest: states + stderr-only `recent_errors` per service, failed-step output inline. `<name>` zooms into one step (full check/provision output) or service |
-| `devme status [--all]` | Grouped STEPS/SERVICES snapshot: state glyph, resolved `http://host:PORT`, pid, restart count, plus a warning footer naming any unhealthy service. `--all` = port matrix across every worktree (`*` = current); `--json` for structured |
+| `devme status [--all]` | Grouped STEPS/SERVICES snapshot: state glyph, resolved URL, pid, restart count, plus a warning footer naming any unhealthy service. Mid-`up`, blocked services show `waiting on <dep>` (not `stopped`); repo-shared (`scope = "repo"`) services show the shared supervisor's true state. `--all` = state-glyph + port matrix across every worktree (`*` = current). `--json` for structured: `services[].state.kind` (`running`/`starting`/`waiting_on_dependency` + `blocked_by`/`failed`/…), resolved `url`, `pid`, `port` |
 | `devme logs [<svc>] [--tail N] [--since 5m] [--json] [-f]` | Service log streams (disk-backed history). No name = all services interleaved by ts; `--json` = NDJSON `{ts, service, stream, text}` for jq; steps are refused (→ doctor) |
 | `devme url <svc> [-o]` | Print a service's URL; `-o` opens it in the browser |
 | `devme start/stop/restart <svc>` | Lifecycle a single service |

@@ -298,6 +298,11 @@ async fn status_all(as_json: bool) -> anyhow::Result<()> {
             }
         }
     }
+    for r in reports.iter_mut() {
+        if let Some(services) = &mut r.services {
+            devme_cli::resolve_service_urls(services, &devme_cli::remote::advertise_host());
+        }
+    }
     if as_json {
         let worktrees: Vec<serde_json::Value> = reports
             .iter()
@@ -378,6 +383,9 @@ async fn status(as_json: bool) -> anyhow::Result<()> {
                 overlay_step_checks(&mut steps, stack, &cwd);
                 overlay_shared_services(&mut services, stack, &cwd).await;
             }
+            // Hand out ready-to-use URLs — agents reading `--json` shouldn't
+            // have to resolve `{host}`/`{port}` templates themselves.
+            devme_cli::resolve_service_urls(&mut services, &devme_cli::remote::advertise_host());
             if as_json {
                 println!("{}", format_status_json(&services, &steps));
             } else {
