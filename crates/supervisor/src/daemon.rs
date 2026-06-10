@@ -239,7 +239,15 @@ impl DaemonState {
     fn current_service_state(&self, name: &str) -> ServiceState {
         match self.executor.state(name) {
             Some(NodeStatus::Service(s)) => s.clone(),
-            _ => ServiceState::Stopped,
+            // No executor entry: either the daemon is idle (Stopped) or a
+            // run is in flight and the graph just hasn't reached this
+            // service yet — then report what it's actually waiting on, so
+            // `status` mid-`up` doesn't claim "stopped" for a service that
+            // is about to start.
+            _ => match self.executor.blocked_by(name) {
+                Some(dep) => ServiceState::WaitingOnDependency { blocked_by: dep },
+                None => ServiceState::Stopped,
+            },
         }
     }
 
@@ -723,10 +731,10 @@ fn handle_client_message(
                 merged.sort_by_key(|(ts, _, _, _)| *ts);
                 // Tail-clipping is the caller's own request, not data loss —
                 // it doesn't set the truncation warning.
-                if let Some(tail) = tail {
-                    if merged.len() > tail {
-                        merged.drain(0..merged.len() - tail);
-                    }
+                if let Some(tail) = tail
+                    && merged.len() > tail
+                {
+                    merged.drain(0..merged.len() - tail);
                 }
                 if truncated {
                     let _ = client.send(ServerMessage::Notice {

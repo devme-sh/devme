@@ -110,11 +110,11 @@ impl LogStore {
         };
 
         let mut truncated_by_tail = false;
-        if let Some(tail) = tail {
-            if all.len() > tail {
-                truncated_by_tail = true;
-                all.drain(0..all.len() - tail);
-            }
+        if let Some(tail) = tail
+            && all.len() > tail
+        {
+            truncated_by_tail = true;
+            all.drain(0..all.len() - tail);
         }
 
         (all, truncated_by_since || truncated_by_tail)
@@ -209,10 +209,10 @@ impl Writer {
             Err(_) => return,
         };
         line.push('\n');
-        if let Some(file) = self.file.as_mut() {
-            if file.write_all(line.as_bytes()).is_ok() {
-                self.bytes += line.len() as u64;
-            }
+        if let Some(file) = self.file.as_mut()
+            && file.write_all(line.as_bytes()).is_ok()
+        {
+            self.bytes += line.len() as u64;
         }
         if self.bytes >= self.rotate_bytes {
             self.rotate();

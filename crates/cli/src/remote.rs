@@ -956,52 +956,6 @@ struct Check {
     hint: Option<String>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::Command as C;
-
-    #[test]
-    fn shell_quote_passes_simple_tokens_and_quotes_the_rest() {
-        assert_eq!(shell_quote("api"), "api");
-        assert_eq!(shell_quote("--tail"), "--tail");
-        assert_eq!(shell_quote("200"), "200");
-        assert_eq!(shell_quote("svc-1.2/x:y=z"), "svc-1.2/x:y=z");
-        // Tilde paths pass through so remote `cd ~/…` still expands.
-        assert_eq!(shell_quote("~/development/api-abc"), "~/development/api-abc");
-        assert_eq!(shell_quote("a b"), "'a b'");
-        assert_eq!(shell_quote("it's"), "'it'\\''s'");
-        assert_eq!(shell_quote(""), "''");
-    }
-
-    #[test]
-    fn strip_marked_block_removes_only_the_devme_block() {
-        let content = "#!/bin/sh\nuser-line\n# >>> devme wake-hook >>>\ndevme remote wake\n# <<< devme wake-hook <<<\nother\n";
-        let out = strip_marked_block(content);
-        assert!(out.contains("user-line"));
-        assert!(out.contains("other"));
-        assert!(!out.contains("devme remote wake"));
-        assert!(!out.contains("devme wake-hook"));
-    }
-
-    #[test]
-    fn proxyable_commands_are_daemon_facing_only() {
-        assert!(is_proxyable(&Some(C::Status { all: false })));
-        assert!(is_proxyable(&Some(C::Logs {
-            service: Some("api".into()),
-            follow: false,
-            tail: 200,
-            since: None,
-            json: false,
-        })));
-        assert!(is_proxyable(&Some(C::Down { timeout: 10, all: false })));
-        // Machine-local / non-daemon commands never proxy.
-        assert!(!is_proxyable(&Some(C::Config { action: None })));
-        assert!(!is_proxyable(&Some(C::Remote { action: None })));
-        assert!(!is_proxyable(&None));
-    }
-}
-
 /// `devme remote doctor`: preflight that turns "works on my machine" into
 /// "anyone can run it". Checks the local tooling, host reachability, and the
 /// remote's `git`/`devme` — with a fixable hint per failure.
@@ -1146,4 +1100,50 @@ pub fn doctor(cwd: &Path, json: bool) -> Result<()> {
         println!("\nsome checks failed — fix the hints above, then re-run `devme remote doctor`");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Command as C;
+
+    #[test]
+    fn shell_quote_passes_simple_tokens_and_quotes_the_rest() {
+        assert_eq!(shell_quote("api"), "api");
+        assert_eq!(shell_quote("--tail"), "--tail");
+        assert_eq!(shell_quote("200"), "200");
+        assert_eq!(shell_quote("svc-1.2/x:y=z"), "svc-1.2/x:y=z");
+        // Tilde paths pass through so remote `cd ~/…` still expands.
+        assert_eq!(shell_quote("~/development/api-abc"), "~/development/api-abc");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn strip_marked_block_removes_only_the_devme_block() {
+        let content = "#!/bin/sh\nuser-line\n# >>> devme wake-hook >>>\ndevme remote wake\n# <<< devme wake-hook <<<\nother\n";
+        let out = strip_marked_block(content);
+        assert!(out.contains("user-line"));
+        assert!(out.contains("other"));
+        assert!(!out.contains("devme remote wake"));
+        assert!(!out.contains("devme wake-hook"));
+    }
+
+    #[test]
+    fn proxyable_commands_are_daemon_facing_only() {
+        assert!(is_proxyable(&Some(C::Status { all: false })));
+        assert!(is_proxyable(&Some(C::Logs {
+            service: Some("api".into()),
+            follow: false,
+            tail: 200,
+            since: None,
+            json: false,
+        })));
+        assert!(is_proxyable(&Some(C::Down { timeout: 10, all: false })));
+        // Machine-local / non-daemon commands never proxy.
+        assert!(!is_proxyable(&Some(C::Config { action: None })));
+        assert!(!is_proxyable(&Some(C::Remote { action: None })));
+        assert!(!is_proxyable(&None));
+    }
 }

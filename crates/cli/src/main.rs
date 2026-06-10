@@ -1198,7 +1198,7 @@ fn config_cmd(action: Option<ConfigAction>, json: bool) -> anyhow::Result<()> {
     use devme_config::GlobalConfig;
 
     match action {
-        Some(ConfigAction::Check) => return config_check(json),
+        Some(ConfigAction::Check) => config_check(json),
         None => {
             let (cfg, warning) = GlobalConfig::load_checked();
             if let Some(w) = warning {

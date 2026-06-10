@@ -131,22 +131,22 @@ jobs:
       # `npx skills add` serves. Overwrite it on every release so the two can
       # never describe different binaries, then kick its eval suite so the
       # skill is re-validated against the binary it now ships alongside.
+      #
+      # A missing token FAILS the job (it used to skip with a green notice,
+      # which let the mirror drift unnoticed for releases). The fix is a
+      # fine-grained PAT scoped to devme-sh/skills (Contents: read/write),
+      # stored as the SKILLS_SYNC_TOKEN secret.
       - name: Check for sync token
-        id: token
         run: |
-          if [ -n "${{ secrets.SKILLS_SYNC_TOKEN }}" ]; then
-            echo "have=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "have=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::SKILLS_SYNC_TOKEN not set — skipping SKILL.md mirror."
+          if [ -z "${{ secrets.SKILLS_SYNC_TOKEN }}" ]; then
+            echo "::error::SKILLS_SYNC_TOKEN not set — the SKILL.md mirror would silently drift. Add the secret (fine-grained PAT for devme-sh/skills, Contents: read/write)."
+            exit 1
           fi
 
       - name: Checkout devme (canonical skill)
-        if: steps.token.outputs.have == 'true'
         uses: actions/checkout@v4
 
       - name: Checkout skills mirror
-        if: steps.token.outputs.have == 'true'
         uses: actions/checkout@v4
         with:
           repository: devme-sh/skills
@@ -154,7 +154,6 @@ jobs:
           path: skills-repo
 
       - name: Sync and push if changed
-        if: steps.token.outputs.have == 'true'
         run: |
           src="crates/config/skill/SKILL.md"
           dst="skills-repo/skills/devme/SKILL.md"
@@ -172,7 +171,6 @@ jobs:
           git push
 
       - name: Trigger skill evals
-        if: steps.token.outputs.have == 'true'
         run: |
           # Fire devme-sh/skills' skill-evals workflow with this release tag, so
           # the skill is exercised against the just-published binary.

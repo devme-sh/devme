@@ -259,6 +259,10 @@ const IDLE_GRACE_SECS: u64 = 30;
 /// arrive after it connected. Matches the instance daemon's ring size.
 const LOG_RING_CAPACITY: usize = 500;
 
+/// Per-service ring of recent `(ts, stream, line)` records, shared between
+/// the spawn-side forwarders and connection handlers.
+type LogRings = Arc<Mutex<HashMap<String, VecDeque<(u64, LogStream, String)>>>>;
+
 /// Live state shared between the accept loop and connection handlers.
 struct SharedState {
     /// Service name → running handle. `Mutex` because Shutdown reaches in
@@ -270,7 +274,7 @@ struct SharedState {
     /// Per-service ring of recent `(ts, line)` log lines, replayed to each
     /// new subscriber so late attachers see history. Bounded by
     /// [`LOG_RING_CAPACITY`] per service.
-    logs: Arc<Mutex<HashMap<String, VecDeque<(u64, LogStream, String)>>>>,
+    logs: LogRings,
     /// On-disk history tier for repo-scoped services — the ring's durable
     /// complement (survives eviction + restart, backs `--since`).
     log_store: Arc<Mutex<LogStore>>,
@@ -291,8 +295,7 @@ impl SharedState {
         let (events, _) = broadcast::channel(1024);
         let services_map: Arc<Mutex<HashMap<String, RunningService>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let logs: Arc<Mutex<HashMap<String, VecDeque<(u64, LogStream, String)>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let logs: LogRings = Arc::new(Mutex::new(HashMap::new()));
         let log_store = Arc::new(Mutex::new(LogStore::new(
             devme_config::paths::shared_log_dir(cwd)
                 .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/devme/orphan-shared-logs")),
@@ -445,7 +448,7 @@ fn spawn_log_forwarder(
     name: String,
     mut lines: mpsc::UnboundedReceiver<(LogStream, String)>,
     events: broadcast::Sender<ServerMessage>,
-    logs: Arc<Mutex<HashMap<String, VecDeque<(u64, LogStream, String)>>>>,
+    logs: LogRings,
     log_store: Arc<Mutex<LogStore>>,
 ) {
     tokio::spawn(async move {
@@ -676,10 +679,10 @@ async fn handle(
                             merged.sort_by_key(|(ts, _, _, _)| *ts);
                             // Tail-clipping is the caller's own request, not
                             // data loss — no truncation warning.
-                            if let Some(tail) = tail {
-                                if merged.len() > tail {
-                                    merged.drain(0..merged.len() - tail);
-                                }
+                            if let Some(tail) = tail
+                                && merged.len() > tail
+                            {
+                                merged.drain(0..merged.len() - tail);
                             }
                             if truncated {
                                 send_msg(
