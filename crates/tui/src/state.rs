@@ -1230,6 +1230,29 @@ impl TuiState {
             .unwrap_or(false)
     }
 
+    /// True if the placeholder at `idx` points at a path that doesn't exist
+    /// on this host — a git worktree registration created on another machine
+    /// (e.g. a laptop worktree whose `.git/worktrees` entry synced over
+    /// before that dir was ignored). "Add a devme.toml" would be the wrong
+    /// hint there; the worktree itself is absent.
+    pub fn instance_missing_on_host(&self, idx: usize) -> bool {
+        self.instances
+            .get(idx)
+            .map(|i| !i.info.cwd.is_empty() && !std::path::Path::new(&i.info.cwd).exists())
+            .unwrap_or(false)
+    }
+
+    /// As [`instance_missing_on_host`](Self::instance_missing_on_host) but
+    /// for the currently-selected instance.
+    pub fn current_instance_missing_on_host(&self) -> bool {
+        if self.shared_selected {
+            return false;
+        }
+        self.current_instance()
+            .map(|i| !i.info.cwd.is_empty() && !std::path::Path::new(&i.info.cwd).exists())
+            .unwrap_or(false)
+    }
+
     /// Filesystem cwd of the currently-selected instance. The renderer
     /// uses this to surface "drop a devme.toml here" hints for
     /// placeholders.
@@ -1328,7 +1351,11 @@ impl TuiState {
     /// Short label for the placeholder tab, naming the cause.
     fn placeholder_tab_label(&self) -> String {
         if self.current_instance_is_placeholder() {
-            "no devme.toml".to_string()
+            if self.current_instance_missing_on_host() {
+                "not on this host".to_string()
+            } else {
+                "no devme.toml".to_string()
+            }
         } else {
             "no services".to_string()
         }
@@ -1338,10 +1365,21 @@ impl TuiState {
     /// tab is focused.
     pub fn placeholder_explanation(&self) -> String {
         let mut msg = if self.current_instance_is_placeholder() {
-            format!(
-                "No devme.toml in {} — add one to start services.",
-                self.current_instance_cwd()
-            )
+            if self.current_instance_missing_on_host() {
+                format!(
+                    "Worktree registered at {}, but that path doesn't exist on this \
+                     machine — it was likely created on another host (only the main \
+                     worktree syncs to a remote).\n\n\
+                     `git worktree prune` here drops the stale registration; \
+                     `git worktree add <path> <branch>` creates it on this host.",
+                    self.current_instance_cwd()
+                )
+            } else {
+                format!(
+                    "No devme.toml in {} — add one to start services.",
+                    self.current_instance_cwd()
+                )
+            }
         } else {
             "No services declared in this worktree's devme.toml.".to_string()
         };
@@ -3371,8 +3409,9 @@ mod tests {
             services: vec![running("proxy"), running("postgres")],
             steps: vec![],
         });
-        // A discovered worktree with no devme.toml: a placeholder row, no daemon.
-        s.add_placeholder_instance("inst", "feature/x", "/tmp/a");
+        // A discovered worktree with no devme.toml: a placeholder row, no
+        // daemon. The cwd must exist, else the label reads "not on this host".
+        s.add_placeholder_instance("inst", "feature/x", "/tmp");
 
         let tabs = s.tab_services();
         let labels: Vec<&str> = tabs.iter().map(|t| t.label.as_str()).collect();
@@ -3399,8 +3438,9 @@ mod tests {
     #[test]
     fn placeholder_explanation_mentions_shared_tabs_only_when_present() {
         // No devme.toml and no shared services: just the "add one" line.
+        // (Existing cwd, so the explanation isn't the missing-on-host one.)
         let mut s = TuiState::default();
-        s.add_placeholder_instance("inst", "feature/x", "/tmp/x");
+        s.add_placeholder_instance("inst", "feature/x", "/tmp");
         let without = s.placeholder_explanation();
         assert!(without.contains("add one to start services"), "{without}");
         assert!(
@@ -3422,6 +3462,35 @@ mod tests {
         s2.add_placeholder_instance("inst", "feature/x", "/tmp/x");
         let with = s2.placeholder_explanation();
         assert!(with.contains("tabs to the right"), "{with}");
+    }
+
+    #[test]
+    fn phantom_worktree_placeholder_reads_not_on_this_host() {
+        // A worktree registration whose path doesn't exist on this machine
+        // (created on another host; its .git/worktrees entry synced over).
+        // "Add a devme.toml" would be the wrong hint — name the real cause.
+        let mut s = TuiState::default();
+        s.apply(ServerMessage::Subscribed {
+            instance: InstanceInfo {
+                id: "shared::repo".into(),
+                label: "shared".into(),
+                cwd: "/tmp".into(),
+            },
+            services: vec![running("proxy")],
+            steps: vec![],
+        });
+        s.add_placeholder_instance("inst", "feature/x", "/nonexistent/laptop-worktree");
+
+        assert!(s.instance_is_placeholder(0) || s.instance_is_placeholder(1));
+        s.select_instance_by_id("inst");
+        assert!(s.current_instance_missing_on_host());
+
+        let tabs = s.tab_services();
+        assert_eq!(tabs[0].label, "not on this host");
+        let msg = s.placeholder_explanation();
+        assert!(msg.contains("doesn't exist on this machine"), "{msg}");
+        assert!(msg.contains("git worktree prune"), "{msg}");
+        assert!(!msg.contains("add one to start services"), "{msg}");
     }
 
     #[test]

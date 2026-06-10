@@ -1367,8 +1367,16 @@ async fn worktree_cmd(action: WorktreeAction, json: bool) -> anyhow::Result<()> 
                     "branch": report.branch,
                     "slot": report.slot,
                     "instance_stopped": report.instance_stopped,
+                    "already_gone": report.already_gone,
                 });
                 println!("{}", serde_json::to_string_pretty(&value)?);
+            } else if report.already_gone {
+                // Idempotent: nothing was on disk to remove. Say so plainly
+                // rather than claiming a removal that didn't happen.
+                println!(
+                    "Worktree {} was already gone — pruned stale state",
+                    report.path.display()
+                );
             } else {
                 println!("Removed worktree {}", report.path.display());
                 if let Some(b) = &report.branch {

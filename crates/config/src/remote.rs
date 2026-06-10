@@ -97,6 +97,13 @@ pub struct RemoteConfig {
     /// remote-first, so opening it attaches to the remote stack's TUI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<bool>,
+    /// Whether linked worktrees sync alongside the main worktree. Default
+    /// true: a repo whose main checkout syncs but whose worktrees silently
+    /// don't is the confusing half-state this exists to prevent. Each
+    /// worktree gets its own session and remote dir (git metadata stays
+    /// host-local — see `worktree_*` helpers below).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_worktrees: Option<bool>,
 }
 
 impl RemoteConfig {
@@ -110,6 +117,12 @@ impl RemoteConfig {
             && self.advertise_host.is_none()
             && self.up_on_attach.is_none()
             && self.default.is_none()
+            && self.sync_worktrees.is_none()
+    }
+
+    /// Whether linked worktrees sync alongside the main worktree. Default on.
+    pub fn sync_worktrees_or_default(&self) -> bool {
+        self.sync_worktrees.unwrap_or(true)
     }
 
     /// Whether bare `devme` should default to `devme remote` for this user.
@@ -213,6 +226,114 @@ pub fn sync_session_name(local_root: &Path) -> String {
     format!("devme-{}", remote_dir_name(local_root))
 }
 
+/// Git bookkeeping the main session must never sync, regardless of the user's
+/// ignore list: lock files and `gc.pid` flap during normal git operation, and
+/// `.git/worktrees` holds per-machine registrations with absolute host paths —
+/// syncing those is how phantom "not on this host" worktrees are born, and a
+/// `git worktree prune` on one side would destroy the other side's worktrees.
+pub const GIT_ALWAYS_IGNORES: &[&str] =
+    &[".git/**/*.lock", ".git/gc.pid", ".git/worktrees"];
+
+// --- worktree sync (model 1a extended to linked worktrees) -------------------
+//
+// The main worktree syncs whole, `.git` included (shared-state, model 1a),
+// with `.git/worktrees` excluded because worktree *registrations* embed
+// absolute host paths — syncing them is how phantom "not on this host" rows
+// are born. Linked worktrees therefore sync as their own sessions with git
+// metadata strictly host-local:
+//
+//   1. branch refs reach the remote through the main session (`.git/refs`);
+//   2. the worktree is materialized host-side: `git worktree add --no-checkout`
+//      registers it and writes a host-correct `.git` pointer file, but stages
+//      nothing — so the session's initial flush (laptop → empty dir) can't
+//      conflict, and the laptop's *uncommitted* changes flow as plain files;
+//   3. its session ignores `.git` (the pointer file) — each host owns its own;
+//   4. after the first flush, `git reset -q` aligns the index with HEAD so
+//      `git status` on the remote shows exactly the laptop's dirty state.
+
+/// The shared `-<repo8>` suffix every session of a repo carries (main and
+/// worktrees alike), used to enumerate "all sessions of this repo" out of a
+/// label-filtered `mutagen sync list`.
+pub fn repo_session_suffix(local_root: &Path) -> String {
+    let id = crate::paths::repo_id(local_root);
+    format!("-{}", &id[..8.min(id.len())])
+}
+
+/// One linked worktree from `git worktree list --porcelain`: its path and
+/// checked-out branch (`None` when detached).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    pub path: String,
+    pub branch: Option<String>,
+}
+
+/// Parse `git worktree list --porcelain` into the *linked* worktrees — the
+/// main worktree (first block) is skipped, as are bare entries. Pure so the
+/// parsing is unit-tested; the caller runs git and filters out paths that
+/// don't exist locally (stale registrations).
+pub fn parse_linked_worktrees(porcelain: &str) -> Vec<WorktreeEntry> {
+    let mut out = Vec::new();
+    let mut first = true;
+    let mut path: Option<String> = None;
+    let mut branch: Option<String> = None;
+    let mut bare = false;
+    let flush = |path: &mut Option<String>,
+                     branch: &mut Option<String>,
+                     bare: &mut bool,
+                     first: &mut bool,
+                     out: &mut Vec<WorktreeEntry>| {
+        if let Some(p) = path.take() {
+            if !*first && !*bare {
+                out.push(WorktreeEntry { path: p, branch: branch.take() });
+            }
+            *first = false;
+        }
+        *branch = None;
+        *bare = false;
+    };
+    for line in porcelain.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            flush(&mut path, &mut branch, &mut bare, &mut first, &mut out);
+            path = Some(p.to_string());
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            branch = Some(b.trim_start_matches("refs/heads/").to_string());
+        } else if line.trim() == "bare" {
+            bare = true;
+        }
+    }
+    flush(&mut path, &mut branch, &mut bare, &mut first, &mut out);
+    out
+}
+
+/// Shell command that materializes a linked worktree on the remote host:
+/// registers it against the synced main repo with `--no-checkout` (host-
+/// correct `.git` pointer, empty index, no files — the sync session brings
+/// those). Prints `created` / `exists` so the caller knows whether the
+/// post-flush index alignment is needed. Best-effort by design: a missing
+/// branch ref or a branch already checked out elsewhere surfaces as the
+/// command's own stderr.
+pub fn worktree_materialize_cmd(
+    remote_main_path: &str,
+    remote_wt_path: &str,
+    branch: &str,
+) -> String {
+    format!(
+        "if [ -e {wt} ]; then echo exists; else cd {main} && git worktree add --no-checkout {wt} {branch} && echo created; fi",
+        wt = shell_quote(remote_wt_path),
+        main = shell_quote(remote_main_path),
+        branch = shell_quote(branch),
+    )
+}
+
+/// Shell command that aligns a freshly materialized worktree's index with its
+/// HEAD after the first flush, so remote `git status` shows exactly the
+/// laptop's uncommitted changes (with `--no-checkout` the index starts
+/// empty, which would read as everything-deleted). Run once, on creation
+/// only — re-running would unstage work someone staged on the remote.
+pub fn worktree_align_index_cmd(remote_wt_path: &str) -> String {
+    format!("git -C {} reset -q", shell_quote(remote_wt_path))
+}
+
 /// Expand an `attach` setting into a shell command line. A known preset
 /// expands to its template; anything else is treated as a raw template and
 /// has its `{host}` / `{remote_path}` / `{name}` placeholders substituted.
@@ -257,15 +378,6 @@ pub fn expand_attach(
         .replace("{name}", &escape(name))
         .replace("{url_host}", &escape(url_host))
 }
-
-/// Paths inside `.git` that are never synced, regardless of the user's
-/// ignore list. Lock files and `gc.pid` flap during normal git activity on
-/// either side and would halt a two-way-safe sync. `.git/worktrees` is
-/// per-machine metadata: worktree checkouts live *outside* the synced root,
-/// so syncing their registrations would make a `git worktree prune` on one
-/// side destroy the other side's worktrees.
-pub const GIT_ALWAYS_IGNORES: &[&str] =
-    &[".git/**/*.lock", ".git/gc.pid", ".git/worktrees"];
 
 // --- herdr preset preparation ------------------------------------------------
 
@@ -720,6 +832,88 @@ mod tests {
         let name = sync_session_name(&PathBuf::from("/x/My App"));
         assert!(name.starts_with("devme-my-app-"));
         assert!(name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    }
+
+    #[test]
+    fn sync_worktrees_defaults_on_and_round_trips() {
+        assert!(RemoteConfig::default().sync_worktrees_or_default());
+        let cfg = RemoteConfig {
+            sync_worktrees: Some(false),
+            ..Default::default()
+        };
+        assert!(!cfg.sync_worktrees_or_default());
+        assert!(!cfg.is_empty());
+    }
+
+    #[test]
+    fn parse_linked_worktrees_skips_main_bare_and_keeps_branch() {
+        let porcelain = "\
+worktree /Users/me/dev/app
+HEAD 1111111111111111111111111111111111111111
+branch refs/heads/master
+
+worktree /Users/me/dev/app-feature-x
+HEAD 2222222222222222222222222222222222222222
+branch refs/heads/feature/x
+
+worktree /Users/me/dev/app-detached
+HEAD 3333333333333333333333333333333333333333
+detached
+
+worktree /Users/me/dev/app.git
+bare
+";
+        let wts = parse_linked_worktrees(porcelain);
+        assert_eq!(wts.len(), 2, "{wts:?}");
+        assert_eq!(wts[0].path, "/Users/me/dev/app-feature-x");
+        assert_eq!(wts[0].branch.as_deref(), Some("feature/x"));
+        // Detached worktrees are listed (path known) with no branch.
+        assert_eq!(wts[1].path, "/Users/me/dev/app-detached");
+        assert_eq!(wts[1].branch, None);
+    }
+
+    #[test]
+    fn parse_linked_worktrees_empty_and_main_only() {
+        assert!(parse_linked_worktrees("").is_empty());
+        let only_main = "worktree /x/app\nHEAD aaaa\nbranch refs/heads/main\n";
+        assert!(parse_linked_worktrees(only_main).is_empty());
+    }
+
+    #[test]
+    fn repo_session_suffix_matches_session_names() {
+        // Both the main session and a (hypothetical) worktree session of the
+        // same repo end with the suffix — that's what repo-wide enumeration
+        // keys on.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("app");
+        std::fs::create_dir_all(&root).unwrap();
+        let suffix = repo_session_suffix(&root);
+        assert!(suffix.starts_with('-') && suffix.len() == 9, "got {suffix}");
+        assert!(sync_session_name(&root).ends_with(&suffix));
+    }
+
+    #[test]
+    fn worktree_materialize_cmd_registers_without_checkout() {
+        let cmd = worktree_materialize_cmd(
+            "~/development/app-abc12345",
+            "~/development/app-feature-x-abc12345",
+            "feature/x",
+        );
+        assert!(cmd.contains("git worktree add --no-checkout"), "{cmd}");
+        assert!(cmd.contains("cd ~/development/app-abc12345"), "{cmd}");
+        assert!(cmd.contains("echo created"), "{cmd}");
+        assert!(cmd.contains("echo exists"), "{cmd}");
+        // A branch with shell-meaningful chars gets quoted.
+        let quoted = worktree_materialize_cmd("~/m", "~/w", "feat(x)");
+        assert!(quoted.contains("'feat(x)'"), "{quoted}");
+    }
+
+    #[test]
+    fn worktree_align_index_cmd_resets_quietly() {
+        assert_eq!(
+            worktree_align_index_cmd("~/development/app-feature-x-abc12345"),
+            "git -C ~/development/app-feature-x-abc12345 reset -q"
+        );
     }
 
     #[test]
