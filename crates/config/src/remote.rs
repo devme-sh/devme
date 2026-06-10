@@ -327,6 +327,39 @@ pub fn herdr_server_start_cmd(session: &str, remote_path: &str, url_host: &str) 
     )
 }
 
+/// Label for the herdr workspace devme seeds (or adopts) for a project —
+/// prefixed so herdr's UI makes it obvious which space is the running devme
+/// instance, next to whatever other workspaces the user keeps in the session.
+pub fn herdr_workspace_label(name: &str) -> String {
+    format!("devme: {name}")
+}
+
+/// Shell command that renames a herdr workspace in the named session.
+pub fn herdr_workspace_rename_cmd(session: &str, workspace_id: &str, label: &str) -> String {
+    format!(
+        "env HERDR_SESSION={} herdr workspace rename {} {}",
+        shell_quote(session),
+        shell_quote(workspace_id),
+        shell_quote(label)
+    )
+}
+
+/// `workspace_id` of the workspace whose label is exactly `label` in a
+/// `herdr workspace list` response, or `None` when no workspace matches (or
+/// the output isn't the JSON shape we expect).
+pub fn herdr_workspace_id_by_label(output: &str, label: &str) -> Option<String> {
+    let line = output.lines().find(|l| l.trim_start().starts_with('{'))?;
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    v.get("result")?
+        .get("workspaces")?
+        .as_array()?
+        .iter()
+        .find(|w| w.get("label").and_then(|l| l.as_str()) == Some(label))?
+        .get("workspace_id")?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// Shell command that creates a workspace rooted at the project directory in
 /// the named herdr session, so the first attach opens in the project instead
 /// of the login dir. Guarded server-side: the create only runs if the session
@@ -761,6 +794,26 @@ mod tests {
         assert!(create.contains("--label My\\ App"), "got {create}");
         // Server-side guard against concurrent double-seeding.
         assert!(create.contains("grep -q workspace_id ||"), "got {create}");
+        assert_eq!(
+            herdr_workspace_rename_cmd("devme-api-abc", "w1", "devme: api"),
+            "env HERDR_SESSION=devme-api-abc herdr workspace rename w1 'devme: api'"
+        );
+    }
+
+    #[test]
+    fn herdr_workspace_label_marks_the_devme_instance() {
+        assert_eq!(herdr_workspace_label("api"), "devme: api");
+    }
+
+    #[test]
+    fn herdr_workspace_id_by_label_matches_exactly() {
+        let list = r#"{"id":"cli:workspace:list","result":{"type":"workspace_list","workspaces":[{"workspace_id":"w1","label":"api"},{"workspace_id":"w2","label":"scratch"}]}}"#;
+        assert_eq!(herdr_workspace_id_by_label(list, "api"), Some("w1".into()));
+        assert_eq!(herdr_workspace_id_by_label(list, "scratch"), Some("w2".into()));
+        // Already-renamed or custom labels don't match the bare default.
+        assert_eq!(herdr_workspace_id_by_label(list, "devme: api"), None);
+        assert_eq!(herdr_workspace_id_by_label("garbage", "api"), None);
+        assert_eq!(herdr_workspace_id_by_label("", "api"), None);
     }
 
     #[test]

@@ -558,14 +558,20 @@ async fn up(
             await_all_running(&mut client, &snapshot, timeout).await?;
         }
         let n = snapshot.len();
-        let verb = if fresh_daemon { "started" } else { "attached to" };
-        println!(
-            "devme: {verb} {n} service{}; daemon running in background.\n\
-             devme logs <service>   tail one service\n\
-             devme status           snapshot\n\
-             devme down             stop everything",
-            if n == 1 { "" } else { "s" }
-        );
+        let plural = if n == 1 { "" } else { "s" };
+        if fresh_daemon {
+            println!(
+                "devme: started {n} service{plural}; daemon running in background.\n\
+                 devme logs <service>   tail one service\n\
+                 devme status           snapshot\n\
+                 devme down             stop everything"
+            );
+        } else {
+            // Re-entry — the stack was already up; one line, no hint block
+            // (it printed when the daemon booted, and `devme remote` re-runs
+            // `up -d` on every attach).
+            println!("devme: {n} service{plural} up; daemon already running.");
+        }
         maybe_skill_update();
         maybe_show_skills_hint();
         return Ok(());
@@ -1512,6 +1518,17 @@ use devme_supervisor::spawn::{
 /// still have a terminal attached (ADR-0014).
 async fn ensure_daemon(sock: &std::path::Path) -> anyhow::Result<bool> {
     let cwd = std::env::current_dir()?;
+
+    // Re-entrant `up` (daemon already listening): skip the boot preflight —
+    // env resolution, dependency checks, Docker, port probes all gated the
+    // *boot* that already happened, and re-running them adds seconds and a
+    // full "Check dependencies" tree to every re-attach (`devme remote` runs
+    // `up -d` on each attach). A daemon that's alive resolved its env and
+    // passed its checks when it booted; if dependencies broke since, `devme
+    // doctor` (or `down` + `up`) is the re-check path.
+    if devme_client::Client::connect(sock).await.is_ok() {
+        return Ok(false);
+    }
 
     let config_path = cwd.join("devme.toml");
     if let Ok(toml_str) = std::fs::read_to_string(&config_path)

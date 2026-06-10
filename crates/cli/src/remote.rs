@@ -386,11 +386,37 @@ fn print_sync_summary(session: &str, quiet: bool) {
 
 // --- ssh wrappers -----------------------------------------------------------
 
+/// `ssh` with devme's shared options: connection **multiplexing** (one
+/// attach runs several ssh commands back-to-back — up, herdr seeding, the
+/// attach itself; `ControlMaster=auto` makes every call after the first
+/// reuse the master's connection instead of paying a fresh handshake) and
+/// `LogLevel=ERROR` (drops the "Connection to <host> closed." banner a pty
+/// session prints on exit; real errors still surface). The control socket
+/// lives in devme's runtime dir — `%C` hashes host/port/user so distinct
+/// targets never share a master. Multiplexing is best-effort: with no
+/// runtime dir, plain per-call connections still work.
+fn ssh_command() -> Command {
+    let mut cmd = Command::new("ssh");
+    cmd.args(["-o", "LogLevel=ERROR"]);
+    if let Ok(dir) = paths::runtime_dir() {
+        let sock = dir.join("ssh-%C");
+        cmd.args([
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            &format!("ControlPath={}", sock.display()),
+            "-o",
+            "ControlPersist=60s",
+        ]);
+    }
+    cmd
+}
+
 /// Run a command on the remote over SSH non-interactively, returning
 /// (success, combined-output). `BatchMode` fails fast instead of hanging on
 /// a password prompt; `ConnectTimeout` caps an unreachable host.
 fn ssh_check(host: &str, remote_cmd: &str) -> (bool, String) {
-    let out = Command::new("ssh")
+    let out = ssh_command()
         .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, remote_cmd])
         .output();
     match out {
@@ -427,7 +453,7 @@ fn remote_up(r: &Resolved, flags: RunFlags) {
     if !flags.quiet {
         eprintln!("devme remote: ensuring stack is up on {} …", r.host);
     }
-    let mut ssh = Command::new("ssh");
+    let mut ssh = ssh_command();
     ssh.args(["-o", "BatchMode=yes"]);
     // Allocate a remote TTY when both stdio ends are terminals (a piped
     // stdout must stay CRLF-free) and prompting is allowed, so first-run
@@ -455,10 +481,13 @@ fn remote_up(r: &Resolved, flags: RunFlags) {
 /// directory. herdr creates a fresh session's first workspace at *attach*
 /// time with the server's cwd (the SSH login dir, i.e. `~`) — so for the
 /// shipped `herdr` preset devme pre-starts the session server and seeds a
-/// workspace rooted at the project via herdr's socket-API CLI. A session
-/// that already has workspaces is left untouched (it's the user's
-/// arrangement). Best-effort throughout: any failure falls through to a
-/// plain attach — worst case herdr opens in `~`, the pre-seed behavior.
+/// workspace rooted at the project via herdr's socket-API CLI, labeled
+/// `devme: <project>` so it's obvious which space is the running devme
+/// instance. In an already-seeded session, a workspace still carrying the
+/// bare project name is renamed to that label; everything else is the user's
+/// arrangement and left untouched. Best-effort throughout: any failure falls
+/// through to a plain attach — worst case herdr opens in `~`, the pre-seed
+/// behavior.
 fn herdr_prepare(r: &Resolved, quiet: bool) {
     let list_cmd = remote::herdr_list_cmd(&r.session);
     let (mut ok, mut out) = ssh_check(&r.host, &list_cmd);
@@ -486,21 +515,34 @@ fn herdr_prepare(r: &Resolved, quiet: bool) {
             return;
         }
     }
-    // Only a *confirmed* empty session gets seeded — `None` (unexpected
-    // output shape) must not create workspaces in a session we misread.
-    if remote::herdr_workspace_count(&out) != Some(0) {
-        return;
-    }
-    let label = r
+    let name = r
         .local_root
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("devme")
         .to_string();
-    let create = remote::herdr_workspace_create_cmd(&r.session, &r.remote_path, &label);
-    let (created, _) = ssh_check(&r.host, &create);
-    if created && !quiet {
-        eprintln!("devme remote: opened herdr workspace at {}", r.remote_path);
+    let label = remote::herdr_workspace_label(&name);
+    match remote::herdr_workspace_count(&out) {
+        // Only a *confirmed* empty session gets seeded — `None` (unexpected
+        // output shape) must not create workspaces in a session we misread.
+        Some(0) => {
+            let create = remote::herdr_workspace_create_cmd(&r.session, &r.remote_path, &label);
+            let (created, _) = ssh_check(&r.host, &create);
+            if created && !quiet {
+                eprintln!("devme remote: opened herdr workspace at {}", r.remote_path);
+            }
+        }
+        // Already-seeded session: a workspace still carrying the bare project
+        // name (an older devme's seed, or herdr's attach-time auto-create)
+        // gets upgraded to the devme label so the UI shows which space is the
+        // running instance. Anything else is the user's arrangement — kept.
+        Some(_) => {
+            if let Some(id) = remote::herdr_workspace_id_by_label(&out, &name) {
+                let rename = remote::herdr_workspace_rename_cmd(&r.session, &id, &label);
+                let _ = ssh_check(&r.host, &rename);
+            }
+        }
+        None => {}
     }
 }
 
@@ -572,7 +614,7 @@ fn remote_devme_cmd(r: &Resolved, args: &[String]) -> String {
 /// -f`, `up` foreground, and Ctrl-C all behave).
 fn proxy_passthrough(r: &Resolved) -> i32 {
     let cmd = remote_devme_cmd(r, &forwarded_args());
-    let mut ssh = Command::new("ssh");
+    let mut ssh = ssh_command();
     // Allocate a remote TTY only when stdin *and* stdout are terminals — so
     // interactive streaming (`logs -f`, foreground `up`) works, but piped
     // output (`logs --json | jq`, agents, scripts) stays clean: a pty would
@@ -594,7 +636,7 @@ fn proxy_passthrough(r: &Resolved) -> i32 {
 /// browser-reachable host and (optionally) open it on the laptop.
 fn proxy_url(r: &Resolved, service: &str, open: bool) -> i32 {
     let cmd = remote_devme_cmd(r, &["url".into(), service.into()]);
-    let out = Command::new("ssh")
+    let out = ssh_command()
         .args(["-o", "BatchMode=yes", &r.host])
         .arg(&cmd)
         .output();
