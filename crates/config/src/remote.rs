@@ -696,13 +696,13 @@ pub fn sync_transition_message(
         }
         // Only celebrate recovery if we were previously *in* a problem — not on
         // a healthy cold start (from == None).
-        SyncHealth::Healthy => from.map(|_| "✓ live-sync healthy again".to_string()),
+        SyncHealth::Healthy => from.map(|_| "✔ live-sync healthy again".to_string()),
     }
 }
 
 /// A compact one-line status for `devme remote status --watch` and the
 /// post-detach summary. `status` is Mutagen's raw status string, folded in
-/// when healthy for a little extra context ("✓ synced · Watching for changes").
+/// when healthy for a little extra context ("✔ synced · Watching for changes").
 pub fn sync_status_line(health: SyncHealth, conflicts: u64, status: Option<&str>) -> String {
     match health {
         SyncHealth::Conflict => {
@@ -713,8 +713,8 @@ pub fn sync_status_line(health: SyncHealth, conflicts: u64, status: Option<&str>
             _ => "⚠ sync down (halted / disconnected)".to_string(),
         },
         SyncHealth::Healthy => match status {
-            Some(s) if !s.is_empty() => format!("✓ synced · {s}"),
-            _ => "✓ synced".to_string(),
+            Some(s) if !s.is_empty() => format!("✔ synced · {s}"),
+            _ => "✔ synced".to_string(),
         },
     }
 }
@@ -1146,7 +1146,7 @@ bare
         use SyncHealth::*;
         assert!(sync_status_line(Conflict, 3, None).contains("3 conflict"));
         assert!(sync_status_line(Down, 0, Some("Halted")).contains("Halted"));
-        assert!(sync_status_line(Healthy, 0, Some("Watching for changes")).starts_with("✓ synced"));
-        assert_eq!(sync_status_line(Healthy, 0, None), "✓ synced");
+        assert!(sync_status_line(Healthy, 0, Some("Watching for changes")).starts_with("✔ synced"));
+        assert_eq!(sync_status_line(Healthy, 0, None), "✔ synced");
     }
 }

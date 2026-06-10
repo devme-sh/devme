@@ -18,6 +18,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use devme_ui::scoped;
+
+/// Every `devme remote` one-liner goes through this scope, so the whole
+/// surface speaks as `devme remote: …` (ADR-0017).
+const R: devme_ui::Scope = scoped("remote");
 use devme_config::{GlobalConfig, paths, remote};
 use devme_config::remote::{SyncHealth, shell_quote};
 
@@ -229,7 +234,7 @@ fn sync_flush(session: &str) -> Result<()> {
 /// Ensure the sync exists; create + flush (wait for the initial pass) on
 /// first run so the remote has the files before we attach. Returns whether
 /// it was freshly created.
-fn ensure_sync(r: &Resolved, quiet: bool) -> Result<bool> {
+fn ensure_sync(r: &Resolved) -> Result<bool> {
     if sync_exists(&r.session) {
         return Ok(false);
     }
@@ -243,13 +248,13 @@ fn ensure_sync(r: &Resolved, quiet: bool) -> Result<bool> {
             r.local_root.display()
         );
     }
-    if !quiet {
-        eprintln!("devme remote: starting live-sync {} → {}", r.local_root.display(), r.beta);
-    }
+    R.info(format!(
+        "starting live-sync {} → {}",
+        r.local_root.display(),
+        r.beta
+    ));
     sync_create(r)?;
-    if !quiet {
-        eprintln!("devme remote: waiting for initial sync…");
-    }
+    R.info("waiting for initial sync…");
     sync_flush(&r.session)?;
     Ok(true)
 }
@@ -291,10 +296,10 @@ fn resolve_worktrees(r: &Resolved) -> Vec<WtSync> {
         }
         let remote_path = remote::remote_path(&r.root, &local_path);
         if !seen.insert(remote_path.clone()) {
-            eprintln!(
-                "devme remote: warning: {} maps to the same remote dir as another worktree — skipping",
+            R.warn(format!(
+                "{} maps to the same remote dir as another worktree — skipping",
                 local_path.display()
-            );
+            ));
             continue;
         }
         let session = remote::sync_session_name(&local_path);
@@ -324,44 +329,44 @@ fn ensure_worktree_syncs(r: &Resolved) {
     let _ = sync_flush(&r.session);
     for wt in pending {
         let Some(branch) = &wt.branch else {
-            eprintln!(
-                "devme remote: skipping {} (detached HEAD — check out a branch to sync it)",
+            R.info(format!(
+                "skipping {} (detached HEAD — check out a branch to sync it)",
                 wt.local_path.display()
-            );
+            ));
             continue;
         };
         let materialize = remote::worktree_materialize_cmd(&r.remote_path, &wt.remote_path, branch);
         let (ok, out) = ssh_check(&r.host, &materialize);
         if !ok {
-            eprintln!(
-                "devme remote: couldn't materialize {} on {}: {out}",
+            R.warn(format!(
+                "couldn't materialize {} on {}: {out}",
                 wt.remote_path, r.host
-            );
+            ));
             continue;
         }
         let created = out.lines().any(|l| l.trim() == "created");
-        eprintln!(
-            "devme remote: starting live-sync {} → {}",
+        R.info(format!(
+            "starting live-sync {} → {}",
             wt.local_path.display(),
             wt.beta
-        );
+        ));
         let local = wt.local_path.to_string_lossy();
         if let Err(e) = sync_create_session(r, &wt.session, &local, &wt.beta, &[".git"]) {
-            eprintln!("devme remote: {e}");
+            R.error(e);
             continue;
         }
         if let Err(e) = sync_flush(&wt.session) {
-            eprintln!("devme remote: {e}");
+            R.error(e);
             continue;
         }
         if created {
             let align = remote::worktree_align_index_cmd(&wt.remote_path);
             let (ok, out) = ssh_check(&r.host, &align);
             if !ok {
-                eprintln!(
-                    "devme remote: warning: couldn't align index for {}: {out}",
+                R.warn(format!(
+                    "couldn't align index for {}: {out}",
                     wt.remote_path
-                );
+                ));
             }
         }
     }
@@ -403,7 +408,7 @@ fn reap_orphan_worktree_syncs(r: &Resolved) {
             continue;
         }
         if !Path::new(&alpha).exists() {
-            eprintln!("devme remote: worktree {alpha} is gone — stopping its sync ({name})");
+            R.info(format!("worktree {alpha} is gone — stopping its sync ({name})"));
             let _ = Command::new("mutagen").args(["sync", "terminate", &name]).status();
         }
     }
@@ -586,19 +591,20 @@ fn spawn_sync_watcher(
 /// without desktop notifications. Under `-q` a healthy close is silent, but a
 /// problem (conflict / down) always prints — quiet suppresses information,
 /// not warnings.
-fn print_sync_summary(session: &str, quiet: bool) {
+fn print_sync_summary(session: &str) {
     let (exists, status, conflicts) = observe_sync(session);
     if !exists {
         return; // sync was stopped/terminated — nothing to summarise.
     }
     let health = remote::classify_sync(exists, status.as_deref(), conflicts);
-    if quiet && health == SyncHealth::Healthy {
-        return;
+    let line = remote::sync_status_line(health, conflicts, status.as_deref());
+    match health {
+        // Healthy close is information (quiet-gated); a problem always
+        // prints — quiet suppresses information, not warnings. The status
+        // line carries its own glyph, so warn() would double it — strip.
+        SyncHealth::Healthy => R.info(line),
+        _ => R.warn(line.trim_start_matches("⚠ ").to_string()),
     }
-    eprintln!(
-        "devme remote: {}",
-        remote::sync_status_line(health, conflicts, status.as_deref())
-    );
 }
 
 // --- ssh wrappers -----------------------------------------------------------
@@ -667,9 +673,7 @@ fn remote_up(r: &Resolved, flags: RunFlags) {
         up.push_str(" -q");
     }
     let cmd = format!("cd {} && {up}", shell_quote(&r.remote_path));
-    if !flags.quiet {
-        eprintln!("devme remote: ensuring stack is up on {} …", r.host);
-    }
+    R.info(format!("ensuring stack is up on {} …", r.host));
     let mut ssh = ssh_command();
     ssh.args(["-o", "BatchMode=yes"]);
     // Allocate a remote TTY when both stdio ends are terminals (a piped
@@ -684,11 +688,11 @@ fn remote_up(r: &Resolved, flags: RunFlags) {
     let status = ssh.arg(&r.host).arg(&cmd).status();
     match status {
         Ok(s) if s.success() => {}
-        Ok(s) => eprintln!(
-            "devme remote: warning: remote `devme up -d` exited {} (attaching anyway)",
+        Ok(s) => R.warn(format!(
+            "remote `devme up -d` exited {} (attaching anyway)",
             s.code().map(|c| c.to_string()).unwrap_or_else(|| "by signal".into())
-        ),
-        Err(e) => eprintln!("devme remote: warning: couldn't start remote stack: {e} (attaching anyway)"),
+        )),
+        Err(e) => R.warn(format!("couldn't start remote stack: {e} (attaching anyway)")),
     }
 }
 
@@ -705,7 +709,7 @@ fn remote_up(r: &Resolved, flags: RunFlags) {
 /// arrangement and left untouched. Best-effort throughout: any failure falls
 /// through to a plain attach — worst case herdr opens in `~`, the pre-seed
 /// behavior.
-fn herdr_prepare(r: &Resolved, quiet: bool) {
+fn herdr_prepare(r: &Resolved) {
     let list_cmd = remote::herdr_list_cmd(&r.session);
     let (mut ok, mut out) = ssh_check(&r.host, &list_cmd);
     if !ok {
@@ -745,8 +749,8 @@ fn herdr_prepare(r: &Resolved, quiet: bool) {
         Some(0) => {
             let create = remote::herdr_workspace_create_cmd(&r.session, &r.remote_path, &label);
             let (created, _) = ssh_check(&r.host, &create);
-            if created && !quiet {
-                eprintln!("devme remote: opened herdr workspace at {}", r.remote_path);
+            if created {
+                R.info(format!("opened herdr workspace at {}", r.remote_path));
             }
         }
         // Already-seeded session: a workspace still carrying the bare project
@@ -865,7 +869,7 @@ fn proxy_passthrough(r: &Resolved) -> i32 {
     match status {
         Ok(s) => s.code().unwrap_or(1),
         Err(e) => {
-            eprintln!("devme: remote proxy failed: {e}");
+            devme_ui::error(format!("remote proxy failed: {e}"));
             1
         }
     }
@@ -886,7 +890,7 @@ fn proxy_url(r: &Resolved, service: &str, open: bool) -> i32 {
             let url = remote::rewrite_url_host(raw, &r.url_host);
             println!("{url}");
             if open && let Err(e) = devme_config::browser::open_url(&url) {
-                eprintln!("devme: couldn't open browser: {e}");
+                devme_ui::warn(format!("couldn't open browser: {e}"));
             }
             0
         }
@@ -895,7 +899,7 @@ fn proxy_url(r: &Resolved, service: &str, open: bool) -> i32 {
             o.status.code().unwrap_or(1)
         }
         Err(e) => {
-            eprintln!("devme: remote proxy failed: {e}");
+            devme_ui::error(format!("remote proxy failed: {e}"));
             1
         }
     }
@@ -910,7 +914,7 @@ pub fn run(cwd: &Path, flags: RunFlags) -> Result<()> {
     let r = resolve(cwd)?;
     require_mutagen()?;
     ensure_mutagen_daemon();
-    ensure_sync(&r, flags.quiet)?;
+    ensure_sync(&r)?;
     ensure_worktree_syncs(&r);
     reap_orphan_worktree_syncs(&r);
 
@@ -925,13 +929,11 @@ pub fn run(cwd: &Path, flags: RunFlags) -> Result<()> {
     // The herdr preset gets its remote session seeded (server + project-
     // rooted workspace) so the attach lands in the project dir, not `~`.
     if r.attach == "herdr" {
-        herdr_prepare(&r, flags.quiet);
+        herdr_prepare(&r);
     }
 
     let cmd = remote::expand_attach(&r.attach, &r.host, &r.remote_path, &r.session, &r.url_host);
-    if !flags.quiet {
-        eprintln!("devme remote: attaching ({}) → {}", r.attach, r.host);
-    }
+    R.info(format!("attaching ({}) → {}", r.attach, r.host));
 
     // Watch the sync in the background for the life of the session: a two-way-
     // safe halt on conflict is silent and laptop-side, so the remote TUI you're
@@ -959,13 +961,13 @@ pub fn run(cwd: &Path, flags: RunFlags) -> Result<()> {
     stop.store(true, Ordering::Relaxed);
     let _ = watcher.join();
     let _ = sync_flush(&r.session);
-    print_sync_summary(&r.session, flags.quiet);
+    print_sync_summary(&r.session);
 
     if !status.success() {
         // A non-zero exit here is usually just the user quitting the remote
         // session — report it without dressing it up as a devme failure.
         if let Some(code) = status.code() {
-            eprintln!("devme remote: attach exited with status {code}");
+            R.info(format!("attach exited with status {code}"));
         }
     }
     Ok(())
@@ -975,11 +977,11 @@ pub fn run(cwd: &Path, flags: RunFlags) -> Result<()> {
 /// worktrees) without attaching, creating sessions for worktrees added since
 /// the last run and reaping sessions whose worktree is gone. Handy from a
 /// wake hook or a script.
-pub fn sync(cwd: &Path, quiet: bool) -> Result<()> {
+pub fn sync(cwd: &Path) -> Result<()> {
     let r = resolve(cwd)?;
     require_mutagen()?;
     ensure_mutagen_daemon();
-    if !ensure_sync(&r, quiet)? {
+    if !ensure_sync(&r)? {
         sync_flush(&r.session)?;
     }
     ensure_worktree_syncs(&r);
@@ -989,9 +991,7 @@ pub fn sync(cwd: &Path, quiet: bool) -> Result<()> {
             let _ = sync_flush(&name);
         }
     }
-    if !quiet {
-        eprintln!("devme remote: synced {} ⇄ {}", r.local_root.display(), r.beta);
-    }
+    R.success(format!("synced {} ⇄ {}", r.local_root.display(), r.beta));
     Ok(())
 }
 
@@ -999,7 +999,7 @@ pub fn sync(cwd: &Path, quiet: bool) -> Result<()> {
 /// switch that decides whether bare `devme` is local-first (opens the local
 /// TUI) or remote-first (behaves as `devme remote`). A shortcut for
 /// `devme config set remote.default true|false`.
-pub fn toggle(quiet: bool) -> Result<()> {
+pub fn toggle() -> Result<()> {
     let mut cfg = GlobalConfig::load();
     let enabled = !cfg.remote.is_default();
     cfg.remote.default = Some(enabled);
@@ -1010,29 +1010,29 @@ pub fn toggle(quiet: bool) -> Result<()> {
         // which is exactly the surprise this message preempts.
         match cfg.remote.host.as_deref().filter(|h| !h.trim().is_empty()) {
             Some(host) => {
-                if !quiet {
-                    eprintln!("devme remote: default = remote — bare `devme` now syncs + attaches to {host}");
-                }
+                R.info(format!(
+                    "default = remote — bare `devme` now syncs + attaches to {host}"
+                ));
             }
             None => {
-                eprintln!("devme remote: default = remote — but no host is set, so bare `devme` stays local");
-                eprintln!("  set one: devme config set remote.host <ssh-target>");
+                R.warn("default = remote — but no host is set, so bare `devme` stays local");
+                devme_ui::hint("set one: devme config set remote.host <ssh-target>");
             }
         }
-    } else if !quiet {
-        eprintln!("devme remote: default = local — bare `devme` opens the local TUI");
+    } else {
+        R.info("default = local — bare `devme` opens the local TUI");
     }
     Ok(())
 }
 
 /// `devme remote stop`: terminate this repo's sync sessions — main and
 /// worktrees (the remote files stay; the live links stop).
-pub fn stop(cwd: &Path, quiet: bool) -> Result<()> {
+pub fn stop(cwd: &Path) -> Result<()> {
     let r = resolve(cwd)?;
     require_mutagen()?;
     let sessions = repo_sessions(&r);
     if sessions.is_empty() {
-        eprintln!("devme remote: no live-sync for this project");
+        R.info("no live-sync for this project");
         return Ok(());
     }
     for (name, _) in sessions {
@@ -1044,24 +1044,20 @@ pub fn stop(cwd: &Path, quiet: bool) -> Result<()> {
             bail!("`mutagen sync terminate` failed for {name}");
         }
     }
-    if !quiet {
-        eprintln!("devme remote: stopped live-sync for {}", r.remote_path);
-    }
+    R.success(format!("stopped live-sync for {}", r.remote_path));
     Ok(())
 }
 
 /// `devme remote flush`: force an immediate reconcile (e.g. right after the
 /// laptop wakes), instead of waiting for the next watch/poll cycle.
-pub fn flush(cwd: &Path, quiet: bool) -> Result<()> {
+pub fn flush(cwd: &Path) -> Result<()> {
     let r = resolve(cwd)?;
     require_mutagen()?;
     if !sync_exists(&r.session) {
         bail!("no live-sync for this project — start one with `devme remote`");
     }
     sync_flush(&r.session)?;
-    if !quiet {
-        eprintln!("devme remote: flushed {}", r.session);
-    }
+    R.success(format!("flushed {}", r.session));
     Ok(())
 }
 
@@ -1082,7 +1078,8 @@ pub fn wake() -> Result<()> {
     // of the next time you happen to run a devme command.
     let n = devme_conflict_total();
     if n > 0 {
-        eprintln!("devme remote: ⚠ {n} conflict(s) across devme syncs — run `devme remote conflicts`");
+        R.warn(format!("{n} conflict(s) across devme syncs"));
+        devme_ui::hint("devme remote conflicts");
         notify(&format!("{n} sync conflict(s) after wake — run `devme remote conflicts`"));
     }
     Ok(())
@@ -1104,17 +1101,17 @@ pub fn wake_hook(uninstall: bool) -> Result<()> {
 
     if uninstall {
         if !existing.contains(WAKE_BEGIN) {
-            eprintln!("devme remote: no wake-hook installed");
+            R.info("no wake-hook installed");
             return Ok(());
         }
         let cleaned = strip_marked_block(&existing);
         std::fs::write(&path, cleaned).context("updating ~/.wakeup")?;
-        eprintln!("devme remote: wake-hook removed from {}", path.display());
+        R.success(format!("wake-hook removed from {}", path.display()));
         return Ok(());
     }
 
     if existing.contains(WAKE_BEGIN) {
-        eprintln!("devme remote: wake-hook already installed in {}", path.display());
+        R.info(format!("wake-hook already installed in {}", path.display()));
         return Ok(());
     }
     let mut content = existing;
@@ -1141,7 +1138,7 @@ pub fn wake_hook(uninstall: bool) -> Result<()> {
             let _ = std::fs::set_permissions(&path, perms);
         }
     }
-    eprintln!("devme remote: wake-hook installed in {}", path.display());
+    R.success(format!("wake-hook installed in {}", path.display()));
     if !sleepwatcher_present() {
         eprintln!(
             "  note: install + start sleepwatcher so it fires:\n    brew install sleepwatcher && brew services start sleepwatcher"
@@ -1233,7 +1230,7 @@ pub fn status(cwd: &Path, json: bool, watch: bool) -> Result<()> {
             "raw": raw,
             "worktrees": worktrees,
         });
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        devme_ui::json(&value);
         return Ok(());
     }
 
@@ -1275,7 +1272,7 @@ pub fn status(cwd: &Path, json: bool, watch: bool) -> Result<()> {
 /// line with `\r` is safe here — unlike the background watcher.
 fn status_watch(session: &str) -> Result<()> {
     use std::io::Write;
-    eprintln!("watching {session} (Ctrl-C to stop)…");
+    R.info(format!("watching {session} (Ctrl-C to stop)…"));
     let mut last_line = String::new();
     loop {
         let (exists, status, conflicts) = observe_sync(session);
@@ -1337,7 +1334,7 @@ pub fn conflicts(cwd: &Path, json: bool) -> Result<()> {
             let v = serde_json::json!({
                 "session": r.session, "exists": false, "conflicts": 0, "paths": [],
             });
-            println!("{}", serde_json::to_string_pretty(&v)?);
+            devme_ui::json(&v);
         } else {
             println!("no live-sync for this project (run `devme remote` to start one)");
         }
@@ -1356,7 +1353,7 @@ pub fn conflicts(cwd: &Path, json: bool) -> Result<()> {
             "conflicts": count,
             "paths": paths,
         });
-        println!("{}", serde_json::to_string_pretty(&v)?);
+        devme_ui::json(&v);
         return Ok(());
     }
 
@@ -1615,22 +1612,29 @@ pub fn doctor(cwd: &Path, json: bool) -> Result<()> {
             "remote_path": r.remote_path,
             "checks": arr,
         });
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        devme_ui::json(&value);
         return Ok(());
     }
 
-    println!("remote: {} → {}", r.host, r.remote_path);
+    // The checklist is the command's report — stdout, house tree style.
+    let mut out = std::io::stdout();
+    let style = devme_ui::out_style();
+    let note = format!("{} → {}", r.host, r.remote_path);
+    let mut sec = devme_ui::Section::begin_noted(&mut out, style, "Remote preflight", Some(&note))?;
     for c in &checks {
-        let mark = if c.ok { "✔" } else { "✗" };
-        println!("  {mark} {:<22} {}", c.name, c.detail);
+        let kind = if c.ok { devme_ui::Item::Ok } else { devme_ui::Item::Fail };
+        sec.item(kind, &format!("{:<22}", c.name), Some(&c.detail))?;
         if let Some(h) = &c.hint {
-            println!("      ↳ {h}");
+            sec.hint(h)?;
         }
     }
     if all_ok {
-        println!("\nall checks passed — `devme remote` is ready");
+        sec.end(devme_ui::Item::Ok, "all checks passed — `devme remote` is ready")?;
     } else {
-        println!("\nsome checks failed — fix the hints above, then re-run `devme remote doctor`");
+        sec.end(
+            devme_ui::Item::Warn,
+            "some checks failed — fix the hints above, then re-run `devme remote doctor`",
+        )?;
     }
     Ok(())
 }

@@ -12,19 +12,7 @@ use std::process::Command;
 
 use devme_config::{Provision, Stack};
 use devme_core::Trust;
-
-// Shared Clack-style constants
-const S_BAR: &str = "│";
-const S_BAR_END: &str = "└";
-const S_STEP_ACTIVE: &str = "◆";
-const S_STEP_SUBMIT: &str = "◇";
-const C_RESET: &str = "\x1b[0m";
-const C_DIM: &str = "\x1b[2m";
-const C_BOLD: &str = "\x1b[1m";
-const C_CYAN: &str = "\x1b[36m";
-const C_GREEN: &str = "\x1b[32m";
-const C_YELLOW: &str = "\x1b[33m";
-const C_RED: &str = "\x1b[31m";
+use devme_ui::{Item, Section, Style};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepResult {
@@ -127,23 +115,14 @@ fn provision_and_report<W: Write>(
     check: &str,
     cmd: &str,
     cwd: &Path,
-    output: &mut W,
+    sec: &mut Section<W>,
 ) -> Result<StepResult, std::io::Error> {
-    writeln!(
-        output,
-        "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}running...{C_RESET}"
-    )?;
+    sec.sub_note("running…")?;
     if run_provision(cmd, cwd) && run_check(check, cwd) {
-        writeln!(
-            output,
-            "  {C_DIM}{S_BAR}{C_RESET}    {C_GREEN}{S_STEP_SUBMIT} Installed{C_RESET}"
-        )?;
+        sec.sub(Item::Ok, "Installed")?;
         Ok(StepResult::Provisioned)
     } else {
-        writeln!(
-            output,
-            "  {C_DIM}{S_BAR}{C_RESET}    {C_RED}▲ Failed to install{C_RESET}"
-        )?;
+        sec.sub(Item::Fail, "Failed to install")?;
         Ok(StepResult::Failed)
     }
 }
@@ -185,6 +164,7 @@ pub fn run_preflight<R: BufRead, W: Write>(
     output: &mut W,
     interactive: bool,
     assume_yes: bool,
+    style: Style,
 ) -> Result<PreflightResult, std::io::Error> {
     let steps = preflight_steps(stack);
     if steps.is_empty() {
@@ -202,32 +182,17 @@ pub fn run_preflight<R: BufRead, W: Write>(
     }
 
     let all_passed = check_results.iter().all(|(_, p)| *p);
-    let _any_failed = check_results.iter().any(|(_, p)| !*p);
 
-    // Render header
-    writeln!(output)?;
-    writeln!(
-        output,
-        "  {C_CYAN}{S_STEP_ACTIVE}{C_RESET}  {C_BOLD}Check dependencies{C_RESET}"
-    )?;
-    writeln!(output, "  {C_DIM}{S_BAR}{C_RESET}")?;
+    let mut sec = Section::begin(output, style, "Check dependencies")?;
 
     if all_passed {
         // Everything is good — compact display
         for (name, _) in &check_results {
             let step = &stack.step[name];
             let label = step.description.as_deref().unwrap_or(name);
-            writeln!(
-                output,
-                "  {C_DIM}{S_BAR}{C_RESET}  {C_GREEN}{S_STEP_SUBMIT}{C_RESET} {label}"
-            )?;
+            sec.ok(label)?;
         }
-        writeln!(output, "  {C_DIM}{S_BAR}{C_RESET}")?;
-        writeln!(
-            output,
-            "  {S_BAR_END}  {C_GREEN}All dependencies satisfied{C_RESET}"
-        )?;
-        writeln!(output)?;
+        sec.end(Item::Ok, "All dependencies satisfied")?;
 
         for (name, _) in check_results {
             results.push((name, StepResult::Passed));
@@ -241,16 +206,10 @@ pub fn run_preflight<R: BufRead, W: Write>(
         let label = step.description.as_deref().unwrap_or(name.as_str());
 
         if *passed {
-            writeln!(
-                output,
-                "  {C_DIM}{S_BAR}{C_RESET}  {C_GREEN}{S_STEP_SUBMIT}{C_RESET} {label}"
-            )?;
+            sec.ok(label)?;
             results.push((name.clone(), StepResult::Passed));
         } else {
-            writeln!(
-                output,
-                "  {C_DIM}{S_BAR}{C_RESET}  {C_YELLOW}▲{C_RESET} {C_BOLD}{label}{C_RESET}  {C_DIM}not found{C_RESET}"
-            )?;
+            sec.warn_item(label, Some("not found"))?;
 
             // `--yes` promotes a `prompt` step to `auto`; `manual` is never
             // promoted and `auto` is already unattended.
@@ -262,22 +221,16 @@ pub fn run_preflight<R: BufRead, W: Write>(
 
             match &step.provision {
                 Some(Provision::Shell(cmd)) => {
-                    writeln!(
-                        output,
-                        "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}fix: {cmd}{C_RESET}"
-                    )?;
+                    sec.hint(&format!("fix: {cmd}"))?;
                     match effective_trust {
                         // Never auto-run: surface the command for the user.
                         Trust::Manual => {
-                            writeln!(
-                                output,
-                                "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}run this yourself{C_RESET}"
-                            )?;
+                            sec.sub_note("run this yourself")?;
                             results.push((name.clone(), StepResult::Manual));
                         }
                         // Safe by declaration (or `--yes`): run without asking.
                         Trust::Auto => {
-                            let r = provision_and_report(&step.check, cmd, cwd, output)?;
+                            let r = provision_and_report(&step.check, cmd, cwd, &mut sec)?;
                             results.push((name.clone(), r));
                         }
                         // Ask first — but only when we have a terminal.
@@ -286,16 +239,12 @@ pub fn run_preflight<R: BufRead, W: Write>(
                                 results.push((name.clone(), StepResult::Failed));
                                 continue;
                             }
-                            write!(
-                                output,
-                                "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}Run fix? Enter to run, s to skip ›{C_RESET} "
-                            )?;
-                            output.flush()?;
+                            sec.prompt("Run fix? Enter to run, s to skip ›")?;
 
                             let mut line = String::new();
                             match input.read_line(&mut line) {
                                 Ok(0) => {
-                                    writeln!(output)?;
+                                    sec.newline()?;
                                     results.push((name.clone(), StepResult::Skipped));
                                     continue;
                                 }
@@ -308,23 +257,17 @@ pub fn run_preflight<R: BufRead, W: Write>(
 
                             let trimmed = line.trim();
                             if trimmed == "s" || trimmed == "S" || trimmed == "skip" {
-                                writeln!(
-                                    output,
-                                    "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}{S_STEP_SUBMIT} Skipped{C_RESET}"
-                                )?;
+                                sec.sub_note("skipped")?;
                                 results.push((name.clone(), StepResult::Skipped));
                             } else {
-                                let r = provision_and_report(&step.check, cmd, cwd, output)?;
+                                let r = provision_and_report(&step.check, cmd, cwd, &mut sec)?;
                                 results.push((name.clone(), r));
                             }
                         }
                     }
                 }
                 Some(Provision::Wizard { wizard }) => {
-                    writeln!(
-                        output,
-                        "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}requires wizard: {wizard}{C_RESET}"
-                    )?;
+                    sec.sub_note(&format!("requires wizard: {wizard}"))?;
                     results.push((name.clone(), StepResult::Failed));
                 }
                 None => {
@@ -336,24 +279,21 @@ pub fn run_preflight<R: BufRead, W: Write>(
     }
 
     // Outro
-    writeln!(output, "  {C_DIM}{S_BAR}{C_RESET}")?;
     let failed_count = results
         .iter()
         .filter(|(_, r)| *r == StepResult::Failed)
         .count();
     if failed_count > 0 {
-        writeln!(
-            output,
-            "  {S_BAR_END}  {C_YELLOW}{failed_count} dependency check{} failed{C_RESET}",
-            if failed_count == 1 { "" } else { "s" }
+        sec.end(
+            Item::Warn,
+            &format!(
+                "{failed_count} dependency check{} failed",
+                if failed_count == 1 { "" } else { "s" }
+            ),
         )?;
     } else {
-        writeln!(
-            output,
-            "  {S_BAR_END}  {C_GREEN}All dependencies resolved{C_RESET}"
-        )?;
+        sec.end(Item::Ok, "All dependencies resolved")?;
     }
-    writeln!(output)?;
 
     Ok(PreflightResult { results })
 }
@@ -383,7 +323,7 @@ description = "Shell available"
         let mut output = Vec::new();
         let dir = std::env::temp_dir();
 
-        let result = run_preflight(&stack, &dir, &mut input, &mut output, false, false).unwrap();
+        let result = run_preflight(&stack, &dir, &mut input, &mut output, false, false, Style::PLAIN).unwrap();
         assert_eq!(result.results[0].1, StepResult::Passed);
 
         let text = String::from_utf8(output).unwrap();
@@ -432,7 +372,7 @@ description = "Missing tool"
         let mut output = Vec::new();
         let dir = std::env::temp_dir();
 
-        let result = run_preflight(&stack, &dir, &mut input, &mut output, true, false).unwrap();
+        let result = run_preflight(&stack, &dir, &mut input, &mut output, true, false, Style::PLAIN).unwrap();
         assert_eq!(result.results[0].1, StepResult::Skipped);
     }
 
@@ -476,7 +416,7 @@ trust = "auto"
         let cwd = TempCwd::new("auto");
         let mut input = Cursor::new(b""); // no input — proves no prompt
         let mut output = Vec::new();
-        let result = run_preflight(&stack, &cwd.0, &mut input, &mut output, false, false).unwrap();
+        let result = run_preflight(&stack, &cwd.0, &mut input, &mut output, false, false, Style::PLAIN).unwrap();
 
         assert_eq!(result.results[0].1, StepResult::Provisioned);
     }
@@ -499,7 +439,7 @@ description = "Privileged step"
         let dir = std::env::temp_dir();
         let mut input = Cursor::new(b"\n");
         let mut output = Vec::new();
-        let result = run_preflight(&stack, &dir, &mut input, &mut output, true, false).unwrap();
+        let result = run_preflight(&stack, &dir, &mut input, &mut output, true, false, Style::PLAIN).unwrap();
 
         assert_eq!(result.results[0].1, StepResult::Manual);
         let text = String::from_utf8(output).unwrap();
@@ -521,7 +461,7 @@ provision = "touch marker"
         let cwd = TempCwd::new("yes");
         let mut input = Cursor::new(b""); // no Enter available
         let mut output = Vec::new();
-        let result = run_preflight(&stack, &cwd.0, &mut input, &mut output, false, true).unwrap();
+        let result = run_preflight(&stack, &cwd.0, &mut input, &mut output, false, true, Style::PLAIN).unwrap();
 
         assert_eq!(result.results[0].1, StepResult::Provisioned);
     }

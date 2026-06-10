@@ -355,6 +355,7 @@ dependencies = [
  "devme-core",
  "devme-supervisor",
  "devme-tui",
+ "devme-ui",
  "serde",
  "serde_json",
  "tempfile",
@@ -472,6 +473,7 @@ dependencies = [
  "devme-executor",
  "devme-ipc",
  "devme-slot-allocator",
+ "devme-ui",
  "futures-util",
  "libc",
  "portable-pty",
@@ -508,6 +510,13 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "devme-ui"
+version = "0.4.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

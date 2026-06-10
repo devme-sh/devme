@@ -8,16 +8,7 @@
 
 use std::io::{BufRead, IsTerminal, Write};
 
-// Clack-style glyphs
-const S_BAR: &str = "│";
-const S_RADIO_ACTIVE: &str = "●";
-const S_RADIO_INACTIVE: &str = "○";
-
-// Colors
-const C_RESET: &str = "\x1b[0m";
-const C_DIM: &str = "\x1b[2m";
-const C_CYAN: &str = "\x1b[36m";
-const C_YELLOW: &str = "\x1b[33m";
+use devme_ui::{Style, glyph};
 
 /// Pick one of `choices`, pre-selecting `default_idx`.
 ///
@@ -29,29 +20,33 @@ pub fn select_one<R: BufRead, W: Write>(
     output: &mut W,
     choices: &[String],
     default_idx: usize,
+    style: Style,
 ) -> std::io::Result<Option<usize>> {
     if std::io::stdin().is_terminal() {
-        pick_choice(output, choices, default_idx)
+        pick_choice(output, choices, default_idx, style)
     } else {
-        pick_choice_numbered(input, output, choices, default_idx)
+        pick_choice_numbered(input, output, choices, default_idx, style)
     }
 }
 
 /// Render N choice lines into a string for the picker.
-fn format_choices(choices: &[String], selected: usize, default_idx: usize) -> String {
+fn format_choices(choices: &[String], selected: usize, default_idx: usize, style: Style) -> String {
     let mut buf = String::new();
+    let bar = style.dim(glyph::BAR);
     for (i, choice) in choices.iter().enumerate() {
         if i == selected {
             buf.push_str(&format!(
-                "  {C_DIM}{S_BAR}{C_RESET}  {C_CYAN}{S_RADIO_ACTIVE}{C_RESET} {choice}"
+                "  {bar}  {} {choice}",
+                style.accent(glyph::RADIO_ON)
             ));
         } else {
             buf.push_str(&format!(
-                "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}{S_RADIO_INACTIVE} {choice}{C_RESET}"
+                "  {bar}  {}",
+                style.dim(&format!("{} {choice}", glyph::RADIO_OFF))
             ));
         }
         if i == default_idx {
-            buf.push_str(&format!(" {C_DIM}(default){C_RESET}"));
+            buf.push_str(&format!(" {}", style.dim("(default)")));
         }
         buf.push_str("\r\n");
     }
@@ -65,6 +60,7 @@ pub fn pick_choice<W: Write>(
     output: &mut W,
     choices: &[String],
     default_idx: usize,
+    style: Style,
 ) -> Result<Option<usize>, std::io::Error> {
     use crossterm::{
         event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -76,7 +72,7 @@ pub fn pick_choice<W: Write>(
 
     // Hide cursor, render initial frame
     write!(output, "\x1b[?25l")?;
-    let frame = format_choices(choices, selected, default_idx);
+    let frame = format_choices(choices, selected, default_idx, style);
     write!(output, "{frame}")?;
     output.flush()?;
     let prev_lines = num_choices;
@@ -108,7 +104,7 @@ pub fn pick_choice<W: Write>(
 
             // Redraw: move to col 0, up N lines, erase down, write new frame
             write!(output, "\r\x1b[{prev_lines}A\x1b[J")?;
-            let frame = format_choices(choices, selected, default_idx);
+            let frame = format_choices(choices, selected, default_idx, style);
             write!(output, "{frame}")?;
             output.flush()?;
         }
@@ -131,19 +127,25 @@ pub fn pick_choice_numbered<R: BufRead, W: Write>(
     output: &mut W,
     choices: &[String],
     default_idx: usize,
+    style: Style,
 ) -> Result<Option<usize>, std::io::Error> {
+    let bar = style.dim(glyph::BAR);
     for (i, choice) in choices.iter().enumerate() {
         let marker = if i == default_idx { " (default)" } else { "" };
         writeln!(
             output,
-            "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}{}){C_RESET} {choice}{C_DIM}{marker}{C_RESET}",
-            i + 1
+            "  {bar}  {} {choice}{}",
+            style.dim(&format!("{})", i + 1)),
+            style.dim(marker)
         )?;
     }
     write!(
         output,
-        "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}Enter a number (1-{}), or Enter for default ›{C_RESET} ",
-        choices.len()
+        "  {bar}  {} ",
+        style.dim(&format!(
+            "Enter a number (1-{}), or Enter for default ›",
+            choices.len()
+        ))
     )?;
     output.flush()?;
 
@@ -161,8 +163,9 @@ pub fn pick_choice_numbered<R: BufRead, W: Write>(
                     _ => {
                         write!(
                             output,
-                            "  {C_DIM}{S_BAR}{C_RESET}  {C_YELLOW}▲{C_RESET} {C_DIM}Enter 1-{} ›{C_RESET} ",
-                            choices.len()
+                            "  {bar}  {} {} ",
+                            style.warn(glyph::WARN),
+                            style.dim(&format!("Enter 1-{} ›", choices.len()))
                         )?;
                         output.flush()?;
                     }
@@ -183,7 +186,8 @@ mod tests {
         let choices = vec!["a".into(), "b".into(), "c".into()];
         let mut input = Cursor::new(b"2\n");
         let mut output = Vec::new();
-        let picked = pick_choice_numbered(&mut input, &mut output, &choices, 0).unwrap();
+        let picked =
+            pick_choice_numbered(&mut input, &mut output, &choices, 0, Style::PLAIN).unwrap();
         assert_eq!(picked, Some(1));
     }
 
@@ -192,7 +196,8 @@ mod tests {
         let choices = vec!["a".into(), "b".into(), "c".into()];
         let mut input = Cursor::new(b"\n");
         let mut output = Vec::new();
-        let picked = pick_choice_numbered(&mut input, &mut output, &choices, 2).unwrap();
+        let picked =
+            pick_choice_numbered(&mut input, &mut output, &choices, 2, Style::PLAIN).unwrap();
         assert_eq!(picked, Some(2));
     }
 
@@ -201,7 +206,8 @@ mod tests {
         let choices = vec!["a".into(), "b".into()];
         let mut input = Cursor::new(b"");
         let mut output = Vec::new();
-        let picked = pick_choice_numbered(&mut input, &mut output, &choices, 0).unwrap();
+        let picked =
+            pick_choice_numbered(&mut input, &mut output, &choices, 0, Style::PLAIN).unwrap();
         assert_eq!(picked, None);
     }
 
@@ -210,7 +216,8 @@ mod tests {
         let choices = vec!["a".into(), "b".into()];
         let mut input = Cursor::new(b"9\n1\n");
         let mut output = Vec::new();
-        let picked = pick_choice_numbered(&mut input, &mut output, &choices, 0).unwrap();
+        let picked =
+            pick_choice_numbered(&mut input, &mut output, &choices, 0, Style::PLAIN).unwrap();
         assert_eq!(picked, Some(0));
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("Enter 1-2"));

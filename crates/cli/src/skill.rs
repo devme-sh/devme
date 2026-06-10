@@ -56,13 +56,10 @@ pub fn status(json: bool) -> anyhow::Result<()> {
             .iter()
             .map(|(p, s)| serde_json::json!({ "path": p, "status": s.label() }))
             .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "version": skill::embedded_version(),
-                "installs": arr,
-            }))?
-        );
+        devme_ui::json(&serde_json::json!({
+            "version": skill::embedded_version(),
+            "installs": arr,
+        }));
         return Ok(());
     }
 
@@ -76,21 +73,22 @@ pub fn status(json: bool) -> anyhow::Result<()> {
         println!("  {:<11} {p}", s.label());
     }
     if !any {
-        println!("  not installed — run `devme skill install` (or `--global`)");
+        println!("  not installed");
+        devme_ui::hint("devme skill install (or --global)");
     }
     Ok(())
 }
 
 fn emit(json: bool, verb: &str, path: &str, version: &str) {
     if json {
-        if let Ok(s) = serde_json::to_string(&serde_json::json!({
+        devme_ui::json(&serde_json::json!({
             "action": verb,
             "path": path,
             "version": version,
-        })) {
-            println!("{s}");
-        }
+        }));
     } else {
-        println!("devme skill {verb}: {path} (v{version})");
+        // Mutation narration, not data — `devme skill: installed …` on
+        // stderr, like every other one-liner (ADR-0017).
+        devme_ui::scoped("skill").success(format!("{verb}: {path} (v{version})"));
     }
 }

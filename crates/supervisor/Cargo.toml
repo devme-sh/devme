@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 devme-core = { workspace = true }
 devme-config = { workspace = true }
+devme-ui = { workspace = true }
 devme-executor = { workspace = true }
 devme-ipc = { workspace = true }
 devme-client = { workspace = true }

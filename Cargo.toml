@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/ui",
     "crates/core",
     "crates/config",
     "crates/slot-allocator",
@@ -22,6 +23,7 @@ repository = "https://github.com/devme-sh/devme"
 
 [workspace.dependencies]
 # Internal crates
+devme-ui = { path = "crates/ui" }
 devme-core = { path = "crates/core" }
 devme-config = { path = "crates/config" }
 devme-slot-allocator = { path = "crates/slot-allocator" }
