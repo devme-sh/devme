@@ -25,7 +25,7 @@ Three mechanisms, each addressing a different failure case:
 
 3. **Forced start.** A runtime override for required deps: `devme start backend --skip-deps` (CLI) or `f` in the TUI when focused on a waiting Service. The Service runs in a visibly degraded state — `running (started without proxy)` — surfaced in `devme status`, `devme errors --json`, and the TUI.
 
-`provision` failures halt the affected subtree (not the entire graph) and show an inline retry/skip/abort overlay. Service crashes follow systemd-style policies: `restart = "on-failure"` default, exponential backoff (1s → 32s), crash-loop guard at 5 restarts in 60 seconds.
+`provision` failures halt the affected subtree (not the entire graph) and show an inline retry/skip/abort overlay. Service crashes follow systemd-style policies: `restart = "on-failure"` default, exponential backoff (0.5s → 30s), crash-loop guard after 5 *consecutive rapid exits* (process died within 5s of spawn; a run that survives longer resets the streak). Counting consecutive rapid exits rather than exits-per-wall-clock-window keeps the guard effective once the backoff saturates — a fixed window shorter than threshold × max-backoff could never trip. A tripped guard parks the Service in a terminal `crash-loop` state (visible in `devme status` and the TUI, with the diagnosed reason — e.g. "port 3011 already in use by tailscaled (pid 1234)" — when the port probe can name one); `devme restart <svc>` resets the breaker.
 
 ## Consequences
 

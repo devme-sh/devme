@@ -1729,6 +1729,10 @@ impl TuiState {
         if now_failed && !was_failed {
             let detail = match new {
                 S::Failed { exit_code: Some(c) } => format!("crashed (exit {c})"),
+                S::CrashLoop {
+                    reason: Some(reason),
+                    ..
+                } => format!("crash-looping — {reason}"),
                 S::CrashLoop { .. } => "crash-looping".to_string(),
                 _ => "crashed".to_string(),
             };

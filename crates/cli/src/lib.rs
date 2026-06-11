@@ -566,6 +566,19 @@ pub fn format_status_text(
                 }
                 detail.push_str(&paint(color, ansi::DIM, &format!("↻{}", s.restart_count)));
             }
+            // A quarantined service with a diagnosed cause says so on its
+            // own status line — "port 3011 already in use by tailscaled
+            // (pid 1234)" beats sending the user to the logs.
+            if let ServiceState::CrashLoop {
+                reason: Some(reason),
+                ..
+            } = &s.state
+            {
+                if !detail.is_empty() {
+                    detail.push_str("  ");
+                }
+                detail.push_str(&paint(color, ansi::RED, reason));
+            }
             // A row with no live detail (typically stopped) still benefits
             // from saying what the service *is*.
             if detail.is_empty()

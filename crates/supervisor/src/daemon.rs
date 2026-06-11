@@ -54,12 +54,16 @@ const RESTART_BACKOFF_BASE_MS: u64 = 500;
 const RESTART_BACKOFF_MAX_MS: u64 = 30_000;
 const BACKOFF_CAP_POW: u32 = 6;
 
-/// Crash-loop detection: if a service exits N times in W seconds, stop
-/// trying to restart it and mark it `CrashLoop`. Tuned to be permissive
-/// enough for normal flaky-during-startup services but tight enough that a
-/// truly broken cmd doesn't burn CPU forever.
-const CRASH_LOOP_THRESHOLD: usize = 5;
-const CRASH_LOOP_WINDOW_SECS: u64 = 60;
+/// Crash-loop detection: if a service dies within [`RAPID_EXIT_MS`] of its
+/// spawn [`CRASH_LOOP_THRESHOLD`] times in a row, stop trying to restart it
+/// and park it in `CrashLoop`. Counting *consecutive rapid exits* (instead
+/// of exits per wall-clock window) keeps the breaker effective even once
+/// the restart backoff saturates at [`RESTART_BACKOFF_MAX_MS`] — a fixed
+/// window shorter than `threshold × max-backoff` could never trip. A run
+/// that survives past [`RAPID_EXIT_MS`] resets the streak, so a service
+/// that works for a while and then dies keeps its normal restart policy.
+const CRASH_LOOP_THRESHOLD: u32 = 5;
+const RAPID_EXIT_MS: u64 = 5_000;
 
 type ClientId = u64;
 type ClientTx = mpsc::UnboundedSender<ServerMessage>;
@@ -129,6 +133,9 @@ struct ChildRecord {
     pid: u32,
     port: Option<u16>,
     restart_count: u32,
+    /// When the child was spawned. Exits within [`RAPID_EXIT_MS`] of this
+    /// count toward the crash-loop breaker.
+    spawned_at: Instant,
 }
 
 struct RingBuffer {
@@ -191,13 +198,15 @@ struct DaemonState {
     /// causes an auto-restart; reset when the user explicitly Starts/Stops.
     /// Powers the backoff curve and the `restart_count` in StatusUpdates.
     restart_counts: HashMap<String, u32>,
-    /// Rolling window of recent exit timestamps per service. Used to detect
-    /// "crashing every few seconds" patterns. Trimmed on every exit so the
-    /// memory stays bounded.
-    recent_exits: HashMap<String, VecDeque<Instant>>,
-    /// Services whose auto-restart loop has been disabled because they're
-    /// crash-looping. Reset on user Start/Stop/Restart.
-    crash_looped: HashSet<String>,
+    /// Consecutive rapid exits (died within [`RAPID_EXIT_MS`] of spawn) per
+    /// service. Reset by a run that survives past the threshold and by user
+    /// Start/Stop/Restart. At [`CRASH_LOOP_THRESHOLD`] the breaker trips.
+    rapid_exits: HashMap<String, u32>,
+    /// Diagnosed root cause of the most recent rapid exit per service (e.g.
+    /// "port 3011 already in use by tailscaled (pid 1234)"). Carried into
+    /// the `CrashLoop` state when the breaker trips. Cleared alongside
+    /// [`Self::rapid_exits`].
+    failure_reasons: HashMap<String, String>,
     next_generation: u64,
     next_client_id: u64,
     shutting_down: bool,
@@ -227,8 +236,8 @@ impl DaemonState {
             intentional_stops: HashSet::new(),
             pending_restarts: HashSet::new(),
             restart_counts: HashMap::new(),
-            recent_exits: HashMap::new(),
-            crash_looped: HashSet::new(),
+            rapid_exits: HashMap::new(),
+            failure_reasons: HashMap::new(),
             next_generation: 0,
             next_client_id: 0,
             shutting_down: false,
@@ -839,8 +848,8 @@ fn handle_client_message(
             // counter so the backoff resets after intentional interaction.
             if !service.is_empty() {
                 state.restart_counts.remove(&service);
-                state.recent_exits.remove(&service);
-                state.crash_looped.remove(&service);
+                state.rapid_exits.remove(&service);
+                state.failure_reasons.remove(&service);
                 // If the service is currently parked in CrashLoop, reset its
                 // executor entry so advance() picks it up again.
                 if matches!(
@@ -858,8 +867,8 @@ fn handle_client_message(
         }
         ClientMessage::Stop { service } => {
             state.restart_counts.remove(&service);
-            state.recent_exits.remove(&service);
-            state.crash_looped.remove(&service);
+            state.rapid_exits.remove(&service);
+            state.failure_reasons.remove(&service);
             if state.children.contains_key(&service) {
                 state.intentional_stops.insert(service.clone());
             }
@@ -883,8 +892,8 @@ fn handle_client_message(
             }
         }
         ClientMessage::Restart { service } => {
-            state.recent_exits.remove(&service);
-            state.crash_looped.remove(&service);
+            state.rapid_exits.remove(&service);
+            state.failure_reasons.remove(&service);
             state.pending_restarts.insert(service.clone());
             if state.children.contains_key(&service) {
                 state.intentional_stops.insert(service.clone());
@@ -968,9 +977,17 @@ fn handle_process_exited(
         .get(&service)
         .map(|r| r.generation == generation)
         .unwrap_or(false);
-    if drop_it {
-        state.children.remove(&service);
-    }
+    // How long the child ran, and which port it was meant to bind. Only
+    // knowable for the current generation — a stale exit must not feed the
+    // crash-loop streak.
+    let (uptime, rec_port) = if drop_it {
+        match state.children.remove(&service) {
+            Some(r) => (Some(r.spawned_at.elapsed()), r.port),
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
     let intentional = state.intentional_stops.remove(&service);
 
     if intentional {
@@ -1009,51 +1026,79 @@ fn handle_process_exited(
         if !state.pending_restarts.contains(&service)
             && should_auto_restart(&state.stack, &service, exit_code)
         {
-            // Record this exit in the crash-loop window and trim old entries.
-            let now = Instant::now();
-            let exits = state
-                .recent_exits
-                .entry(service.clone())
-                .or_insert_with(|| VecDeque::with_capacity(CRASH_LOOP_THRESHOLD + 1));
-            let window = Duration::from_secs(CRASH_LOOP_WINDOW_SECS);
-            while exits
-                .front()
-                .is_some_and(|&t| now.duration_since(t) > window)
-            {
-                exits.pop_front();
-            }
-            exits.push_back(now);
+            // Track consecutive rapid exits (died within RAPID_EXIT_MS of
+            // spawn). A run that survived past the threshold resets the
+            // streak — the service was genuinely up, so a later crash is a
+            // fresh incident, not a loop.
+            let rapid = uptime.is_some_and(|u| u < Duration::from_millis(RAPID_EXIT_MS));
+            let streak = if rapid {
+                let n = state.rapid_exits.entry(service.clone()).or_insert(0);
+                *n = n.saturating_add(1);
+                // A rapid exit with the service's own port held by someone
+                // else is the classic "foreign process owns my port" crash
+                // (EADDRINUSE). Our child is already dead, so any listener
+                // on that port is not ours — diagnose it now, while the
+                // holder is still around, and put the verdict in the
+                // service's log so `devme logs <svc>` explains the crash.
+                if let Some(reason) = rec_port.and_then(port_conflict_reason)
+                    && state.failure_reasons.get(&service) != Some(&reason)
+                {
+                    push_daemon_log(state, &service, &format!("devme: {reason}"));
+                    state.failure_reasons.insert(service.clone(), reason);
+                }
+                *state.rapid_exits.get(&service).unwrap_or(&0)
+            } else if uptime.is_some() {
+                state.rapid_exits.remove(&service);
+                state.failure_reasons.remove(&service);
+                0
+            } else {
+                // Stale-generation exit: no verdict either way.
+                *state.rapid_exits.get(&service).unwrap_or(&0)
+            };
 
-            if exits.len() >= CRASH_LOOP_THRESHOLD {
-                // Trip the breaker: stop trying to restart this service and
+            if streak >= CRASH_LOOP_THRESHOLD {
+                // Trip the breaker: stop trying to restart this service,
+                // park it in CrashLoop (a terminal state the executor
+                // records, so status snapshots report the quarantine), and
                 // surface a Notice so clients can flag it loudly. The
                 // service stays in CrashLoop until the user explicitly
                 // intervenes via Start / Restart / Stop.
-                state.crash_looped.insert(service.clone());
                 let count = *state.restart_counts.get(&service).unwrap_or(&0);
+                let reason = state.failure_reasons.get(&service).cloned();
+                let actions = state.executor.handle(ExecEvent::ServiceCrashLooped {
+                    name: service.clone(),
+                    restart_count: count,
+                    reason: reason.clone(),
+                });
                 state.broadcast(
                     Some(&service),
                     ServerMessage::StatusUpdate {
                         service: service.clone(),
                         state: ServiceState::CrashLoop {
                             restart_count: count,
+                            reason: reason.clone(),
                         },
                         pid: None,
                         port: None,
                         restart_count: count,
                     },
                 );
+                let cause = match &reason {
+                    Some(r) => format!(" — {r}"),
+                    None => String::new(),
+                };
                 state.broadcast(
                     None,
                     ServerMessage::Notice {
                         level: NoticeLevel::Error,
                         message: format!(
                             "service {service} crash-looped \
-                             ({CRASH_LOOP_THRESHOLD} exits in \
-                             {CRASH_LOOP_WINDOW_SECS}s) — auto-restart disabled"
+                             ({CRASH_LOOP_THRESHOLD} rapid exits in a row) \
+                             — auto-restart disabled{cause}"
                         ),
                     },
                 );
+                enact_actions(state, actions, tx);
             } else {
                 let prev = state.restart_counts.entry(service.clone()).or_insert(0);
                 *prev = prev.saturating_add(1);
@@ -1089,6 +1134,55 @@ fn backoff_for(count: u32) -> u64 {
     let pow = count.saturating_sub(1).min(BACKOFF_CAP_POW);
     let raw = RESTART_BACKOFF_BASE_MS.saturating_mul(1u64 << pow);
     raw.min(RESTART_BACKOFF_MAX_MS)
+}
+
+/// After a rapid exit: is the service's own port held by somebody else?
+/// The crashed child is already gone, so any listener still on the port is
+/// foreign — name it (container / pid+comm via the preflight prober, which
+/// is as far as "cheap" identification goes) so the status line and logs
+/// can say *why* the service keeps dying instead of just that it does.
+fn port_conflict_reason(port: u16) -> Option<String> {
+    if crate::port_preflight::is_port_free(port) {
+        return None;
+    }
+    let holder = match crate::port_preflight::identify_holder(port) {
+        crate::port_preflight::Holder::Container { name, project } => match project {
+            Some(p) => format!("container {name} (compose: {p})"),
+            None => format!("container {name}"),
+        },
+        crate::port_preflight::Holder::Process(pids) => pids
+            .iter()
+            .map(|(pid, name)| match name {
+                Some(n) => format!("{n} (pid {pid})"),
+                None => format!("pid {pid}"),
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        crate::port_preflight::Holder::Unknown => "another process".to_string(),
+    };
+    Some(format!("port {port} already in use by {holder}"))
+}
+
+/// Append a daemon-authored diagnostic line to a service's log history —
+/// disk tier, live ring, and connected followers — so `devme logs <svc>`
+/// shows it inline with the process output it explains.
+fn push_daemon_log(state: &mut DaemonState, service: &str, line: &str) {
+    let ts = now_ms();
+    state.log_store.append(service, ts, LogStream::Stderr, line);
+    state
+        .logs
+        .entry(service.to_string())
+        .or_insert_with(|| RingBuffer::new(RING_CAPACITY))
+        .push(ts, LogStream::Stderr, line.to_string());
+    state.broadcast(
+        Some(service),
+        ServerMessage::LogChunk {
+            service: service.to_string(),
+            bytes: encode_line(line),
+            ts,
+            stream: LogStream::Stderr,
+        },
+    );
 }
 
 fn handle_grace_passed(
@@ -1247,6 +1341,26 @@ fn enact_actions(
                                 message: format!("spawn {name}: {e}"),
                             },
                         );
+                        // The executor marked the node Starting when it
+                        // emitted this action; with no child there will
+                        // never be an exit event to move it on, so record
+                        // the failure now — otherwise the service shows
+                        // "starting" forever.
+                        let failed = state.executor.handle(ExecEvent::ServiceExited {
+                            name: name.clone(),
+                            exit_code: None,
+                        });
+                        state.broadcast(
+                            Some(&name),
+                            ServerMessage::StatusUpdate {
+                                service: name.clone(),
+                                state: ServiceState::Failed { exit_code: None },
+                                pid: None,
+                                port,
+                                restart_count: 0,
+                            },
+                        );
+                        work.extend(failed);
                         continue;
                     }
                 };
@@ -1259,6 +1373,7 @@ fn enact_actions(
                         pid: parts.pid,
                         port,
                         restart_count,
+                        spawned_at: Instant::now(),
                     },
                 );
                 state.broadcast(
@@ -1799,6 +1914,7 @@ cmd = "sleep 30"
                 pid,
                 port: None,
                 restart_count: 0,
+                spawned_at: Instant::now(),
             },
         );
 
@@ -2539,6 +2655,126 @@ restart = "always"
 
         send_msg(&mut conn, ClientMessage::Shutdown).await;
         let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    /// The kpi `ai`-on-the-VPS regression: a foreign process (tailscaled)
+    /// holds the service's port, so every spawn dies instantly with
+    /// EADDRINUSE. The breaker must trip into CrashLoop, the state must name
+    /// the occupied port, a fresh `devme status`-style snapshot must report
+    /// the quarantine (not a transient Failed), and the service's log must
+    /// contain the diagnosis.
+    #[tokio::test]
+    async fn port_held_by_foreign_process_quarantines_with_reason() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("d.sock");
+        // Foreign holder of the port (stands in for tailscaled).
+        let holder = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let toml = format!(
+            r#"
+schema_version = 1
+
+[service.ai]
+cmd = "echo 'EADDRINUSE: Failed to start server. Is port {port} in use?' >&2; exit 1"
+port = {{ fixed = {port} }}
+health = {{ tcp = "localhost:{{port}}" }}
+"#,
+        );
+        let server = DaemonServer::bind_with_stack(&sock, make_stack(&toml)).unwrap();
+        let task = tokio::spawn(server.serve());
+
+        let mut conn = connect(&sock).await;
+        send_msg(&mut conn, ClientMessage::Subscribe { services: vec![] }).await;
+        let _ = recv_msg(&mut conn).await;
+        send_msg(
+            &mut conn,
+            ClientMessage::Start {
+                service: String::new(),
+                skip_deps: false,
+            },
+        )
+        .await;
+
+        // Backoff 0.5+1+2+4s, breaker trips on the 5th rapid exit (~7.5s).
+        let mut crash_loop_reason: Option<Option<String>> = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline && crash_loop_reason.is_none() {
+            match tokio::time::timeout(Duration::from_secs(2), recv_msg(&mut conn)).await {
+                Ok(ServerMessage::StatusUpdate {
+                    service,
+                    state: ServiceState::CrashLoop { reason, .. },
+                    ..
+                }) if service == "ai" => {
+                    crash_loop_reason = Some(reason);
+                }
+                Ok(_) | Err(_) => {}
+            }
+        }
+        let reason = crash_loop_reason
+            .expect("service never reached CrashLoop")
+            .expect("crash loop carried no reason despite the occupied port");
+        assert!(
+            reason.contains(&format!("port {port} already in use by")),
+            "reason should name the occupied port, got: {reason}"
+        );
+
+        // A fresh subscriber (what `devme status` does) must see the
+        // quarantine, not the momentary Failed that preceded it, and the
+        // replayed log ring must contain the daemon's diagnosis.
+        let mut conn2 = connect(&sock).await;
+        send_msg(&mut conn2, ClientMessage::Subscribe { services: vec![] }).await;
+        let ServerMessage::Subscribed { services, .. } = recv_msg(&mut conn2).await else {
+            panic!("expected Subscribed");
+        };
+        let ai = services.iter().find(|s| s.name == "ai").expect("ai");
+        match &ai.state {
+            ServiceState::CrashLoop {
+                reason: Some(r), ..
+            } => assert!(r.contains("already in use"), "snapshot reason: {r}"),
+            other => panic!("snapshot should report CrashLoop with reason, got {other:?}"),
+        }
+        let mut saw_diagnosis_line = false;
+        let log_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < log_deadline && !saw_diagnosis_line {
+            match tokio::time::timeout(Duration::from_millis(500), recv_msg(&mut conn2)).await {
+                Ok(ServerMessage::LogChunk { service, bytes, .. }) if service == "ai" => {
+                    let line = base64::engine::general_purpose::STANDARD
+                        .decode(&bytes)
+                        .ok()
+                        .and_then(|b| String::from_utf8(b).ok())
+                        .unwrap_or_default();
+                    if line.contains("already in use") && line.starts_with("devme:") {
+                        saw_diagnosis_line = true;
+                    }
+                }
+                Ok(_) | Err(_) => {}
+            }
+        }
+        assert!(
+            saw_diagnosis_line,
+            "service log should contain the daemon's port-conflict diagnosis"
+        );
+
+        send_msg(&mut conn, ClientMessage::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    #[test]
+    fn port_conflict_reason_names_an_occupied_port_and_ignores_a_free_one() {
+        // Occupied: this test process holds the listener.
+        let holder = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let reason = port_conflict_reason(port).expect("occupied port should yield a reason");
+        assert!(
+            reason.contains(&format!("port {port} already in use by")),
+            "got: {reason}"
+        );
+        // Free: bind then drop to find a vacant port.
+        let free = {
+            let l = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        assert_eq!(port_conflict_reason(free), None);
     }
 
     #[tokio::test]

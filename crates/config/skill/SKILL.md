@@ -18,9 +18,10 @@ Route on `$action`. Default to diagnostics when none is given.
 1. Run `devme doctor`. It returns an error-anchored JSON digest: per-service state/pid/port/restart count + `recent_errors` (stderr only — tracebacks, not access logs), and step states with a *failed* step's check/provision output inline. History is disk-backed, so a service that crashed an hour ago still shows its dying stderr. Summarize for the user; don't dump raw. (`status: "no_daemon"` → tell them to run `devme up -d`.)
 2. Zoom with `devme doctor <name>` — for a failed step it returns the full check/provision output (the **only** place step output surfaces); for a service, `recent_errors` + `recent_logs` (`[stderr]`-prefixed). Then fix:
    - Container name conflict ("already in use") → `docker rm -f <name>`, then `devme restart <svc>`
-   - Port conflict ("address already in use") → `lsof -ti :<port> | xargs kill -9`, then `devme restart <svc>`
+   - Port conflict → devme diagnoses this itself: a service whose port is held by a foreign process crash-loops with "port N already in use by <holder>" in its status line and logs. Free the port (`lsof -ti :<port> | xargs kill -9`, or stop the named container/process), then `devme restart <svc>`
    - Docker not running → `devme config set docker.daemon orbstack`, then `devme up -d`
    - Failed step → fix the cause, then `devme restart <dependent>` (step states gate dependent services)
+   - `crash-loop` state → the service died within 5s of spawn 5 times in a row, so auto-restart is suspended (it is **not** still "starting"). `devme status` / `doctor` show the diagnosed reason when known. Fix the root error, then `devme restart <svc>` — that resets the breaker
 3. Confirm with `devme doctor`.
 
 ### action "logs" — read service logs

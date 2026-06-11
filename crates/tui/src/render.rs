@@ -2244,6 +2244,17 @@ fn render_service_meta(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             .fg(service_color(&p, &svc.state))
             .add_modifier(Modifier::BOLD),
     ));
+    // A diagnosed crash-loop cause (e.g. "port 3011 already in use by
+    // tailscaled (pid 1234)") is the headline — show it right next to the
+    // state instead of making the user dig through logs.
+    if let ServiceState::CrashLoop {
+        reason: Some(reason),
+        ..
+    } = &svc.state
+    {
+        spans.push(Span::styled("  · ", Style::default().fg(p.overlay0)));
+        spans.push(Span::styled(reason.clone(), Style::default().fg(p.red)));
+    }
     if let Some(pid) = svc.pid {
         spans.push(Span::styled("  · pid ", Style::default().fg(p.overlay0)));
         spans.push(Span::raw(pid.to_string()));
