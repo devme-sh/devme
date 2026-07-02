@@ -17,7 +17,19 @@ use std::net::TcpListener;
 use devme_config::docker;
 use devme_config::{Service, Stack};
 use devme_core::{PortSpec, Scope};
-use devme_ui::{Item, Section, Style, glyph};
+
+// Shared Clack-style constants (kept in sync with `preflight.rs`).
+const S_BAR: &str = "│";
+const S_BAR_END: &str = "└";
+const S_STEP_ACTIVE: &str = "◆";
+const S_STEP_SUBMIT: &str = "◇";
+const C_RESET: &str = "\x1b[0m";
+const C_DIM: &str = "\x1b[2m";
+const C_BOLD: &str = "\x1b[1m";
+const C_CYAN: &str = "\x1b[36m";
+const C_GREEN: &str = "\x1b[32m";
+const C_YELLOW: &str = "\x1b[33m";
+const C_RED: &str = "\x1b[31m";
 
 /// The concrete host port a service will bind, when it's knowable before
 /// the daemon allocates a slot.
@@ -181,7 +193,6 @@ pub fn check_ports<R: BufRead, W: Write>(
     input: &mut R,
     output: &mut W,
     interactive: bool,
-    style: Style,
 ) -> std::io::Result<()> {
     // Collect knowable ports, deduped (first service to claim a port wins
     // the label). Declaration order is preserved via the IndexMap.
@@ -216,7 +227,12 @@ pub fn check_ports<R: BufRead, W: Write>(
         return Ok(());
     }
 
-    let mut sec = Section::begin(output, style, "Port conflicts")?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "  {C_CYAN}{S_STEP_ACTIVE}{C_RESET}  {C_BOLD}Port conflicts{C_RESET}"
+    )?;
+    writeln!(output, "  {C_DIM}{S_BAR}{C_RESET}")?;
 
     let mut unresolved = 0usize;
     for conflict in &conflicts {
@@ -228,12 +244,8 @@ pub fn check_ports<R: BufRead, W: Write>(
 
         let who = match holder {
             Holder::Container { name, project } => match project {
-                Some(p) => format!(
-                    "container {}{}",
-                    style.bold(name),
-                    style.dim(&format!(" (compose: {p})"))
-                ),
-                None => format!("container {}", style.bold(name)),
+                Some(p) => format!("container {C_BOLD}{name}{C_RESET}{C_DIM} (compose: {p})"),
+                None => format!("container {C_BOLD}{name}{C_RESET}"),
             },
             Holder::Process(pids) => {
                 let label = pids
@@ -244,18 +256,16 @@ pub fn check_ports<R: BufRead, W: Write>(
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                style.bold(&label)
+                format!("{C_BOLD}{label}{C_RESET}")
             }
-            Holder::Unknown => style.dim("an unknown process"),
+            Holder::Unknown => format!("{C_DIM}an unknown process{C_RESET}"),
         };
 
-        sec.line(&format!(
-            "{} {} wants port {}{}{who}",
-            style.warn(glyph::WARN),
-            style.bold(service),
-            style.bold(&port.to_string()),
-            style.dim(" — held by ")
-        ))?;
+        writeln!(
+            output,
+            "  {C_DIM}{S_BAR}{C_RESET}  {C_YELLOW}▲{C_RESET} {C_BOLD}{service}{C_RESET} wants \
+             port {C_BOLD}{port}{C_RESET}{C_DIM} — held by {C_RESET}{who}{C_RESET}"
+        )?;
 
         if !interactive {
             unresolved += 1;
@@ -264,7 +274,10 @@ pub fn check_ports<R: BufRead, W: Write>(
 
         // A port we can't attribute gets no menu — there's nothing to act on.
         if let Holder::Unknown = holder {
-            sec.sub_note("can't attribute this port — free it manually")?;
+            writeln!(
+                output,
+                "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}can't attribute this port — free it manually{C_RESET}"
+            )?;
             unresolved += 1;
             continue;
         }
@@ -307,75 +320,100 @@ pub fn check_ports<R: BufRead, W: Write>(
         choices.push("Skip".to_string());
         actions.push(Act::Skip);
 
-        let picked = crate::prompt::select_one(input, sec.writer(), &choices, 0, style)?
-            .unwrap_or(actions.len() - 1); // aborted → Skip (always last)
+        let picked =
+            crate::prompt::select_one(input, output, &choices, 0)?.unwrap_or(actions.len() - 1); // aborted → Skip (always last)
 
         let freed = match &actions[picked] {
-            Act::Stop(name) => act(&mut sec, "docker stop", docker::stop_container(name)),
-            Act::Down(project) => {
-                act(&mut sec, "docker compose down", docker::compose_down(project))
-            }
+            Act::Stop(name) => act(output, "docker stop", docker::stop_container(name)),
+            Act::Down(project) => act(output, "docker compose down", docker::compose_down(project)),
             Act::Kill(pids) => {
                 let mut ok = true;
                 for (pid, _) in pids.iter() {
                     if let Err(e) = kill_pid(*pid) {
                         ok = false;
-                        sec.sub(Item::Fail, &e)?;
+                        writeln!(output, "  {C_DIM}{S_BAR}{C_RESET}    {C_RED}▲ {e}{C_RESET}")?;
                     }
                 }
                 if ok {
-                    sec.sub(Item::Ok, "Killed")?;
+                    act_ok(output, "Killed")?;
                     true
                 } else {
                     false
                 }
             }
-            Act::Skip => {
-                sec.sub_note("skipped")?;
-                false
-            }
+            Act::Skip => skip(output)?,
         };
 
         // Re-probe: confirm the action actually freed the port.
         if freed {
             if is_port_free(*port) {
-                sec.sub(Item::Ok, &format!("Port {port} is free"))?;
+                writeln!(
+                    output,
+                    "  {C_DIM}{S_BAR}{C_RESET}    {C_GREEN}{S_STEP_SUBMIT} Port {port} is free{C_RESET}"
+                )?;
             } else {
                 unresolved += 1;
-                sec.sub(Item::Warn, &format!("Port {port} still in use"))?;
+                writeln!(
+                    output,
+                    "  {C_DIM}{S_BAR}{C_RESET}    {C_YELLOW}▲ Port {port} still in use{C_RESET}"
+                )?;
             }
         } else {
             unresolved += 1;
         }
     }
 
+    writeln!(output, "  {C_DIM}{S_BAR}{C_RESET}")?;
     if unresolved > 0 {
-        sec.end(
-            Item::Warn,
-            &format!(
-                "{unresolved} port conflict{} unresolved — services may fail to start",
-                if unresolved == 1 { "" } else { "s" }
-            ),
+        writeln!(
+            output,
+            "  {S_BAR_END}  {C_YELLOW}{unresolved} port conflict{} unresolved — services may fail to start{C_RESET}",
+            if unresolved == 1 { "" } else { "s" }
         )?;
     } else {
-        sec.end(Item::Ok, "All conflicting ports freed")?;
+        writeln!(
+            output,
+            "  {S_BAR_END}  {C_GREEN}All conflicting ports freed{C_RESET}"
+        )?;
     }
+    writeln!(output)?;
 
     Ok(())
 }
 
 /// Run a remediation, render the outcome, and report whether it succeeded.
-fn act<W: Write>(sec: &mut Section<W>, label: &str, result: Result<(), String>) -> bool {
+fn act<W: Write>(output: &mut W, label: &str, result: Result<(), String>) -> bool {
     match result {
         Ok(()) => {
-            let _ = sec.sub(Item::Ok, label);
+            let _ = writeln!(
+                output,
+                "  {C_DIM}{S_BAR}{C_RESET}    {C_GREEN}{S_STEP_SUBMIT} {label}{C_RESET}"
+            );
             true
         }
         Err(e) => {
-            let _ = sec.sub(Item::Fail, &format!("{label} failed: {e}"));
+            let _ = writeln!(
+                output,
+                "  {C_DIM}{S_BAR}{C_RESET}    {C_RED}▲ {label} failed: {e}{C_RESET}"
+            );
             false
         }
     }
+}
+
+fn act_ok<W: Write>(output: &mut W, label: &str) -> std::io::Result<()> {
+    writeln!(
+        output,
+        "  {C_DIM}{S_BAR}{C_RESET}    {C_GREEN}{S_STEP_SUBMIT} {label}{C_RESET}"
+    )
+}
+
+fn skip<W: Write>(output: &mut W) -> std::io::Result<bool> {
+    writeln!(
+        output,
+        "  {C_DIM}{S_BAR}{C_RESET}    {C_DIM}{S_STEP_SUBMIT} Skipped{C_RESET}"
+    )?;
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -465,7 +503,7 @@ port = {{ fixed = {port} }}
         ));
         let mut input = Cursor::new(b"");
         let mut output = Vec::new();
-        check_ports(&stack, &mut input, &mut output, false, Style::PLAIN).unwrap();
+        check_ports(&stack, &mut input, &mut output, false).unwrap();
         assert!(output.is_empty(), "free port should yield no report");
     }
 
@@ -485,7 +523,7 @@ port = {{ fixed = {port} }}
         ));
         let mut input = Cursor::new(b"");
         let mut output = Vec::new();
-        check_ports(&stack, &mut input, &mut output, false, Style::PLAIN).unwrap();
+        check_ports(&stack, &mut input, &mut output, false).unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("Port conflicts"), "got: {text}");
         assert!(text.contains(&port.to_string()));
@@ -565,7 +603,7 @@ port = {{ fixed = {port} }}
         // "2" = Skip for a host-process holder (choices are [Kill, Skip]).
         let mut input = Cursor::new(b"2\n");
         let mut output = Vec::new();
-        check_ports(&stack, &mut input, &mut output, true, Style::PLAIN).unwrap();
+        check_ports(&stack, &mut input, &mut output, true).unwrap();
         let text = String::from_utf8(output).unwrap();
         // The interactive menu fired (either a Kill option, or — if the port
         // couldn't be attributed — the manual-free hint), and nothing was

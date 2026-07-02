@@ -1,7 +1,16 @@
 # ADR-0014: Cloud relay — continuous sync and automatic session handoff
 
-**Status**: Accepted
+**Status**: Superseded by ADR-0018
 **Date**: 2026-05-25
+
+## Migration note
+
+This ADR records the old cloud relay direction for historical context. The
+active direction is ADR-0018: devme remains the stack/runtime supervisor, while
+devcloud owns remote project context and SSH execution. New remote work uses Git
+as the v1 sync boundary, not live Mutagen sync or automatic agent session
+handoff. Do not implement new remote-primary behavior from this ADR without
+reopening ADR-0018.
 
 ## Context
 

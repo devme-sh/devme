@@ -11,7 +11,22 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use devme_config::EnvVar;
-use devme_ui::{Item, Section, Style};
+
+// Clack-style glyphs
+const S_BAR: &str = "│";
+const S_BAR_END: &str = "└";
+const S_STEP_ACTIVE: &str = "◆";
+const S_STEP_SUBMIT: &str = "◇";
+const S_STEP_SKIP: &str = "◇";
+
+// Colors
+const C_RESET: &str = "\x1b[0m";
+const C_DIM: &str = "\x1b[2m";
+const C_BOLD: &str = "\x1b[1m";
+const C_CYAN: &str = "\x1b[36m";
+const C_GREEN: &str = "\x1b[32m";
+const C_YELLOW: &str = "\x1b[33m";
+const C_RED: &str = "\x1b[31m";
 
 #[derive(Debug)]
 pub struct EnvResolution {
@@ -137,7 +152,6 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
     input: &mut R,
     output: &mut W,
     interactive: bool,
-    style: Style,
 ) -> Result<EnvResolution, std::io::Error> {
     let parsed = parse_env_file(env_file);
     let existing = parsed.vars;
@@ -162,32 +176,38 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
     }
 
     // Intro
-    let count_note = format!(
-        "{} variable{}",
+    writeln!(output)?;
+    writeln!(
+        output,
+        "  {C_CYAN}{S_STEP_ACTIVE}{C_RESET}  {C_BOLD}Configure environment{C_RESET}  {C_DIM}{} variable{}{C_RESET}",
         missing.len(),
         if missing.len() == 1 { "" } else { "s" }
-    );
-    let mut sec = Section::begin_noted(output, style, "Configure environment", Some(&count_note))?;
+    )?;
 
-    let mut first = true;
     for (name, var) in &missing {
-        // `begin_noted` already opened the gutter for the first field.
-        if !first {
-            sec.gutter()?;
-        }
-        first = false;
+        writeln!(output, "  {C_DIM}{S_BAR}{C_RESET}")?;
 
         // --- Generate vars: prompt with Enter-to-generate ---
         if let Some(gen_cmd) = &var.generate
             && var.choices.is_empty()
         {
             if interactive {
-                sec.field(name, var.help.as_deref())?;
-                sec.prompt("Enter to auto-generate, or type a value ›")?;
+                writeln!(
+                    output,
+                    "  {C_DIM}{S_BAR}{C_RESET}  {C_CYAN}{C_BOLD}{name}{C_RESET}"
+                )?;
+                if let Some(help) = &var.help {
+                    writeln!(output, "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}{help}{C_RESET}")?;
+                }
+                write!(
+                    output,
+                    "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}Enter to auto-generate, or type a value ›{C_RESET} "
+                )?;
+                output.flush()?;
 
                 match read_line_safe(input)? {
                     None => {
-                        sec.newline()?;
+                        writeln!(output)?;
                         break;
                     }
                     Some(line) => {
@@ -195,16 +215,25 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
                         if trimmed.is_empty() {
                             match run_generate(gen_cmd, cwd) {
                                 Ok(value) => {
-                                    sec.sub(Item::Ok, "Generated")?;
+                                    writeln!(
+                                        output,
+                                        "  {C_DIM}{S_BAR}{C_RESET}  {C_GREEN}{S_STEP_SUBMIT}{C_RESET} Generated"
+                                    )?;
                                     resolved.push(((*name).clone(), value));
                                 }
                                 Err(e) => {
-                                    sec.sub(Item::Warn, &format!("Generate failed: {e}"))?;
+                                    writeln!(
+                                        output,
+                                        "  {C_DIM}{S_BAR}{C_RESET}  {C_YELLOW}▲{C_RESET} Generate failed: {e}"
+                                    )?;
                                     skipped.push((*name).clone());
                                 }
                             }
                         } else {
-                            sec.sub(Item::Ok, "Set")?;
+                            writeln!(
+                                output,
+                                "  {C_DIM}{S_BAR}{C_RESET}  {C_GREEN}{S_STEP_SUBMIT}{C_RESET} Set"
+                            )?;
                             resolved.push(((*name).clone(), trimmed.to_string()));
                         }
                     }
@@ -214,7 +243,10 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
                 // Non-interactive: auto-generate silently
                 match run_generate(gen_cmd, cwd) {
                     Ok(value) => {
-                        sec.item(Item::Ok, name, Some("Generated"))?;
+                        writeln!(
+                            output,
+                            "  {C_DIM}{S_BAR}{C_RESET}  {C_GREEN}{S_STEP_SUBMIT}{C_RESET} {C_DIM}{name}{C_RESET}  Generated"
+                        )?;
                         resolved.push(((*name).clone(), value));
                     }
                     Err(_) => {
@@ -228,10 +260,16 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
         // --- Non-interactive fallback ---
         if !interactive {
             if let Some(d) = &var.default {
-                sec.item(Item::Ok, name, Some(d))?;
+                writeln!(
+                    output,
+                    "  {C_DIM}{S_BAR}{C_RESET}  {C_GREEN}{S_STEP_SUBMIT}{C_RESET} {C_DIM}{name}{C_RESET}  {d}"
+                )?;
                 resolved.push(((*name).clone(), d.clone()));
             } else {
-                sec.item(Item::Skip, name, Some("skipped"))?;
+                writeln!(
+                    output,
+                    "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}{S_STEP_SKIP}{C_RESET} {C_DIM}{name}  skipped{C_RESET}"
+                )?;
                 skipped.push((*name).clone());
             }
             continue;
@@ -239,7 +277,13 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
 
         // --- Choice selector ---
         if !var.choices.is_empty() {
-            sec.field(name, var.help.as_deref())?;
+            writeln!(
+                output,
+                "  {C_DIM}{S_BAR}{C_RESET}  {C_CYAN}{C_BOLD}{name}{C_RESET}"
+            )?;
+            if let Some(help) = &var.help {
+                writeln!(output, "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}{help}{C_RESET}")?;
+            }
 
             let default_idx = var
                 .default
@@ -250,48 +294,61 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
             if interactive {
                 // Shared single-select prompt: arrow-key picker on a TTY,
                 // numbered fallback when stdin is piped (CI, tests).
-                let picked = crate::prompt::select_one(
-                    input,
-                    sec.writer(),
-                    &var.choices,
-                    default_idx,
-                    style,
-                )?;
+                let picked = crate::prompt::select_one(input, output, &var.choices, default_idx)?;
                 match picked {
                     Some(idx) => {
                         let value = var.choices[idx].clone();
-                        sec.sub(Item::Ok, &value)?;
+                        writeln!(
+                            output,
+                            "  {C_DIM}{S_BAR}{C_RESET}  {C_GREEN}{S_STEP_SUBMIT}{C_RESET} {value}"
+                        )?;
                         resolved.push(((*name).clone(), value));
                     }
                     None => {
-                        sec.sub(Item::Skip, "Skipped")?;
+                        writeln!(
+                            output,
+                            "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}{S_STEP_SKIP} Skipped{C_RESET}"
+                        )?;
                         skipped.push((*name).clone());
                     }
                 }
             } else {
                 // Non-interactive: use default
                 let value = var.choices[default_idx].clone();
-                sec.sub(Item::Ok, &value)?;
+                writeln!(
+                    output,
+                    "  {C_DIM}{S_BAR}{C_RESET}  {C_GREEN}{S_STEP_SUBMIT}{C_RESET} {value}"
+                )?;
                 resolved.push(((*name).clone(), value));
             }
             continue;
         }
 
         // --- Free-text prompt ---
-        sec.field(name, var.help.as_deref())?;
+        writeln!(
+            output,
+            "  {C_DIM}{S_BAR}{C_RESET}  {C_CYAN}{C_BOLD}{name}{C_RESET}"
+        )?;
+        if let Some(help) = &var.help {
+            writeln!(output, "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}{help}{C_RESET}")?;
+        }
 
         let prompt_hint = if let Some(d) = &var.default {
-            format!("Enter for {d}, or type a value ›")
+            format!("Enter for {C_BOLD}{d}{C_RESET}{C_DIM}, or type a value ›")
         } else if var.required {
-            "required ›".to_string()
+            format!("{C_RED}required{C_RESET}{C_DIM} ›")
         } else {
             "Enter to skip, or type a value ›".to_string()
         };
-        sec.prompt(&prompt_hint)?;
+        write!(
+            output,
+            "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}{prompt_hint}{C_RESET} "
+        )?;
+        output.flush()?;
 
         match read_line_safe(input)? {
             None => {
-                sec.newline()?;
+                writeln!(output)?;
                 break;
             }
             Some(line) => {
@@ -304,11 +361,15 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
 
                 if value.is_empty() {
                     if var.required {
-                        sec.sub(Item::Fail, "This variable is required.")?;
-                        sec.prompt("›")?;
+                        writeln!(
+                            output,
+                            "  {C_DIM}{S_BAR}{C_RESET}  {C_RED}▲ This variable is required.{C_RESET}"
+                        )?;
+                        write!(output, "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}›{C_RESET} ")?;
+                        output.flush()?;
                         match read_line_safe(input)? {
                             None => {
-                                sec.newline()?;
+                                writeln!(output)?;
                                 break;
                             }
                             Some(retry) => {
@@ -316,17 +377,26 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
                                 if retry_val.is_empty() {
                                     skipped.push((*name).clone());
                                 } else {
-                                    sec.sub(Item::Ok, "Set")?;
+                                    writeln!(
+                                        output,
+                                        "  {C_DIM}{S_BAR}{C_RESET}  {C_GREEN}{S_STEP_SUBMIT}{C_RESET} Set"
+                                    )?;
                                     resolved.push(((*name).clone(), retry_val.to_string()));
                                 }
                             }
                         }
                     } else {
-                        sec.sub(Item::Skip, "Skipped")?;
+                        writeln!(
+                            output,
+                            "  {C_DIM}{S_BAR}{C_RESET}  {C_DIM}{S_STEP_SKIP} Skipped{C_RESET}"
+                        )?;
                         skipped.push((*name).clone());
                     }
                 } else {
-                    sec.sub(Item::Ok, &value)?;
+                    writeln!(
+                        output,
+                        "  {C_DIM}{S_BAR}{C_RESET}  {C_GREEN}{S_STEP_SUBMIT}{C_RESET} {value}"
+                    )?;
                     resolved.push(((*name).clone(), value));
                 }
             }
@@ -334,19 +404,22 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
     }
 
     // Outro
+    writeln!(output, "  {C_DIM}{S_BAR}{C_RESET}")?;
     if !resolved.is_empty() {
-        sec.end(
-            Item::Ok,
-            &format!(
-                "Wrote {} variable{} to {}",
-                resolved.len(),
-                if resolved.len() == 1 { "" } else { "s" },
-                env_file.display()
-            ),
+        writeln!(
+            output,
+            "  {S_BAR_END}  {C_GREEN}Wrote {} variable{} to {}{C_RESET}",
+            resolved.len(),
+            if resolved.len() == 1 { "" } else { "s" },
+            env_file.display()
         )?;
     } else {
-        sec.end(Item::Skip, "No variables configured")?;
+        writeln!(
+            output,
+            "  {S_BAR_END}  {C_DIM}No variables configured{C_RESET}"
+        )?;
     }
+    writeln!(output)?;
 
     append_to_env_file(env_file, &resolved, &skipped)?;
 
@@ -467,7 +540,6 @@ mod tests {
             &mut input,
             &mut output,
             true,
-            Style::PLAIN,
         )
         .unwrap();
 
@@ -503,7 +575,6 @@ mod tests {
             &mut input,
             &mut output,
             true,
-            Style::PLAIN,
         )
         .unwrap();
 
@@ -539,7 +610,6 @@ mod tests {
             &mut input,
             &mut output,
             true,
-            Style::PLAIN,
         )
         .unwrap();
 
@@ -569,7 +639,6 @@ mod tests {
             &mut input,
             &mut output,
             true,
-            Style::PLAIN,
         )
         .unwrap();
 
@@ -604,7 +673,6 @@ mod tests {
             &mut input,
             &mut output,
             true,
-            Style::PLAIN,
         )
         .unwrap();
 
@@ -633,7 +701,6 @@ mod tests {
             &mut input,
             &mut output,
             true,
-            Style::PLAIN,
         )
         .unwrap();
 
@@ -680,7 +747,6 @@ mod tests {
             &mut input,
             &mut output,
             true,
-            Style::PLAIN,
         )
         .unwrap();
 
@@ -720,7 +786,6 @@ mod tests {
             &mut input,
             &mut output,
             true,
-            Style::PLAIN,
         )
         .unwrap();
 

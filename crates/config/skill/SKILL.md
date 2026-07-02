@@ -4,7 +4,7 @@ description: Manage dev environments with devme. Use when services fail, won't s
 license: MIT
 metadata:
   version: "0.1.0"
-allowed-tools: Bash(devme *) Bash(docker *) Bash(lsof *) Bash(ps *) Bash(find *) Bash(cat *) Bash(ls *) Read Write
+allowed-tools: Bash(devme *) Bash(devcloud *) Bash(docker *) Bash(lsof *) Bash(ps *) Bash(find *) Bash(cat *) Bash(ls *) Read Write
 ---
 
 ## devme: $action
@@ -18,10 +18,9 @@ Route on `$action`. Default to diagnostics when none is given.
 1. Run `devme doctor`. It returns an error-anchored JSON digest: per-service state/pid/port/restart count + `recent_errors` (stderr only — tracebacks, not access logs), and step states with a *failed* step's check/provision output inline. History is disk-backed, so a service that crashed an hour ago still shows its dying stderr. Summarize for the user; don't dump raw. (`status: "no_daemon"` → tell them to run `devme up -d`.)
 2. Zoom with `devme doctor <name>` — for a failed step it returns the full check/provision output (the **only** place step output surfaces); for a service, `recent_errors` + `recent_logs` (`[stderr]`-prefixed). Then fix:
    - Container name conflict ("already in use") → `docker rm -f <name>`, then `devme restart <svc>`
-   - Port conflict → devme diagnoses this itself: a service whose port is held by a foreign process crash-loops with "port N already in use by <holder>" in its status line and logs. Free the port (`lsof -ti :<port> | xargs kill -9`, or stop the named container/process), then `devme restart <svc>`
+   - Port conflict ("address already in use") → `lsof -ti :<port> | xargs kill -9`, then `devme restart <svc>`
    - Docker not running → `devme config set docker.daemon orbstack`, then `devme up -d`
    - Failed step → fix the cause, then `devme restart <dependent>` (step states gate dependent services)
-   - `crash-loop` state → the service died within 5s of spawn 5 times in a row, so auto-restart is suspended (it is **not** still "starting"). `devme status` / `doctor` show the diagnosed reason when known. Fix the root error, then `devme restart <svc>` — that resets the breaker
 3. Confirm with `devme doctor`.
 
 ### action "logs" — read service logs
@@ -95,8 +94,7 @@ Rules:
 | `devme worktree add <branch> [path]` | New worktree (+branch), ready for `devme up` (steps converge it — no setup hook). Default path `<repo>-<branch-leaf>` |
 | `devme worktree rm <target>` | Stop stack, `git worktree remove`, release the port slot. Target by path/dir/branch; `-f` forces dirty. Branch + commits are kept |
 | `devme config [set <k> <v>] [check]` | Show / set global config; `check` lints `devme.toml` (`--json`, non-zero on errors) |
-| `devme remote [doctor\|status\|conflicts\|sync\|flush\|stop\|wake\|toggle]` | Live-sync to `remote.host` and run the stack there — see remote note. `doctor` preflights; resolve `conflicts` before changes flow. `status --watch` (`-w`) refreshes a one-line sync state for a side pane. `toggle` flips `remote.default` — whether bare `devme` is local or remote-first |
-| `devme --local <cmd>` | Force a command against the local daemon, bypassing the remote proxy |
+| `devcloud name/path/status/doctor/run/ssh` | Remote project context and SSH execution. Use devcloud for VPS project paths and remote commands; devme remains the stack/runtime supervisor |
 | `devme skill install [-g]` | (Re)install this skill into `.claude/skills/devme/` (`-g` = `~/.claude/`); embedded, always matches the binary |
 
 ### Notes
@@ -105,4 +103,4 @@ Rules:
 - **Worktree-aware.** Each git worktree runs its own supervisor, slot, and ports. `up`/`down`/`doctor`/`status`/`logs`/`url` act on the worktree you're in — just call them. `devme down --all` stops every worktree's stack (and the shared services); `devme status --all` shows every worktree's ports; `devme url <svc>` gives a ready link without guessing the slot.
 - **Worktrees converge — no lifecycle hooks.** There is no per-worktree setup or teardown hook (`[stack] on_create`/`on_destroy` parse for back-compat but never run — `config check` flags them). Per-worktree setup is a `[step]` check/provision: idempotent, so *any* worktree — created by `devme worktree add`, the TUI's `w`, or a bare `git worktree add` — converges on its first `devme up`. Removal is mechanical (stop, `git worktree remove`, release slot); a bare `git worktree remove` is reaped to the same end state. Make slot-scoped provisions idempotent (e.g. `dropdb --if-exists app_slot{slot} && createdb app_slot{slot}`) so a reused slot starts clean.
 - **Restart cascades.** Services have dependency ordering; restarting a DB can cascade to dependents.
-- **Remote is remote-primary.** The supervisor, stack, and TUI run on `remote.host`; the laptop syncs files (Mutagen `two-way-safe` — a conflict *halts* the sync). The main worktree syncs whole (`.git` included, minus per-machine bookkeeping); **linked worktrees sync too** (`remote.sync_worktrees`, default on): each gets its own session and remote dir, materialized host-side via `git worktree add` so git metadata stays host-local — uncommitted changes flow, and removing a worktree locally just stops its session on the next `devme remote sync`. Starting a sync requires a project root (a `devme.toml` or git repo) — `devme remote` refuses a bare directory. `devme remote --no-input` fails closed if the remote stack would prompt (env wizard), so agents never hang on it. While a sync is live, daemon commands (`status`, `logs`, `up`, `doctor`, `url`, …) auto-run on the remote — from inside a worktree they land in *that* worktree's remote dir — `devme logs api` streams the host's logs, and `devme url` rewrites to a laptop-reachable host. Run `devme remote doctor` before the first attach; if `devme remote status` shows conflicts the sync is halted — fix them first. While you're attached, `devme remote` watches every of the repo's syncs in the background and desktop-notifies if one halts (you can't see it from the remote TUI), and prints a closing sync summary on detach.
+- **Remote context belongs to devcloud.** devme owns stack/runtime supervision: steps, services, logs, status, URLs, and the TUI. devcloud owns remote project context: Git-origin identity, canonical VPS path, remote clone convergence, and SSH command/shell execution. v1 remote work uses Git as the sync boundary; there is no live Mutagen sync, transparent remote proxy, Herdr attach preset, Codex/Claude session transfer, or remote URL rewriting in the active devme contract. If devcloud is unavailable, ask the user how they want to run the remote command instead of falling back to legacy remote-primary behavior.

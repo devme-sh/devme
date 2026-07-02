@@ -14,26 +14,45 @@ use devme_cli::{
 use devme_config::Stack;
 use devme_core::{ClientMessage, ServerMessage, ServiceState};
 
+/// True when output should be ANSI-color-free. Set once in `main` from
+/// the combination of `--no-color`, `$NO_COLOR`, and stdout-is-a-tty.
+static NO_COLOR: AtomicBool = AtomicBool::new(false);
+/// True when informational stderr output should be suppressed (`-q`).
+/// Errors print regardless.
+static QUIET: AtomicBool = AtomicBool::new(false);
 /// True when `--yes` was passed: promote `prompt` provisions to `auto` so
 /// preflight fixes run without asking. Set once in `main`.
 static ASSUME_YES: AtomicBool = AtomicBool::new(false);
 
-/// Should the *stdout* surface (tables, data) use color? Quiet/color
-/// resolution lives in [`devme_ui`]; this is the bool the table formatters
-/// thread through.
 fn no_color() -> bool {
-    !devme_ui::out_style().color
+    NO_COLOR.load(Ordering::Relaxed)
 }
 
 fn assume_yes() -> bool {
     ASSUME_YES.load(Ordering::Relaxed)
 }
 
+/// Print to stderr unless `--quiet` was passed. Errors should go through
+/// `eprintln!` directly so they always surface.
+macro_rules! info {
+    ($($arg:tt)*) => {
+        if !crate::QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 fn main() {
     let cli = Cli::parse();
-    // Resolve quiet + per-stream color once (ADR-0017): the flag wins, then
-    // `NO_COLOR`/`FORCE_COLOR`, then each stream's own tty-ness.
-    devme_ui::init(cli.quiet, cli.no_color);
+    // Resolve the no-color decision once: CLI flag wins, then `NO_COLOR`
+    // env per https://no-color.org, finally a non-TTY stdout (piped to
+    // `less`, `grep`, etc.). `QUIET` is a straight pass-through from the
+    // CLI flag.
+    let no_color = cli.no_color
+        || std::env::var_os("NO_COLOR").is_some()
+        || !std::io::stdout().is_terminal();
+    NO_COLOR.store(no_color, Ordering::Relaxed);
+    QUIET.store(cli.quiet, Ordering::Relaxed);
     ASSUME_YES.store(cli.yes, Ordering::Relaxed);
 
     let is_tui = cli.command.is_none();
@@ -45,7 +64,7 @@ fn main() {
     let runtime = match builder.enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
-            devme_ui::error(format!("tokio init failed: {e}"));
+            eprintln!("devme: tokio init failed: {e}");
             std::process::exit(1);
         }
     };
@@ -103,7 +122,7 @@ async fn run(cli: Cli) -> i32 {
     match result {
         Ok(()) => 0,
         Err(e) => {
-            devme_ui::error(e);
+            eprintln!("devme: {e}");
             1
         }
     }
@@ -116,7 +135,7 @@ async fn down(timeout_secs: u64, all: bool) -> anyhow::Result<()> {
 
     let sock = socket_path();
     if !teardown_daemon(&sock, timeout_secs, None).await? {
-        devme_ui::info("no daemon running");
+        println!("devme: no daemon running");
         return Ok(());
     }
 
@@ -129,7 +148,7 @@ async fn down(timeout_secs: u64, all: bool) -> anyhow::Result<()> {
     if let Ok(cwd) = std::env::current_dir()
         && devme_tui::worktree::shutdown_shared_if_last(&cwd).await
     {
-        devme_ui::success("shared services stopped");
+        println!(" ✔ Shared services            Stopped");
     }
     Ok(())
 }
@@ -162,12 +181,12 @@ async fn down_all(timeout_secs: u64) -> anyhow::Result<()> {
         && let Ok(mut shared) = devme_client::Client::connect(&shared_sock).await
     {
         let _ = shared.send(ClientMessage::Shutdown).await;
-        devme_ui::success("shared services stopped");
+        println!(" ✔ Shared services            Stopped");
         any = true;
     }
 
     if !any {
-        devme_ui::info("no daemons running");
+        println!("devme: no daemons running");
     }
     Ok(())
 }
@@ -217,38 +236,23 @@ async fn teardown_daemon(
         .map(|s| s.name.clone())
         .collect();
 
-    // Stopping is narration, not data — it renders to stderr as the house
-    // tree style (ADR-0017), one item ticking in as each service stops.
-    // Under `-q` the tree goes to a sink: a clean stop is silent, while the
-    // timeout summary still surfaces through the Warn end-cap below.
     let total = live.len();
-    let mut out: Box<dyn std::io::Write> = if devme_ui::quiet() {
-        Box::new(std::io::sink())
-    } else {
-        Box::new(std::io::stderr())
-    };
-    let title = match label {
-        Some(l) => format!("Stopping {l}"),
-        None => "Stopping stack".to_string(),
-    };
-    let mut sec = devme_ui::Section::begin(&mut out, devme_ui::err_style(), &title)?;
+    match label {
+        Some(l) => println!("[+] Stopping {l} ({total}/{total})"),
+        None => println!("[+] Stopping {total}/{total}"),
+    }
 
     client.send(ClientMessage::Shutdown).await?;
 
     let started = std::time::Instant::now();
     let mut stopped: std::collections::HashSet<String> = std::collections::HashSet::new();
     let deadline = started + std::time::Duration::from_secs(timeout_secs);
-    let timeout_summary =
-        format!("timeout after {timeout_secs}s — some services may still be running");
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            sec.end(devme_ui::Item::Warn, &timeout_summary)?;
-            // The section is sunk under `-q`; a timeout is a warning and
-            // must surface regardless.
-            if devme_ui::quiet() {
-                devme_ui::warn(&timeout_summary);
-            }
+            eprintln!(
+                "devme: timeout after {timeout_secs}s — some services may still be running"
+            );
             return Ok(true);
         }
         match tokio::time::timeout(remaining, client.next_event()).await {
@@ -258,20 +262,15 @@ async fn teardown_daemon(
                 ..
             }))) if live.contains(&service) && stopped.insert(service.clone()) => {
                 let elapsed = started.elapsed().as_secs_f32();
-                sec.item(
-                    devme_ui::Item::Ok,
-                    &format!("{service:<20}"),
-                    Some(&format!("stopped  {elapsed:>5.1}s")),
-                )?;
+                println!(" ✔ Service {service:<20}  Stopped   {elapsed:>5.1}s");
             }
             Ok(Ok(Some(ServerMessage::Goodbye { .. }))) | Ok(Ok(None)) => break,
             Ok(Ok(Some(_))) => {} // other frames during teardown
             Ok(Err(_)) => break,
             Err(_) => {
-                sec.end(devme_ui::Item::Warn, &timeout_summary)?;
-                if devme_ui::quiet() {
-                    devme_ui::warn(&timeout_summary);
-                }
+                eprintln!(
+                    "devme: timeout after {timeout_secs}s — some services may still be running"
+                );
                 return Ok(true);
             }
         }
@@ -281,17 +280,9 @@ async fn teardown_daemon(
     for name in &live {
         if !stopped.contains(name) {
             let elapsed = started.elapsed().as_secs_f32();
-            sec.item(
-                devme_ui::Item::Ok,
-                &format!("{name:<20}"),
-                Some(&format!("stopped  {elapsed:>5.1}s")),
-            )?;
+            println!(" ✔ Service {name:<20}  Stopped   {elapsed:>5.1}s");
         }
     }
-    sec.end(
-        devme_ui::Item::Ok,
-        &format!("{total} service{} stopped", if total == 1 { "" } else { "s" }),
-    )?;
     Ok(true)
 }
 
@@ -333,7 +324,7 @@ async fn status_all(as_json: bool) -> anyhow::Result<()> {
                 })
             })
             .collect();
-        devme_ui::json(&serde_json::json!({ "worktrees": worktrees }));
+        println!("{}", serde_json::json!({ "worktrees": worktrees }));
     } else {
         print!("{}", format_status_all(&reports, !no_color()));
     }
@@ -371,7 +362,7 @@ async fn url(service: String, open: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     if let Err(e) = devme_config::browser::open_url(&url) {
-        devme_ui::warn(format!("couldn't open browser: {e}"));
+        eprintln!("devme: couldn't open browser: {e}");
     }
     Ok(())
 }
@@ -533,7 +524,7 @@ async fn up(
     if let Ok(cwd) = std::env::current_dir()
         && let Err(e) = ensure_shared_daemon(&cwd).await
     {
-        devme_ui::warn(format!("shared supervisor not started: {e}"));
+        eprintln!("devme: shared supervisor not started: {e}");
     }
     let fresh_daemon = ensure_daemon(&sock).await?;
     let mut client = devme_client::Client::connect(&sock).await?;
@@ -548,7 +539,7 @@ async fn up(
         None => return Err(anyhow::anyhow!("daemon closed before snapshot")),
     };
     if snapshot.is_empty() {
-        devme_ui::info("no services declared");
+        println!("devme: no services declared");
         return Ok(());
     }
 
@@ -567,20 +558,14 @@ async fn up(
             await_all_running(&mut client, &snapshot, timeout).await?;
         }
         let n = snapshot.len();
-        let plural = if n == 1 { "" } else { "s" };
-        if fresh_daemon {
-            devme_ui::success(format!(
-                "started {n} service{plural}; daemon running in background"
-            ));
-            devme_ui::hint("devme logs <service> — tail one service");
-            devme_ui::hint("devme status — snapshot");
-            devme_ui::hint("devme down — stop everything");
-        } else {
-            // Re-entry — the stack was already up; one line, no hint block
-            // (it printed when the daemon booted, and `devme remote` re-runs
-            // `up -d` on every attach).
-            devme_ui::success(format!("{n} service{plural} up; daemon already running"));
-        }
+        let verb = if fresh_daemon { "started" } else { "attached to" };
+        println!(
+            "devme: {verb} {n} service{}; daemon running in background.\n\
+             devme logs <service>   tail one service\n\
+             devme status           snapshot\n\
+             devme down             stop everything",
+            if n == 1 { "" } else { "s" }
+        );
         maybe_skill_update();
         maybe_show_skills_hint();
         return Ok(());
@@ -588,20 +573,17 @@ async fn up(
 
     let names: Vec<&str> = snapshot.iter().map(|s| s.name.as_str()).collect();
     if fresh_daemon {
-        devme_ui::info(format!(
-            "running {n}/{n} — attaching to {names}",
+        info!(
+            "[+] Running {n}/{n}\nAttaching to {names}",
             n = snapshot.len(),
             names = names.join(", ")
-        ));
+        );
     } else {
         // Re-entrancy: daemon already alive. Skip the boot header — those
         // services have been up for a while. Just announce the attach.
-        devme_ui::info(format!(
-            "attaching to {} (already running)",
-            names.join(", ")
-        ));
+        info!("Attaching to {} (already running)", names.join(", "));
     }
-    devme_ui::hint("Ctrl-C: graceful stop · twice: force quit");
+    info!("(Ctrl-C: graceful stop · twice: force quit)");
 
     // Two-stage signal handling matches `docker compose up`:
     //   1st SIGINT  → "Gracefully stopping… (press Ctrl+C again to force)",
@@ -619,20 +601,17 @@ async fn up(
         tokio::select! {
             _ = sigint.recv() => {
                 if stopping {
-                    devme_ui::note("");
-                    devme_ui::info("force-quitting");
+                    info!("\ndevme: force-quitting.");
                     std::process::exit(130);
                 }
                 stopping = true;
-                devme_ui::note("");
-                devme_ui::info("gracefully stopping… (press Ctrl+C again to force)");
+                info!("\ndevme: gracefully stopping… (press Ctrl+C again to force)");
                 let _ = client.send(ClientMessage::Shutdown).await;
             }
             _ = sigterm.recv() => {
                 if !stopping {
                     stopping = true;
-                    devme_ui::note("");
-                    devme_ui::info("SIGTERM received, gracefully stopping…");
+                    info!("\ndevme: SIGTERM received, gracefully stopping…");
                     let _ = client.send(ClientMessage::Shutdown).await;
                 }
             }
@@ -652,11 +631,11 @@ async fn up(
                     }
                     ServerMessage::StatusUpdate { service, state, .. } => {
                         if let Some(label) = transition_label(&state) {
-                            devme_ui::note(format!("[{service}] {label}"));
+                            info!("[{service}] {label}");
                         }
                     }
                     ServerMessage::Notice { level, message } => {
-                        devme_ui::note(format!("[devme {level:?}] {message}"));
+                        info!("[devme {level:?}] {message}");
                     }
                     ServerMessage::Goodbye { .. } => break,
                     _ => {}
@@ -674,7 +653,7 @@ async fn up(
         && let Ok(cwd) = std::env::current_dir()
         && devme_tui::worktree::shutdown_shared_if_last(&cwd).await
     {
-        devme_ui::success("shared services stopped");
+        info!(" ✔ Shared services            Stopped");
     }
     Ok(())
 }
@@ -910,7 +889,7 @@ async fn logs(
             Ok(Ok(Some(ServerMessage::Notice { message, .. }))) => {
                 // Truncation marker etc. — to stderr so it never pollutes the
                 // (possibly JSON) stdout stream.
-                devme_ui::info(message);
+                eprintln!("devme: {message}");
             }
             Ok(Ok(Some(_))) => {}
             Ok(Ok(None)) | Ok(Err(_)) | Err(_) => return Ok(()),
@@ -920,7 +899,7 @@ async fn logs(
     if !follow {
         if !printed_any {
             let what = service.as_deref().unwrap_or("any service");
-            devme_ui::info(format!("no logs for {what} yet (try --follow to wait)"));
+            eprintln!("devme: no logs for {what} yet (try --follow to wait)");
         }
         return Ok(());
     }
@@ -928,7 +907,7 @@ async fn logs(
     // --follow: keep streaming new lines indefinitely. Ctrl-C exits cleanly.
     if !printed_any {
         let what = service.as_deref().unwrap_or("all services");
-        devme_ui::info(format!("tailing {what} (Ctrl-C to stop)"));
+        eprintln!("devme: tailing {what} (Ctrl-C to stop)");
     }
     let interrupt = tokio::signal::ctrl_c();
     let mut pinned_interrupt = std::pin::pin!(interrupt);
@@ -1047,7 +1026,7 @@ async fn doctor(name: Option<String>, tail: usize) -> anyhow::Result<()> {
                 "services": [],
                 "steps": [],
             });
-            devme_ui::json(&report);
+            println!("{}", serde_json::to_string_pretty(&report)?);
             return Ok(());
         }
     };
@@ -1163,7 +1142,7 @@ async fn doctor(name: Option<String>, tail: usize) -> anyhow::Result<()> {
                 "recent_logs": fmt_tail(&lines, tail),
             })
         };
-        devme_ui::json(&report);
+        println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
 
@@ -1226,7 +1205,7 @@ async fn doctor(name: Option<String>, tail: usize) -> anyhow::Result<()> {
         "hint": "zoom with `devme doctor <name>`; stream services with `devme logs`",
     });
 
-    devme_ui::json(&report);
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
@@ -1238,7 +1217,7 @@ fn config_cmd(action: Option<ConfigAction>, json: bool) -> anyhow::Result<()> {
         None => {
             let (cfg, warning) = GlobalConfig::load_checked();
             if let Some(w) = warning {
-                devme_ui::warn(w);
+                eprintln!("warning: {w}");
             }
             for (key, desc) in GlobalConfig::keys() {
                 let value = cfg.get(key).unwrap_or_else(|| "(unset)".into());
@@ -1249,7 +1228,7 @@ fn config_cmd(action: Option<ConfigAction>, json: bool) -> anyhow::Result<()> {
         Some(ConfigAction::Get { key }) => {
             let (cfg, warning) = GlobalConfig::load_checked();
             if let Some(w) = warning {
-                devme_ui::warn(w);
+                eprintln!("warning: {w}");
             }
             match cfg.get(&key) {
                 Some(v) => println!("{v}"),
@@ -1260,12 +1239,12 @@ fn config_cmd(action: Option<ConfigAction>, json: bool) -> anyhow::Result<()> {
         // Surgical writes preserve any comments/formatting in the file.
         Some(ConfigAction::Set { key, value }) => {
             GlobalConfig::persist(&key, &value).map_err(|e| anyhow::anyhow!("{e}"))?;
-            devme_ui::info(format!("{key} = {value}"));
+            info!("devme: {key} = {value}");
             Ok(())
         }
         Some(ConfigAction::Unset { key }) => {
             GlobalConfig::unset_persisted(&key).map_err(|e| anyhow::anyhow!("{e}"))?;
-            devme_ui::info(format!("unset {key}"));
+            info!("devme: unset {key}");
             Ok(())
         }
     }
@@ -1294,7 +1273,7 @@ fn config_check(json: bool) -> anyhow::Result<()> {
                     "errors": [],
                     "warnings": [],
                 });
-                devme_ui::json(&v);
+                println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
                 println!("✗ devme.toml failed to parse:\n  {e}");
             }
@@ -1321,7 +1300,7 @@ fn config_check(json: bool) -> anyhow::Result<()> {
                 }))
                 .collect::<Vec<_>>(),
         });
-        devme_ui::json(&v);
+        println!("{}", serde_json::to_string_pretty(&v)?);
     } else {
         for e in &errors {
             println!("✗ {e}");
@@ -1331,7 +1310,7 @@ fn config_check(json: bool) -> anyhow::Result<()> {
             println!("  fix: {}", l.hint);
         }
         if errors.is_empty() && warnings.is_empty() {
-            println!("✔ devme.toml looks good — no errors or warnings");
+            println!("✓ devme.toml looks good — no errors or warnings");
         } else {
             println!(
                 "\n{} error(s), {} warning(s)",
@@ -1361,15 +1340,15 @@ async fn worktree_cmd(action: WorktreeAction, json: bool) -> anyhow::Result<()> 
                     "branch": report.branch,
                     "created_branch": report.created_branch,
                 });
-                devme_ui::json(&value);
+                println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
-                devme_ui::success(format!("created worktree {}", report.path.display()));
-                devme_ui::info(format!(
-                    "branch: {}{}",
+                println!("Created worktree {}", report.path.display());
+                info!(
+                    "  branch: {}{}",
                     report.branch,
                     if report.created_branch { " (new)" } else { "" }
-                ));
-                devme_ui::hint(format!("cd {} && devme up -d", report.path.display()));
+                );
+                info!("  start it: cd {} && devme up -d", report.path.display());
             }
             Ok(())
         }
@@ -1382,26 +1361,18 @@ async fn worktree_cmd(action: WorktreeAction, json: bool) -> anyhow::Result<()> 
                     "branch": report.branch,
                     "slot": report.slot,
                     "instance_stopped": report.instance_stopped,
-                    "already_gone": report.already_gone,
                 });
-                devme_ui::json(&value);
-            } else if report.already_gone {
-                // Idempotent: nothing was on disk to remove. Say so plainly
-                // rather than claiming a removal that didn't happen.
-                devme_ui::info(format!(
-                    "worktree {} was already gone — pruned stale state",
-                    report.path.display()
-                ));
+                println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
-                devme_ui::success(format!("removed worktree {}", report.path.display()));
+                println!("Removed worktree {}", report.path.display());
                 if let Some(b) = &report.branch {
-                    devme_ui::info(format!("branch: {b} (kept — `git branch -d {b}` to delete)"));
+                    info!("  branch: {b} (kept — `git branch -d {b}` to delete)");
                 }
                 if let Some(s) = report.slot {
-                    devme_ui::info(format!("slot {s} released"));
+                    info!("  slot:   {s} (released)");
                 }
                 if report.instance_stopped {
-                    devme_ui::info("stopped instance stack");
+                    info!("  stopped instance stack");
                 }
             }
             Ok(())
@@ -1422,11 +1393,11 @@ fn remote_cmd(
         Some(RemoteAction::Doctor) => devme_cli::remote::doctor(&cwd, json),
         Some(RemoteAction::Status { watch }) => devme_cli::remote::status(&cwd, json, watch),
         Some(RemoteAction::Conflicts) => devme_cli::remote::conflicts(&cwd, json),
-        Some(RemoteAction::Sync) => devme_cli::remote::sync(&cwd),
-        Some(RemoteAction::Flush) => devme_cli::remote::flush(&cwd),
-        Some(RemoteAction::Stop) => devme_cli::remote::stop(&cwd),
+        Some(RemoteAction::Sync) => devme_cli::remote::sync(&cwd, flags.quiet),
+        Some(RemoteAction::Flush) => devme_cli::remote::flush(&cwd, flags.quiet),
+        Some(RemoteAction::Stop) => devme_cli::remote::stop(&cwd, flags.quiet),
         Some(RemoteAction::Wake) => devme_cli::remote::wake(),
-        Some(RemoteAction::Toggle) => devme_cli::remote::toggle(),
+        Some(RemoteAction::Toggle) => devme_cli::remote::toggle(flags.quiet),
         Some(RemoteAction::WakeHook { uninstall }) => devme_cli::remote::wake_hook(uninstall),
     }
 }
@@ -1458,12 +1429,12 @@ async fn launch_default(force_local: bool, flags: devme_cli::remote::RunFlags) -
                 Ok(cwd) => match devme_cli::remote::run(&cwd, flags) {
                     Ok(()) => 0,
                     Err(e) => {
-                        devme_ui::error(e);
+                        eprintln!("devme: {e}");
                         1
                     }
                 },
                 Err(e) => {
-                    devme_ui::error(e);
+                    eprintln!("devme: {e}");
                     1
                 }
             };
@@ -1472,7 +1443,7 @@ async fn launch_default(force_local: bool, flags: devme_cli::remote::RunFlags) -
     match launch_tui().await {
         Ok(code) => code,
         Err(e) => {
-            devme_ui::error(e);
+            eprintln!("devme: {e}");
             1
         }
     }
@@ -1497,7 +1468,6 @@ async fn launch_tui() -> anyhow::Result<i32> {
                 let mut stderr = std::io::stderr();
                 let _ = devme_supervisor::env_resolve::resolve_env_vars(
                     &env_pairs, &env_file, &cwd, &mut stdin, &mut stderr, interactive,
-                    devme_ui::err_style(),
                 );
             }
             // Only show preflight output when something needs provisioning.
@@ -1505,7 +1475,10 @@ async fn launch_tui() -> anyhow::Result<i32> {
                 if !devme_supervisor::preflight::all_checks_pass(&stack, &cwd) {
                     let interactive = std::io::stdin().is_terminal();
                     let mut stdin = std::io::BufReader::new(std::io::stdin());
-                    run_preflight_quiet_aware(&stack, &cwd, &mut stdin, interactive);
+                    let mut stderr = std::io::stderr();
+                    let _ = devme_supervisor::preflight::run_preflight(
+                        &stack, &cwd, &mut stdin, &mut stderr, interactive, assume_yes(),
+                    );
                 }
                 ensure_docker_if_needed(&stack)?;
 
@@ -1516,7 +1489,6 @@ async fn launch_tui() -> anyhow::Result<i32> {
                 let mut stderr = std::io::stderr();
                 let _ = devme_supervisor::port_preflight::check_ports(
                     &stack, &mut stdin, &mut stderr, interactive,
-                    devme_ui::err_style(),
                 );
             }
         }
@@ -1541,17 +1513,6 @@ use devme_supervisor::spawn::{
 async fn ensure_daemon(sock: &std::path::Path) -> anyhow::Result<bool> {
     let cwd = std::env::current_dir()?;
 
-    // Re-entrant `up` (daemon already listening): skip the boot preflight —
-    // env resolution, dependency checks, Docker, port probes all gated the
-    // *boot* that already happened, and re-running them adds seconds and a
-    // full "Check dependencies" tree to every re-attach (`devme remote` runs
-    // `up -d` on each attach). A daemon that's alive resolved its env and
-    // passed its checks when it booted; if dependencies broke since, `devme
-    // doctor` (or `down` + `up`) is the re-check path.
-    if devme_client::Client::connect(sock).await.is_ok() {
-        return Ok(false);
-    }
-
     let config_path = cwd.join("devme.toml");
     if let Ok(toml_str) = std::fs::read_to_string(&config_path)
         && let Ok(stack) = Stack::parse(&toml_str) {
@@ -1566,20 +1527,19 @@ async fn ensure_daemon(sock: &std::path::Path) -> anyhow::Result<bool> {
                 let mut stderr = std::io::stderr();
                 if let Err(e) = devme_supervisor::env_resolve::resolve_env_vars(
                     &env_pairs, &env_file, &cwd, &mut stdin, &mut stderr, interactive,
-                    devme_ui::err_style(),
                 ) {
-                    devme_ui::warn(format!("env resolution failed: {e}"));
+                    eprintln!("devme: env resolution failed: {e}");
                 }
             }
             // Re-parse since we moved `stack.env` above
             if let Ok(stack) = Stack::parse(&toml_str) {
-                // Preflight: check dependencies that don't need services.
-                // Under `-q` the tree renders into a buffer that's dumped
-                // only when something failed — quiet suppresses information,
-                // not warnings.
+                // Preflight: check dependencies that don't need services
                 let interactive = std::io::stdin().is_terminal();
                 let mut stdin = std::io::BufReader::new(std::io::stdin());
-                run_preflight_quiet_aware(&stack, &cwd, &mut stdin, interactive);
+                let mut stderr = std::io::stderr();
+                let _ = devme_supervisor::preflight::run_preflight(
+                    &stack, &cwd, &mut stdin, &mut stderr, interactive, assume_yes(),
+                );
 
                 ensure_docker_if_needed(&stack)?;
 
@@ -1590,51 +1550,11 @@ async fn ensure_daemon(sock: &std::path::Path) -> anyhow::Result<bool> {
                 let mut stderr = std::io::stderr();
                 let _ = devme_supervisor::port_preflight::check_ports(
                     &stack, &mut stdin, &mut stderr, interactive,
-                    devme_ui::err_style(),
                 );
             }
         }
 
     ensure_daemon_inner(sock, &cwd).await
-}
-
-/// Run the dependency preflight with `-q` semantics: normally the tree
-/// streams to stderr; under quiet it renders into a buffer that is shown
-/// only when a step ended Failed/Manual — so a clean quiet boot is silent
-/// but a broken dependency still surfaces (quiet suppresses information,
-/// not warnings).
-fn run_preflight_quiet_aware<R: std::io::BufRead>(
-    stack: &Stack,
-    cwd: &std::path::Path,
-    stdin: &mut R,
-    interactive: bool,
-) {
-    use devme_supervisor::preflight::{StepResult, run_preflight};
-    if !devme_ui::quiet() {
-        let mut stderr = std::io::stderr();
-        let _ = run_preflight(
-            stack, cwd, stdin, &mut stderr, interactive, assume_yes(),
-            devme_ui::err_style(),
-        );
-        return;
-    }
-    let mut buf: Vec<u8> = Vec::new();
-    // Quiet implies no interactive prompts — a prompt into a buffer would
-    // hang invisibly, so provisioning falls back to its non-interactive path.
-    let result = run_preflight(
-        stack, cwd, stdin, &mut buf, false, assume_yes(),
-        devme_ui::err_style(),
-    );
-    let failed = match &result {
-        Ok(r) => r
-            .results
-            .iter()
-            .any(|(_, s)| matches!(s, StepResult::Failed | StepResult::Manual)),
-        Err(_) => true,
-    };
-    if failed {
-        let _ = std::io::Write::write_all(&mut std::io::stderr(), &buf);
-    }
 }
 
 /// If the stack has services that use Docker and Docker isn't running,
@@ -1663,7 +1583,7 @@ fn ensure_docker_if_needed(stack: &Stack) -> anyhow::Result<()> {
             }
             if installed.len() == 1 {
                 let id = installed[0].id.clone();
-                devme_ui::info(format!("auto-selected {} (only daemon installed)", installed[0].label));
+                info!("devme: auto-selected {} (only daemon installed)", installed[0].label);
                 cfg.docker.daemon = Some(id.clone());
                 let _ = cfg.save();
                 id
@@ -1692,7 +1612,7 @@ fn ensure_docker_if_needed(stack: &Stack) -> anyhow::Result<()> {
                 };
                 let chosen = installed.get(idx)
                     .ok_or_else(|| anyhow::anyhow!("invalid choice"))?;
-                devme_ui::info(format!("saved docker.daemon = {}", chosen.id));
+                info!("devme: saved docker.daemon = {}", chosen.id);
                 cfg.docker.daemon = Some(chosen.id.clone());
                 let _ = cfg.save();
                 chosen.id.clone()
@@ -1700,9 +1620,9 @@ fn ensure_docker_if_needed(stack: &Stack) -> anyhow::Result<()> {
         }
     };
 
-    devme_ui::info(format!("starting Docker via {daemon_id}…"));
+    info!("devme: starting Docker via {daemon_id}…");
     docker::start_daemon(&daemon_id).map_err(|e| anyhow::anyhow!("{e}"))?;
-    devme_ui::success("Docker is ready");
+    info!("devme: Docker is ready");
     Ok(())
 }
 
@@ -1717,7 +1637,7 @@ fn ensure_docker_if_needed(stack: &Stack) -> anyhow::Result<()> {
 /// user hasn't edited since; foreign/modified copies are left alone. Agents
 /// and pipes (no tty) get nothing but the silent auto-update path.
 fn maybe_skill_update() {
-    if devme_ui::quiet() {
+    if QUIET.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let mut cfg = devme_config::GlobalConfig::load();
@@ -1728,11 +1648,11 @@ fn maybe_skill_update() {
     if cfg.skill_auto_update() {
         let updated = devme_config::skill::auto_update(&mut cfg);
         if !updated.is_empty() {
-            devme_ui::info(format!(
-                "refreshed AI skill to v{} in {} location(s)",
+            info!(
+                "devme: refreshed AI skill to v{} in {} location(s)",
                 devme_config::skill::embedded_version(),
                 updated.len()
-            ));
+            );
         }
         return;
     }
@@ -1752,17 +1672,16 @@ fn maybe_skill_update() {
     if cfg.skill_last_nudge() == Some(embedded.as_str()) {
         return;
     }
-    devme_ui::info(format!(
-        "AI skill is out of date (v{} → v{})",
+    eprintln!(
+        "hint: devme's AI skill is out of date (v{} → v{}). Update: devme skill install",
         first.from, first.to
-    ));
-    devme_ui::hint("devme skill install");
+    );
     cfg.set_skill_last_nudge(&embedded);
     let _ = cfg.save();
 }
 
 fn maybe_show_skills_hint() {
-    if devme_ui::quiet() {
+    if QUIET.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
 
@@ -1817,10 +1736,12 @@ fn maybe_show_skills_hint() {
         return;
     }
 
-    devme_ui::info("devme has an AI coding skill");
-    devme_ui::hint("install: devme skill install (or: npx skills add devme-sh/skills)");
+    eprintln!(
+        "hint: devme has an AI coding skill. Install it: devme skill install \
+         (or: npx skills add devme-sh/skills)"
+    );
     if count == 0 {
-        devme_ui::hint("suppress with: devme config set hints.skills false");
+        eprintln!("hint: suppress with: devme config set hints.skills false");
     }
 
     let _ = std::fs::create_dir_all(&config_dir);

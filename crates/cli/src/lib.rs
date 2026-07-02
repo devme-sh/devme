@@ -343,47 +343,56 @@ pub fn step_state_label(state: &devme_core::StepState) -> &'static str {
 
 /// ANSI escape codes for the status renderer. Emitted only when `color` is
 /// true (a TTY with color enabled); see [`format_status_text`].
-use devme_ui::ansi;
+mod ansi {
+    pub const RESET: &str = "\x1b[0m";
+    pub const BOLD: &str = "\x1b[1m";
+    pub const DIM: &str = "\x1b[2m";
+    pub const RED: &str = "\x1b[31m";
+    pub const GREEN: &str = "\x1b[32m";
+    pub const YELLOW: &str = "\x1b[33m";
+    pub const BLUE: &str = "\x1b[34m";
+    pub const CYAN: &str = "\x1b[36m";
+    pub const BRIGHT_RED: &str = "\x1b[91m";
+}
 
 /// Wrap `s` in an ANSI `code`…reset pair, or return it untouched when color
 /// is disabled. Padding must be applied to `s` *before* calling this so the
-/// invisible escape bytes don't throw off column alignment. Thin shim over
-/// [`devme_ui::Style::paint`] for the table formatters, which thread a
-/// plain `color: bool`.
+/// invisible escape bytes don't throw off column alignment.
 fn paint(color: bool, code: &str, s: &str) -> String {
-    devme_ui::Style { color }.paint(code, s)
+    if color {
+        format!("{code}{s}{}", ansi::RESET)
+    } else {
+        s.to_string()
+    }
 }
 
 /// Status glyph + color for a service state. Glyphs are all single terminal
-/// cells (the [`devme_ui::glyph`] vocabulary) so they don't disturb
-/// alignment.
+/// cells so they don't disturb alignment.
 fn service_glyph(state: &devme_core::ServiceState) -> (&'static str, &'static str) {
     use devme_core::ServiceState as S;
-    use devme_ui::glyph as g;
     match state {
-        S::Running { degraded: false, .. } => (g::RUNNING, ansi::GREEN),
-        S::Running { degraded: true, .. } => (g::PARTIAL, ansi::YELLOW),
-        S::Starting => (g::PARTIAL, ansi::CYAN),
-        S::WaitingOnDependency { .. } => (g::WAITING, ansi::CYAN),
-        S::Restarting { .. } => (g::RESTART, ansi::YELLOW),
-        S::CrashLoop { .. } => (g::FAIL, ansi::BRIGHT_RED),
-        S::Failed { .. } => (g::FAIL, ansi::RED),
-        S::Stopped => (g::STOPPED, ansi::DIM),
-        S::External { healthy: true } => (g::EXTERNAL, ansi::GREEN),
-        S::External { healthy: false } => (g::EXTERNAL, ansi::RED),
+        S::Running { degraded: false, .. } => ("●", ansi::GREEN),
+        S::Running { degraded: true, .. } => ("◐", ansi::YELLOW),
+        S::Starting => ("◐", ansi::CYAN),
+        S::WaitingOnDependency { .. } => ("◌", ansi::CYAN),
+        S::Restarting { .. } => ("↻", ansi::YELLOW),
+        S::CrashLoop { .. } => ("✗", ansi::BRIGHT_RED),
+        S::Failed { .. } => ("✗", ansi::RED),
+        S::Stopped => ("○", ansi::DIM),
+        S::External { healthy: true } => ("◆", ansi::GREEN),
+        S::External { healthy: false } => ("◆", ansi::RED),
     }
 }
 
 /// Status glyph + color for a step state.
 fn step_glyph(state: &devme_core::StepState) -> (&'static str, &'static str) {
     use devme_core::StepState as S;
-    use devme_ui::glyph as g;
     match state {
-        S::Passed => (g::OK, ansi::GREEN),
-        S::Failed | S::ProvisionFailed => (g::FAIL, ansi::RED),
+        S::Passed => ("✔", ansi::GREEN),
+        S::Failed | S::ProvisionFailed => ("✗", ansi::RED),
         S::Unknown => ("·", ansi::DIM),
         S::SkippedThisRun => ("–", ansi::DIM),
-        S::Overridden => (g::OK, ansi::YELLOW),
+        S::Overridden => ("✔", ansi::YELLOW),
     }
 }
 
@@ -565,19 +574,6 @@ pub fn format_status_text(
                     detail.push_str("  ");
                 }
                 detail.push_str(&paint(color, ansi::DIM, &format!("↻{}", s.restart_count)));
-            }
-            // A quarantined service with a diagnosed cause says so on its
-            // own status line — "port 3011 already in use by tailscaled
-            // (pid 1234)" beats sending the user to the logs.
-            if let ServiceState::CrashLoop {
-                reason: Some(reason),
-                ..
-            } = &s.state
-            {
-                if !detail.is_empty() {
-                    detail.push_str("  ");
-                }
-                detail.push_str(&paint(color, ansi::RED, reason));
             }
             // A row with no live detail (typically stopped) still benefits
             // from saying what the service *is*.

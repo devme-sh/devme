@@ -104,20 +104,45 @@ The TUI modal shown when a [[Step]]'s check fails. Actions: `Enter` (install —
 
 The first tab inside every [[Stack instance]]'s pane. Synthetic — not a real [[Service]]. Shows the graph traversal status, every [[Step]]'s state, output from the daemon itself, and shared-service status. The "what's happening at the meta level for this instance" view.
 
-## Cloud terms
+## Remote workflow terms
+
+### devcloud
+
+The remote project context adapter. devcloud is separate from devme: it resolves
+the current Git repo into a canonical remote project directory, verifies or
+creates the remote clone, and runs commands or shells over SSH in that directory.
+It does not supervise the [[Stack]], own [[Service]] lifecycle, or manage Herdr,
+Codex, or shell sessions.
+
+### Remote project context
+
+The Git-derived identity devcloud uses to connect a local project to a remote
+clone. In v1 this starts from the local repo's `origin` remote, derives provider
+host plus owner/repo, and maps that identity under the configured remote root.
+Git is the source of truth for moving project state between machines.
+
+### On-demand runtime
+
+The devme runtime model where attaching a dashboard or checking status does not
+itself imply that services must be awake. Explicit runtime commands wake or keep
+the stack awake when they need live services, logs, URLs, or service control.
+Passive snapshots do not count as meaningful runtime activity.
 
 ### Cloud relay
 
-The continuous sync link between a local machine and a remote host (VPS). Comprises bidirectional file sync (Mutagen) for the worktree, JSONL session sync for Claude Code conversations, and a WebSocket heartbeat for presence detection. Starts automatically with `devme up` when `[cloud]` is configured.
-
-### Watchdog
-
-A lightweight devme process running on the remote host in warm standby. Maintains the WebSocket heartbeat with the local machine, monitors sync health. On heartbeat loss (laptop offline for >2 minutes), triggers [[Takeover]].
+Superseded design from ADR-0014. It described continuous Mutagen sync, devme-run
+remote stack proxying, watchdog takeover, and agent session handoff. Keep the
+term for historical discussions only; it is not the active devme/devcloud
+boundary.
 
 ### Takeover
 
-The automatic transfer of an agent session from local to remote. Triggered by the [[Watchdog]] when the local machine has been offline for the configured delay (default 2 minutes) and the Claude session was idle. The watchdog runs `devme up` on the remote to start the dev stack, then `claude --resume` to continue the session.
+Superseded cloud relay term for automatic transfer of an agent session from a
+local machine to a remote host. Herdr and Codex own session control in the active
+design; devme does not resume or transfer their sessions.
 
 ### Pull-back
 
-The reverse of [[Takeover]] — transferring a session from the remote back to local. Triggered explicitly by the user via a tmux keybinding or `devme cloud pull`. Stops the remote agent, syncs files and JSONL, resumes Claude Code locally.
+Superseded cloud relay term for transferring an agent session from remote back
+to local. In the active design, shell functions, Herdr, Codex, and Git compose
+the workflow outside devme.

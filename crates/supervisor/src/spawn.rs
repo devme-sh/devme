@@ -10,13 +10,9 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use devme_core::ClientMessage;
-
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 
 /// Make sure a supervisor daemon is listening on `sock`. If not, fork
 /// `devme-supervisor` with `cwd` as its working directory and wait up
@@ -38,7 +34,13 @@ pub async fn ensure_daemon(sock: &Path, cwd: &Path) -> anyhow::Result<bool> {
     }
 
     let supervisor = find_sibling_binary("devme-supervisor")?;
-    let mut child = spawn_detached_supervisor(&supervisor, cwd)?;
+    let mut child = std::process::Command::new(&supervisor)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawning {}: {e}", supervisor.display()))?;
 
     for _ in 0..50 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -104,7 +106,13 @@ pub async fn ensure_shared_daemon(cwd: &Path) -> anyhow::Result<bool> {
     }
 
     let binary = find_sibling_binary("devme-shared-supervisor")?;
-    let mut child = spawn_detached_supervisor(&binary, cwd)?;
+    let mut child = std::process::Command::new(&binary)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("spawning {}: {e}", binary.display()))?;
 
     for _ in 0..50 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -162,31 +170,6 @@ async fn wait_for_daemon_exit(sock: &Path) {
         if devme_client::Client::connect(sock).await.is_err() {
             return;
         }
-    }
-}
-
-fn spawn_detached_supervisor(binary: &Path, cwd: &Path) -> anyhow::Result<Child> {
-    let mut command = Command::new(binary);
-    command
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    detach_from_calling_session(&mut command);
-    command
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("spawning {}: {e}", binary.display()))
-}
-
-fn detach_from_calling_session(command: &mut Command) {
-    #[cfg(unix)]
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
     }
 }
 
@@ -286,28 +269,5 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), wait_for_daemon_exit(&sock))
             .await
             .expect("wait_for_daemon_exit should return after the listener drops");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn detach_from_calling_session_starts_child_in_new_session() {
-        let mut command = Command::new("sh");
-        command
-            .arg("-c")
-            .arg("sleep 5")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        detach_from_calling_session(&mut command);
-
-        let mut child = command.spawn().unwrap();
-        let parent_sid = unsafe { libc::getsid(0) };
-        let child_sid = unsafe { libc::getsid(child.id() as libc::pid_t) };
-
-        let _ = child.kill();
-        let _ = child.wait();
-
-        assert_ne!(child_sid, -1);
-        assert_ne!(parent_sid, child_sid);
     }
 }

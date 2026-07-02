@@ -24,15 +24,9 @@ pub enum ServiceState {
     WaitingOnDependency { blocked_by: String },
     /// Restarting after a crash; the next start attempt is scheduled.
     Restarting { attempt: u32 },
-    /// Crashed too many times in a row; auto-restart suspended.
+    /// Crashed too many times in too short a window; auto-restart suspended.
     /// Resumes when the user hits `r` in the TUI or `devme restart`.
-    /// `reason`, when known, names the diagnosed root cause (e.g.
-    /// "port 3011 already in use by tailscaled (pid 1234)").
-    CrashLoop {
-        restart_count: u32,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-    },
+    CrashLoop { restart_count: u32 },
     /// Exited or crashed. `exit_code = None` indicates terminated by signal.
     Failed { exit_code: Option<i32> },
     /// Declared `external = true` in config. Devme only health-checks.
@@ -116,13 +110,7 @@ mod tests {
             }
             .is_up()
         );
-        assert!(
-            !ServiceState::CrashLoop {
-                restart_count: 5,
-                reason: None
-            }
-            .is_up()
-        );
+        assert!(!ServiceState::CrashLoop { restart_count: 5 }.is_up());
     }
 
     #[test]
@@ -156,14 +144,7 @@ mod tests {
                 blocked_by: "db".into(),
             },
             ServiceState::Restarting { attempt: 3 },
-            ServiceState::CrashLoop {
-                restart_count: 5,
-                reason: None,
-            },
-            ServiceState::CrashLoop {
-                restart_count: 5,
-                reason: Some("port 3011 already in use by tailscaled (pid 1234)".into()),
-            },
+            ServiceState::CrashLoop { restart_count: 5 },
             ServiceState::Failed {
                 exit_code: Some(137),
             },
@@ -192,21 +173,6 @@ mod tests {
             let back: StepState = serde_json::from_str(&json).unwrap();
             assert_eq!(state, back);
         }
-    }
-
-    #[test]
-    fn crash_loop_without_reason_stays_wire_compatible() {
-        // No reason → the field is omitted entirely (old readers unaffected).
-        let s = ServiceState::CrashLoop {
-            restart_count: 3,
-            reason: None,
-        };
-        let json = serde_json::to_string(&s).unwrap();
-        assert!(!json.contains("reason"), "got: {json}");
-        // Payloads from pre-`reason` daemons still deserialize.
-        let legacy = r#"{"kind":"crash_loop","restart_count":3}"#;
-        let back: ServiceState = serde_json::from_str(legacy).unwrap();
-        assert_eq!(back, s);
     }
 
     #[test]
