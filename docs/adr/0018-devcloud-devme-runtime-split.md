@@ -32,7 +32,8 @@ Split the remote workflow into two tools:
 - `devcloud` becomes the remote project context adapter. It resolves the current
   local Git repository to a canonical remote clone, verifies that the clone
   points at the same origin, and runs commands or shells over SSH in that remote
-  project directory.
+  project directory. It is developed and released from a separate repository,
+  `devme-sh/devcloud`, so devme does not depend on devcloud at build time.
 
 Do not continue the old remote-primary direction in new work. devme should not
 own transparent remote proxying, Mutagen sync orchestration, Herdr attach
@@ -46,7 +47,8 @@ remains as historical context, but this ADR is the active direction.
 - devme keeps a narrow runtime boundary and does not become a global session
   orchestrator.
 - devcloud can be tested and evolved around one concern: Git-derived remote
-  project context plus SSH execution.
+  project context plus SSH execution, with its own repository and release
+  lifecycle.
 - Herdr, Codex, and shell functions can compose the two tools without either
   tool depending on their internals.
 - Git is the v1 sync boundary, which avoids hidden file flows, Mutagen conflict
@@ -88,9 +90,10 @@ orchestration. Those concerns change for different reasons.
 Mutagen conflicts and hidden file flow remain the hard operational problem.
 Git is enough for the initial VPS workflow.
 
-**Make devcloud a separate repository immediately.** Rejected for v1. Keeping it
-in this workspace lets the split share release infrastructure and domain
-language while the interface is still settling.
+**Keep devcloud in this workspace for v1.** Rejected after the first slice.
+The shared workspace made bootstrapping quick, but it left the build/config
+boundary too soft. A separate repository under the same `devme-sh` organization
+keeps ownership coherent while making the tool boundary real.
 
 **Make devme launch Herdr or Codex through presets.** Rejected because Herdr and
 Codex already own their session models. devcloud can print names and paths that

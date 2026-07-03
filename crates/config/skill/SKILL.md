@@ -4,7 +4,7 @@ description: Manage dev environments with devme. Use when services fail, won't s
 license: MIT
 metadata:
   version: "0.1.0"
-allowed-tools: Bash(devme *) Bash(devcloud *) Bash(docker *) Bash(lsof *) Bash(ps *) Bash(find *) Bash(cat *) Bash(ls *) Read Write
+allowed-tools: Bash(devme *) Bash(docker *) Bash(lsof *) Bash(ps *) Bash(find *) Bash(cat *) Bash(ls *) Read Write
 ---
 
 ## devme: $action
@@ -95,7 +95,6 @@ Rules:
 | `devme worktree add <branch> [path]` | New worktree (+branch), ready for `devme up` (steps converge it — no setup hook). Default path `<repo>-<branch-leaf>` |
 | `devme worktree rm <target>` | Stop stack, `git worktree remove`, release the port slot. Target by path/dir/branch; `-f` forces dirty. Branch + commits are kept |
 | `devme config [set <k> <v>] [check]` | Show / set global config; `check` lints `devme.toml` (`--json`, non-zero on errors) |
-| `devcloud name/path/status/doctor` | Remote project context: Git-origin identity, configured host, and canonical VPS path. Use devcloud for project names/paths; devme remains the stack/runtime supervisor |
 | `devme skill install [-g]` | (Re)install this skill into `.claude/skills/devme/` (`-g` = `~/.claude/`); embedded, always matches the binary |
 
 ### Notes
@@ -104,4 +103,4 @@ Rules:
 - **Worktree-aware.** Each git worktree runs its own supervisor, slot, and ports. `up`/`down`/`doctor`/`status`/`logs`/`url` act on the worktree you're in — just call them. `devme down --all` stops every worktree's stack (and the shared services); `devme status --all` shows every worktree's ports; `devme url <svc>` gives a ready link without guessing the slot.
 - **Worktrees converge — no lifecycle hooks.** There is no per-worktree setup or teardown hook (`[stack] on_create`/`on_destroy` parse for back-compat but never run — `config check` flags them). Per-worktree setup is a `[step]` check/provision: idempotent, so *any* worktree — created by `devme worktree add`, the TUI's `w`, or a bare `git worktree add` — converges on its first `devme up`. Removal is mechanical (stop, `git worktree remove`, release slot); a bare `git worktree remove` is reaped to the same end state. Make slot-scoped provisions idempotent (e.g. `dropdb --if-exists app_slot{slot} && createdb app_slot{slot}`) so a reused slot starts clean.
 - **Restart cascades.** Services have dependency ordering; restarting a DB can cascade to dependents.
-- **Remote context belongs to devcloud.** devme owns stack/runtime supervision: steps, services, logs, status, URLs, and the TUI. devcloud owns remote project context: Git-origin identity, configured host, and canonical VPS path. This first surface is local-only (`name`, `path`, `status`, `doctor`); SSH command/shell execution and remote clone convergence arrive in later devcloud slices. v1 remote work uses Git as the sync boundary; there is no live Mutagen sync, transparent remote proxy, Herdr attach preset, Codex/Claude session transfer, or remote URL rewriting in the active devme contract. If devcloud is unavailable, ask the user how they want to run the remote command instead of falling back to legacy remote-primary behavior.
+- **Remote context is external.** devme owns stack/runtime supervision: steps, services, logs, status, URLs, and the TUI. Remote project context is owned by the separate `devme-sh/devcloud` tool/repository. v1 remote work uses Git as the sync boundary; there is no live Mutagen sync, transparent remote proxy, Herdr attach preset, Codex/Claude session transfer, or remote URL rewriting in the active devme contract.

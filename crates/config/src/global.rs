@@ -16,8 +16,6 @@ pub struct GlobalConfig {
     pub hints: HintsConfig,
     #[serde(default, skip_serializing_if = "SkillConfig::is_empty")]
     pub skill: SkillConfig,
-    #[serde(default, skip_serializing_if = "crate::DevcloudConfig::is_empty")]
-    pub devcloud: crate::DevcloudConfig,
     #[serde(default, skip_serializing_if = "TuiConfig::is_empty")]
     pub tui: TuiConfig,
     #[serde(default, skip_serializing_if = "crate::RemoteConfig::is_empty")]
@@ -196,8 +194,6 @@ impl GlobalConfig {
             "docker.daemon" => self.docker.daemon.clone(),
             "hints.skills" => self.hints.skills.clone(),
             "skill.auto_update" => self.skill.auto_update.map(|b| b.to_string()),
-            "devcloud.host" => self.devcloud.host.clone(),
-            "devcloud.root" => self.devcloud.root.clone(),
             "tui.theme" => self.tui.theme.clone(),
             "tui.confirm_quit" => self.tui.confirm_quit.map(|b| b.to_string()),
             "tui.toasts" => self.tui.toasts.map(|b| b.to_string()),
@@ -227,14 +223,6 @@ impl GlobalConfig {
                 let b = parse_bool(value)
                     .ok_or_else(|| format!("skill.auto_update expects true/false, got: {value}"))?;
                 self.skill.auto_update = Some(b);
-                Ok(())
-            }
-            "devcloud.host" => {
-                self.devcloud.host = Some(value.to_string());
-                Ok(())
-            }
-            "devcloud.root" => {
-                self.devcloud.root = Some(value.to_string());
                 Ok(())
             }
             "tui.theme" => match value {
@@ -312,14 +300,6 @@ impl GlobalConfig {
                 self.skill.auto_update = None;
                 Ok(())
             }
-            "devcloud.host" => {
-                self.devcloud.host = None;
-                Ok(())
-            }
-            "devcloud.root" => {
-                self.devcloud.root = None;
-                Ok(())
-            }
             "tui.theme" => {
                 self.tui.theme = None;
                 Ok(())
@@ -378,11 +358,6 @@ impl GlobalConfig {
             (
                 "skill.auto_update",
                 "Auto-update the embedded AI skill when devme updates (true/false)",
-            ),
-            ("devcloud.host", "Remote devcloud SSH target (default vps)"),
-            (
-                "devcloud.root",
-                "Remote source root for Git-derived project paths (default ~/development/projects)",
             ),
             ("tui.theme", "TUI colour theme (mocha/latte/auto)"),
             (
@@ -583,29 +558,6 @@ mod tests {
         assert_eq!(loaded.remote.attach.as_deref(), Some("tui"));
         cfg.unset("remote.host").unwrap();
         assert_eq!(cfg.get("remote.host"), None);
-    }
-
-    #[test]
-    fn devcloud_defaults_and_keys_round_trip() {
-        let mut cfg = GlobalConfig::default();
-        assert_eq!(cfg.devcloud.host_or_default(), "vps");
-        assert_eq!(cfg.devcloud.root_or_default(), "~/development/projects");
-        assert_eq!(cfg.get("devcloud.host"), None);
-
-        cfg.set("devcloud.host", "workbox").unwrap();
-        cfg.set("devcloud.root", "~/src").unwrap();
-        assert_eq!(cfg.get("devcloud.host"), Some("workbox".into()));
-        assert_eq!(cfg.get("devcloud.root"), Some("~/src".into()));
-
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("config.toml");
-        cfg.save_to(&path).unwrap();
-        let loaded = GlobalConfig::load_from(&path).unwrap();
-        assert_eq!(loaded.devcloud.host_or_default(), "workbox");
-        assert_eq!(loaded.devcloud.root_or_default(), "~/src");
-
-        cfg.unset("devcloud.host").unwrap();
-        assert_eq!(cfg.get("devcloud.host"), None);
     }
 
     #[test]
