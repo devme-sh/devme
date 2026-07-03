@@ -4,6 +4,7 @@
 //! See `CONTEXT.md` at the repo root and ADR-0001.
 
 pub mod browser;
+pub mod devcloud;
 pub mod docker;
 mod env_var;
 mod error;
@@ -20,6 +21,7 @@ mod step;
 mod surgical;
 mod validate;
 
+pub use devcloud::DevcloudConfig;
 pub use env_var::EnvVar;
 pub use error::ConfigError;
 pub use global::{GlobalConfig, SkillConfig, SkillInstall};
