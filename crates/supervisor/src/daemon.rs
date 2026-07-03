@@ -2769,12 +2769,21 @@ health = {{ tcp = "localhost:{{port}}" }}
             reason.contains(&format!("port {port} already in use by")),
             "got: {reason}"
         );
-        // Free: bind then drop to find a vacant port.
-        let free = {
-            let l = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
-            l.local_addr().unwrap().port()
-        };
-        assert_eq!(port_conflict_reason(free), None);
+        // Free: bind then drop to find a vacant port. The OS can hand the
+        // released ephemeral port to another process immediately, so retry a
+        // few candidates before treating the diagnostic as wrong.
+        let mut last_reason = None;
+        for _ in 0..10 {
+            let free = {
+                let l = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+                l.local_addr().unwrap().port()
+            };
+            last_reason = port_conflict_reason(free);
+            if last_reason.is_none() {
+                return;
+            }
+        }
+        assert_eq!(last_reason, None);
     }
 
     #[tokio::test]
