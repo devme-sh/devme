@@ -551,6 +551,11 @@ pub struct RemovalReport {
     pub slot: Option<u8>,
     /// Whether an instance supervisor was found and shut down.
     pub instance_stopped: bool,
+    /// True when the worktree was already gone (no live git registration and
+    /// its directory absent): `rm` was a no-op idempotent cleanup rather than
+    /// an actual removal. Stack teardown is skipped — there's nothing left to
+    /// tear down.
+    pub already_gone: bool,
 }
 
 /// One worktree as reported by `git worktree list --porcelain`.
@@ -580,7 +585,16 @@ pub async fn remove_worktree(
     force: bool,
 ) -> anyhow::Result<RemovalReport> {
     let worktrees = list_worktrees_detailed(cwd);
-    let resolved = resolve_target(&worktrees, target)?;
+    let resolved = match resolve_target(&worktrees, target)? {
+        Some(meta) => meta,
+        // No live git worktree matches. If the target names a path that no
+        // longer exists, the worktree is already gone — make `rm` idempotent
+        // (best-effort prune + slot release) rather than erroring with a
+        // dead-end "no worktree matches". This is the case a wrapper like
+        // herdr hits when it removed the directory first, then asks devme to
+        // tear down the now-absent stack.
+        None => return already_gone_cleanup(cwd, target),
+    };
     if resolved.is_main {
         anyhow::bail!(
             "refusing to remove the main worktree ({})",
@@ -609,7 +623,46 @@ pub async fn remove_worktree(
         branch,
         slot,
         instance_stopped,
+        already_gone: false,
     })
+}
+
+/// Idempotent path for `devme worktree rm <target>` when no live git worktree
+/// matches. Only a *path* target whose directory is already absent is treated
+/// as "already gone" — a non-path target (branch/dirname typo) or an existing
+/// directory that isn't a worktree is a genuine mismatch and keeps the helpful
+/// error. Best-effort: prune stale git worktree registrations and release a
+/// lingering slot claim, then report the removal as a no-op.
+fn already_gone_cleanup(cwd: &Path, target: &str) -> anyhow::Result<RemovalReport> {
+    let looks_like_path =
+        target.contains('/') || target.starts_with('.') || target.starts_with('~');
+    let path = PathBuf::from(target);
+    if !looks_like_path || path.exists() {
+        anyhow::bail!("no worktree matches '{target}' (try a path, directory name, or branch)");
+    }
+    // Clear any stale git registration the deleted directory left behind, and
+    // release the slot claim keyed to this path. Both are best-effort: the
+    // goal ("this worktree is gone") is already satisfied on disk.
+    let _ = git_worktree_prune(cwd);
+    if let Ok(registry) = devme_config::paths::slot_registry() {
+        let _ = SlotAllocator::open(&registry).release(&devme_config::paths::instance_id(&path));
+    }
+    Ok(RemovalReport {
+        path,
+        branch: None,
+        slot: None,
+        instance_stopped: false,
+        already_gone: true,
+    })
+}
+
+/// `git worktree prune` — drop registrations whose working directory is gone.
+fn git_worktree_prune(cwd: &Path) -> std::io::Result<std::process::ExitStatus> {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["worktree", "prune"])
+        .status()
 }
 
 /// Report from `devme worktree add`.
@@ -873,8 +926,13 @@ fn list_worktrees_detailed(cwd: &Path) -> Vec<WorktreeMeta> {
 }
 
 /// Match `target` against the worktree set by path, directory name, or
-/// branch. Errors on no match or an ambiguous match.
-fn resolve_target(worktrees: &[WorktreeMeta], target: &str) -> anyhow::Result<WorktreeMeta> {
+/// branch. `Ok(None)` means no match (the caller decides whether that's an
+/// already-gone no-op or a hard error); `Err` is an empty repo or an
+/// ambiguous match.
+fn resolve_target(
+    worktrees: &[WorktreeMeta],
+    target: &str,
+) -> anyhow::Result<Option<WorktreeMeta>> {
     if worktrees.is_empty() {
         anyhow::bail!("no git worktrees found (is this a git repo?)");
     }
@@ -896,10 +954,8 @@ fn resolve_target(worktrees: &[WorktreeMeta], target: &str) -> anyhow::Result<Wo
         .collect();
 
     match matches.as_slice() {
-        [] => {
-            anyhow::bail!("no worktree matches '{target}' (try a path, directory name, or branch)")
-        }
-        [one] => Ok((*one).clone()),
+        [] => Ok(None),
+        [one] => Ok(Some((*one).clone())),
         many => {
             let names: Vec<String> = many.iter().map(|w| w.path.display().to_string()).collect();
             anyhow::bail!("'{target}' is ambiguous — matches: {}", names.join(", "))
@@ -1170,19 +1226,57 @@ mod tests {
         let linked_canon = std::fs::canonicalize(&linked).unwrap();
 
         // by directory name
-        let by_dir = resolve_target(&wts, "linked").unwrap();
+        let by_dir = resolve_target(&wts, "linked").unwrap().unwrap();
         assert_eq!(by_dir.path, linked_canon);
         assert!(!by_dir.is_main);
         // by full branch name
         assert_eq!(
-            resolve_target(&wts, "feature/foo").unwrap().path,
+            resolve_target(&wts, "feature/foo").unwrap().unwrap().path,
             linked_canon
         );
         // by branch tail
-        assert_eq!(resolve_target(&wts, "foo").unwrap().path, linked_canon);
-        // no match
-        assert!(resolve_target(&wts, "does-not-exist").is_err());
+        assert_eq!(
+            resolve_target(&wts, "foo").unwrap().unwrap().path,
+            linked_canon
+        );
+        // no match → Ok(None), not an error (the caller decides what that means)
+        assert!(resolve_target(&wts, "does-not-exist").unwrap().is_none());
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_worktree_is_idempotent_when_already_gone() {
+        // A path-shaped target whose directory no longer exists: `rm` should
+        // succeed as a no-op (report.already_gone) rather than erroring.
+        let Some((root, main, linked)) = setup_linked_worktree("gone", "feature/foo", None) else {
+            return;
+        };
+        // Remove the worktree out-of-band (as herdr/plain-git would), so devme
+        // is asked to remove something git no longer tracks and disk lacks.
+        let linked_str = linked.display().to_string();
+        git_worktree_remove(&main, &linked, true).unwrap();
+        assert!(!linked.exists());
+
+        let report = block_on(remove_worktree(&main, &linked_str, false)).unwrap();
+        assert!(report.already_gone, "should report an idempotent no-op");
+        assert!(!report.instance_stopped);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remove_worktree_still_errors_on_genuine_mismatch() {
+        // A non-path target that matches no worktree is a real mistake — keep
+        // the helpful error rather than silently succeeding.
+        let Some((root, main, _linked)) = setup_linked_worktree("typo", "feature/foo", None) else {
+            return;
+        };
+        let err = block_on(remove_worktree(&main, "nonexistent-branch", false)).unwrap_err();
+        assert!(
+            err.to_string().contains("no worktree matches"),
+            "got: {err}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -57,6 +57,17 @@ pub enum Event {
         name: String,
         exit_code: Option<i32>,
     },
+    /// The supervisor's crash-loop breaker tripped: the Service kept dying
+    /// right after spawn and auto-restart has been suspended. Parks the node
+    /// in [`ServiceState::CrashLoop`] — terminal until the user resets it —
+    /// so status snapshots report the quarantine, not a transient `Failed`.
+    /// `reason`, when known, names the diagnosed cause (e.g. an occupied
+    /// port).
+    ServiceCrashLooped {
+        name: String,
+        restart_count: u32,
+        reason: Option<String>,
+    },
     /// User asked to stop a service.
     UserStop { name: String },
     /// User marked a Step as overridden (mark-as-installed / skip-this-run).
@@ -127,6 +138,20 @@ impl Executor {
                 self.nodes.insert(
                     name,
                     NodeStatus::Service(ServiceState::Failed { exit_code }),
+                );
+                self.advance()
+            }
+            Event::ServiceCrashLooped {
+                name,
+                restart_count,
+                reason,
+            } => {
+                self.nodes.insert(
+                    name,
+                    NodeStatus::Service(ServiceState::CrashLoop {
+                        restart_count,
+                        reason,
+                    }),
                 );
                 self.advance()
             }
@@ -447,6 +472,47 @@ depends_on = ["db"]
             e.state("db"),
             Some(NodeStatus::Service(ServiceState::Failed { .. }))
         ));
+    }
+
+    #[test]
+    fn crash_looped_service_is_parked_terminal_and_blocks_dependents() {
+        let mut e = Executor::new(graph(
+            r#"
+schema_version = 1
+
+[service.db]
+cmd = "postgres"
+
+[service.backend]
+cmd = "server"
+depends_on = ["db"]
+"#,
+        ));
+        e.handle(Event::Start);
+        e.handle(Event::ServiceExited {
+            name: "db".into(),
+            exit_code: Some(1),
+        });
+        let next = e.handle(Event::ServiceCrashLooped {
+            name: "db".into(),
+            restart_count: 4,
+            reason: Some("port 5432 already in use by another process".into()),
+        });
+        // Quarantine emits no new work and dependents stay blocked.
+        assert!(next.is_empty());
+        assert!(matches!(
+            e.state("db"),
+            Some(NodeStatus::Service(ServiceState::CrashLoop {
+                restart_count: 4,
+                reason: Some(_),
+            }))
+        ));
+        // A later global Start must not resurrect the quarantined node —
+        // only an explicit per-service reset (user restart) does.
+        let restarted = e.handle(Event::Start);
+        assert!(restarted.is_empty());
+        let after_reset = e.reset("db");
+        assert_eq!(after_reset, vec![Action::StartService("db".into())]);
     }
 
     #[test]
