@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 use devme_core::{ServiceSnapshot, StepSnapshot};
 
+pub mod devcloud;
 pub mod remote;
 pub mod skill;
 
