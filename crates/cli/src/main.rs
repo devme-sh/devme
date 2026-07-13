@@ -200,7 +200,7 @@ async fn run(cli: Cli) -> i32 {
                     .session
                     .get(&session)
                     .and_then(|session| session.run.as_deref())
-                    && let Err(error) = converge_task_steps(&stack, run, &cwd)
+                    && let Err(error) = converge_task_steps(&stack, run, &cwd, true)
                 {
                     return match devme_cli::task::record_preflight_failure(
                         &stack, &cwd, run, &error, output,
@@ -370,7 +370,7 @@ async fn run_task(
 ) -> anyhow::Result<devme_cli::task::TaskResult> {
     let cwd = std::env::current_dir()?;
     let stack = devme_cli::task::load(&cwd)?;
-    if let Err(error) = converge_task_steps(&stack, task, &cwd) {
+    if let Err(error) = converge_task_steps(&stack, task, &cwd, emit) {
         return if emit {
             devme_cli::task::record_preflight_failure(&stack, &cwd, task, &error, output)
         } else {
@@ -442,7 +442,12 @@ async fn wait_for_task_cancel(mut cancellation: Option<tokio::sync::watch::Recei
     }
 }
 
-fn converge_task_steps(stack: &Stack, task: &str, cwd: &std::path::Path) -> anyhow::Result<()> {
+fn converge_task_steps(
+    stack: &Stack,
+    task: &str,
+    cwd: &std::path::Path,
+    render: bool,
+) -> anyhow::Result<()> {
     let steps = devme_cli::task::steps_for(stack, task)?;
     if steps.is_empty() {
         return Ok(());
@@ -454,7 +459,20 @@ fn converge_task_steps(stack: &Stack, task: &str, cwd: &std::path::Path) -> anyh
     focused.resource.clear();
     focused.session.clear();
     let mut stdin = std::io::BufReader::new(std::io::stdin());
-    run_preflight_quiet_aware(&focused, cwd, &mut stdin, interactive_input());
+    if render {
+        run_preflight_quiet_aware(&focused, cwd, &mut stdin, interactive_input());
+    } else {
+        let mut output = Vec::new();
+        let _ = devme_supervisor::preflight::run_preflight(
+            &focused,
+            cwd,
+            &mut stdin,
+            &mut output,
+            false,
+            assume_yes(),
+            devme_ui::err_style(),
+        );
+    }
     for name in keep {
         let step = &stack.step[&name];
         let status = std::process::Command::new("sh")
@@ -3242,7 +3260,7 @@ async fn launch_default(
                 .session
                 .get(name)
                 .and_then(|session| session.run.as_deref())
-                && let Err(error) = converge_task_steps(workspace.stack(), run, &cwd)
+                && let Err(error) = converge_task_steps(workspace.stack(), run, &cwd, true)
             {
                 return match devme_cli::task::record_preflight_failure(
                     workspace.stack(),
@@ -3382,7 +3400,15 @@ async fn launch_tui(session_owns_home: bool) -> anyhow::Result<i32> {
                 }
             })
             .collect();
-        let home = devme_tui::home::HomeState::from_stack(&home_stack, recent);
+        let member_focus = match resolved.focus() {
+            devme_config::Focus::Root => None,
+            devme_config::Focus::Member(member) => Some(member.as_str()),
+        };
+        let home = devme_tui::home::HomeState::from_stack_with_member_focus(
+            &home_stack,
+            member_focus,
+            recent,
+        );
         let kinds = home_stack
             .task
             .iter()

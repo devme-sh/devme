@@ -564,6 +564,11 @@ async fn run(
                             let Some(action) = keymap::resolve(&k) else { continue };
                             use keymap::Action;
                             match action {
+                                Action::Home => {
+                                    if let Some(home) = state.home_mut() {
+                                        home.visible = true;
+                                    }
+                                }
                                 Action::NextService => state.select_next_service(),
                                 Action::PrevService => state.select_prev_service(),
                                 Action::NextStack => state.select_next_instance(),
@@ -895,7 +900,7 @@ async fn run(
                         TaskUpdate::Finished(result) => {
                             task_cancel = None;
                             home.running = None;
-                            home.recent.push(result);
+                            home.record_result(result);
                         }
                     }
             },

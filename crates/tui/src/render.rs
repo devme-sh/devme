@@ -149,12 +149,29 @@ fn render_home(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
     let Some(home) = state.home().cloned() else {
         return;
     };
+    let group_count = home
+        .actions
+        .iter()
+        .map(|action| action.kind)
+        .fold((None, 0_u16), |(previous, count), kind| {
+            (Some(kind), count + u16::from(previous != Some(kind)))
+        })
+        .1;
+    let action_line_count = home.actions.len() as u16 + group_count;
+    let flexible_height = inner.height.saturating_sub(4);
+    let recent_height = if flexible_height <= 6 {
+        1
+    } else {
+        flexible_height
+            .saturating_sub(action_line_count)
+            .clamp(2, 5)
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(5),
-            Constraint::Length(5),
+            Constraint::Length(recent_height),
             Constraint::Length(1),
         ])
         .split(inner);
@@ -173,7 +190,6 @@ fn render_home(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
     );
     let mut lines = Vec::new();
     let mut last_kind = None;
-    let mut row = chunks[1].y;
     let label_width = home
         .actions
         .iter()
@@ -182,44 +198,77 @@ fn render_home(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
         .unwrap_or_default();
     for (index, action) in home.actions.iter().enumerate() {
         if last_kind != Some(action.kind) {
-            lines.push(Line::styled(
-                action.kind.label(),
-                Style::default().fg(p.subtext0).add_modifier(Modifier::BOLD),
+            lines.push((
+                Line::styled(
+                    action.kind.label(),
+                    Style::default().fg(p.subtext0).add_modifier(Modifier::BOLD),
+                ),
+                None,
             ));
-            row += 1;
             last_kind = Some(action.kind);
         }
         let selected = index == home.selected;
         let marker = if selected { "  ▸ " } else { "    " };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{marker}{:<label_width$}  ", action.label),
-                Style::default()
-                    .fg(if selected { p.text } else { p.subtext0 })
-                    .add_modifier(if selected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            ),
-            Span::styled(action.description.clone(), Style::default().fg(p.overlay0)),
-        ]));
-        state.push_click_region(
-            chunks[1].x,
-            row,
-            chunks[1].width,
-            1,
-            crate::state::ClickTarget::HomeAction(index),
-        );
-        row += 1;
-    }
-    if lines.is_empty() {
-        lines.push(Line::styled(
-            "No tasks declared - add [task.<name>] to devme.toml",
-            Style::default().fg(p.overlay0),
+        let description_width =
+            (chunks[1].width as usize).saturating_sub(marker.chars().count() + label_width + 2);
+        lines.push((
+            Line::from(vec![
+                Span::styled(
+                    format!("{marker}{:<label_width$}  ", action.label),
+                    Style::default()
+                        .fg(if selected { p.text } else { p.subtext0 })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(
+                    theme::truncate(&action.description, description_width),
+                    Style::default().fg(p.overlay0),
+                ),
+            ]),
+            Some(index),
         ));
     }
-    frame.render_widget(Paragraph::new(lines), chunks[1]);
+    if lines.is_empty() {
+        lines.push((
+            Line::styled(
+                "No tasks declared - add [task.<name>] to devme.toml",
+                Style::default().fg(p.overlay0),
+            ),
+            None,
+        ));
+    }
+    let selected_line = lines
+        .iter()
+        .position(|(_, action)| *action == Some(home.selected))
+        .unwrap_or_default();
+    let viewport_height = chunks[1].height as usize;
+    let max_scroll = lines.len().saturating_sub(viewport_height);
+    let scroll = selected_line
+        .saturating_sub(viewport_height.saturating_sub(1))
+        .min(max_scroll);
+    for (line_index, (_, action)) in lines.iter().enumerate().skip(scroll) {
+        let visible_row = line_index - scroll;
+        if visible_row >= viewport_height {
+            break;
+        }
+        if let Some(index) = action {
+            state.push_click_region(
+                chunks[1].x,
+                chunks[1].y + visible_row as u16,
+                chunks[1].width,
+                1,
+                crate::state::ClickTarget::HomeAction(*index),
+            );
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines.into_iter().map(|(line, _)| line).collect::<Vec<_>>())
+            .scroll((scroll as u16, 0)),
+        chunks[1],
+    );
     let (activity, title) = if let Some(task) = &home.running {
         let lines = home
             .logs
@@ -238,14 +287,20 @@ fn render_home(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
         } else {
             lines
         };
-        (lines, format!("Running {task}"))
+        (lines, format!("Running {}", home.task_label(task)))
     } else {
         let lines = home
             .recent
             .iter()
             .rev()
             .take(3)
-            .map(|result| Line::from(format!("{}  {}", result.task, result.wording())))
+            .map(|result| {
+                Line::from(format!(
+                    "{}  {}",
+                    home.task_label(&result.task),
+                    result.wording()
+                ))
+            })
             .collect::<Vec<_>>();
         let lines = if lines.is_empty() {
             vec![Line::styled(
@@ -265,7 +320,11 @@ fn render_home(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
         chunks[2],
     );
     frame.render_widget(
-        Paragraph::new("↑↓ navigate   Enter run   Esc cancel   d dashboard   q quit"),
+        Paragraph::new(format!(
+            "↑↓ navigate   Enter run   Esc cancel   d dashboard   q quit   {}/{}",
+            home.selected.saturating_add(1).min(home.actions.len()),
+            home.actions.len()
+        )),
         chunks[3],
     );
 }
@@ -2580,6 +2639,44 @@ mod tests {
         assert!(text.contains("typescript check  Format-check TypeScript"));
         assert!(text.contains("last launch succeeded"));
         assert!(!text.contains("currently running"));
+    }
+
+    #[test]
+    fn home_prioritizes_actions_and_keeps_the_selection_visible() {
+        let mut config = String::from("schema_version=1\n");
+        for index in 0..3 {
+            config.push_str(&format!(
+                "[task.launch-{index}]\nkind=\"launch\"\ncmd=\"true\"\n"
+            ));
+        }
+        for index in 0..10 {
+            config.push_str(&format!(
+                "[task.check-{index}]\nkind=\"check\"\ncmd=\"true\"\n"
+            ));
+        }
+        for index in 0..6 {
+            config.push_str(&format!("[task.utility-{index}]\ncmd=\"true\"\n"));
+        }
+        let stack = devme_config::Stack::parse(&config).unwrap();
+        let mut state = TuiState::default();
+        state.set_home(crate::home::HomeState::from_stack(&stack, vec![]));
+
+        let text = render_to_text(&mut state, 100, 30);
+        assert!(
+            text.contains("utility 5"),
+            "last action was clipped:\n{text}"
+        );
+        assert!(text.contains("1/19"), "action position is missing:\n{text}");
+
+        for _ in 1..19 {
+            state.home_mut().unwrap().move_next();
+        }
+        let text = render_to_text(&mut state, 80, 16);
+        assert!(
+            text.contains("▸ utility 5"),
+            "selected action did not scroll into view:\n{text}"
+        );
+        assert!(text.contains("19/19"), "action position is stale:\n{text}");
     }
 
     #[test]

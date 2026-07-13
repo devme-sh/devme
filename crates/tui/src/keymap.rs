@@ -24,6 +24,7 @@ pub enum Action {
     NextStack,
     PrevStack,
     ToggleSidebar,
+    Home,
     // log viewport
     PageUp,
     PageDown,
@@ -151,6 +152,16 @@ pub const MOUSE_NOTES: &[MouseNote] = &[
 /// some entry's `actions` (enforced by `tests::every_action_is_documented`).
 pub const BINDINGS: &[Binding] = &[
     // navigation
+    Binding {
+        keys: "d",
+        desc: "return to Home actions",
+        section: Section::Navigation,
+        actions: &[Action::Home],
+        footer: Some(FooterHint {
+            keys: "d",
+            label: "home",
+        }),
+    },
     Binding {
         keys: "←→ / hl",
         desc: "service tab",
@@ -341,6 +352,7 @@ pub const ALL_ACTIONS: &[Action] = &[
     Action::NextStack,
     Action::PrevStack,
     Action::ToggleSidebar,
+    Action::Home,
     Action::PageUp,
     Action::PageDown,
     Action::HalfPageUp,
@@ -381,6 +393,7 @@ fn exhaustive_marker(a: Action) {
         | Action::NextStack
         | Action::PrevStack
         | Action::ToggleSidebar
+        | Action::Home
         | Action::PageUp
         | Action::PageDown
         | Action::HalfPageUp
@@ -423,6 +436,7 @@ pub fn resolve(k: &KeyEvent) -> Option<Action> {
         (KeyCode::Down | KeyCode::Char('j'), false) => NextStack,
         (KeyCode::Up | KeyCode::Char('k'), false) => PrevStack,
         (KeyCode::Char('`'), false) => ToggleSidebar,
+        (KeyCode::Char('d'), false) => Home,
         // log viewport
         (KeyCode::PageUp | KeyCode::Char('b'), false) => PageUp,
         (KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('f'), false) => PageDown,
@@ -494,7 +508,7 @@ mod tests {
         let code = |kc: KeyCode| KeyEvent::new(kc, KeyModifiers::NONE);
 
         let mut events: Vec<KeyEvent> = Vec::new();
-        for c in "lhjkbfgGJKyYpvzSsrociqDwx,nR?` ".chars() {
+        for c in "dlhjkbfgGJKyYpvzSsrociqDwx,nR?` ".chars() {
             events.push(plain(c));
         }
         for c in ['u', 'd', 'c'] {
