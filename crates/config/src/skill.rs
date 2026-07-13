@@ -29,7 +29,12 @@ use crate::{GlobalConfig, SkillInstall};
 /// The canonical skill, embedded at compile time. Source of truth lives at
 /// `crates/config/skill/SKILL.md`; the published `devme-sh/skills` repo
 /// mirrors it.
-pub const SKILL_MD: &str = include_str!("../skill/SKILL.md");
+pub const AGENT_GUIDANCE: &str = include_str!("../skill/GUIDANCE.md");
+pub const SKILL_MD: &str = concat!(
+    include_str!("../skill/SKILL.md"),
+    "\n",
+    include_str!("../skill/GUIDANCE.md")
+);
 
 /// The skill's identity for display/state is the binary version — the skill
 /// ships with the binary, so "which devme is this skill for" is the honest
@@ -298,5 +303,16 @@ mod tests {
     fn embedded_skill_has_expected_frontmatter() {
         assert!(SKILL_MD.starts_with("---\nname: devme\n"));
         assert!(SKILL_MD.contains("### CLI reference"));
+    }
+
+    #[test]
+    fn embedded_skill_contains_the_canonical_live_guidance_verbatim() {
+        assert!(SKILL_MD.ends_with(AGENT_GUIDANCE));
+        for command in AGENT_GUIDANCE
+            .lines()
+            .filter_map(|line| line.strip_prefix("- "))
+        {
+            assert!(SKILL_MD.contains(command));
+        }
     }
 }

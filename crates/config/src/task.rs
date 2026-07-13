@@ -32,6 +32,13 @@ pub struct Task {
     /// Hard execution deadline in seconds. Zero means no deadline.
     #[serde(default)]
     pub timeout: u64,
+    /// Overall seconds to wait for required services to become ready.
+    #[serde(default = "default_readiness_timeout")]
+    pub readiness_timeout: u64,
+}
+
+fn default_readiness_timeout() -> u64 {
+    60
 }
 
 /// A generic bounded resource pool.

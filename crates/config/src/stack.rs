@@ -9,6 +9,31 @@ use crate::service::Service;
 use crate::step::Step;
 use crate::task::{Resource, Task};
 
+/// Shared persistence policy for service and task history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogPolicy {
+    /// Regular-expression patterns replaced with `[REDACTED]` before persistence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redact: Vec<String>,
+    /// Maximum bytes per active history file before rotation/trimming.
+    #[serde(default = "default_history_bytes")]
+    pub retention_bytes: u64,
+}
+
+impl Default for LogPolicy {
+    fn default() -> Self {
+        Self {
+            redact: Vec::new(),
+            retention_bytes: default_history_bytes(),
+        }
+    }
+}
+
+fn default_history_bytes() -> u64 {
+    8 * 1024 * 1024
+}
+
 /// Wire protocol version for `devme.toml`. Bumped on every breaking change.
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -45,6 +70,10 @@ pub struct Stack {
     /// Generic scarce-resource pools used by tasks.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub resource: IndexMap<String, Resource>,
+
+    /// Shared service/task history retention and redaction policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs: Option<LogPolicy>,
 }
 
 impl Stack {
@@ -260,6 +289,30 @@ unsupported_meta = true
     }
 
     #[test]
+    fn parses_log_policy_and_readiness_timing() {
+        let stack = Stack::parse(
+            r#"
+schema_version = 1
+
+[logs]
+redact = ["token-[0-9]+"]
+retention_bytes = 4096
+
+[service.backend]
+cmd = "serve"
+health = { shell = "published-schema-check" }
+readiness = { interval_ms = 25, timeout_ms = 100, retries = 7 }
+"#,
+        )
+        .unwrap();
+        assert_eq!(stack.logs.as_ref().unwrap().retention_bytes, 4096);
+        let readiness = stack.service["backend"].readiness.as_ref().unwrap();
+        assert_eq!(readiness.interval_ms, 25);
+        assert_eq!(readiness.timeout_ms, 100);
+        assert_eq!(readiness.retries, 7);
+    }
+
+    #[test]
     fn empty_step_and_service_tables_omitted_from_serialization() {
         let s = Stack {
             schema_version: 1,
@@ -269,6 +322,7 @@ unsupported_meta = true
             service: IndexMap::new(),
             task: IndexMap::new(),
             resource: IndexMap::new(),
+            logs: None,
         };
         let toml_str = toml::to_string(&s).unwrap();
         assert!(!toml_str.contains("[step"), "got: {toml_str}");
@@ -361,6 +415,7 @@ cmd = "npm run dev"
             service: IndexMap::new(),
             task: IndexMap::new(),
             resource: IndexMap::new(),
+            logs: None,
         };
         let toml_str = toml::to_string(&s).unwrap();
         assert!(!toml_str.contains("[env"), "got: {toml_str}");

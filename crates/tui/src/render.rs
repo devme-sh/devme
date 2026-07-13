@@ -2393,6 +2393,7 @@ mod tests {
             port: None,
             url: None,
             restart_count: 0,
+            readiness: None,
         }
     }
 
@@ -2965,6 +2966,7 @@ mod tests {
                 port: None,
                 url: None,
                 restart_count: 0,
+                readiness: None,
             }],
             steps: vec![],
         });
@@ -3005,6 +3007,7 @@ mod tests {
                 port: Some(5432),
                 url: Some("{host}:{port}".into()),
                 restart_count: 0,
+                readiness: None,
             }],
             steps: vec![],
         });

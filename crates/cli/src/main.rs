@@ -5,7 +5,7 @@ use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine;
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, Parser, error::ErrorKind};
 use clap_complete::{Shell, generate};
 use devme_cli::{
     Cli, Command, ConfigAction, RemoteAction, SkillAction, WorktreeAction, format_status_all,
@@ -30,7 +30,46 @@ fn assume_yes() -> bool {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
+            error.exit()
+        }
+        Err(error) => {
+            let args = std::env::args().skip(1).collect::<Vec<_>>();
+            let json = args.iter().any(|arg| arg == "--json")
+                || args.windows(2).any(|pair| pair == ["--output", "json"]);
+            let toon = args.windows(2).any(|pair| pair == ["--output", "toon"])
+                || args.first().is_some_and(|arg| arg == "agent");
+            let message = error.to_string();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "error": {
+                            "code": "invalid_arguments",
+                            "message": message.trim(),
+                            "help": "Run `devme --help` or the subcommand with `--help`.",
+                        }
+                    })
+                );
+            } else if toon {
+                print!(
+                    "error:\n  code: invalid_arguments\n  message: {}\n  help: {}",
+                    toon_cli_string(message.trim()),
+                    toon_cli_string("Run `devme --help` or the subcommand with `--help`.")
+                );
+            } else {
+                let _ = error.print();
+            }
+            std::process::exit(2);
+        }
+    };
     // Resolve quiet + per-stream color once (ADR-0017): the flag wins, then
     // `NO_COLOR`/`FORCE_COLOR`, then each stream's own tty-ness.
     devme_ui::init(cli.quiet, cli.no_color);
@@ -73,38 +112,51 @@ async fn run(cli: Cli) -> i32 {
     let result = match cli.command {
         None => return launch_default(cli.local, remote_flags).await,
         Some(Command::Run { task, output, args }) => {
-            let output = if cli.json { devme_cli::OutputFormat::Json } else { output };
+            let output = if cli.json {
+                devme_cli::OutputFormat::Json
+            } else {
+                output
+            };
             let cwd = match std::env::current_dir() {
                 Ok(value) => value,
-                Err(e) => { devme_ui::error(e); return 1; }
+                Err(e) => return emit_command_error(output, &e.into()),
             };
             let stack = match devme_cli::task::load(&cwd) {
                 Ok(value) => value,
-                Err(e) => { devme_ui::error(e); return 1; }
+                Err(e) => return emit_command_error(output, &e),
             };
             let services = match devme_cli::task::services_for(&stack, &task) {
                 Ok(value) => value,
-                Err(e) => { devme_ui::error(e); return 1; }
+                Err(e) => return emit_command_error(output, &e),
             };
+            let readiness_timeout =
+                devme_cli::task::readiness_timeout_for(&stack, &task).unwrap_or(60);
             if !services.is_empty()
-                && let Err(e) = up(services, true, true, 60).await
+                && let Err(e) = ensure_task_services(&stack, &services, readiness_timeout).await
             {
-                devme_ui::error(e);
-                return 1;
+                return emit_command_error(output, &e);
             }
             return match devme_cli::task::execute(&stack, &cwd, &task, &args, output).await {
                 Ok(result) => result.exit_code,
-                Err(e) => { devme_ui::error(e); 1 }
+                Err(e) => emit_command_error(output, &e),
             };
         }
         Some(Command::Tasks { action, output }) => {
-            let output = if cli.json { devme_cli::OutputFormat::Json } else { output };
-            match std::env::current_dir().map_err(anyhow::Error::from)
+            let output = if cli.json {
+                devme_cli::OutputFormat::Json
+            } else {
+                output
+            };
+            return match std::env::current_dir()
+                .map_err(anyhow::Error::from)
                 .and_then(|cwd| devme_cli::task::load(&cwd))
             {
-                Ok(stack) => devme_cli::task::show(&stack, action, output),
-                Err(e) => Err(e),
-            }
+                Ok(stack) => match devme_cli::task::show(&stack, action, output) {
+                    Ok(()) => 0,
+                    Err(e) => emit_command_error(output, &e),
+                },
+                Err(e) => emit_command_error(output, &e),
+            };
         }
         Some(Command::Status { all }) => {
             if all {
@@ -114,16 +166,23 @@ async fn run(cli: Cli) -> i32 {
             }
         }
         Some(Command::Down { timeout, all }) => down(timeout, all).await,
-        Some(Command::Up { services, detach, wait, timeout }) => {
-            up(services, detach, wait, timeout).await
-        }
+        Some(Command::Up {
+            services,
+            detach,
+            wait,
+            timeout,
+        }) => up(services, detach, wait, timeout).await,
         Some(Command::Start { service }) => start(service).await,
         Some(Command::Stop { service }) => stop(service).await,
         Some(Command::Restart { service }) => restart(service).await,
         Some(Command::Url { service, open }) => url(service, open).await,
-        Some(Command::Logs { service, follow, tail, since, json }) => {
-            logs(service, follow, tail, since, json).await
-        }
+        Some(Command::Logs {
+            service,
+            follow,
+            tail,
+            since,
+            json,
+        }) => logs(service, follow, tail, since, json).await,
         Some(Command::Completions { shell }) => {
             print_completions(shell);
             Ok(())
@@ -133,6 +192,13 @@ async fn run(cli: Cli) -> i32 {
         Some(Command::Worktree { action }) => worktree_cmd(action, cli.json).await,
         Some(Command::Remote { action }) => remote_cmd(action, cli.json, remote_flags),
         Some(Command::Skill { action }) => skill_cmd(action, cli.json),
+        Some(Command::Agent { action }) => {
+            return match agent_cmd(action).await {
+                Ok(()) => 0,
+                Err(e) => emit_command_error(devme_cli::OutputFormat::Toon, &e),
+            };
+        }
+        Some(Command::Setup { write }) => setup_cmd(write),
     };
     match result {
         Ok(()) => 0,
@@ -141,6 +207,142 @@ async fn run(cli: Cli) -> i32 {
             1
         }
     }
+}
+
+fn emit_command_error(format: devme_cli::OutputFormat, error: &anyhow::Error) -> i32 {
+    let message = error.to_string();
+    match format {
+        devme_cli::OutputFormat::Human => devme_ui::error(&message),
+        devme_cli::OutputFormat::Json => devme_ui::json(&serde_json::json!({
+            "error": {
+                "code": "operation_failed",
+                "message": message,
+                "help": "Inspect `devme doctor` or correct the named task/configuration.",
+            }
+        })),
+        devme_cli::OutputFormat::Toon => print!(
+            "error:\n  code: operation_failed\n  message: {}\n  help: {}",
+            toon_cli_string(&message),
+            toon_cli_string("Inspect `devme doctor` or correct the named task/configuration.")
+        ),
+    }
+    1
+}
+
+fn toon_cli_string(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t")
+    )
+}
+
+fn setup_cmd(write: bool) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let config = devme_cli::setup::detect(&cwd)?;
+    if write {
+        let path = cwd.join("devme.toml");
+        if path.exists() {
+            anyhow::bail!("{} already exists; refusing to overwrite", path.display());
+        }
+        std::fs::write(&path, &config)?;
+        devme_ui::success(format!("wrote {}", path.display()));
+    } else {
+        print!("{config}");
+    }
+    Ok(())
+}
+
+async fn agent_cmd(action: devme_cli::AgentAction) -> anyhow::Result<()> {
+    use devme_cli::AgentAction;
+    let cwd = std::env::current_dir()?;
+    match action {
+        AgentAction::Setup { target } => {
+            emit_agent_integrations(devme_cli::agent::setup(&cwd, target)?)
+        }
+        AgentAction::Status { target } => {
+            emit_agent_integrations(devme_cli::agent::status(&cwd, target)?)
+        }
+        AgentAction::Remove { target } => {
+            emit_agent_integrations(devme_cli::agent::remove(&cwd, target)?)
+        }
+        AgentAction::Context => agent_context(&cwd).await,
+    }
+}
+
+fn emit_agent_integrations(rows: Vec<(String, &'static str)>) -> anyhow::Result<()> {
+    let mut out = format!("integrations[{}]{{target,status}}:", rows.len());
+    for (target, status) in rows {
+        out.push_str(&format!("\n  {target},{status}"));
+    }
+    print!("{out}");
+    Ok(())
+}
+
+async fn agent_context(cwd: &std::path::Path) -> anyhow::Result<()> {
+    let stack = devme_cli::task::load(cwd)?;
+    let bin = std::env::current_exe()?
+        .display()
+        .to_string()
+        .replace(&std::env::var("HOME").unwrap_or_default(), "~");
+    let history = devme_cli::task::read_history(cwd, None, None)?;
+    let failed = history
+        .iter()
+        .rev()
+        .filter(|run| run.exit_code != 0)
+        .take(3)
+        .collect::<Vec<_>>();
+    let mut services = Vec::new();
+    if let Ok(sock) = devme_config::paths::supervisor_socket(cwd)
+        && let Ok(mut client) = devme_client::Client::connect(&sock).await
+        && let Ok(ServerMessage::Subscribed {
+            services: snapshot, ..
+        }) = client
+            .request(ClientMessage::Subscribe { services: vec![] })
+            .await
+    {
+        services = snapshot;
+    }
+    let active = services
+        .iter()
+        .filter(|service| service.state.is_up())
+        .count();
+    let mut out = format!(
+        "bin: {}\ndescription: Orchestrate this directory's setup, services, tasks, resources, and diagnostics\nstate:\n  services: {active}/{} ready\n  tasks: {} declared\n  recent_failures: {}",
+        toon_cli_string(&bin),
+        services.len(),
+        stack.task.len(),
+        failed.len()
+    );
+    if !failed.is_empty() {
+        out.push_str(&format!(
+            "\nfailures[{}]{{task,exit_code,finished_at}}:",
+            failed.len()
+        ));
+        for run in failed {
+            out.push_str(&format!(
+                "\n  {},{},{}",
+                toon_cli_string(&run.task),
+                run.exit_code,
+                run.finished_at
+            ));
+        }
+    }
+    let commands: Vec<_> = devme_config::skill::AGENT_GUIDANCE
+        .lines()
+        .filter_map(|line| line.strip_prefix("- "))
+        .take(3)
+        .collect();
+    out.push_str(&format!("\nhelp[{}]:", commands.len()));
+    for command in commands {
+        out.push_str(&format!("\n  - {command}"));
+    }
+    print!("{out}");
+    Ok(())
 }
 
 async fn down(timeout_secs: u64, all: bool) -> anyhow::Result<()> {
@@ -713,6 +915,131 @@ async fn up(
     Ok(())
 }
 
+async fn ensure_task_services(
+    stack: &Stack,
+    services: &[String],
+    timeout_secs: u64,
+) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let closure = required_service_closure(stack, services);
+    if closure.iter().any(|name| {
+        stack
+            .service
+            .get(name)
+            .is_some_and(|service| service.scope == devme_core::Scope::Repo)
+    }) {
+        ensure_shared_daemon(&cwd).await?;
+    }
+    let sock = socket_path();
+    ensure_daemon(&sock).await?;
+    let mut client = devme_client::Client::connect(&sock).await?;
+    let initial = client
+        .request(ClientMessage::Subscribe {
+            services: closure.clone(),
+        })
+        .await?;
+    let mut states: std::collections::HashMap<String, ServiceState> = match initial {
+        ServerMessage::Subscribed {
+            services: snapshot, ..
+        } => snapshot
+            .into_iter()
+            .filter(|item| closure.contains(&item.name))
+            .map(|item| (item.name, item.state))
+            .collect(),
+        other => anyhow::bail!("unexpected supervisor reply: {other:?}"),
+    };
+    client
+        .send(ClientMessage::StartTargets {
+            services: services.to_vec(),
+        })
+        .await?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut last_errors = std::collections::HashMap::new();
+    loop {
+        if services
+            .iter()
+            .all(|name| states.get(name).is_some_and(ServiceState::is_up))
+        {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let timeout_error = || {
+            let detail = closure
+                .iter()
+                .filter_map(|name| {
+                    last_errors
+                        .get(name)
+                        .map(|error| format!("{name}: {error}"))
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            anyhow::anyhow!(
+                "required services were not ready after {timeout_secs}s{}",
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            )
+        };
+        if remaining.is_zero() {
+            return Err(timeout_error());
+        }
+        let event = match tokio::time::timeout(remaining, client.next_event()).await {
+            Ok(event) => event?,
+            Err(_) => return Err(timeout_error()),
+        };
+        match event {
+            Some(ServerMessage::StatusUpdate { service, state, .. }) => {
+                states.insert(service, state);
+            }
+            Some(ServerMessage::Readiness {
+                service,
+                last_error: Some(error),
+                ..
+            }) => {
+                last_errors.insert(service, error);
+            }
+            Some(ServerMessage::Error { message, .. }) => anyhow::bail!("{message}"),
+            Some(_) => {}
+            None => anyhow::bail!("supervisor stopped while waiting for readiness"),
+        }
+    }
+}
+
+fn required_service_closure(stack: &Stack, targets: &[String]) -> Vec<String> {
+    fn visit(
+        graph: &devme_config::Graph,
+        stack: &Stack,
+        name: &str,
+        seen: &mut std::collections::HashSet<String>,
+        services: &mut Vec<String>,
+    ) {
+        if !seen.insert(name.to_string()) {
+            return;
+        }
+        if stack.service.contains_key(name) {
+            services.push(name.to_string());
+        }
+        for dependency in graph
+            .dependencies(name)
+            .iter()
+            .filter(|dependency| dependency.required)
+        {
+            visit(graph, stack, &dependency.name, seen, services);
+        }
+    }
+
+    let graph = devme_config::Graph::from_stack(stack);
+    let mut seen = std::collections::HashSet::new();
+    let mut services = Vec::new();
+    for target in targets {
+        visit(&graph, stack, target, &mut seen, &mut services);
+    }
+    services.sort();
+    services
+}
+
 /// Block on StatusUpdate stream until every service in `snapshot` is in a
 /// terminal post-boot state (Running, Failed, or CrashLoop). Used by
 /// `up -d --wait` so CI/scripts can know whether the stack is actually
@@ -855,6 +1182,33 @@ async fn logs(
     let tail_opt = if tail == 0 { None } else { Some(tail) };
 
     let cwd = std::env::current_dir()?;
+    let stack = std::fs::read_to_string(cwd.join("devme.toml"))
+        .ok()
+        .and_then(|text| Stack::parse(&text).ok());
+    if service.as_ref().is_some_and(|name| {
+        stack
+            .as_ref()
+            .is_some_and(|stack| stack.task.contains_key(name))
+    }) {
+        if follow {
+            anyhow::bail!(
+                "task history is finite; omit --follow and rerun the task separately with `devme run {}`",
+                service.as_deref().unwrap()
+            );
+        }
+        let names = service
+            .clone()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let mut lines = task_history_lines(&cwd, Some(&names), since_ms)?;
+        if tail > 0 && lines.len() > tail {
+            lines.drain(0..lines.len() - tail);
+        }
+        for line in lines {
+            emit_plain_log(&line.source, line.ts, line.stream, &line.text, json);
+        }
+        return Ok(());
+    }
 
     // Routing: a *named* repo-scoped service is owned by the shared supervisor
     // (the instance daemon only health-checks it and holds no log buffer), so
@@ -893,7 +1247,7 @@ async fn logs(
         .request(ClientMessage::LogQuery {
             services: services_arg,
             since: since_ms,
-            tail: tail_opt,
+            tail: if service.is_none() { None } else { tail_opt },
             follow,
         })
         .await?;
@@ -933,12 +1287,25 @@ async fn logs(
     // generous timeout is only a safety net against a daemon that dies
     // mid-replay; the marker is what normally terminates the loop.
     let drain_max = std::time::Duration::from_secs(10);
-    let mut printed_any = false;
+    let mut replay = Vec::new();
     loop {
         match tokio::time::timeout(drain_max, client.next_event()).await {
-            Ok(Ok(Some(ServerMessage::LogChunk { service: s, bytes, ts, stream }))) if want(&s) => {
-                emit_log(&s, ts, stream, &bytes, json);
-                printed_any = true;
+            Ok(Ok(Some(ServerMessage::LogChunk {
+                service: s,
+                bytes,
+                ts,
+                stream,
+            }))) if want(&s) => {
+                if let Some(text) = decode_log(&bytes) {
+                    for line in text.lines().filter(|line| !line.is_empty()) {
+                        replay.push(CorrelatedLine {
+                            source: s.clone(),
+                            ts,
+                            stream,
+                            text: strip_ansi(line.trim_end_matches('\r')),
+                        });
+                    }
+                }
             }
             Ok(Ok(Some(ServerMessage::LogEnd {}))) => break, // replay finished
             Ok(Ok(Some(ServerMessage::Notice { message, .. }))) => {
@@ -949,6 +1316,18 @@ async fn logs(
             Ok(Ok(Some(_))) => {}
             Ok(Ok(None)) | Ok(Err(_)) | Err(_) => return Ok(()),
         }
+    }
+
+    if service.is_none() {
+        replay.extend(task_history_lines(&cwd, None, since_ms)?);
+        replay.sort_by_key(|line| line.ts);
+        if tail > 0 && replay.len() > tail {
+            replay.drain(0..replay.len() - tail);
+        }
+    }
+    let printed_any = !replay.is_empty();
+    for line in replay {
+        emit_plain_log(&line.source, line.ts, line.stream, &line.text, json);
     }
 
     if !follow {
@@ -983,28 +1362,82 @@ async fn logs(
 /// Decode and print one log chunk — either prefixed text or an NDJSON record
 /// (`{ts, service, stream, text}`, ANSI stripped) for piping to `jq`.
 fn emit_log(service: &str, ts: u64, stream: devme_core::LogStream, bytes: &str, json: bool) {
-    let decoded = match base64::engine::general_purpose::STANDARD.decode(bytes.as_bytes()) {
-        Ok(d) => d,
-        Err(_) => return,
+    let Some(text) = decode_log(bytes) else {
+        return;
     };
-    let text = String::from_utf8_lossy(&decoded);
     for line in text.split('\n') {
         let line = line.trim_end_matches('\r');
         if line.is_empty() {
             continue;
         }
-        if json {
-            let obj = serde_json::json!({
-                "ts": ts,
-                "service": service,
-                "stream": stream,
-                "text": strip_ansi(line),
-            });
-            println!("{obj}");
+        emit_plain_log(service, ts, stream, line, json);
+    }
+}
+
+#[derive(Clone)]
+struct CorrelatedLine {
+    source: String,
+    ts: u64,
+    stream: devme_core::LogStream,
+    text: String,
+}
+
+fn decode_log(bytes: &str) -> Option<String> {
+    base64::engine::general_purpose::STANDARD
+        .decode(bytes.as_bytes())
+        .ok()
+        .map(|decoded| String::from_utf8_lossy(&decoded).into_owned())
+}
+
+fn emit_plain_log(source: &str, ts: u64, stream: devme_core::LogStream, text: &str, json: bool) {
+    if json {
+        let source_kind = if source.starts_with("task:") {
+            "task"
         } else {
-            print_prefixed(service, line);
+            "service"
+        };
+        println!(
+            "{}",
+            serde_json::json!({
+                "ts": ts,
+                // Keep the established key for JSON consumers. Task records use
+                // the unambiguous `task:<name>` namespace.
+                "service": source,
+                "source_kind": source_kind,
+                "stream": stream,
+                "text": strip_ansi(text),
+            })
+        );
+    } else {
+        print_prefixed(source, text);
+    }
+}
+
+fn task_history_lines(
+    cwd: &std::path::Path,
+    names: Option<&std::collections::HashSet<String>>,
+    since: Option<u64>,
+) -> anyhow::Result<Vec<CorrelatedLine>> {
+    let mut lines = Vec::new();
+    for result in devme_cli::task::read_history(cwd, names, since)? {
+        for text in result.stdout.lines() {
+            lines.push(CorrelatedLine {
+                source: format!("task:{}", result.task),
+                ts: result.finished_at,
+                stream: devme_core::LogStream::Stdout,
+                text: text.into(),
+            });
+        }
+        for text in result.stderr.lines() {
+            lines.push(CorrelatedLine {
+                source: format!("task:{}", result.task),
+                ts: result.finished_at,
+                stream: devme_core::LogStream::Stderr,
+                text: text.into(),
+            });
         }
     }
+    Ok(lines)
 }
 
 /// Parse a `--since` value into an epoch-ms floor. Accepts a duration relative
@@ -1071,6 +1504,30 @@ fn strip_ansi(s: &str) -> String {
 type DoctorLine = (u64, devme_core::LogStream, String);
 
 async fn doctor(name: Option<String>, tail: usize) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let stack = devme_cli::task::load(&cwd).ok();
+    if let Some(task_name) = name.as_ref().filter(|name| {
+        stack
+            .as_ref()
+            .is_some_and(|stack| stack.task.contains_key(*name))
+    }) {
+        let names = [task_name.clone()].into_iter().collect();
+        let history = devme_cli::task::read_history(&cwd, Some(&names), None)?;
+        let latest = history.last();
+        devme_ui::json(&serde_json::json!({
+            "name": task_name, "kind": "task", "runs": history.len(),
+            "latest": latest, "status": latest.map(|run| run.status.as_str()).unwrap_or("never_run")
+        }));
+        return Ok(());
+    }
+    if let (Some(node), Some(stack)) = (&name, &stack)
+        && !stack.service.contains_key(node)
+        && !stack.step.contains_key(node)
+    {
+        anyhow::bail!("no task, service, or step named {node:?} in devme.toml");
+    }
+    let task_history = devme_cli::task::read_history(&cwd, None, None)?;
+    let task_digest = latest_task_digest(&task_history);
     let sock = socket_path();
     let mut client = match devme_client::Client::connect(&sock).await {
         Ok(c) => c,
@@ -1080,6 +1537,7 @@ async fn doctor(name: Option<String>, tail: usize) -> anyhow::Result<()> {
                 "message": "no devme daemon running — start one with `devme up -d`",
                 "services": [],
                 "steps": [],
+                "tasks": task_digest,
             });
             devme_ui::json(&report);
             return Ok(());
@@ -1193,6 +1651,7 @@ async fn doctor(name: Option<String>, tail: usize) -> anyhow::Result<()> {
                 "pid": s.pid,
                 "port": s.port,
                 "restart_count": s.restart_count,
+                "readiness": s.readiness,
                 "recent_errors": fmt_tail(&errors, tail),
                 "recent_logs": fmt_tail(&lines, tail),
             })
@@ -1205,17 +1664,19 @@ async fn doctor(name: Option<String>, tail: usize) -> anyhow::Result<()> {
     // per-service stderr, plus step output only when the step actually failed.
     // Healthy chatter costs the reader tokens without aiding diagnosis; it
     // stays one `devme logs` away.
-    let has_failures = services.iter().any(|s| {
-        matches!(
-            s.state,
-            ServiceState::Failed { .. } | ServiceState::CrashLoop { .. }
-        )
-    }) || steps.iter().any(|s| {
-        matches!(
-            s.state,
-            devme_core::StepState::Failed | devme_core::StepState::ProvisionFailed
-        )
-    });
+    let has_failures = task_history.iter().any(|run| run.exit_code != 0)
+        || services.iter().any(|s| {
+            matches!(
+                s.state,
+                ServiceState::Failed { .. } | ServiceState::CrashLoop { .. }
+            )
+        })
+        || steps.iter().any(|s| {
+            matches!(
+                s.state,
+                devme_core::StepState::Failed | devme_core::StepState::ProvisionFailed
+            )
+        });
 
     let svc_json: Vec<serde_json::Value> = services
         .iter()
@@ -1229,6 +1690,7 @@ async fn doctor(name: Option<String>, tail: usize) -> anyhow::Result<()> {
                 "pid": s.pid,
                 "port": s.port,
                 "restart_count": s.restart_count,
+                "readiness": s.readiness,
                 "recent_errors": fmt_tail(&errors, tail),
             })
         })
@@ -1257,11 +1719,29 @@ async fn doctor(name: Option<String>, tail: usize) -> anyhow::Result<()> {
         "status": if has_failures { "unhealthy" } else { "healthy" },
         "services": svc_json,
         "steps": step_json,
-        "hint": "zoom with `devme doctor <name>`; stream services with `devme logs`",
+        "tasks": task_digest,
+        "hint": "zoom with `devme doctor <name>`; stream services and tasks with `devme logs`",
     });
 
     devme_ui::json(&report);
     Ok(())
+}
+
+fn latest_task_digest(history: &[devme_cli::task::TaskResult]) -> Vec<serde_json::Value> {
+    let mut latest = std::collections::BTreeMap::new();
+    for run in history {
+        latest.insert(run.task.clone(), run);
+    }
+    latest
+        .into_iter()
+        .map(|(name, run)| {
+            serde_json::json!({
+                "name": name, "status": run.status, "exit_code": run.exit_code,
+                "duration_ms": run.duration_ms, "finished_at": run.finished_at,
+                "recent_error": run.stderr.lines().last(),
+            })
+        })
+        .collect()
 }
 
 fn config_cmd(action: Option<ConfigAction>, json: bool) -> anyhow::Result<()> {

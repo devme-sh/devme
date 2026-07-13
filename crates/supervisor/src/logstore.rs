@@ -43,6 +43,7 @@ pub struct LogStore {
     dir: PathBuf,
     rotate_bytes: u64,
     writers: HashMap<String, Writer>,
+    redactor: devme_config::Redactor,
 }
 
 impl LogStore {
@@ -53,7 +54,14 @@ impl LogStore {
             dir,
             rotate_bytes: DEFAULT_ROTATE_BYTES,
             writers: HashMap::new(),
+            redactor: devme_config::Redactor::default(),
         }
+    }
+
+    pub fn with_policy(mut self, rotate_bytes: u64, redactions: Vec<String>) -> Self {
+        self.rotate_bytes = rotate_bytes.max(1024);
+        self.redactor = devme_config::Redactor::new(&redactions).unwrap_or_default();
+        self
     }
 
     /// Test/tuning hook: set a smaller rotation threshold.
@@ -66,13 +74,14 @@ impl LogStore {
     /// floor rather than killing the daemon's event loop — the ring is still
     /// authoritative for live streaming.
     pub fn append(&mut self, service: &str, ts: u64, stream: LogStream, text: &str) {
+        let text = self.redactor.apply(text);
         let dir = self.dir.clone();
         let rotate_bytes = self.rotate_bytes;
         let writer = self
             .writers
             .entry(service.to_string())
             .or_insert_with(|| Writer::open(&dir, service, rotate_bytes));
-        writer.append(ts, stream, text);
+        writer.append(ts, stream, &text);
     }
 
     /// Read persisted records for `service`, oldest-first. Applies `since`
@@ -277,6 +286,18 @@ mod tests {
         );
         assert_eq!(recs[1].stream, LogStream::Stderr);
         assert_eq!(recs[2].text, "third");
+    }
+
+    #[test]
+    fn redacts_patterns_before_writing_to_disk() {
+        let dir = TempDir::new().unwrap();
+        let mut store = LogStore::new(dir.path().join("logs"))
+            .with_policy(4096, vec![r"bearer [A-Za-z0-9]+".into()]);
+        store.append("api", 1, LogStream::Stderr, "bearer secret123");
+        let persisted =
+            std::fs::read_to_string(active_path(&dir.path().join("logs"), "api")).unwrap();
+        assert!(!persisted.contains("secret123"));
+        assert!(persisted.contains("[REDACTED]"));
     }
 
     #[test]

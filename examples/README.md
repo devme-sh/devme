@@ -12,4 +12,6 @@ inside any of them.
 | `interp-envfile/`          | Cross-service port interpolation (`frontend` env references `{port.backend}`), a `scope = "repo"` fixed-port `proxy`, and `env_file = ".env"`. |
 | `native-mobile-monorepo/`  | Backend + iOS + Android tasks, service readiness, isolated writable state, device-log services, and host-scoped simulator/emulator leases. |
 
-All commands are shell loops — no real binaries needed.
+Most examples use portable shell loops. The native-mobile example intentionally
+delegates to Bun, xcodebuild, Gradle, and adb; the CLI test suite has a matching
+portable executable fixture for environments without those toolchains.

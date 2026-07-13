@@ -101,6 +101,8 @@ pub enum ClientMessage {
         #[serde(default)]
         skip_deps: bool,
     },
+    /// Start only these services and their required transitive dependencies.
+    StartTargets { services: Vec<String> },
     /// Re-run health checks across the whole graph. Equivalent to
     /// `devme health --recheck`.
     RecheckHealth,
@@ -158,6 +160,14 @@ pub enum ServerMessage {
         port: Option<u16>,
         restart_count: u32,
     },
+    /// One readiness-probe attempt, suitable for progress and diagnostics.
+    Readiness {
+        service: String,
+        attempt: u32,
+        ready: bool,
+        #[serde(default)]
+        last_error: Option<String>,
+    },
     /// A step's state changed.
     StepStatusUpdate { step: String, state: StepState },
     /// End-of-replay marker for a [`ClientMessage::LogQuery`]. Everything
@@ -190,6 +200,19 @@ pub struct ServiceSnapshot {
     #[serde(default)]
     pub url: Option<String>,
     pub restart_count: u32,
+    /// Latest readiness-probe state. Optional for compatibility with older
+    /// supervisors that predate targeted task readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<ReadinessSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadinessSnapshot {
+    pub attempt: u32,
+    pub ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// One step's state in a `Subscribed` snapshot.
@@ -328,6 +351,9 @@ mod tests {
                 service: "backend".into(),
                 skip_deps: true,
             },
+            ClientMessage::StartTargets {
+                services: vec!["backend".into()],
+            },
             ClientMessage::RecheckHealth,
             ClientMessage::Shutdown,
         ];
@@ -361,6 +387,11 @@ mod tests {
                     port: Some(8080),
                     url: Some("http://{host}:{port}".into()),
                     restart_count: 0,
+                    readiness: Some(ReadinessSnapshot {
+                        attempt: 2,
+                        ready: true,
+                        last_error: None,
+                    }),
                 }],
                 steps: vec![StepSnapshot {
                     name: "gcloud".into(),
@@ -379,6 +410,12 @@ mod tests {
                 pid: None,
                 port: None,
                 restart_count: 0,
+            },
+            ServerMessage::Readiness {
+                service: "backend".into(),
+                attempt: 3,
+                ready: false,
+                last_error: Some("schema is not published".into()),
             },
             ServerMessage::StepStatusUpdate {
                 step: "gcloud".into(),

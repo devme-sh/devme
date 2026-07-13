@@ -5,6 +5,38 @@ use std::collections::BTreeMap;
 use devme_core::{Dependency, HealthCheck, PortSpec, RestartPolicy, Scope};
 use serde::{Deserialize, Serialize};
 
+/// Retry policy for a service's readiness probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Readiness {
+    #[serde(default = "default_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default = "default_probe_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_retries")]
+    pub retries: u32,
+}
+
+impl Default for Readiness {
+    fn default() -> Self {
+        Self {
+            interval_ms: default_interval_ms(),
+            timeout_ms: default_probe_timeout_ms(),
+            retries: default_retries(),
+        }
+    }
+}
+
+fn default_interval_ms() -> u64 {
+    500
+}
+fn default_probe_timeout_ms() -> u64 {
+    2_000
+}
+fn default_retries() -> u32 {
+    60
+}
+
 /// One Service in the Stack graph. Stays alive after starting.
 ///
 /// In TOML:
@@ -75,6 +107,11 @@ pub struct Service {
     /// `external = true`; advisory otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<HealthCheck>,
+
+    /// Timing and retry policy for `health`. Defaults preserve the existing
+    /// 500ms polling behavior while making failure finite and diagnosable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<Readiness>,
 
     /// Path to a log file to tail. Only meaningful when `external = true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -30,11 +30,26 @@ scope. The OS releases locks after crashes, owner metadata remains inspectable,
 and a configured environment variable exposes the allocated zero-based slot.
 Names are acquired in sorted order to prevent multi-resource deadlock.
 
-Task results are appended as bounded JSONL history beside instance runtime
-state. Captured stdout and stderr are bounded and values from secret-shaped
-task environment keys are redacted before persistence. Human mode replays raw
-task output; `--output toon` provides compact agent output and `--output json`
-plus the global `--json` alias preserve JSON consumers.
+Task and service history share one retention and redaction policy. Redaction
+patterns are compiled as regular expressions and applied before disk writes.
+`devme logs` correlates service and `task:<name>` records by timestamp, while
+`devme doctor` includes the latest task results and readiness failure details.
+
+Required service startup is a targeted supervisor operation. It advances only
+the required dependency closure and reports each readiness attempt, the last
+actionable error, and the configured interval, probe timeout, retries, and
+overall task deadline. HTTP, TCP, and shell probes remain generic, so a shell
+probe can prove that backend schema and functions are published.
+
+`devme agent setup|status|remove` manages explicit project-scoped session
+integrations for Claude Code, Codex, and OpenCode. It never installs them
+implicitly. `devme agent context` emits compact directory-scoped TOON state and
+next commands. The embedded skill and this context use the same canonical live
+guidance, guarded by a freshness test.
+
+`devme setup` conservatively detects Xcode projects/workspaces, Package.swift,
+Gradle Kotlin/Android, Convex, and Vite+ markers. It emits explicit delegated
+commands and does not infer or reproduce native build graphs.
 
 ## Consequences
 
@@ -44,26 +59,7 @@ adb log streams. Existing service health probes, including HTTP and shell
 checks, remain the readiness authority, so a shell probe can verify published
 backend schema or functions rather than only an open port.
 
-This tracer bullet does not install agent session hooks or implement project
-detection. Those surfaces need separate compatibility work for each supported
-agent and init workflow. Task history is persisted and structured but is not
-yet merged into the existing `logs` and `doctor` query surfaces.
-
-## Follow-up tasks
-
-1. **Task diagnostics and configurable redaction** - merge task records into
-   `devme logs` and `devme doctor`, add explicit redaction patterns and shared
-   retention policy, and test correlation across service and task timestamps.
-2. **Targeted supervisor readiness** - add an IPC operation that starts only a
-   task's required service closure, reports per-probe attempts and last errors,
-   and supports configured probe timeout, interval, retries, and overall task
-   readiness deadline. The current tracer uses `up --wait`, whose v1 executor
-   advances the whole service graph.
-3. **Agent session integration and generated guidance** - add explicit,
-   idempotent setup/status/remove commands for Claude Code, Codex, and OpenCode
-   after confirming each current hook contract. Generate both the home surface
-   and installable skill from one guidance source and add a CI freshness check.
-4. **Native-monorepo init detection** - extend init/setup detection for Xcode
-   projects and workspaces, Package.swift, Gradle Kotlin/Android, Convex, and
-   Vite+ while keeping emitted commands explicit and delegating all build graph
-   knowledge to the native tools.
+The orchestration remains deliberately shallow: Xcode, Gradle, Vite+, Bun, and
+Convex own compilation and runtime semantics. Devme owns ordering, isolation,
+leases, readiness, history, redaction, and diagnostics. There is no second root
+task runner, package graph, remote cache, or native build-graph model.

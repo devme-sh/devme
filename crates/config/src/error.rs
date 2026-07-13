@@ -30,4 +30,10 @@ pub enum ConfigError {
 
     #[error("resource '{name}' has capacity 0; capacity must be at least 1")]
     InvalidResourceCapacity { name: String },
+
+    #[error("service '{name}' readiness.{field} must be at least 1")]
+    InvalidReadinessValue { name: String, field: &'static str },
+
+    #[error("invalid logs.redact pattern {pattern:?}: {message}")]
+    InvalidRedactionPattern { pattern: String, message: String },
 }
