@@ -342,6 +342,7 @@ impl SharedState {
                         port: *port,
                         url: url.clone(),
                         restart_count: 0,
+                        readiness: None,
                     };
                     services_map.lock().await.insert(
                         name.clone(),

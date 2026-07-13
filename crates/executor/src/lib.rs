@@ -6,7 +6,7 @@
 //!
 //! See ADR-0001 (unified graph) and ADR-0005 (override-aware failure model).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use devme_config::{DepStatus, Graph, NodeKind, SatisfactionOutcome};
 use devme_core::{ServiceState, StepState};
@@ -39,6 +39,8 @@ pub enum Event {
     /// Begin executing — runs all leaf checks and starts dependency-free
     /// services.
     Start,
+    /// Begin only the required dependency closure for these services.
+    StartTargets { names: Vec<String> },
     /// The Step's `check` finished. `passed=true` means the prerequisite
     /// was already met; `false` means it wasn't.
     StepCheckCompleted { name: String, passed: bool },
@@ -84,12 +86,14 @@ pub enum NodeStatus {
 pub struct Executor {
     graph: Graph,
     nodes: HashMap<String, NodeStatus>,
+    active_targets: Option<HashSet<String>>,
 }
 
 impl Executor {
     pub fn new(graph: Graph) -> Self {
         Self {
             nodes: HashMap::new(),
+            active_targets: None,
             graph,
         }
     }
@@ -108,19 +112,28 @@ impl Executor {
 
     pub fn handle(&mut self, event: Event) -> Vec<Action> {
         match event {
-            Event::Start => self.advance(),
+            Event::Start => {
+                self.active_targets = None;
+                self.advance()
+            }
+            Event::StartTargets { names } => {
+                let mut closure = HashSet::new();
+                for name in names {
+                    self.collect_required(&name, &mut closure);
+                }
+                self.active_targets = Some(closure);
+                self.advance()
+            }
             Event::StepCheckCompleted { name, passed } => {
                 if passed {
-                    self.nodes
-                        .insert(name, NodeStatus::Step(StepState::Passed));
+                    self.nodes.insert(name, NodeStatus::Step(StepState::Passed));
                     self.advance()
                 } else if self.graph.has_provision(&name) {
                     self.nodes
                         .insert(name.clone(), NodeStatus::Step(StepState::Unknown));
                     vec![Action::RunProvision(name)]
                 } else {
-                    self.nodes
-                        .insert(name, NodeStatus::Step(StepState::Failed));
+                    self.nodes.insert(name, NodeStatus::Step(StepState::Failed));
                     self.advance()
                 }
             }
@@ -193,6 +206,13 @@ impl Executor {
     fn advance(&mut self) -> Vec<Action> {
         let mut out = Vec::new();
         for name in self.graph.nodes().to_vec() {
+            if self
+                .active_targets
+                .as_ref()
+                .is_some_and(|targets| !targets.contains(&name))
+            {
+                continue;
+            }
             if self.nodes.contains_key(&name) {
                 continue;
             }
@@ -226,6 +246,20 @@ impl Executor {
         out
     }
 
+    fn collect_required(&self, name: &str, out: &mut HashSet<String>) {
+        if !out.insert(name.to_string()) {
+            return;
+        }
+        for dep in self
+            .graph
+            .dependencies(name)
+            .iter()
+            .filter(|dep| dep.required)
+        {
+            self.collect_required(&dep.name, out);
+        }
+    }
+
     fn required_deps_satisfied(&self, name: &str) -> bool {
         matches!(
             self.graph.deps_satisfied(name, |dep| self.dep_status(dep)),
@@ -242,9 +276,9 @@ impl Executor {
             }
             Some(NodeStatus::Step(_)) => DepStatus::Pending,
             Some(NodeStatus::Service(s)) if s.is_up() => DepStatus::Satisfied,
-            Some(NodeStatus::Service(ServiceState::Failed { .. } | ServiceState::CrashLoop { .. })) => {
-                DepStatus::Failed
-            }
+            Some(NodeStatus::Service(
+                ServiceState::Failed { .. } | ServiceState::CrashLoop { .. },
+            )) => DepStatus::Failed,
             Some(NodeStatus::Service(_)) => DepStatus::Pending,
         }
     }
@@ -352,6 +386,39 @@ cmd = "docker run postgres"
     }
 
     #[test]
+    fn targeted_start_advances_only_required_dependency_closure() {
+        let mut executor = Executor::new(graph(
+            r#"
+schema_version = 1
+
+[step.schema]
+check = "published"
+
+[service.backend]
+cmd = "serve"
+depends_on = ["schema"]
+
+[service.unrelated]
+cmd = "other"
+"#,
+        ));
+        assert_eq!(
+            executor.handle(Event::StartTargets {
+                names: vec!["backend".into()],
+            }),
+            vec![Action::RunCheck("schema".into())]
+        );
+        assert_eq!(
+            executor.handle(Event::StepCheckCompleted {
+                name: "schema".into(),
+                passed: true,
+            }),
+            vec![Action::StartService("backend".into())]
+        );
+        assert!(executor.state("unrelated").is_none());
+    }
+
+    #[test]
     fn successful_provision_reruns_the_check() {
         let mut e = Executor::new(graph(
             r#"
@@ -436,7 +503,9 @@ depends_on = ["tools"]
             passed: false,
         });
         // Step is now Failed (no provision) and backend is blocked.
-        let override_actions = e.handle(Event::UserOverride { name: "tools".into() });
+        let override_actions = e.handle(Event::UserOverride {
+            name: "tools".into(),
+        });
         assert_eq!(
             override_actions,
             vec![Action::StartService("backend".into())]
@@ -632,7 +701,9 @@ health = { tcp = "localhost:15432" }
         assert_eq!(actions, vec![Action::ProbeExternal("proxy".into())]);
         assert!(matches!(
             e.state("proxy"),
-            Some(NodeStatus::Service(ServiceState::External { healthy: false }))
+            Some(NodeStatus::Service(ServiceState::External {
+                healthy: false
+            }))
         ));
     }
 
@@ -656,11 +727,15 @@ depends_on = ["proxy"]
         // Only the external probe is requested; backend waits on it.
         assert_eq!(first, vec![Action::ProbeExternal("proxy".into())]);
 
-        let after = e.handle(Event::ExternalHealthy { name: "proxy".into() });
+        let after = e.handle(Event::ExternalHealthy {
+            name: "proxy".into(),
+        });
         assert_eq!(after, vec![Action::StartService("backend".into())]);
         assert!(matches!(
             e.state("proxy"),
-            Some(NodeStatus::Service(ServiceState::External { healthy: true }))
+            Some(NodeStatus::Service(ServiceState::External {
+                healthy: true
+            }))
         ));
     }
 

@@ -1345,6 +1345,7 @@ mod tests {
             port: None,
             url: None,
             restart_count: 0,
+            readiness: None,
         }
     }
 

@@ -17,7 +17,8 @@ use base64::Engine;
 use devme_config::{Graph, InterpContext, Stack, interpolate};
 use devme_core::{
     ClientMessage, Envelope, ErrorCode, HealthCheck, InstanceInfo, LogStream, NoticeLevel,
-    RestartPolicy, ServerMessage, ServiceSnapshot, ServiceState, Slot, StepSnapshot, StepState,
+    ReadinessSnapshot, RestartPolicy, ServerMessage, ServiceSnapshot, ServiceState, Slot,
+    StepSnapshot, StepState,
 };
 use devme_executor::{Action, Event as ExecEvent, Executor, NodeStatus};
 use devme_ipc::FrameCodec;
@@ -44,9 +45,6 @@ const HEALTH_GRACE_MS: u64 = 150;
 /// service ignores SIGTERM. Under `devme down`'s default 10s client wait so it
 /// still observes the resulting Stopped events.
 const STOP_GRACE: Duration = Duration::from_secs(5);
-
-/// How often the health probe re-runs while a service is in `Starting`.
-const PROBE_INTERVAL_MS: u64 = 1000;
 
 /// Base restart backoff. Real delay = `BASE * 2^min(count, BACKOFF_CAP_POW)`,
 /// capped at [`RESTART_BACKOFF_MAX_MS`].
@@ -96,11 +94,20 @@ enum InternalEvent {
     ServiceGracePassed {
         service: String,
         generation: u64,
+        attempt: u32,
     },
     /// An `external` service's health probe passed. Carries no generation —
     /// devme doesn't own the process, so there's no child to match against.
     ExternalHealthy {
         service: String,
+        attempt: u32,
+    },
+    ProbeAttempt {
+        service: String,
+        generation: Option<u64>,
+        attempt: u32,
+        error: String,
+        exhausted: bool,
     },
     /// Restart-policy backoff timer expired — try to bring the service back.
     AutoRestart {
@@ -207,6 +214,8 @@ struct DaemonState {
     /// the `CrashLoop` state when the breaker trips. Cleared alongside
     /// [`Self::rapid_exits`].
     failure_reasons: HashMap<String, String>,
+    /// Latest probe state, exposed in status and doctor snapshots.
+    readiness: HashMap<String, ReadinessSnapshot>,
     next_generation: u64,
     next_client_id: u64,
     shutting_down: bool,
@@ -217,10 +226,12 @@ impl DaemonState {
         let graph = Graph::from_stack(&stack);
         let worktree = instance.cwd.clone();
         let branch = current_git_branch(Path::new(&worktree)).unwrap_or_default();
+        let policy = stack.logs.clone().unwrap_or_default();
         let log_store = LogStore::new(
             devme_config::paths::instance_log_dir(Path::new(&worktree))
                 .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/devme/orphan-logs")),
-        );
+        )
+        .with_policy(policy.retention_bytes, policy.redact);
         Self {
             stack,
             executor: Executor::new(graph),
@@ -238,6 +249,7 @@ impl DaemonState {
             restart_counts: HashMap::new(),
             rapid_exits: HashMap::new(),
             failure_reasons: HashMap::new(),
+            readiness: HashMap::new(),
             next_generation: 0,
             next_client_id: 0,
             shutting_down: false,
@@ -290,6 +302,7 @@ impl DaemonState {
                     port: rec.and_then(|r| r.port),
                     url: svc.url_template(),
                     restart_count: count,
+                    readiness: self.readiness.get(name).cloned(),
                 }
             })
             .collect();
@@ -637,8 +650,64 @@ fn process_event(
         InternalEvent::ServiceGracePassed {
             service,
             generation,
-        } => handle_grace_passed(state, service, generation, tx),
-        InternalEvent::ExternalHealthy { service } => handle_external_healthy(state, service, tx),
+            attempt,
+        } => handle_grace_passed(state, service, generation, attempt, tx),
+        InternalEvent::ExternalHealthy { service, attempt } => {
+            handle_external_healthy(state, service, attempt, tx)
+        }
+        InternalEvent::ProbeAttempt {
+            service,
+            generation,
+            attempt,
+            error,
+            exhausted,
+        } => {
+            state.readiness.insert(
+                service.clone(),
+                ReadinessSnapshot {
+                    attempt,
+                    ready: false,
+                    last_error: Some(error.clone()),
+                },
+            );
+            state.broadcast(
+                Some(&service),
+                ServerMessage::Readiness {
+                    service: service.clone(),
+                    attempt,
+                    ready: false,
+                    last_error: Some(error.clone()),
+                },
+            );
+            if exhausted {
+                state.failure_reasons.insert(service.clone(), error);
+                if let Some(generation) = generation {
+                    if let Some(rec) = state
+                        .children
+                        .get(&service)
+                        .filter(|rec| rec.generation == generation)
+                    {
+                        send_sigkill(rec.pid);
+                    }
+                } else {
+                    let actions = state.executor.handle(ExecEvent::ServiceExited {
+                        name: service.clone(),
+                        exit_code: None,
+                    });
+                    state.broadcast(
+                        Some(&service),
+                        ServerMessage::StatusUpdate {
+                            service: service.clone(),
+                            state: ServiceState::Failed { exit_code: None },
+                            pid: None,
+                            port: None,
+                            restart_count: 0,
+                        },
+                    );
+                    enact_actions(state, actions, tx);
+                }
+            }
+        }
         InternalEvent::AutoRestart { service } => handle_auto_restart(state, service, tx),
         InternalEvent::StepCheckResult { step, passed } => {
             let actions = state.executor.handle(ExecEvent::StepCheckCompleted {
@@ -863,6 +932,26 @@ fn handle_client_message(
                 }
             }
             let actions = state.executor.handle(ExecEvent::Start);
+            enact_actions(state, actions, tx);
+        }
+        ClientMessage::StartTargets { services } => {
+            let unknown: Vec<_> = services
+                .iter()
+                .filter(|name| !state.stack.service.contains_key(*name))
+                .cloned()
+                .collect();
+            if !unknown.is_empty() {
+                if let Some(client) = state.clients.get(&id) {
+                    let _ = client.send(ServerMessage::Error {
+                        code: ErrorCode::NotFound,
+                        message: format!("unknown services: {}", unknown.join(", ")),
+                    });
+                }
+                return;
+            }
+            let actions = state
+                .executor
+                .handle(ExecEvent::StartTargets { names: services });
             enact_actions(state, actions, tx);
         }
         ClientMessage::Stop { service } => {
@@ -1189,6 +1278,7 @@ fn handle_grace_passed(
     state: &mut DaemonState,
     service: String,
     generation: u64,
+    attempt: u32,
     tx: &mpsc::UnboundedSender<InternalEvent>,
 ) {
     let still_running = state
@@ -1203,6 +1293,26 @@ fn handle_grace_passed(
         name: service.clone(),
     });
     let rec = state.children.get(&service).expect("checked");
+    let pid = rec.pid;
+    let port = rec.port;
+    let restart_count = rec.restart_count;
+    state.readiness.insert(
+        service.clone(),
+        ReadinessSnapshot {
+            attempt,
+            ready: true,
+            last_error: None,
+        },
+    );
+    state.broadcast(
+        Some(&service),
+        ServerMessage::Readiness {
+            service: service.clone(),
+            attempt,
+            ready: true,
+            last_error: None,
+        },
+    );
     state.broadcast(
         Some(&service),
         ServerMessage::StatusUpdate {
@@ -1211,9 +1321,9 @@ fn handle_grace_passed(
                 degraded: false,
                 started_without: vec![],
             },
-            pid: Some(rec.pid),
-            port: rec.port,
-            restart_count: rec.restart_count,
+            pid: Some(pid),
+            port,
+            restart_count,
         },
     );
     enact_actions(state, actions, tx);
@@ -1225,8 +1335,26 @@ fn handle_grace_passed(
 fn handle_external_healthy(
     state: &mut DaemonState,
     service: String,
+    attempt: u32,
     tx: &mpsc::UnboundedSender<InternalEvent>,
 ) {
+    state.readiness.insert(
+        service.clone(),
+        ReadinessSnapshot {
+            attempt,
+            ready: true,
+            last_error: None,
+        },
+    );
+    state.broadcast(
+        Some(&service),
+        ServerMessage::Readiness {
+            service: service.clone(),
+            attempt,
+            ready: true,
+            last_error: None,
+        },
+    );
     // Already healthy? Nothing to do (the probe loop only fires once, but a
     // re-subscribe or duplicate event must stay idempotent).
     if matches!(
@@ -1268,6 +1396,7 @@ fn enact_actions(
     while let Some(action) = work.pop() {
         match action {
             Action::StartService(name) => {
+                state.readiness.remove(&name);
                 let svc = match state.stack.service.get(&name) {
                     Some(s) => s.clone(),
                     None => continue,
@@ -1424,23 +1553,37 @@ fn enact_actions(
                 // grace timer.
                 if let Some(check) = svc.health.clone() {
                     let check = interpolate_health(&check, &ctx);
+                    let readiness = svc.readiness.clone().unwrap_or_default();
                     let probe_tx = tx.clone();
                     let probe_name = name.clone();
                     tokio::spawn(async move {
-                        let mut ticker =
-                            tokio::time::interval(Duration::from_millis(PROBE_INTERVAL_MS));
+                        let mut ticker = tokio::time::interval(Duration::from_millis(
+                            readiness.interval_ms.max(1),
+                        ));
                         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                         // Skip the immediate first tick — give the service a
                         // beat to actually start listening.
                         ticker.tick().await;
-                        loop {
+                        for attempt in 1..=readiness.retries {
                             ticker.tick().await;
-                            if probe(&check).await {
-                                let _ = probe_tx.send(InternalEvent::ServiceGracePassed {
-                                    service: probe_name,
-                                    generation,
-                                });
-                                return;
+                            match probe(&check, Duration::from_millis(readiness.timeout_ms)).await {
+                                Ok(()) => {
+                                    let _ = probe_tx.send(InternalEvent::ServiceGracePassed {
+                                        service: probe_name,
+                                        generation,
+                                        attempt,
+                                    });
+                                    return;
+                                }
+                                Err(error) => {
+                                    let _ = probe_tx.send(InternalEvent::ProbeAttempt {
+                                        service: probe_name.clone(),
+                                        generation: Some(generation),
+                                        attempt,
+                                        error,
+                                        exhausted: attempt == readiness.retries,
+                                    });
+                                }
                             }
                         }
                     });
@@ -1452,11 +1595,13 @@ fn enact_actions(
                         let _ = grace_tx.send(InternalEvent::ServiceGracePassed {
                             service: grace_name,
                             generation,
+                            attempt: 0,
                         });
                     });
                 }
             }
             Action::ProbeExternal(name) => {
+                state.readiness.remove(&name);
                 // External service: never spawn — the process is owned by
                 // someone else (the shared supervisor, or a developer's own
                 // daemon). Poll its health probe until it passes, then report
@@ -1485,23 +1630,39 @@ fn enact_actions(
                 // attaches a default TCP probe to repo-scoped services, so
                 // this branch is the degenerate "external with no health" case.
                 let Some(check) = svc.health.clone() else {
-                    let _ = tx.send(InternalEvent::ExternalHealthy { service: name });
+                    let _ = tx.send(InternalEvent::ExternalHealthy {
+                        service: name,
+                        attempt: 0,
+                    });
                     continue;
                 };
                 let check = interpolate_health(&check, &ctx);
+                let readiness = svc.readiness.clone().unwrap_or_default();
                 let probe_tx = tx.clone();
                 let probe_name = name.clone();
                 tokio::spawn(async move {
                     let mut ticker =
-                        tokio::time::interval(Duration::from_millis(PROBE_INTERVAL_MS));
+                        tokio::time::interval(Duration::from_millis(readiness.interval_ms.max(1)));
                     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                    loop {
+                    for attempt in 1..=readiness.retries {
                         ticker.tick().await;
-                        if probe(&check).await {
-                            let _ = probe_tx.send(InternalEvent::ExternalHealthy {
-                                service: probe_name,
-                            });
-                            return;
+                        match probe(&check, Duration::from_millis(readiness.timeout_ms)).await {
+                            Ok(()) => {
+                                let _ = probe_tx.send(InternalEvent::ExternalHealthy {
+                                    service: probe_name,
+                                    attempt,
+                                });
+                                return;
+                            }
+                            Err(error) => {
+                                let _ = probe_tx.send(InternalEvent::ProbeAttempt {
+                                    service: probe_name.clone(),
+                                    generation: None,
+                                    attempt,
+                                    error,
+                                    exhausted: attempt == readiness.retries,
+                                });
+                            }
                         }
                     }
                 });

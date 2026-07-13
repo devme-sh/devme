@@ -19,7 +19,7 @@ const CAPTURE_LIMIT: usize = 64 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResult {
     pub task: String,
-    pub status: &'static str,
+    pub status: String,
     pub exit_code: i32,
     pub started_at: u64,
     pub finished_at: u64,
@@ -53,6 +53,14 @@ pub fn services_for(stack: &Stack, name: &str) -> Result<Vec<String>> {
         }
     }
     Ok(result)
+}
+
+pub fn readiness_timeout_for(stack: &Stack, name: &str) -> Result<u64> {
+    Ok(execution_order(stack, name)?
+        .into_iter()
+        .map(|task| stack.task[task].readiness_timeout)
+        .max()
+        .unwrap_or(60))
 }
 
 pub fn show(stack: &Stack, action: Option<TaskAction>, format: OutputFormat) -> Result<()> {
@@ -208,6 +216,20 @@ async fn execute_one(
     slot: u8,
 ) -> Result<TaskResult> {
     let task = &stack.task[name];
+    let retention = stack
+        .logs
+        .as_ref()
+        .map(|policy| policy.retention_bytes)
+        .unwrap_or(8 * 1024 * 1024);
+    let capture_limit = CAPTURE_LIMIT.min((retention / 4).max(256) as usize);
+    let redactor = devme_config::Redactor::new(
+        &stack
+            .logs
+            .as_ref()
+            .map(|policy| policy.redact.clone())
+            .unwrap_or_default(),
+    )
+    .context("invalid logs.redact pattern")?;
     for step in &task.steps {
         let configured = stack
             .step
@@ -222,13 +244,16 @@ async fn execute_one(
         }
     }
     if task.cmd.is_none() {
-        return Ok(empty_result(name));
+        let result = empty_result(name);
+        persist(root, &result, retention)?;
+        return Ok(result);
     }
 
     let leases = acquire_resources(stack, root, name, &task.resources).await?;
     let started_at = now_ms();
     let started = std::time::Instant::now();
     let ctx = interpolation_context(root, slot);
+    let secret_values = redaction_values(task, &ctx);
     let cwd = match &task.cwd {
         Some(value) => root.join(devme_config::interpolate(value, &ctx)?),
         None => root.to_path_buf(),
@@ -266,16 +291,10 @@ async fn execute_one(
     let pid = child
         .id()
         .ok_or_else(|| anyhow!("task process has no pid"))? as i32;
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let out_reader = tokio::spawn(async move {
-        let mut b = Vec::new();
-        stdout.read_to_end(&mut b).await.map(|_| b)
-    });
-    let err_reader = tokio::spawn(async move {
-        let mut b = Vec::new();
-        stderr.read_to_end(&mut b).await.map(|_| b)
-    });
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let out_reader = tokio::spawn(read_tail(stdout, capture_limit));
+    let err_reader = tokio::spawn(read_tail(stderr, capture_limit));
 
     let deadline = if task.timeout == 0 {
         Duration::from_secs(365 * 24 * 3600)
@@ -287,11 +306,10 @@ async fn execute_one(
         _ = tokio::time::sleep(deadline) => { terminate_group(pid, &mut child).await?; (child.wait().await?, true, false) },
         _ = tokio::signal::ctrl_c() => { terminate_group(pid, &mut child).await?; (child.wait().await?, false, true) },
     };
-    let raw_out = out_reader.await??;
-    let raw_err = err_reader.await??;
-    let redactions = redaction_values(task);
-    let (stdout, out_cut) = bounded_redacted(&raw_out, &redactions);
-    let (stderr, err_cut) = bounded_redacted(&raw_err, &redactions);
+    let (raw_out, out_cut) = out_reader.await??;
+    let (raw_err, err_cut) = err_reader.await??;
+    let stdout = redact(&raw_out, &secret_values, &redactor);
+    let stderr = redact(&raw_err, &secret_values, &redactor);
     if format == OutputFormat::Human {
         print!("{stdout}");
         eprint!("{stderr}");
@@ -306,13 +324,13 @@ async fn execute_one(
     let result = TaskResult {
         task: name.to_string(),
         status: if exit_code == 0 {
-            "passed"
+            "passed".into()
         } else if timed_out {
-            "timed_out"
+            "timed_out".into()
         } else if cancelled {
-            "cancelled"
+            "cancelled".into()
         } else {
-            "failed"
+            "failed".into()
         },
         exit_code,
         started_at,
@@ -324,8 +342,35 @@ async fn execute_one(
         stderr,
         truncated: out_cut || err_cut,
     };
-    persist(root, &result)?;
+    persist(root, &result, retention)?;
     Ok(result)
+}
+
+async fn read_tail<R>(mut reader: R, limit: usize) -> std::io::Result<(Vec<u8>, bool)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut output = Vec::with_capacity(limit);
+    let mut buffer = [0_u8; 8192];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        if output.len() + read > limit {
+            truncated = true;
+            let overflow = output.len() + read - limit;
+            if overflow >= output.len() {
+                output.clear();
+            } else {
+                output.drain(..overflow);
+            }
+        }
+        let start = read.saturating_sub(limit);
+        output.extend_from_slice(&buffer[start..read]);
+    }
+    Ok((output, truncated))
 }
 
 fn interpolation_context(root: &Path, slot: u8) -> devme_config::InterpContext {
@@ -496,7 +541,7 @@ fn resource_dir(root: &Path, name: &str, resource: &Resource) -> Result<PathBuf>
     })
 }
 
-fn persist(root: &Path, result: &TaskResult) -> Result<()> {
+fn persist(root: &Path, result: &TaskResult, max: u64) -> Result<()> {
     let dir = devme_config::paths::repo_socket_dir(root)?
         .join(format!("{}-tasks", devme_config::paths::instance_id(root)));
     std::fs::create_dir_all(&dir)?;
@@ -504,12 +549,12 @@ fn persist(root: &Path, result: &TaskResult) -> Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     serde_json::to_writer(&mut file, result)?;
     writeln!(file)?;
-    const MAX: u64 = 2 * 1024 * 1024;
-    if file.metadata()?.len() > MAX {
+    let max = max.max(1024);
+    if file.metadata()?.len() > max {
         drop(file);
         let mut bytes = Vec::new();
         File::open(&path)?.read_to_end(&mut bytes)?;
-        let start = bytes.len().saturating_sub(MAX as usize);
+        let start = bytes.len().saturating_sub(max as usize);
         let start = bytes[start..]
             .iter()
             .position(|b| *b == b'\n')
@@ -520,7 +565,38 @@ fn persist(root: &Path, result: &TaskResult) -> Result<()> {
     Ok(())
 }
 
-fn redaction_values(task: &Task) -> Vec<String> {
+pub fn read_history(
+    root: &Path,
+    names: Option<&HashSet<String>>,
+    since: Option<u64>,
+) -> Result<Vec<TaskResult>> {
+    let dir = devme_config::paths::repo_socket_dir(root)?
+        .join(format!("{}-tasks", devme_config::paths::instance_id(root)));
+    let mut results = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(results),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries.flatten() {
+        let file = match File::open(entry.path()) {
+            Ok(file) => file,
+            Err(_) => continue,
+        };
+        for line in std::io::BufRead::lines(std::io::BufReader::new(file)).map_while(Result::ok) {
+            if let Ok(result) = serde_json::from_str::<TaskResult>(&line)
+                && names.is_none_or(|set| set.contains(&result.task))
+                && since.is_none_or(|floor| result.finished_at >= floor)
+            {
+                results.push(result);
+            }
+        }
+    }
+    results.sort_by_key(|result| result.finished_at);
+    Ok(results)
+}
+
+fn redaction_values(task: &Task, ctx: &devme_config::InterpContext) -> Vec<String> {
     task.env
         .iter()
         .filter(|(k, v)| {
@@ -529,22 +605,18 @@ fn redaction_values(task: &Task) -> Vec<String> {
                     .iter()
                     .any(|needle| k.to_ascii_uppercase().contains(needle))
         })
-        .map(|(_, v)| v.clone())
+        .filter_map(|(_, value)| devme_config::interpolate(value, ctx).ok())
         .collect()
 }
 
-fn bounded_redacted(bytes: &[u8], redactions: &[String]) -> (String, bool) {
-    let cut = bytes.len() > CAPTURE_LIMIT;
-    let slice = if cut {
-        &bytes[bytes.len() - CAPTURE_LIMIT..]
-    } else {
-        bytes
-    };
-    let mut text = String::from_utf8_lossy(slice).into_owned();
-    for value in redactions {
-        text = text.replace(value, "[REDACTED]");
+fn redact(bytes: &[u8], literals: &[String], redactor: &devme_config::Redactor) -> String {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    for value in literals {
+        if !value.is_empty() {
+            text = text.replace(value, "[REDACTED]");
+        }
     }
-    (text, cut)
+    redactor.apply(&text)
 }
 
 fn emit_result(result: &TaskResult, format: OutputFormat) -> Result<()> {
@@ -576,7 +648,7 @@ fn empty_result(name: &str) -> TaskResult {
     let now = now_ms();
     TaskResult {
         task: name.into(),
-        status: "passed",
+        status: "passed".into(),
         exit_code: 0,
         started_at: now,
         finished_at: now,
@@ -663,8 +735,46 @@ mod tests {
 
     #[test]
     fn output_redacts_secret_values_before_bounding() {
-        let (text, _) = bounded_redacted(b"token=swordfish", &["swordfish".into()]);
+        let text = redact(
+            b"token=swordfish",
+            &["swordfish".into()],
+            &devme_config::Redactor::default(),
+        );
         assert_eq!(text, "token=[REDACTED]");
+    }
+
+    #[tokio::test]
+    async fn stream_capture_is_bounded_to_the_tail() {
+        let input = tokio::io::BufReader::new(&b"0123456789"[..]);
+        let (bytes, truncated) = read_tail(input, 4).await.unwrap();
+        assert_eq!(bytes, b"6789");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn task_history_retention_keeps_a_parseable_bounded_tail() {
+        let dir = TempDir::new().unwrap();
+        for index in 0..20 {
+            let mut result = empty_result("check");
+            result.finished_at += index;
+            result.stdout = "x".repeat(300);
+            persist(dir.path(), &result, 1024).unwrap();
+        }
+        let history = read_history(dir.path(), None, None).unwrap();
+        assert!(!history.is_empty());
+        assert_eq!(history.last().unwrap().task, "check");
+        let history_dir = devme_config::paths::repo_socket_dir(dir.path())
+            .unwrap()
+            .join(format!(
+                "{}-tasks",
+                devme_config::paths::instance_id(dir.path())
+            ));
+        assert!(
+            std::fs::metadata(history_dir.join("check.jsonl"))
+                .unwrap()
+                .len()
+                <= 1024
+        );
     }
 
     #[test]
@@ -676,8 +786,9 @@ mod tests {
             scope: ResourceScope::Host,
             env: Some("DEVICE_SLOT".into()),
         };
-        let dir_a = resource_dir(a.path(), "device-fixture", &resource).unwrap();
-        let dir_b = resource_dir(b.path(), "device-fixture", &resource).unwrap();
+        let name = format!("device-fixture-{}", std::process::id());
+        let dir_a = resource_dir(a.path(), &name, &resource).unwrap();
+        let dir_b = resource_dir(b.path(), &name, &resource).unwrap();
         assert_eq!(dir_a, dir_b);
         std::fs::create_dir_all(&dir_a).unwrap();
         let first = try_acquire(&dir_a, &resource, "worktree-a")

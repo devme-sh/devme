@@ -7,7 +7,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use devme_core::{ServiceSnapshot, StepSnapshot};
 
+pub mod agent;
 pub mod remote;
+pub mod setup;
 pub mod skill;
 pub mod task;
 
@@ -70,7 +72,7 @@ pub enum Command {
         /// Task name.
         task: String,
         /// Structured result format. `--json` remains a compatibility alias.
-        #[arg(long, value_enum, default_value_t)]
+        #[arg(long, value_enum, default_value_t, global = true)]
         output: OutputFormat,
         /// Arguments appended to the configured command after `--`.
         #[arg(last = true, allow_hyphen_values = true)]
@@ -80,7 +82,7 @@ pub enum Command {
     Tasks {
         #[command(subcommand)]
         action: Option<TaskAction>,
-        #[arg(long, value_enum, default_value_t)]
+        #[arg(long, value_enum, default_value_t, global = true)]
         output: OutputFormat,
     },
     /// Start the supervisor (or attach to a running one) and bring services up.
@@ -234,6 +236,43 @@ pub enum Command {
         #[command(subcommand)]
         action: SkillAction,
     },
+    /// Explicit agent session integration and compact directory context.
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+    /// Detect native/web tooling and produce an explicit devme.toml.
+    Setup {
+        /// Write devme.toml. Without this flag, print a preview only.
+        #[arg(long)]
+        write: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AgentTarget {
+    Claude,
+    Codex,
+    Opencode,
+    All,
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum AgentAction {
+    Setup {
+        #[arg(long, value_enum, default_value_t = AgentTarget::All)]
+        target: AgentTarget,
+    },
+    Status {
+        #[arg(long, value_enum, default_value_t = AgentTarget::All)]
+        target: AgentTarget,
+    },
+    Remove {
+        #[arg(long, value_enum, default_value_t = AgentTarget::All)]
+        target: AgentTarget,
+    },
+    /// Compact directory-scoped live state for session-start hooks.
+    Context,
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -972,6 +1011,7 @@ mod tests {
             port: None,
             url: None,
             restart_count: 0,
+            readiness: None,
         }
     }
 

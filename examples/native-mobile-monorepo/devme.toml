@@ -4,6 +4,10 @@ schema_version = 1
 name = "native-mobile-monorepo"
 description = "Backend, iOS, and Android orchestration without a second root task runner"
 
+[logs]
+redact = ["(?i)authorization: bearer [^[:space:]]+", "CONVEX_DEPLOY_KEY=[^[:space:]]+"]
+retention_bytes = 8388608
+
 [step.backend-deps]
 check = "test -d backend/node_modules"
 provision = "cd backend && bun install"
@@ -14,6 +18,7 @@ cmd = "bun run dev --port {port}"
 cwd = "backend"
 port = { base = 3210, slot_offset = 10 }
 health = { http = "http://localhost:{port}/health" }
+readiness = { interval_ms = 1000, timeout_ms = 5000, retries = 60 }
 env = { DEVME_STATE_DIR = "{worktree}/.devme/backend-{slot}" }
 
 # A normal service can model any correlated device log stream. Devme does not
@@ -48,6 +53,7 @@ cwd = "apps/ios"
 services = ["backend"]
 resources = ["ios-simulator"]
 timeout = 1200
+readiness_timeout = 90
 
 [task.android-test]
 cmd = "./gradlew test connectedCheck"
@@ -56,6 +62,7 @@ services = ["backend"]
 resources = ["android-emulator"]
 env = { GRADLE_USER_HOME = "../../.devme/gradle-{slot}" }
 timeout = 1200
+readiness_timeout = 90
 
 [task.check]
 description = "Run backend, iOS, and Android verification"

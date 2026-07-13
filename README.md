@@ -31,7 +31,7 @@ Setup steps have trust levels (`auto`, `prompt`, `manual`) so dependencies get p
 
 ```bash
 cd my-project
-devme init          # generates devme.toml from your project
+devme setup --write # generates devme.toml from supported project markers
 devme up            # starts everything
 ```
 
@@ -39,23 +39,33 @@ devme up            # starts everything
 
 ```toml
 # devme.toml
-[services.backend]
-command = "cargo watch -x run"
-port = 8080
-health = "http://localhost:{{port}}/health"
+[service.backend]
+cmd = "cargo watch -x run"
+port = { base = 8080, slot_offset = 10 }
+health = { http = "http://localhost:{port}/health" }
+readiness = { interval_ms = 500, timeout_ms = 2000, retries = 60 }
 
-[services.frontend]
-command = "npm run dev"
-port = 5173
+[service.frontend]
+cmd = "bun run dev"
+port = { base = 5173, slot_offset = 10 }
 depends_on = ["backend"]
 
-[services.db]
-command = "docker compose up postgres"
-port = 5432
-health = { command = "pg_isready -p {{port}}" }
+[task.test]
+cmd = "cargo test"
+services = ["backend"]
+timeout = 300
 ```
 
 Ports automatically offset per worktree slot. Slot 0 keeps defaults, slot 1 gets `+10`, and so on.
+One-shot tasks run through `devme run <name>` and delegate to the project's
+authoritative native tools. See [`examples/native-mobile-monorepo`](./examples/native-mobile-monorepo/)
+for backend, iOS, and Android orchestration with scoped runtime leases.
+
+Coding agents can opt into compact session context with
+`devme agent setup --target <claude|codex|opencode|all>`, inspect it with `devme agent status`, and
+remove it with `devme agent remove`. Hooks are never installed implicitly.
+The separate `devme skill install` path uses guidance embedded from the same
+canonical source as `devme agent context`.
 
 ## How It Compares
 

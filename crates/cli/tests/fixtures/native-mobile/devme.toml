@@ -1,0 +1,36 @@
+schema_version = 1
+
+[logs]
+redact = ["fixture-secret-[0-9]+"]
+retention_bytes = 16384
+
+[service.backend]
+cmd = "sleep 0.1; touch schema-published; printf 'backend ready\\n'; sleep 30"
+health = { shell = "test -f schema-published" }
+readiness = { interval_ms = 20, timeout_ms = 100, retries = 50 }
+
+[resource.ios-runtime]
+scope = "host"
+capacity = 2
+env = "IOS_RUNTIME_SLOT"
+
+[resource.android-runtime]
+scope = "host"
+capacity = 2
+env = "ANDROID_RUNTIME_SLOT"
+
+[task.ios-test]
+cmd = "test -f schema-published; printf 'ios slot=%s\\n' \"$IOS_RUNTIME_SLOT\""
+services = ["backend"]
+resources = ["ios-runtime"]
+readiness_timeout = 5
+
+[task.android-test]
+cmd = "test -f schema-published; printf 'android slot=%s\\n' \"$ANDROID_RUNTIME_SLOT\""
+services = ["backend"]
+resources = ["android-runtime"]
+readiness_timeout = 5
+
+[task.check]
+description = "Portable backend, iOS, and Android orchestration fixture"
+depends_on = ["ios-test", "android-test"]

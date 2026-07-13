@@ -35,6 +35,7 @@ fn main() {
                 port: Some(5432),
                 url: Some("{host}:{port}".into()),
                 restart_count: 0,
+                readiness: None,
             },
             ServiceSnapshot {
                 name: "backend".into(),
@@ -43,6 +44,7 @@ fn main() {
                 port: Some(8080),
                 url: Some("http://{host}:{port}".into()),
                 restart_count: 0,
+                readiness: None,
             },
             ServiceSnapshot {
                 name: "frontend".into(),
@@ -51,6 +53,7 @@ fn main() {
                 port: None,
                 url: None,
                 restart_count: 0,
+                readiness: None,
             },
             ServiceSnapshot {
                 name: "proxy".into(),
@@ -61,6 +64,7 @@ fn main() {
                 port: None,
                 url: Some("{host}:{port}".into()),
                 restart_count: 3,
+                readiness: None,
             },
         ],
         steps: vec![

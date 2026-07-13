@@ -23,12 +23,47 @@ pub fn validate(stack: &Stack) -> Result<(), Vec<ConfigError>> {
     check_dependency_targets_exist(stack, &mut errors);
     check_no_cycles(stack, &mut errors);
     check_external_services_have_health(stack, &mut errors);
+    check_readiness(stack, &mut errors);
+    check_redaction_patterns(stack, &mut errors);
     check_tasks(stack, &mut errors);
 
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+fn check_redaction_patterns(stack: &Stack, errors: &mut Vec<ConfigError>) {
+    if let Some(policy) = &stack.logs {
+        for pattern in &policy.redact {
+            if let Err(error) = regex::Regex::new(pattern) {
+                errors.push(ConfigError::InvalidRedactionPattern {
+                    pattern: pattern.clone(),
+                    message: error.to_string(),
+                });
+            }
+        }
+    }
+}
+
+fn check_readiness(stack: &Stack, errors: &mut Vec<ConfigError>) {
+    for (name, service) in &stack.service {
+        let Some(readiness) = &service.readiness else {
+            continue;
+        };
+        for (field, value) in [
+            ("interval_ms", readiness.interval_ms),
+            ("timeout_ms", readiness.timeout_ms),
+            ("retries", u64::from(readiness.retries)),
+        ] {
+            if value == 0 {
+                errors.push(ConfigError::InvalidReadinessValue {
+                    name: name.clone(),
+                    field,
+                });
+            }
+        }
     }
 }
 
@@ -597,6 +632,36 @@ health = { tcp = "localhost:5432" }
 "#,
         );
         assert!(validate(&s).is_ok());
+    }
+
+    #[test]
+    fn zero_readiness_values_and_invalid_redaction_patterns_are_errors() {
+        let stack = parse(
+            r#"
+schema_version = 1
+
+[logs]
+redact = ["["]
+
+[service.backend]
+cmd = "serve"
+health = { shell = "true" }
+readiness = { interval_ms = 0, timeout_ms = 0, retries = 0 }
+"#,
+        );
+        let errors = validate(&stack).unwrap_err();
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| matches!(error, ConfigError::InvalidReadinessValue { .. }))
+                .count(),
+            3
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error, ConfigError::InvalidRedactionPattern { .. }))
+        );
     }
 
     #[test]
