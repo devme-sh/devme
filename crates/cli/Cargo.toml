@@ -21,6 +21,7 @@ devme-ui = { workspace = true }
 devme-client = { workspace = true }
 devme-slot-allocator = { workspace = true }
 devme-supervisor = { path = "../supervisor" }
+devme-shared-supervisor = { path = "../shared-supervisor" }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 tokio = { workspace = true }

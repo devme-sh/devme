@@ -34,8 +34,8 @@ pub async fn ensure_daemon(sock: &Path, cwd: &Path) -> anyhow::Result<bool> {
         .map_err(|error| anyhow::anyhow!("cannot start supervisor: {error}"))?;
     let root = workspace.root();
 
-    let supervisor = find_sibling_binary("devme-supervisor")?;
-    let mut child = spawn_detached_supervisor(&supervisor, root)?;
+    let (supervisor, args) = supervisor_command("devme-supervisor", "__supervisor")?;
+    let mut child = spawn_detached_supervisor(&supervisor, &args, root)?;
 
     for _ in 0..50 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -100,8 +100,8 @@ pub async fn ensure_shared_daemon(cwd: &Path) -> anyhow::Result<bool> {
         wait_for_daemon_exit(&sock).await;
     }
 
-    let binary = find_sibling_binary("devme-shared-supervisor")?;
-    let mut child = spawn_detached_supervisor(&binary, cwd)?;
+    let (binary, args) = supervisor_command("devme-shared-supervisor", "__shared-supervisor")?;
+    let mut child = spawn_detached_supervisor(&binary, &args, cwd)?;
 
     for _ in 0..50 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -162,9 +162,10 @@ async fn wait_for_daemon_exit(sock: &Path) {
     }
 }
 
-fn spawn_detached_supervisor(binary: &Path, cwd: &Path) -> anyhow::Result<Child> {
+fn spawn_detached_supervisor(binary: &Path, args: &[&str], cwd: &Path) -> anyhow::Result<Child> {
     let mut command = Command::new(binary);
     command
+        .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -173,6 +174,19 @@ fn spawn_detached_supervisor(binary: &Path, cwd: &Path) -> anyhow::Result<Child>
     command
         .spawn()
         .map_err(|e| anyhow::anyhow!("spawning {}: {e}", binary.display()))
+}
+
+fn supervisor_command(
+    sibling_name: &str,
+    embedded_arg: &'static str,
+) -> anyhow::Result<(PathBuf, Vec<&'static str>)> {
+    if let Ok(self_exe) = std::env::current_exe() {
+        let resolved = std::fs::canonicalize(&self_exe).unwrap_or(self_exe);
+        if resolved.file_name().and_then(|name| name.to_str()) == Some("devme") {
+            return Ok((resolved, vec![embedded_arg]));
+        }
+    }
+    Ok((find_sibling_binary(sibling_name)?, Vec::new()))
 }
 
 fn detach_from_calling_session(command: &mut Command) {

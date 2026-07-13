@@ -157,7 +157,8 @@ readiness_timeout=5
     let output = run(&dir, &["run", "check", "--output", "json"]);
     assert!(
         output.status.success(),
-        "{}",
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!dir.path().join("unrelated-started").exists());
@@ -528,7 +529,8 @@ fn portable_native_mobile_fixture_executes_end_to_end() {
     let output = run(&dir, &["run", "check", "--output", "json"]);
     assert!(
         output.status.success(),
-        "{}",
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();

@@ -37,6 +37,9 @@ supervisor crash, the replacement verifies those identities, kills and waits
 for matching orphan groups, and only then reassigns the lease. PID reuse is
 treated as an already-gone orphan rather than permission to signal an unrelated
 process. Runtime state is private to the current user with mode 0700.
+The `devme` executable embeds both instance and repository supervisor entry
+points and launches its own exact build, so an older separately installed daemon
+cannot parse or execute a newer CLI's workspace configuration.
 
 `[session.<name>]` is a narrow composition over existing service closures,
 resources, and an optional launch task. It holds resource leases while

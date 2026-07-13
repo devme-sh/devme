@@ -353,6 +353,7 @@ dependencies = [
  "devme-client",
  "devme-config",
  "devme-core",
+ "devme-shared-supervisor",
  "devme-slot-allocator",
  "devme-supervisor",
  "devme-tui",
