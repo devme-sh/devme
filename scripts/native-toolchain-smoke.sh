@@ -13,6 +13,7 @@ if [[ ! -x "$DEVME" ]]; then
   echo "devme binary not found at $DEVME" >&2
   exit 2
 fi
+DEVME="$(cd "$(dirname "$DEVME")" && pwd)/$(basename "$DEVME")"
 command -v xcodebuild >/dev/null || { echo "xcodebuild required" >&2; exit 2; }
 if [[ -z "$GRADLE" || ! -x "$GRADLE" ]]; then
   echo "Gradle required; set GRADLE to an executable Gradle distribution" >&2
