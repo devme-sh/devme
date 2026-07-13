@@ -3,12 +3,24 @@
 //! Conventions per ADR-0008 (clig.dev + agent-native):
 //! `--json` everywhere, semantic exit codes, no spinner without a tty.
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use devme_core::{ServiceSnapshot, StepSnapshot};
 
 pub mod remote;
 pub mod skill;
+pub mod task;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    /// Interactive prose plus raw task output.
+    #[default]
+    Human,
+    /// Token-Oriented Object Notation for coding agents.
+    Toon,
+    /// Stable JSON compatibility output.
+    Json,
+}
 
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(name = "devme", version, about = "Multi-service dev environment supervisor")]
@@ -53,6 +65,24 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum Command {
+    /// Run a declarative one-shot task from devme.toml.
+    Run {
+        /// Task name.
+        task: String,
+        /// Structured result format. `--json` remains a compatibility alias.
+        #[arg(long, value_enum, default_value_t)]
+        output: OutputFormat,
+        /// Arguments appended to the configured command after `--`.
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Discover declarative one-shot tasks.
+    Tasks {
+        #[command(subcommand)]
+        action: Option<TaskAction>,
+        #[arg(long, value_enum, default_value_t)]
+        output: OutputFormat,
+    },
     /// Start the supervisor (or attach to a running one) and bring services up.
     Up {
         /// Restrict to a subset of services. Empty = all.
@@ -204,6 +234,12 @@ pub enum Command {
         #[command(subcommand)]
         action: SkillAction,
     },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum TaskAction {
+    /// Show full configuration for one task.
+    Show { task: String },
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

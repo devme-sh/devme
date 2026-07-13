@@ -18,6 +18,7 @@ pub mod skill;
 mod stack;
 mod step;
 mod surgical;
+mod task;
 mod validate;
 
 pub use env_var::EnvVar;
@@ -30,4 +31,5 @@ pub use remote::RemoteConfig;
 pub use service::Service;
 pub use stack::{SCHEMA_VERSION, Stack, StackMeta};
 pub use step::Step;
+pub use task::{Resource, ResourceScope, Task};
 pub use validate::{Lint, lint, validate};

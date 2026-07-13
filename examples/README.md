@@ -10,5 +10,6 @@ inside any of them.
 | `web-app/`                 | Realistic six-node graph: db, cache, api, worker, web, plus a one-shot `migrations` step. Shows port-slot interpolation and optional deps. |
 | `shared/frontend/`, `shared/backend/` | Two stacks that share a `scope = "repo"` cache service. Demonstrates the shared-supervisor coordination. |
 | `interp-envfile/`          | Cross-service port interpolation (`frontend` env references `{port.backend}`), a `scope = "repo"` fixed-port `proxy`, and `env_file = ".env"`. |
+| `native-mobile-monorepo/`  | Backend + iOS + Android tasks, service readiness, isolated writable state, device-log services, and host-scoped simulator/emulator leases. |
 
 All commands are shell loops — no real binaries needed.

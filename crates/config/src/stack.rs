@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::env_var::EnvVar;
 use crate::service::Service;
 use crate::step::Step;
+use crate::task::{Resource, Task};
 
 /// Wire protocol version for `devme.toml`. Bumped on every breaking change.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -36,6 +37,14 @@ pub struct Stack {
     /// Long-running nodes keyed by name.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub service: IndexMap<String, Service>,
+
+    /// One-shot commands exposed by `devme run`.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub task: IndexMap<String, Task>,
+
+    /// Generic scarce-resource pools used by tasks.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub resource: IndexMap<String, Resource>,
 }
 
 impl Stack {
@@ -101,6 +110,8 @@ mod tests {
         assert!(s.stack.is_none());
         assert!(s.step.is_empty());
         assert!(s.service.is_empty());
+        assert!(s.task.is_empty());
+        assert!(s.resource.is_empty());
     }
 
     #[test]
@@ -178,6 +189,41 @@ cmd = "docker run postgres"
     }
 
     #[test]
+    fn parses_tasks_and_scoped_resources() {
+        let s = Stack::parse(
+            r#"
+schema_version = 1
+
+[resource.ios-simulator]
+scope = "host"
+capacity = 2
+env = "SIMULATOR_SLOT"
+
+[task.test-ios]
+cmd = "xcodebuild test"
+cwd = "apps/ios"
+depends_on = ["generate"]
+steps = ["xcode"]
+services = ["backend"]
+resources = ["ios-simulator"]
+timeout = 900
+
+[task.generate]
+cmd = "swift package resolve"
+"#,
+        )
+        .unwrap();
+        let task = &s.task["test-ios"];
+        assert_eq!(task.cwd.as_deref(), Some("apps/ios"));
+        assert_eq!(task.services, ["backend"]);
+        assert_eq!(s.resource["ios-simulator"].capacity, 2);
+        assert_eq!(
+            s.resource["ios-simulator"].scope,
+            crate::ResourceScope::Host
+        );
+    }
+
+    #[test]
     fn missing_schema_version_is_a_parse_error() {
         let result = Stack::parse(
             r#"
@@ -221,6 +267,8 @@ unsupported_meta = true
             env: IndexMap::new(),
             step: IndexMap::new(),
             service: IndexMap::new(),
+            task: IndexMap::new(),
+            resource: IndexMap::new(),
         };
         let toml_str = toml::to_string(&s).unwrap();
         assert!(!toml_str.contains("[step"), "got: {toml_str}");
@@ -311,6 +359,8 @@ cmd = "npm run dev"
             env: IndexMap::new(),
             step: IndexMap::new(),
             service: IndexMap::new(),
+            task: IndexMap::new(),
+            resource: IndexMap::new(),
         };
         let toml_str = toml::to_string(&s).unwrap();
         assert!(!toml_str.contains("[env"), "got: {toml_str}");

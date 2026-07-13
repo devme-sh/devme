@@ -23,11 +23,86 @@ pub fn validate(stack: &Stack) -> Result<(), Vec<ConfigError>> {
     check_dependency_targets_exist(stack, &mut errors);
     check_no_cycles(stack, &mut errors);
     check_external_services_have_health(stack, &mut errors);
+    check_tasks(stack, &mut errors);
 
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+fn check_tasks(stack: &Stack, errors: &mut Vec<ConfigError>) {
+    for (name, resource) in &stack.resource {
+        if resource.capacity == 0 {
+            errors.push(ConfigError::InvalidResourceCapacity { name: name.clone() });
+        }
+    }
+    for (name, task) in &stack.task {
+        for (kind, references, known) in [
+            (
+                "task",
+                &task.depends_on,
+                stack.task.keys().collect::<HashSet<_>>(),
+            ),
+            (
+                "step",
+                &task.steps,
+                stack.step.keys().collect::<HashSet<_>>(),
+            ),
+            (
+                "service",
+                &task.services,
+                stack.service.keys().collect::<HashSet<_>>(),
+            ),
+            (
+                "resource",
+                &task.resources,
+                stack.resource.keys().collect::<HashSet<_>>(),
+            ),
+        ] {
+            for reference in references {
+                if !known.contains(reference) {
+                    errors.push(ConfigError::UnknownTaskReference {
+                        task: name.clone(),
+                        kind,
+                        name: reference.clone(),
+                    });
+                }
+            }
+        }
+    }
+    fn visit<'a>(
+        name: &'a str,
+        stack: &'a Stack,
+        gray: &mut Vec<&'a str>,
+        black: &mut HashSet<&'a str>,
+        errors: &mut Vec<ConfigError>,
+    ) {
+        if black.contains(name) {
+            return;
+        }
+        if let Some(at) = gray.iter().position(|item| *item == name) {
+            let mut cycle = gray[at..].to_vec();
+            cycle.push(name);
+            errors.push(ConfigError::TaskCycle {
+                cycle: cycle.join(" -> "),
+            });
+            return;
+        }
+        let Some(task) = stack.task.get(name) else {
+            return;
+        };
+        gray.push(name);
+        for dep in &task.depends_on {
+            visit(dep, stack, gray, black, errors);
+        }
+        gray.pop();
+        black.insert(name);
+    }
+    let mut black = HashSet::new();
+    for name in stack.task.keys() {
+        visit(name, stack, &mut Vec::new(), &mut black, errors);
     }
 }
 
