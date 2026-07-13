@@ -231,8 +231,7 @@ pub fn sync_session_name(local_root: &Path) -> String {
 /// `.git/worktrees` holds per-machine registrations with absolute host paths —
 /// syncing those is how phantom "not on this host" worktrees are born, and a
 /// `git worktree prune` on one side would destroy the other side's worktrees.
-pub const GIT_ALWAYS_IGNORES: &[&str] =
-    &[".git/**/*.lock", ".git/gc.pid", ".git/worktrees"];
+pub const GIT_ALWAYS_IGNORES: &[&str] = &[".git/**/*.lock", ".git/gc.pid", ".git/worktrees"];
 
 // --- worktree sync (model 1a extended to linked worktrees) -------------------
 //
@@ -278,13 +277,16 @@ pub fn parse_linked_worktrees(porcelain: &str) -> Vec<WorktreeEntry> {
     let mut branch: Option<String> = None;
     let mut bare = false;
     let flush = |path: &mut Option<String>,
-                     branch: &mut Option<String>,
-                     bare: &mut bool,
-                     first: &mut bool,
-                     out: &mut Vec<WorktreeEntry>| {
+                 branch: &mut Option<String>,
+                 bare: &mut bool,
+                 first: &mut bool,
+                 out: &mut Vec<WorktreeEntry>| {
         if let Some(p) = path.take() {
             if !*first && !*bare {
-                out.push(WorktreeEntry { path: p, branch: branch.take() });
+                out.push(WorktreeEntry {
+                    path: p,
+                    branch: branch.take(),
+                });
             }
             *first = false;
         }
@@ -389,7 +391,8 @@ pub fn shell_quote(s: &str) -> String {
     // its tilde expansion (single-quoting would make the remote shell `cd`
     // into a literal `~` directory).
     let simple = !s.is_empty()
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || "_./:=-~".contains(c));
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_./:=-~".contains(c));
     if simple {
         s.to_string()
     } else {
@@ -420,7 +423,10 @@ pub fn backslash_escape(s: &str) -> String {
 /// stdout). Doubles as the cheapest "is the session server running?" probe —
 /// herdr exits non-zero when the session's socket is absent.
 pub fn herdr_list_cmd(session: &str) -> String {
-    format!("env HERDR_SESSION={} herdr workspace list", shell_quote(session))
+    format!(
+        "env HERDR_SESSION={} herdr workspace list",
+        shell_quote(session)
+    )
 }
 
 /// Shell command that starts the named herdr session server headless on the
@@ -946,7 +952,13 @@ bare
         assert_eq!(cmd, "mosh box -- tmux a -t proj");
         // Raw templates substitute verbatim — the user owns the quoting, so
         // a spacey value is *not* escaped under their template.
-        let raw = expand_attach("ssh {host} 'cd \"{remote_path}\"'", "box", "/my dev/p", "n", "box");
+        let raw = expand_attach(
+            "ssh {host} 'cd \"{remote_path}\"'",
+            "box",
+            "/my dev/p",
+            "n",
+            "box",
+        );
         assert!(raw.contains("cd \"/my dev/p\""), "got {raw}");
     }
 
@@ -964,7 +976,10 @@ bare
         assert_eq!(shell_quote("200"), "200");
         assert_eq!(shell_quote("svc-1.2/x:y=z"), "svc-1.2/x:y=z");
         // Tilde paths pass through so remote `cd ~/…` still expands.
-        assert_eq!(shell_quote("~/development/api-abc"), "~/development/api-abc");
+        assert_eq!(
+            shell_quote("~/development/api-abc"),
+            "~/development/api-abc"
+        );
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
         assert_eq!(shell_quote(""), "''");
@@ -977,7 +992,10 @@ bare
             "env HERDR_SESSION=devme-api-abc herdr workspace list"
         );
         let start = herdr_server_start_cmd("devme-api-abc", "~/development/api-abc", "vps.ts.net");
-        assert!(start.starts_with("cd ~/development/api-abc && "), "got {start}");
+        assert!(
+            start.starts_with("cd ~/development/api-abc && "),
+            "got {start}"
+        );
         // DEVME_URL_HOST rides into the server env so every pane inherits it.
         assert!(start.contains("env HERDR_SESSION=devme-api-abc DEVME_URL_HOST=vps.ts.net"));
         assert!(start.contains("nohup herdr server"));
@@ -1003,7 +1021,10 @@ bare
     fn herdr_workspace_id_by_label_matches_exactly() {
         let list = r#"{"id":"cli:workspace:list","result":{"type":"workspace_list","workspaces":[{"workspace_id":"w1","label":"api"},{"workspace_id":"w2","label":"scratch"}]}}"#;
         assert_eq!(herdr_workspace_id_by_label(list, "api"), Some("w1".into()));
-        assert_eq!(herdr_workspace_id_by_label(list, "scratch"), Some("w2".into()));
+        assert_eq!(
+            herdr_workspace_id_by_label(list, "scratch"),
+            Some("w2".into())
+        );
         // Already-renamed or custom labels don't match the bare default.
         assert_eq!(herdr_workspace_id_by_label(list, "devme: api"), None);
         assert_eq!(herdr_workspace_id_by_label("garbage", "api"), None);
@@ -1013,21 +1034,39 @@ bare
     #[test]
     fn open_request_round_trips_and_refuses_non_http() {
         let json = open_request_json(42, "http://vps:3000/app");
-        assert_eq!(parse_open_request(&json), Some((42, "http://vps:3000/app".into())));
+        assert_eq!(
+            parse_open_request(&json),
+            Some((42, "http://vps:3000/app".into()))
+        );
         let json = open_request_json(7, "https://vps:8443");
-        assert_eq!(parse_open_request(&json), Some((7, "https://vps:8443".into())));
+        assert_eq!(
+            parse_open_request(&json),
+            Some((7, "https://vps:8443".into()))
+        );
         // The laptop opens this sight unseen — refuse non-web schemes.
-        assert_eq!(parse_open_request(&open_request_json(1, "file:///etc/passwd")), None);
-        assert_eq!(parse_open_request(&open_request_json(1, "javascript:alert(1)")), None);
+        assert_eq!(
+            parse_open_request(&open_request_json(1, "file:///etc/passwd")),
+            None
+        );
+        assert_eq!(
+            parse_open_request(&open_request_json(1, "javascript:alert(1)")),
+            None
+        );
         // Unknown schema / garbage → None.
-        assert_eq!(parse_open_request(r#"{"schema_version":2,"seq":1,"url":"http://x"}"#), None);
+        assert_eq!(
+            parse_open_request(r#"{"schema_version":2,"seq":1,"url":"http://x"}"#),
+            None
+        );
         assert_eq!(parse_open_request("not json"), None);
         assert_eq!(parse_open_request(""), None);
     }
 
     #[test]
     fn backslash_escape_survives_single_quoted_templates() {
-        assert_eq!(backslash_escape("~/development/api-abc"), "~/development/api-abc");
+        assert_eq!(
+            backslash_escape("~/development/api-abc"),
+            "~/development/api-abc"
+        );
         assert_eq!(backslash_escape("dev@10.0.0.1"), "dev@10.0.0.1");
         assert_eq!(backslash_escape("a b"), "a\\ b");
         assert_eq!(backslash_escape("it's"), "it\\'s");
@@ -1041,7 +1080,10 @@ bare
         let empty = r#"{"id":"x","result":{"type":"workspace_list","workspaces":[]}}"#;
         assert_eq!(herdr_workspace_count(empty), Some(0));
         // Error text / no JSON → None, which the caller treats as "don't touch".
-        assert_eq!(herdr_workspace_count("Error: Os { code: 2, kind: NotFound }"), None);
+        assert_eq!(
+            herdr_workspace_count("Error: Os { code: 2, kind: NotFound }"),
+            None
+        );
         assert_eq!(herdr_workspace_count(""), None);
         assert_eq!(herdr_workspace_count(r#"{"result":{}}"#), None);
     }

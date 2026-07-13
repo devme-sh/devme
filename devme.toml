@@ -22,12 +22,6 @@ provision = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -
 depends_on = ["cc"]
 description = "Rust toolchain (rustup -y, non-interactive)"
 
-[step.just]
-check = 'command -v just || test -x "$HOME/.cargo/bin/just"'
-provision = 'export PATH="$HOME/.cargo/bin:$PATH"; cargo install just'
-depends_on = ["rust"]
-description = "just command runner"
-
 [step.cargo-watch]
 check = 'export PATH="$HOME/.cargo/bin:$PATH"; cargo watch --version'
 provision = 'export PATH="$HOME/.cargo/bin:$PATH"; cargo install cargo-watch'
@@ -39,3 +33,37 @@ description = "cargo-watch for the build loop"
 cmd = 'export PATH="$HOME/.cargo/bin:$PATH"; cargo watch -w crates -x "build --release"'
 depends_on = ["cargo-watch"]
 description = "Rebuild the workspace on every change"
+
+[task.build]
+description = "Build every Devme binary"
+cmd = "cargo build --workspace"
+steps = ["rust"]
+timeout = 600
+
+[task.check]
+description = "Check formatting and lint the complete workspace"
+cmd = "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings"
+steps = ["rust"]
+timeout = 1200
+
+[task.test]
+description = "Run the complete workspace test suite"
+cmd = "cargo test --workspace"
+steps = ["rust"]
+timeout = 1200
+
+[task.install]
+description = "Install the CLI and both supervisors to Cargo's binary directory"
+cmd = "cargo install --path crates/cli --force && cargo install --path crates/supervisor --force && cargo install --path crates/shared-supervisor --force"
+steps = ["rust"]
+timeout = 1200
+
+[task.smoke]
+description = "Drive the installed TUI headlessly and assert the rendered interface"
+cmd = "scripts/tui-smoke.sh"
+depends_on = ["install"]
+timeout = 300
+
+[task.verify]
+description = "Run every deterministic repository check"
+depends_on = ["check", "test"]

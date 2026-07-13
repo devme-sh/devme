@@ -312,9 +312,11 @@ pub fn check_ports<R: BufRead, W: Write>(
 
         let freed = match &actions[picked] {
             Act::Stop(name) => act(&mut sec, "docker stop", docker::stop_container(name)),
-            Act::Down(project) => {
-                act(&mut sec, "docker compose down", docker::compose_down(project))
-            }
+            Act::Down(project) => act(
+                &mut sec,
+                "docker compose down",
+                docker::compose_down(project),
+            ),
             Act::Kill(pids) => {
                 let mut ok = true;
                 for (pid, _) in pids.iter() {

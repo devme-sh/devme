@@ -23,8 +23,8 @@ use devme_ui::scoped;
 /// Every `devme remote` one-liner goes through this scope, so the whole
 /// surface speaks as `devme remote: …` (ADR-0017).
 const R: devme_ui::Scope = scoped("remote");
-use devme_config::{GlobalConfig, paths, remote};
 use devme_config::remote::{SyncHealth, shell_quote};
+use devme_config::{GlobalConfig, paths, remote};
 
 /// How often the background watcher polls the sync's health while an attached
 /// `devme remote` session runs in the foreground.
@@ -304,7 +304,13 @@ fn resolve_worktrees(r: &Resolved) -> Vec<WtSync> {
         }
         let session = remote::sync_session_name(&local_path);
         let beta = format!("{}:{remote_path}", r.host);
-        wts.push(WtSync { local_path, branch: e.branch, session, remote_path, beta });
+        wts.push(WtSync {
+            local_path,
+            branch: e.branch,
+            session,
+            remote_path,
+            beta,
+        });
     }
     wts
 }
@@ -408,8 +414,12 @@ fn reap_orphan_worktree_syncs(r: &Resolved) {
             continue;
         }
         if !Path::new(&alpha).exists() {
-            R.info(format!("worktree {alpha} is gone — stopping its sync ({name})"));
-            let _ = Command::new("mutagen").args(["sync", "terminate", &name]).status();
+            R.info(format!(
+                "worktree {alpha} is gone — stopping its sync ({name})"
+            ));
+            let _ = Command::new("mutagen")
+                .args(["sync", "terminate", &name])
+                .status();
         }
     }
 }
@@ -437,8 +447,7 @@ fn observe_repo_syncs(main_session: &str, suffix: &str) -> (bool, Option<String>
     let mut conflicts = 0u64;
     for line in String::from_utf8_lossy(&o.stdout).lines() {
         let mut parts = line.splitn(3, "@@");
-        let (Some(name), Some(status), Some(n)) = (parts.next(), parts.next(), parts.next())
-        else {
+        let (Some(name), Some(status), Some(n)) = (parts.next(), parts.next(), parts.next()) else {
             continue;
         };
         if !name.ends_with(suffix) {
@@ -640,7 +649,14 @@ fn ssh_command() -> Command {
 /// a password prompt; `ConnectTimeout` caps an unreachable host.
 fn ssh_check(host: &str, remote_cmd: &str) -> (bool, String) {
     let out = ssh_command()
-        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, remote_cmd])
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=5",
+            host,
+            remote_cmd,
+        ])
         .output();
     match out {
         Ok(o) => {
@@ -690,9 +706,13 @@ fn remote_up(r: &Resolved, flags: RunFlags) {
         Ok(s) if s.success() => {}
         Ok(s) => R.warn(format!(
             "remote `devme up -d` exited {} (attaching anyway)",
-            s.code().map(|c| c.to_string()).unwrap_or_else(|| "by signal".into())
+            s.code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "by signal".into())
         )),
-        Err(e) => R.warn(format!("couldn't start remote stack: {e} (attaching anyway)")),
+        Err(e) => R.warn(format!(
+            "couldn't start remote stack: {e} (attaching anyway)"
+        )),
     }
 }
 
@@ -774,7 +794,11 @@ fn herdr_prepare(r: &Resolved) {
 /// commands forward there. Returns the resolved context when active.
 fn remote_active(cwd: &Path) -> Option<Resolved> {
     let r = resolve(cwd).ok()?;
-    if sync_exists(&r.session) { Some(retarget_for_cwd(r, cwd)) } else { None }
+    if sync_exists(&r.session) {
+        Some(retarget_for_cwd(r, cwd))
+    } else {
+        None
+    }
 }
 
 /// When `cwd` is inside a linked worktree with its own live sync, daemon
@@ -843,7 +867,10 @@ pub fn maybe_proxy(command: &Option<crate::Command>) -> Option<i32> {
 /// Forward this invocation's own arguments to the remote verbatim, dropping
 /// `--local` (a local-only escape hatch the remote shouldn't see).
 fn forwarded_args() -> Vec<String> {
-    std::env::args().skip(1).filter(|a| a != "--local").collect()
+    std::env::args()
+        .skip(1)
+        .filter(|a| a != "--local")
+        .collect()
 }
 
 /// Build the remote command: `cd <remote_path> && devme <args…>`.
@@ -1080,7 +1107,9 @@ pub fn wake() -> Result<()> {
     if n > 0 {
         R.warn(format!("{n} conflict(s) across devme syncs"));
         devme_ui::hint("devme remote conflicts");
-        notify(&format!("{n} sync conflict(s) after wake — run `devme remote conflicts`"));
+        notify(&format!(
+            "{n} sync conflict(s) after wake — run `devme remote conflicts`"
+        ));
     }
     Ok(())
 }
@@ -1198,7 +1227,11 @@ pub fn status(cwd: &Path, json: bool, watch: bool) -> Result<()> {
         .collect();
 
     if json {
-        let (status_str, conflicts) = if exists { sync_status_fields(&r.session) } else { (None, None) };
+        let (status_str, conflicts) = if exists {
+            sync_status_fields(&r.session)
+        } else {
+            (None, None)
+        };
         let raw = if exists {
             Command::new("mutagen")
                 .args(["sync", "list", &r.session])
@@ -1283,7 +1316,10 @@ fn status_watch(session: &str) -> Result<()> {
             "no live-sync (run `devme remote` to start one)".to_string()
         };
         // Pad to clear any leftover from a previous, longer line before the \r.
-        let pad = last_line.chars().count().saturating_sub(line.chars().count());
+        let pad = last_line
+            .chars()
+            .count()
+            .saturating_sub(line.chars().count());
         print!("\r{line}{}", " ".repeat(pad));
         let _ = std::io::stdout().flush();
         last_line = line;
@@ -1373,12 +1409,19 @@ pub fn conflicts(cwd: &Path, json: bool) -> Result<()> {
         println!();
     }
     // Full per-endpoint detail (the alpha/beta versions) verbatim.
-    let _ = Command::new("mutagen").args(["sync", "list", "--long", &r.session]).status();
+    let _ = Command::new("mutagen")
+        .args(["sync", "list", "--long", &r.session])
+        .status();
     println!("\nresolve by making the two sides agree, then re-sync:");
-    println!("  • keep the LAPTOP copy:  re-save (`touch`) the file locally, then `devme remote flush`");
+    println!(
+        "  • keep the LAPTOP copy:  re-save (`touch`) the file locally, then `devme remote flush`"
+    );
     println!("  • keep the REMOTE copy:  delete the local copy, then `devme remote flush`");
     println!("                           (the remote — primary — version syncs back down)");
-    println!("  • inspect the remote:    ssh {} 'cd {} && …'", r.host, r.remote_path);
+    println!(
+        "  • inspect the remote:    ssh {} 'cd {} && …'",
+        r.host, r.remote_path
+    );
     println!("\nThe whole tree (including .git) is synced, so genuine code divergence");
     println!("can also be settled with normal git on either side.");
 
@@ -1390,7 +1433,9 @@ pub fn conflicts(cwd: &Path, json: bool) -> Result<()> {
         let n = sync_status_fields(&name).1.unwrap_or(0);
         if n > 0 {
             println!("\n⚠ worktree {path} has {n} conflict(s) ({name}):");
-            let _ = Command::new("mutagen").args(["sync", "list", "--long", &name]).status();
+            let _ = Command::new("mutagen")
+                .args(["sync", "list", "--long", &name])
+                .status();
         }
     }
     Ok(())
@@ -1414,7 +1459,11 @@ fn conflict_paths(session: &str) -> Vec<String> {
     let mut seen = std::collections::BTreeSet::new();
     for line in s.lines() {
         let p = line.trim();
-        seen.insert(if p.is_empty() { "<sync root>".to_string() } else { p.to_string() });
+        seen.insert(if p.is_empty() {
+            "<sync root>".to_string()
+        } else {
+            p.to_string()
+        });
     }
     seen.into_iter().collect()
 }
@@ -1497,7 +1546,11 @@ pub fn doctor(cwd: &Path, json: bool) -> Result<()> {
     checks.push(Check {
         name: "mutagen installed",
         ok: mutagen,
-        detail: if mutagen { "found".into() } else { "not found".into() },
+        detail: if mutagen {
+            "found".into()
+        } else {
+            "not found".into()
+        },
         hint: (!mutagen).then(|| "brew install mutagen-io/mutagen/mutagen".to_string()),
     });
     if mutagen {
@@ -1514,9 +1567,8 @@ pub fn doctor(cwd: &Path, json: bool) -> Result<()> {
         } else {
             format!("{}: {reach_detail}", r.host)
         },
-        hint: (!reachable).then(|| {
-            format!("check the host is up and SSH works: ssh {} true", r.host)
-        }),
+        hint: (!reachable)
+            .then(|| format!("check the host is up and SSH works: ssh {} true", r.host)),
     });
 
     // The remaining checks need a live connection; skip them if unreachable.
@@ -1526,19 +1578,29 @@ pub fn doctor(cwd: &Path, json: bool) -> Result<()> {
         checks.push(Check {
             name: "remote git",
             ok: git_ok,
-            detail: if git_ok { "present".into() } else { "missing".into() },
+            detail: if git_ok {
+                "present".into()
+            } else {
+                "missing".into()
+            },
             hint: (!git_ok).then(|| "install git on the remote host".to_string()),
         });
 
         // 4. Remote root writable (created if absent).
         let root = &r.root;
         let rootq = shell_quote(root);
-        let (root_ok, root_detail) =
-            ssh_check(&r.host, &format!("mkdir -p {rootq} && test -w {rootq} && echo ok"));
+        let (root_ok, root_detail) = ssh_check(
+            &r.host,
+            &format!("mkdir -p {rootq} && test -w {rootq} && echo ok"),
+        );
         checks.push(Check {
             name: "remote root writable",
             ok: root_ok,
-            detail: if root_ok { format!("{root} ok") } else { format!("{root}: {root_detail}") },
+            detail: if root_ok {
+                format!("{root} ok")
+            } else {
+                format!("{root}: {root_detail}")
+            },
             hint: (!root_ok).then(|| format!("ensure {root} is creatable/writable on the remote")),
         });
 
@@ -1556,8 +1618,10 @@ pub fn doctor(cwd: &Path, json: bool) -> Result<()> {
                 } else {
                     "not running (this stack uses Docker)".into()
                 },
-                hint: (!docker_ok)
-                    .then(|| "start Docker on the remote host (or it'll fail when the stack boots)".to_string()),
+                hint: (!docker_ok).then(|| {
+                    "start Docker on the remote host (or it'll fail when the stack boots)"
+                        .to_string()
+                }),
             });
         }
 
@@ -1583,9 +1647,15 @@ pub fn doctor(cwd: &Path, json: bool) -> Result<()> {
                 format!("v{remote_ver} (local v{local_ver} — version mismatch)")
             },
             hint: if !devme_ok {
-                Some("install devme on the remote: curl -fsSL https://devme.sh/install | sh".to_string())
+                Some(
+                    "install devme on the remote: curl -fsSL https://devme.sh/install | sh"
+                        .to_string(),
+                )
             } else if !version_match {
-                Some("update the remote (or local) so versions match: avoids IPC protocol drift".to_string())
+                Some(
+                    "update the remote (or local) so versions match: avoids IPC protocol drift"
+                        .to_string(),
+                )
             } else {
                 None
             },
@@ -1622,14 +1692,21 @@ pub fn doctor(cwd: &Path, json: bool) -> Result<()> {
     let note = format!("{} → {}", r.host, r.remote_path);
     let mut sec = devme_ui::Section::begin_noted(&mut out, style, "Remote preflight", Some(&note))?;
     for c in &checks {
-        let kind = if c.ok { devme_ui::Item::Ok } else { devme_ui::Item::Fail };
+        let kind = if c.ok {
+            devme_ui::Item::Ok
+        } else {
+            devme_ui::Item::Fail
+        };
         sec.item(kind, &format!("{:<22}", c.name), Some(&c.detail))?;
         if let Some(h) = &c.hint {
             sec.hint(h)?;
         }
     }
     if all_ok {
-        sec.end(devme_ui::Item::Ok, "all checks passed — `devme remote` is ready")?;
+        sec.end(
+            devme_ui::Item::Ok,
+            "all checks passed — `devme remote` is ready",
+        )?;
     } else {
         sec.end(
             devme_ui::Item::Warn,
@@ -1673,8 +1750,17 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) {
-        let out = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]
@@ -1683,19 +1769,51 @@ mod tests {
         let main = tmp.path().join("app");
         std::fs::create_dir_all(&main).unwrap();
         git(&main, &["init", "-q", "-b", "main"]);
-        git(&main, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init"]);
-        git(&main, &["worktree", "add", "-q", "-b", "feature/x", "../app-feature-x"]);
+        git(
+            &main,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature/x",
+                "../app-feature-x",
+            ],
+        );
 
         let main = std::fs::canonicalize(&main).unwrap();
         let r = resolved_for(&main);
         let wts = resolve_worktrees(&r);
-        assert_eq!(wts.len(), 1, "{:?}", wts.iter().map(|w| &w.local_path).collect::<Vec<_>>());
+        assert_eq!(
+            wts.len(),
+            1,
+            "{:?}",
+            wts.iter().map(|w| &w.local_path).collect::<Vec<_>>()
+        );
         let wt = &wts[0];
         assert_eq!(wt.branch.as_deref(), Some("feature/x"));
         // Worktree session shares the repo suffix but is distinct from main's.
         assert!(wt.session.ends_with(&r.session_suffix), "{}", wt.session);
         assert_ne!(wt.session, r.session);
-        assert!(wt.remote_path.starts_with("~/development/app-feature-x-"), "{}", wt.remote_path);
+        assert!(
+            wt.remote_path.starts_with("~/development/app-feature-x-"),
+            "{}",
+            wt.remote_path
+        );
         assert_eq!(wt.beta, format!("testhost:{}", wt.remote_path));
 
         // A vanished worktree dir (stale registration) is skipped.
@@ -1709,8 +1827,31 @@ mod tests {
         let main = tmp.path().join("app");
         std::fs::create_dir_all(&main).unwrap();
         git(&main, &["init", "-q", "-b", "main"]);
-        git(&main, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init"]);
-        git(&main, &["worktree", "add", "-q", "-b", "feature/x", "../app-feature-x"]);
+        git(
+            &main,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature/x",
+                "../app-feature-x",
+            ],
+        );
 
         let main = std::fs::canonicalize(&main).unwrap();
         let r = resolved_for(&main);
@@ -1735,7 +1876,10 @@ mod tests {
             since: None,
             json: false,
         })));
-        assert!(is_proxyable(&Some(C::Down { timeout: 10, all: false })));
+        assert!(is_proxyable(&Some(C::Down {
+            timeout: 10,
+            all: false
+        })));
         // Machine-local / non-daemon commands never proxy.
         assert!(!is_proxyable(&Some(C::Config { action: None })));
         assert!(!is_proxyable(&Some(C::Remote { action: None })));

@@ -323,7 +323,16 @@ description = "Shell available"
         let mut output = Vec::new();
         let dir = std::env::temp_dir();
 
-        let result = run_preflight(&stack, &dir, &mut input, &mut output, false, false, Style::PLAIN).unwrap();
+        let result = run_preflight(
+            &stack,
+            &dir,
+            &mut input,
+            &mut output,
+            false,
+            false,
+            Style::PLAIN,
+        )
+        .unwrap();
         assert_eq!(result.results[0].1, StepResult::Passed);
 
         let text = String::from_utf8(output).unwrap();
@@ -372,7 +381,16 @@ description = "Missing tool"
         let mut output = Vec::new();
         let dir = std::env::temp_dir();
 
-        let result = run_preflight(&stack, &dir, &mut input, &mut output, true, false, Style::PLAIN).unwrap();
+        let result = run_preflight(
+            &stack,
+            &dir,
+            &mut input,
+            &mut output,
+            true,
+            false,
+            Style::PLAIN,
+        )
+        .unwrap();
         assert_eq!(result.results[0].1, StepResult::Skipped);
     }
 
@@ -416,7 +434,16 @@ trust = "auto"
         let cwd = TempCwd::new("auto");
         let mut input = Cursor::new(b""); // no input — proves no prompt
         let mut output = Vec::new();
-        let result = run_preflight(&stack, &cwd.0, &mut input, &mut output, false, false, Style::PLAIN).unwrap();
+        let result = run_preflight(
+            &stack,
+            &cwd.0,
+            &mut input,
+            &mut output,
+            false,
+            false,
+            Style::PLAIN,
+        )
+        .unwrap();
 
         assert_eq!(result.results[0].1, StepResult::Provisioned);
     }
@@ -439,7 +466,16 @@ description = "Privileged step"
         let dir = std::env::temp_dir();
         let mut input = Cursor::new(b"\n");
         let mut output = Vec::new();
-        let result = run_preflight(&stack, &dir, &mut input, &mut output, true, false, Style::PLAIN).unwrap();
+        let result = run_preflight(
+            &stack,
+            &dir,
+            &mut input,
+            &mut output,
+            true,
+            false,
+            Style::PLAIN,
+        )
+        .unwrap();
 
         assert_eq!(result.results[0].1, StepResult::Manual);
         let text = String::from_utf8(output).unwrap();
@@ -461,7 +497,16 @@ provision = "touch marker"
         let cwd = TempCwd::new("yes");
         let mut input = Cursor::new(b""); // no Enter available
         let mut output = Vec::new();
-        let result = run_preflight(&stack, &cwd.0, &mut input, &mut output, false, true, Style::PLAIN).unwrap();
+        let result = run_preflight(
+            &stack,
+            &cwd.0,
+            &mut input,
+            &mut output,
+            false,
+            true,
+            Style::PLAIN,
+        )
+        .unwrap();
 
         assert_eq!(result.results[0].1, StepResult::Provisioned);
     }

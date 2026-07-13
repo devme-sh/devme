@@ -57,7 +57,10 @@ impl Registry {
 
     /// Remove any claim matching `instance_id`, returning the removed record.
     pub fn remove_by_instance(&mut self, instance_id: &str) -> Option<ClaimRecord> {
-        let idx = self.claims.iter().position(|c| c.instance_id == instance_id)?;
+        let idx = self
+            .claims
+            .iter()
+            .position(|c| c.instance_id == instance_id)?;
         Some(self.claims.remove(idx))
     }
 
@@ -134,7 +137,10 @@ claimed_at = 1700000000
         let r = Registry {
             claims: vec![rec(0, "a", 1), rec(1, "b", 2)],
         };
-        assert_eq!(r.find_by_slot(Slot::new(1).unwrap()).unwrap().instance_id, "b");
+        assert_eq!(
+            r.find_by_slot(Slot::new(1).unwrap()).unwrap().instance_id,
+            "b"
+        );
         assert!(r.find_by_slot(Slot::new(5).unwrap()).is_none());
     }
 

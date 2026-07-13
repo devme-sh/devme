@@ -164,10 +164,11 @@ impl SlotAllocator {
             path: parent.to_path_buf(),
             source,
         })?;
-        tmp.write_all(s.as_bytes()).map_err(|source| AllocError::Io {
-            path: tmp.path().to_path_buf(),
-            source,
-        })?;
+        tmp.write_all(s.as_bytes())
+            .map_err(|source| AllocError::Io {
+                path: tmp.path().to_path_buf(),
+                source,
+            })?;
         tmp.persist(&self.path).map_err(|e| AllocError::Io {
             path: self.path.clone(),
             source: e.error,
@@ -186,7 +187,9 @@ impl SlotAllocator {
                 return Ok(slot);
             }
         }
-        Err(AllocError::Exhausted { max: self.max_slots })
+        Err(AllocError::Exhausted {
+            max: self.max_slots,
+        })
     }
 }
 
@@ -263,9 +266,15 @@ mod tests {
         let path = dir.path().join("slots.toml");
         let mock = Arc::new(MockLiveness::default());
 
-        let a = SlotAllocator::open(&path).with_liveness(mock.clone()).with_pid(1000);
-        let b = SlotAllocator::open(&path).with_liveness(mock.clone()).with_pid(1001);
-        let c = SlotAllocator::open(&path).with_liveness(mock.clone()).with_pid(1002);
+        let a = SlotAllocator::open(&path)
+            .with_liveness(mock.clone())
+            .with_pid(1000);
+        let b = SlotAllocator::open(&path)
+            .with_liveness(mock.clone())
+            .with_pid(1001);
+        let c = SlotAllocator::open(&path)
+            .with_liveness(mock.clone())
+            .with_pid(1002);
 
         assert_eq!(a.claim("a").unwrap(), Slot::new(0).unwrap());
         assert_eq!(b.claim("b").unwrap(), Slot::new(1).unwrap());
@@ -278,9 +287,15 @@ mod tests {
         let path = dir.path().join("slots.toml");
         let mock = Arc::new(MockLiveness::default());
 
-        let a = SlotAllocator::open(&path).with_liveness(mock.clone()).with_pid(1000);
-        let b = SlotAllocator::open(&path).with_liveness(mock.clone()).with_pid(1001);
-        let c = SlotAllocator::open(&path).with_liveness(mock.clone()).with_pid(1002);
+        let a = SlotAllocator::open(&path)
+            .with_liveness(mock.clone())
+            .with_pid(1000);
+        let b = SlotAllocator::open(&path)
+            .with_liveness(mock.clone())
+            .with_pid(1001);
+        let c = SlotAllocator::open(&path)
+            .with_liveness(mock.clone())
+            .with_pid(1002);
 
         a.claim("a").unwrap();
         b.claim("b").unwrap();
@@ -296,11 +311,15 @@ mod tests {
         let mock = Arc::new(MockLiveness::default());
 
         // Dead-process claim from a previous run.
-        let stale = SlotAllocator::open(&path).with_liveness(mock.clone()).with_pid(9999);
+        let stale = SlotAllocator::open(&path)
+            .with_liveness(mock.clone())
+            .with_pid(9999);
         stale.claim("ghost").unwrap();
         mock.mark_dead(9999);
 
-        let live = SlotAllocator::open(&path).with_liveness(mock.clone()).with_pid(1000);
+        let live = SlotAllocator::open(&path)
+            .with_liveness(mock.clone())
+            .with_pid(1000);
         assert_eq!(live.claim("real").unwrap(), Slot::new(0).unwrap());
     }
 
@@ -349,8 +368,12 @@ mod tests {
         let path = dir.path().join("slots.toml");
         let mock = Arc::new(MockLiveness::default());
 
-        let a = SlotAllocator::open(&path).with_liveness(mock.clone()).with_pid(1000);
-        let b = SlotAllocator::open(&path).with_liveness(mock.clone()).with_pid(1001);
+        let a = SlotAllocator::open(&path)
+            .with_liveness(mock.clone())
+            .with_pid(1000);
+        let b = SlotAllocator::open(&path)
+            .with_liveness(mock.clone())
+            .with_pid(1001);
 
         a.claim("a").unwrap();
         b.claim("b").unwrap();
@@ -367,11 +390,15 @@ mod tests {
         let path = dir.path().join("slots.toml");
         let mock = Arc::new(MockLiveness::default());
 
-        let first = SlotAllocator::open(&path).with_liveness(mock.clone()).with_pid(1000);
+        let first = SlotAllocator::open(&path)
+            .with_liveness(mock.clone())
+            .with_pid(1000);
         let s = first.claim("a").unwrap();
         drop(first);
 
-        let second = SlotAllocator::open(&path).with_liveness(mock.clone()).with_pid(1000);
+        let second = SlotAllocator::open(&path)
+            .with_liveness(mock.clone())
+            .with_pid(1000);
         // Same instance — should be idempotent across allocator instances.
         assert_eq!(second.claim("a").unwrap(), s);
     }

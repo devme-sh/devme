@@ -958,7 +958,12 @@ fn render_worktree_remove_dialog(frame: &mut Frame<'_>, area: Rect, state: &TuiS
     }
     if let Some(pr) = &dlg.pr {
         lines.push(Line::from(Span::styled(
-            format!("PR #{} {} — {}", pr.number, pr.state.to_lowercase(), pr.title),
+            format!(
+                "PR #{} {} — {}",
+                pr.number,
+                pr.state.to_lowercase(),
+                pr.title
+            ),
             dim,
         )));
     }
@@ -992,7 +997,12 @@ fn render_worktree_remove_dialog(frame: &mut Frame<'_>, area: Rect, state: &TuiS
 
     let content_w = lines
         .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.chars().count()).sum::<usize>())
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>()
+        })
         .max()
         .unwrap_or(40);
     let w = ((content_w as u16) + 4).clamp(44, area.width.saturating_sub(4));

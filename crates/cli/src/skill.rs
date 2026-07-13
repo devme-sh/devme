@@ -16,7 +16,12 @@ pub fn install(global: bool, force: bool, json: bool) -> anyhow::Result<()> {
         InstallOutcome::Installed => "installed",
         InstallOutcome::Updated => "updated",
     };
-    emit(json, verb, &path.to_string_lossy(), &skill::embedded_version());
+    emit(
+        json,
+        verb,
+        &path.to_string_lossy(),
+        &skill::embedded_version(),
+    );
     Ok(())
 }
 
@@ -27,7 +32,12 @@ pub fn uninstall(global: bool, json: bool) -> anyhow::Result<()> {
         RemoveOutcome::Absent => "absent",
         RemoveOutcome::Removed => "removed",
     };
-    emit(json, verb, &path.to_string_lossy(), &skill::embedded_version());
+    emit(
+        json,
+        verb,
+        &path.to_string_lossy(),
+        &skill::embedded_version(),
+    );
     Ok(())
 }
 
@@ -37,7 +47,10 @@ pub fn status(json: bool) -> anyhow::Result<()> {
 
     // Candidate locations: the two default scopes plus anything we recorded.
     let mut paths: Vec<String> = Vec::new();
-    for p in [skill::skill_file(false), skill::skill_file(true)].into_iter().flatten() {
+    for p in [skill::skill_file(false), skill::skill_file(true)]
+        .into_iter()
+        .flatten()
+    {
         paths.push(p.to_string_lossy().to_string());
     }
     for k in cfg.skill_installs().keys() {
@@ -48,7 +61,12 @@ pub fn status(json: bool) -> anyhow::Result<()> {
 
     let rows: Vec<(String, skill::InstallStatus)> = paths
         .iter()
-        .map(|p| (p.clone(), skill::status_at(Path::new(p), cfg.skill_installs().get(p))))
+        .map(|p| {
+            (
+                p.clone(),
+                skill::status_at(Path::new(p), cfg.skill_installs().get(p)),
+            )
+        })
         .collect();
 
     if json {
@@ -63,7 +81,10 @@ pub fn status(json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("devme skill {} (embedded in this binary)", skill::embedded_version());
+    println!(
+        "devme skill {} (embedded in this binary)",
+        skill::embedded_version()
+    );
     let mut any = false;
     for (p, s) in &rows {
         if *s == skill::InstallStatus::Missing {

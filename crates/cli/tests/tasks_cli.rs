@@ -37,6 +37,10 @@ depends_on=["echo","fail"]
     let list = run(&dir, &["tasks", "--output", "json"]);
     assert!(list.status.success());
     assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&list.stdout).unwrap()["schema_version"],
+        1
+    );
+    assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&list.stdout).unwrap()["count"],
         3
     );
@@ -49,6 +53,10 @@ depends_on=["echo","fail"]
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&echo.stdout).unwrap()["stdout"],
         "hello world"
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&echo.stdout).unwrap()["schema_version"],
+        1
     );
     let failed = run(&dir, &["run", "all", "--output", "json"]);
     assert_eq!(failed.status.code(), Some(7));
@@ -163,6 +171,18 @@ readiness_timeout=1
         stdout.contains("expected schema is not published"),
         "{stdout}"
     );
+    for expected in [
+        "earlier attempts omitted",
+        "interval_ms=20",
+        "timeout_ms=100",
+        "retries=100",
+        "deadline_seconds=1",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in {stdout}"
+        );
+    }
     assert!(output.stderr.is_empty());
 
     let doctor = run(&dir, &["doctor", "backend"]);
@@ -400,8 +420,33 @@ fn toon_surfaces_have_no_trailing_newline_and_usage_errors_are_structured() {
     assert!(String::from_utf8_lossy(&unknown.stdout).starts_with("error:\n"));
 
     let missing = run(&dir, &["run", "missing", "--output", "json"]);
-    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(missing.status.code(), Some(3));
     let error: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
-    assert_eq!(error["error"]["code"], "operation_failed");
+    assert_eq!(error["schema_version"], 1);
+    assert_eq!(error["error"]["code"], "not_found");
     assert!(missing.stderr.is_empty());
+}
+
+#[test]
+fn agent_status_honors_json_and_context_uses_all_canonical_guidance() {
+    let dir = fixture("schema_version=1\n[task.check]\ncmd=\"true\"\n");
+    let status = run(&dir, &["agent", "status", "--json"]);
+    assert!(status.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["integrations"].as_array().unwrap().len(), 3);
+
+    std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+    std::fs::write(dir.path().join(".claude/settings.json"), "not json").unwrap();
+    let error = run(&dir, &["agent", "setup", "--target", "claude", "--json"]);
+    assert_eq!(error.status.code(), Some(1));
+    let error_value: serde_json::Value = serde_json::from_slice(&error.stdout).unwrap();
+    assert_eq!(error_value["schema_version"], 1);
+    assert_eq!(error_value["error"]["code"], "operation_failed");
+    assert!(error.stderr.is_empty());
+
+    let context = run(&dir, &["agent", "context"]);
+    let text = String::from_utf8_lossy(&context.stdout);
+    assert!(text.contains("logs --since 5m --json"));
+    assert!(text.contains("only after explicit user approval"));
 }

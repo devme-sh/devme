@@ -137,9 +137,7 @@ fn detect_color(no_color_flag: bool, is_tty: bool) -> bool {
     if no_color_flag || std::env::var_os("NO_COLOR").is_some() {
         return false;
     }
-    if std::env::var_os("FORCE_COLOR").is_some()
-        || std::env::var_os("CLICOLOR_FORCE").is_some()
-    {
+    if std::env::var_os("FORCE_COLOR").is_some() || std::env::var_os("CLICOLOR_FORCE").is_some() {
         return true;
     }
     is_tty
@@ -221,7 +219,11 @@ impl Scope {
         if glyph.is_empty() {
             format!("{} {msg}", self.prefix())
         } else {
-            format!("{} {} {msg}", self.prefix(), style.paint(glyph_color, glyph))
+            format!(
+                "{} {} {msg}",
+                self.prefix(),
+                style.paint(glyph_color, glyph)
+            )
         }
     }
 

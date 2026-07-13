@@ -25,7 +25,11 @@ pub enum OutputFormat {
 }
 
 #[derive(Debug, Parser, PartialEq, Eq)]
-#[command(name = "devme", version, about = "Multi-service dev environment supervisor")]
+#[command(
+    name = "devme",
+    version,
+    about = "Multi-service dev environment supervisor"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -391,7 +395,9 @@ pub fn service_state_label(state: &devme_core::ServiceState) -> String {
     match state {
         S::Stopped => "stopped".into(),
         S::Starting => "starting".into(),
-        S::Running { degraded: false, .. } => "running".into(),
+        S::Running {
+            degraded: false, ..
+        } => "running".into(),
         S::Running { degraded: true, .. } => "degraded".into(),
         S::WaitingOnDependency { blocked_by } => format!("waiting on {blocked_by}"),
         S::Restarting { attempt } => format!("restarting({attempt})"),
@@ -436,7 +442,9 @@ fn service_glyph(state: &devme_core::ServiceState) -> (&'static str, &'static st
     use devme_core::ServiceState as S;
     use devme_ui::glyph as g;
     match state {
-        S::Running { degraded: false, .. } => (g::RUNNING, ansi::GREEN),
+        S::Running {
+            degraded: false, ..
+        } => (g::RUNNING, ansi::GREEN),
         S::Running { degraded: true, .. } => (g::PARTIAL, ansi::YELLOW),
         S::Starting => (g::PARTIAL, ansi::CYAN),
         S::WaitingOnDependency { .. } => (g::WAITING, ansi::CYAN),
@@ -493,7 +501,11 @@ fn status_summary_line(
         let list = step_problems
             .iter()
             .map(|s| format!("{} {}", s.name, step_state_label(&s.state)))
-            .chain(problems.iter().map(|s| format!("{} {}", s.name, service_state_label(&s.state))))
+            .chain(
+                problems
+                    .iter()
+                    .map(|s| format!("{} {}", s.name, service_state_label(&s.state))),
+            )
             .collect::<Vec<_>>()
             .join(", ");
         // Name a concrete next command: logs for a broken service, up to
@@ -511,14 +523,20 @@ fn status_summary_line(
         .filter(|s| {
             matches!(
                 s.state,
-                S::Running { degraded: false, .. } | S::External { healthy: true }
+                S::Running {
+                    degraded: false,
+                    ..
+                } | S::External { healthy: true }
             )
         })
         .count();
     let total = services.len();
 
     let msg = if total == 0 {
-        let passed = steps.iter().filter(|s| matches!(s.state, StepState::Passed)).count();
+        let passed = steps
+            .iter()
+            .filter(|s| matches!(s.state, StepState::Passed))
+            .count();
         format!("  {passed}/{} steps passed", steps.len())
     } else if running == total {
         "  ✔ all services running".to_string()
@@ -881,7 +899,12 @@ mod tests {
         let cli = Cli::parse_from(["devme", "up"]);
         assert_eq!(
             cli.command,
-            Some(Command::Up { services: vec![], detach: false, wait: false, timeout: 30 })
+            Some(Command::Up {
+                services: vec![],
+                detach: false,
+                wait: false,
+                timeout: 30
+            })
         );
     }
 
@@ -890,7 +913,12 @@ mod tests {
         let cli = Cli::parse_from(["devme", "up", "-d"]);
         assert_eq!(
             cli.command,
-            Some(Command::Up { services: vec![], detach: true, wait: false, timeout: 30 })
+            Some(Command::Up {
+                services: vec![],
+                detach: true,
+                wait: false,
+                timeout: 30
+            })
         );
     }
 
@@ -1047,7 +1075,10 @@ mod tests {
 
     #[test]
     fn resolve_service_urls_fills_templates_and_drops_unresolvable() {
-        let running = ServiceState::Running { degraded: false, started_without: vec![] };
+        let running = ServiceState::Running {
+            degraded: false,
+            started_without: vec![],
+        };
         let mut services = vec![
             {
                 let mut s = svc("api", running.clone());
@@ -1069,7 +1100,10 @@ mod tests {
             },
         ];
         resolve_service_urls(&mut services, "localhost");
-        assert_eq!(services[0].url.as_deref(), Some("http://localhost:8080/docs"));
+        assert_eq!(
+            services[0].url.as_deref(),
+            Some("http://localhost:8080/docs")
+        );
         assert_eq!(services[1].url, None);
         assert_eq!(services[2].url.as_deref(), Some("https://example.test"));
     }
@@ -1096,10 +1130,18 @@ mod tests {
     fn status_text_shows_port_and_clean_state() {
         let mut s = svc(
             "backend",
-            ServiceState::Running { degraded: false, started_without: vec![] },
+            ServiceState::Running {
+                degraded: false,
+                started_without: vec![],
+            },
         );
         s.port = Some(8090);
-        let out = format_status_text(&[s], &[step("tools", StepState::Passed)], &Default::default(), false);
+        let out = format_status_text(
+            &[s],
+            &[step("tools", StepState::Passed)],
+            &Default::default(),
+            false,
+        );
         assert!(out.contains("running"), "got: {out}");
         assert!(out.contains(":8090"), "port missing: {out}");
         // The port is rendered as a clickable URL, not a bare `:PORT`.
@@ -1113,13 +1155,25 @@ mod tests {
     fn status_footer_warns_and_points_at_logs_when_unhealthy() {
         let services = vec![
             svc("api", ServiceState::Failed { exit_code: Some(1) }),
-            svc("db", ServiceState::Running { degraded: false, started_without: vec![] }),
+            svc(
+                "db",
+                ServiceState::Running {
+                    degraded: false,
+                    started_without: vec![],
+                },
+            ),
         ];
         let out = format_status_text(&services, &[], &Default::default(), false);
         let footer = out.lines().last().unwrap();
         assert!(footer.contains("⚠"), "no warning glyph: {out}");
-        assert!(footer.contains("api failed(1)"), "missing failed service: {out}");
-        assert!(footer.contains("devme logs api"), "hint should name the service: {out}");
+        assert!(
+            footer.contains("api failed(1)"),
+            "missing failed service: {out}"
+        );
+        assert!(
+            footer.contains("devme logs api"),
+            "hint should name the service: {out}"
+        );
     }
 
     #[test]
@@ -1134,11 +1188,26 @@ mod tests {
     #[test]
     fn status_footer_tallies_when_all_healthy() {
         let services = vec![
-            svc("api", ServiceState::Running { degraded: false, started_without: vec![] }),
-            svc("db", ServiceState::Running { degraded: false, started_without: vec![] }),
+            svc(
+                "api",
+                ServiceState::Running {
+                    degraded: false,
+                    started_without: vec![],
+                },
+            ),
+            svc(
+                "db",
+                ServiceState::Running {
+                    degraded: false,
+                    started_without: vec![],
+                },
+            ),
         ];
         let out = format_status_text(&services, &[], &Default::default(), false);
-        assert!(out.lines().last().unwrap().contains("all services running"), "got: {out}");
+        assert!(
+            out.lines().last().unwrap().contains("all services running"),
+            "got: {out}"
+        );
     }
 
     #[test]
@@ -1149,14 +1218,23 @@ mod tests {
         ];
         let services = vec![svc("db", ServiceState::Stopped)];
         let descriptions: std::collections::HashMap<String, String> = [
-            ("gcloud_adc".to_string(), "gcloud app-default creds".to_string()),
+            (
+                "gcloud_adc".to_string(),
+                "gcloud app-default creds".to_string(),
+            ),
             ("db".to_string(), "Postgres via Docker".to_string()),
         ]
         .into();
         let out = format_status_text(&services, &steps, &descriptions, false);
-        assert!(out.contains("gcloud app-default creds"), "step desc missing: {out}");
+        assert!(
+            out.contains("gcloud app-default creds"),
+            "step desc missing: {out}"
+        );
         assert!(out.contains("runs on `devme up`"), "up note missing: {out}");
-        assert!(out.contains("Postgres via Docker"), "stopped svc desc missing: {out}");
+        assert!(
+            out.contains("Postgres via Docker"),
+            "stopped svc desc missing: {out}"
+        );
     }
 
     #[test]
@@ -1173,7 +1251,10 @@ mod tests {
     fn status_resolves_url_template_over_default_http() {
         let mut s = svc(
             "db",
-            ServiceState::Running { degraded: false, started_without: vec![] },
+            ServiceState::Running {
+                degraded: false,
+                started_without: vec![],
+            },
         );
         s.port = Some(5432);
         s.url = Some("postgres://{host}:{port}/dev".into());
@@ -1196,12 +1277,18 @@ mod tests {
         let cli = Cli::parse_from(["devme", "url", "backend"]);
         assert_eq!(
             cli.command,
-            Some(Command::Url { service: "backend".into(), open: false })
+            Some(Command::Url {
+                service: "backend".into(),
+                open: false
+            })
         );
         let cli = Cli::parse_from(["devme", "url", "-o", "backend"]);
         assert_eq!(
             cli.command,
-            Some(Command::Url { service: "backend".into(), open: true })
+            Some(Command::Url {
+                service: "backend".into(),
+                open: true
+            })
         );
     }
 
@@ -1216,7 +1303,10 @@ mod tests {
         use devme_tui::worktree::WorktreeReport;
         let mut backend = svc(
             "backend",
-            ServiceState::Running { degraded: false, started_without: vec![] },
+            ServiceState::Running {
+                degraded: false,
+                started_without: vec![],
+            },
         );
         backend.port = Some(8090);
         let reports = vec![
@@ -1253,7 +1343,10 @@ mod tests {
             "glyph+port cells missing: {out}"
         );
         assert!(out.contains("* feat/foo"), "cwd marker missing: {out}");
-        assert!(out.contains("(not running)"), "stopped worktree row missing: {out}");
+        assert!(
+            out.contains("(not running)"),
+            "stopped worktree row missing: {out}"
+        );
         assert!(out.contains("● running"), "legend missing: {out}");
         // color=false must leave no escape bytes behind.
         assert!(!out.contains('\x1b'), "leaked ANSI: {out:?}");
@@ -1267,10 +1360,16 @@ mod tests {
         use devme_core::ServiceState as S;
         assert_eq!(service_state_label(&S::Stopped), "stopped");
         assert_eq!(
-            service_state_label(&S::Running { degraded: true, started_without: vec![] }),
+            service_state_label(&S::Running {
+                degraded: true,
+                started_without: vec![]
+            }),
             "degraded"
         );
-        assert_eq!(service_state_label(&S::Failed { exit_code: Some(2) }), "failed(2)");
+        assert_eq!(
+            service_state_label(&S::Failed { exit_code: Some(2) }),
+            "failed(2)"
+        );
     }
 
     #[test]
@@ -1333,7 +1432,12 @@ mod tests {
     #[test]
     fn config_check_parses() {
         let cli = Cli::parse_from(["devme", "config", "check"]);
-        assert_eq!(cli.command, Some(Command::Config { action: Some(ConfigAction::Check) }));
+        assert_eq!(
+            cli.command,
+            Some(Command::Config {
+                action: Some(ConfigAction::Check)
+            })
+        );
     }
 
     #[test]
@@ -1388,7 +1492,12 @@ mod tests {
             ("toggle", RemoteAction::Toggle),
         ] {
             let cli = Cli::parse_from(["devme", "remote", arg]);
-            assert_eq!(cli.command, Some(Command::Remote { action: Some(expected) }));
+            assert_eq!(
+                cli.command,
+                Some(Command::Remote {
+                    action: Some(expected)
+                })
+            );
         }
     }
 
@@ -1397,13 +1506,17 @@ mod tests {
         let cli = Cli::parse_from(["devme", "remote", "status", "--watch"]);
         assert_eq!(
             cli.command,
-            Some(Command::Remote { action: Some(RemoteAction::Status { watch: true }) })
+            Some(Command::Remote {
+                action: Some(RemoteAction::Status { watch: true })
+            })
         );
         // Short form too.
         let cli = Cli::parse_from(["devme", "remote", "status", "-w"]);
         assert_eq!(
             cli.command,
-            Some(Command::Remote { action: Some(RemoteAction::Status { watch: true }) })
+            Some(Command::Remote {
+                action: Some(RemoteAction::Status { watch: true })
+            })
         );
     }
 
@@ -1412,12 +1525,16 @@ mod tests {
         let cli = Cli::parse_from(["devme", "remote", "wake-hook"]);
         assert_eq!(
             cli.command,
-            Some(Command::Remote { action: Some(RemoteAction::WakeHook { uninstall: false }) })
+            Some(Command::Remote {
+                action: Some(RemoteAction::WakeHook { uninstall: false })
+            })
         );
         let cli = Cli::parse_from(["devme", "remote", "wake-hook", "--uninstall"]);
         assert_eq!(
             cli.command,
-            Some(Command::Remote { action: Some(RemoteAction::WakeHook { uninstall: true }) })
+            Some(Command::Remote {
+                action: Some(RemoteAction::WakeHook { uninstall: true })
+            })
         );
     }
 
@@ -1434,7 +1551,10 @@ mod tests {
         assert_eq!(
             cli.command,
             Some(Command::Worktree {
-                action: WorktreeAction::Add { branch: "feat/x".into(), path: None }
+                action: WorktreeAction::Add {
+                    branch: "feat/x".into(),
+                    path: None
+                }
             })
         );
         let cli = Cli::parse_from(["devme", "worktree", "add", "feat/x", "../wt-x"]);

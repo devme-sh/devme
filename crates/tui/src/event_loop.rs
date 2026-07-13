@@ -154,8 +154,7 @@ async fn run(
     // opens. Results: `(instance id, pr)`.
     const PR_EVERY_TICKS: u64 = 12; // × 5s = every minute
     let mut git_tick: u64 = 0;
-    let (pr_tx, mut pr_rx) =
-        mpsc::unbounded_channel::<(String, Option<crate::worktree::PrInfo>)>();
+    let (pr_tx, mut pr_rx) = mpsc::unbounded_channel::<(String, Option<crate::worktree::PrInfo>)>();
     // Worktree add/remove run async (a removal stops a daemon, gated on a
     // 10s grace); their outcomes come back here.
     let (wt_op_tx, mut wt_op_rx) = mpsc::unbounded_channel::<WorktreeOp>();

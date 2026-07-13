@@ -1321,8 +1321,7 @@ mod tests {
         // Uncommitted work is the one thing removal destroys — git refuses
         // a dirty tree without --force, and we surface that instead of
         // silently discarding changes.
-        let Some((root, main, linked)) = setup_linked_worktree("dirty", "feature/foo", None)
-        else {
+        let Some((root, main, linked)) = setup_linked_worktree("dirty", "feature/foo", None) else {
             return;
         };
         std::fs::write(linked.join("wip.txt"), b"uncommitted").unwrap();

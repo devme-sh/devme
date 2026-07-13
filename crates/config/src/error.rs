@@ -31,6 +31,11 @@ pub enum ConfigError {
     #[error("resource '{name}' has capacity 0; capacity must be at least 1")]
     InvalidResourceCapacity { name: String },
 
+    #[error(
+        "aggregate task '{task}' cannot declare `{field}`; aggregates contain dependencies only"
+    )]
+    InvalidAggregateTaskField { task: String, field: &'static str },
+
     #[error("service '{name}' readiness.{field} must be at least 1")]
     InvalidReadinessValue { name: String, field: &'static str },
 

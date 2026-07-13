@@ -16,6 +16,25 @@ use crate::{OutputFormat, TaskAction};
 
 const CAPTURE_LIMIT: usize = 64 * 1024;
 
+#[derive(Debug)]
+pub struct UnknownTask {
+    name: String,
+    available: Vec<String>,
+}
+
+impl std::fmt::Display for UnknownTask {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "no task named {:?}; available tasks: {}",
+            self.name,
+            self.available.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for UnknownTask {}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResult {
     pub task: String,
@@ -71,7 +90,11 @@ pub fn show(stack: &Stack, action: Option<TaskAction>, format: OutputFormat) -> 
                 .get(&task)
                 .ok_or_else(|| unknown_task(stack, &task))?;
             match format {
-                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(value)?),
+                OutputFormat::Json => devme_ui::json(&serde_json::json!({
+                    "schema_version": 1,
+                    "name": task,
+                    "task": value,
+                })),
                 OutputFormat::Toon => {
                     print!(
                         "task:\n  name: {}\n  command: {}\n  dependencies: {}\n  services: {}\n  resources: {}\n  timeout_seconds: {}",
@@ -91,12 +114,11 @@ pub fn show(stack: &Stack, action: Option<TaskAction>, format: OutputFormat) -> 
                 let rows: Vec<_> = stack.task.iter().map(|(name, task)| serde_json::json!({
                         "name": name, "description": task.description, "has_command": task.cmd.is_some()
                     })).collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(
-                        &serde_json::json!({"count": rows.len(), "tasks": rows})
-                    )?
-                );
+                devme_ui::json(&serde_json::json!({
+                    "schema_version": 1,
+                    "count": rows.len(),
+                    "tasks": rows,
+                }));
             }
             OutputFormat::Toon => {
                 let mut output = format!(
@@ -625,7 +647,14 @@ fn emit_result(result: &TaskResult, format: OutputFormat) -> Result<()> {
             "task {} {} in {}ms",
             result.task, result.status, result.duration_ms
         )),
-        OutputFormat::Json => println!("{}", serde_json::to_string(result)?),
+        OutputFormat::Json => {
+            let mut value = serde_json::to_value(result)?;
+            value
+                .as_object_mut()
+                .expect("task result serializes as an object")
+                .insert("schema_version".into(), serde_json::json!(1));
+            devme_ui::json(&value);
+        }
         OutputFormat::Toon => {
             print!(
                 "result:\n  task: {}\n  status: {}\n  exit_code: {}\n  duration_ms: {}\n  timed_out: {}\n  cancelled: {}\n  truncated: {}\n  stdout: {}\n  stderr: {}",
@@ -661,15 +690,11 @@ fn empty_result(name: &str) -> TaskResult {
     }
 }
 fn unknown_task(stack: &Stack, name: &str) -> anyhow::Error {
-    anyhow!(
-        "no task named {name:?}; available tasks: {}",
-        stack
-            .task
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
+    UnknownTask {
+        name: name.to_string(),
+        available: stack.task.keys().cloned().collect(),
+    }
+    .into()
 }
 fn sanitize(value: &str) -> String {
     value

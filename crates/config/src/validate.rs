@@ -74,6 +74,24 @@ fn check_tasks(stack: &Stack, errors: &mut Vec<ConfigError>) {
         }
     }
     for (name, task) in &stack.task {
+        if task.cmd.is_none() {
+            for (field, present) in [
+                ("cwd", task.cwd.is_some()),
+                ("env", !task.env.is_empty()),
+                ("steps", !task.steps.is_empty()),
+                ("services", !task.services.is_empty()),
+                ("resources", !task.resources.is_empty()),
+                ("timeout", task.timeout != 0),
+                ("readiness_timeout", task.readiness_timeout != 60),
+            ] {
+                if present {
+                    errors.push(ConfigError::InvalidAggregateTaskField {
+                        task: name.clone(),
+                        field,
+                    });
+                }
+            }
+        }
         for (kind, references, known) in [
             (
                 "task",
@@ -662,6 +680,29 @@ readiness = { interval_ms = 0, timeout_ms = 0, retries = 0 }
                 .iter()
                 .any(|error| matches!(error, ConfigError::InvalidRedactionPattern { .. }))
         );
+    }
+
+    #[test]
+    fn aggregate_tasks_may_only_declare_metadata_and_dependencies() {
+        let stack = parse(
+            r#"
+schema_version = 1
+
+[task.leaf]
+cmd = "true"
+
+[task.all]
+description = "everything"
+depends_on = ["leaf"]
+services = ["backend"]
+"#,
+        );
+        let errors = validate(&stack).unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ConfigError::InvalidAggregateTaskField { task, field }
+                if task == "all" && *field == "services"
+        )));
     }
 
     #[test]
