@@ -1,0 +1,43 @@
+name: Native toolchain smoke
+
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "scripts/native-toolchain-smoke.sh"
+      - ".github/workflows/native-toolchain-smoke.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  native-toolchains:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.4.1"
+
+      - name: Build Devme
+        run: cargo build --release --workspace
+
+      - name: Delegate through xcodebuild and Gradle
+        run: scripts/native-toolchain-smoke.sh target/release/devme

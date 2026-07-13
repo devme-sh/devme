@@ -147,6 +147,11 @@ fn runtime_dir_inner() -> std::io::Result<PathBuf> {
         PathBuf::from("/tmp/devme")
     };
     std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     Ok(dir)
 }
 
@@ -168,6 +173,18 @@ mod tests {
         let a = TempDir::new().unwrap();
         let b = TempDir::new().unwrap();
         assert_ne!(instance_id(a.path()), instance_id(b.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_directory_is_private_to_the_current_user() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = runtime_dir().unwrap();
+        assert_eq!(
+            std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 
     #[test]

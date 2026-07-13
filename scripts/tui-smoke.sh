@@ -61,6 +61,12 @@ tmux new-session -d -s "$SESSION" -x 120 -y 30 \
 # Long enough for the daemon to spawn and for tick (10 lines/s) to overflow
 # the ~24-row viewport, so page-up in step 2 has somewhere to scroll to.
 sleep 5
+# Home is the default entry surface. Switch to the service dashboard before
+# exercising dashboard navigation and log scrolling.
+tmux send-keys -t "$SESSION" "d"
+sleep 1
+tmux send-keys -t "$SESSION" "S"
+sleep 5
 
 # Helper: capture, grep, fail with full pane on miss.
 assert_contains() {

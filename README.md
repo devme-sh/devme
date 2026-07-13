@@ -60,6 +60,9 @@ Ports automatically offset per worktree slot. Slot 0 keeps defaults, slot 1 gets
 One-shot tasks run through `devme run <name>` and delegate to the project's
 authoritative native tools. See [`examples/native-mobile-monorepo`](./examples/native-mobile-monorepo/)
 for backend, iOS, and Android orchestration with scoped runtime leases.
+Repository verification also includes `scripts/native-toolchain-smoke.sh`,
+which runs generated workspace members through real `xcodebuild` and Gradle
+executables without teaching Devme either native build graph.
 
 Large monorepos can keep the same root interface while splitting configuration
 by app:

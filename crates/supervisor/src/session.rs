@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -89,6 +89,20 @@ impl SessionLeases {
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
     }
+
+    /// Persist every session-owned process group beside the lock owner. A new
+    /// supervisor terminates these orphans before reassigning the resource.
+    pub fn record_child(&self, pid: u32) -> Result<()> {
+        let identity = process_identity(pid)
+            .ok_or_else(|| anyhow!("cannot read identity for session child pid {pid}"))?;
+        for file in &self.files {
+            let mut file = file;
+            writeln!(file, "child={pid}:{identity}")?;
+            file.flush()?;
+            file.sync_data()?;
+        }
+        Ok(())
+    }
 }
 
 fn try_pool(dir: &Path, capacity: u32, session: &str, root: &Path) -> Result<Option<(File, u32)>> {
@@ -103,17 +117,23 @@ fn try_pool(dir: &Path, capacity: u32, session: &str, root: &Path) -> Result<Opt
             .with_context(|| format!("open resource lease {}", path.display()))?;
         match file.try_lock_exclusive() {
             Ok(()) => {
+                if !recover_stale_owner(&mut file)? {
+                    FileExt::unlock(&file)?;
+                    continue;
+                }
                 file.set_len(0)?;
                 file.seek(SeekFrom::Start(0))?;
                 write!(
                     file,
-                    "pid={}\nsession={}\nworktree={}\nacquired_at={}\n",
+                    "pid={}\nowner_start={}\nsession={}\nworktree={}\nacquired_at={}\n",
                     std::process::id(),
+                    process_identity(std::process::id()).unwrap_or_else(|| "unknown".into()),
                     session,
                     root.display(),
                     now_ms()
                 )?;
                 file.flush()?;
+                file.sync_data()?;
                 return Ok(Some((file, id)));
             }
             Err(error) if lock_contended(&error) => continue,
@@ -122,6 +142,114 @@ fn try_pool(dir: &Path, capacity: u32, session: &str, root: &Path) -> Result<Opt
     }
     Ok(None)
 }
+
+fn recover_stale_owner(file: &mut File) -> Result<bool> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut metadata = String::new();
+    file.read_to_string(&mut metadata)?;
+    let owner = metadata
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))
+        .and_then(|value| value.parse::<u32>().ok());
+    let owner_start = metadata
+        .lines()
+        .find_map(|line| line.strip_prefix("owner_start="));
+    let children = metadata
+        .lines()
+        .filter_map(|line| line.strip_prefix("child="))
+        .filter_map(|value| value.split_once(':'))
+        .filter_map(|(pid, identity)| Some((pid.parse::<u32>().ok()?, identity.to_string())))
+        .collect::<Vec<_>>();
+    let owner_matches = owner
+        .zip(owner_start)
+        .is_some_and(|(pid, identity)| process_identity(pid).as_deref() == Some(identity));
+    if owner.is_none() {
+        return Ok(true);
+    }
+    if owner_matches {
+        // The kernel lock is authoritative in normal operation, but do not
+        // silently reuse a slot if unexpectedly unlocked metadata from this
+        // live supervisor still identifies a live child.
+        return Ok(children
+            .iter()
+            .all(|(pid, identity)| process_identity(*pid).as_deref() != Some(identity)));
+    }
+    for (pid, identity) in &children {
+        if process_identity(*pid).as_deref() == Some(identity) {
+            kill_process_group(*pid);
+        }
+    }
+    for _ in 0..40 {
+        if children
+            .iter()
+            .all(|(pid, identity)| process_identity(*pid).as_deref() != Some(identity))
+        {
+            return Ok(true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Ok(children
+        .iter()
+        .all(|(pid, identity)| process_identity(*pid).as_deref() != Some(identity)))
+}
+
+#[cfg(target_os = "macos")]
+fn process_identity(pid: u32) -> Option<String> {
+    // SAFETY: proc_pidinfo initializes the provided proc_bsdinfo buffer for a
+    // live process. The return size is checked before any fields are read.
+    unsafe {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let written = libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        );
+        if written != size {
+            return None;
+        }
+        let info = info.assume_init();
+        Some(format!(
+            "{}-{}",
+            info.pbi_start_tvsec, info.pbi_start_tvusec
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_identity(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    // Field 22 is process start time. `after_comm` starts at field 3.
+    after_comm.split_whitespace().nth(19).map(str::to_string)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_identity(_pid: u32) -> Option<String> {
+    None
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    let pid = pid as libc::pid_t;
+    // SAFETY: kill only targets the recorded session process. The group form
+    // is used when the process is still its own process-group leader.
+    unsafe {
+        if libc::getpgid(pid) == pid {
+            libc::kill(-pid, libc::SIGKILL);
+        } else {
+            libc::kill(pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pid: u32) {}
 
 fn lock_contended(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::WouldBlock
@@ -166,6 +294,10 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use devme_config::ResourceScope;
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
+    #[cfg(unix)]
+    use std::process::{Command, Stdio};
     use tempfile::TempDir;
 
     fn resource(scope: ResourceScope) -> Resource {
@@ -259,5 +391,128 @@ mod tests {
             .unwrap()
             .is_some()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_owner_children_are_killed_before_resource_reassignment() {
+        let runtime = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let device = resource(ResourceScope::Host);
+        let mut resources = IndexMap::new();
+        resources.insert("device".into(), device.clone());
+
+        let mut dead_owner = Command::new("true").spawn().unwrap();
+        let dead_owner_pid = dead_owner.id();
+        let dead_owner_start = process_identity(dead_owner_pid).unwrap();
+        dead_owner.wait().unwrap();
+
+        let mut child = Command::new("sleep");
+        child.arg("30").stdout(Stdio::null()).stderr(Stdio::null());
+        // SAFETY: this pre-exec closure only creates a fresh session in the
+        // child immediately before exec.
+        unsafe {
+            child.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        let child = child.spawn().unwrap();
+        let child_pid = child.id();
+        let child_identity = process_identity(child_pid).unwrap();
+        let waiter = std::thread::spawn(move || {
+            let mut child = child;
+            child.wait().unwrap()
+        });
+
+        let lease_dir = resource_dir(runtime.path(), root.path(), "device", &device);
+        std::fs::create_dir_all(&lease_dir).unwrap();
+        std::fs::write(
+            lease_dir.join("0.lease"),
+            format!(
+                "pid={dead_owner_pid}\nowner_start={dead_owner_start}\nchild={child_pid}:{child_identity}\n"
+            ),
+        )
+        .unwrap();
+
+        let recovered = SessionLeases::try_acquire_at(
+            runtime.path(),
+            &resources,
+            root.path(),
+            "recovered",
+            &["device".into()],
+        )
+        .unwrap()
+        .expect("resource is reassigned after its stale child is gone");
+        assert!(process_identity(child_pid).is_none());
+        assert!(!waiter.join().unwrap().success());
+        drop(recovered);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_metadata_never_kills_a_reused_process_id() {
+        let runtime = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let device = resource(ResourceScope::Host);
+        let mut resources = IndexMap::new();
+        resources.insert("device".into(), device.clone());
+
+        let mut unrelated = Command::new("sleep").arg("30").spawn().unwrap();
+        let unrelated_pid = unrelated.id();
+        let lease_dir = resource_dir(runtime.path(), root.path(), "device", &device);
+        std::fs::create_dir_all(&lease_dir).unwrap();
+        std::fs::write(
+            lease_dir.join("0.lease"),
+            format!(
+                "pid=999999\nowner_start=gone\nchild={unrelated_pid}:not-the-current-start-time\n"
+            ),
+        )
+        .unwrap();
+
+        let recovered = SessionLeases::try_acquire_at(
+            runtime.path(),
+            &resources,
+            root.path(),
+            "recovered",
+            &["device".into()],
+        )
+        .unwrap()
+        .expect("a mismatched identity is treated as an already-gone orphan");
+        assert!(process_identity(unrelated_pid).is_some());
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
+        drop(recovered);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_owner_with_live_child_is_not_treated_as_a_free_lease() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let child_pid = child.id();
+        let child_identity = process_identity(child_pid).unwrap();
+        std::fs::write(
+            file.path(),
+            format!(
+                "pid={}\nowner_start={}\nchild={child_pid}:{child_identity}\n",
+                std::process::id(),
+                process_identity(std::process::id()).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let mut lease = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(file.path())
+            .unwrap();
+        assert!(!recover_stale_owner(&mut lease).unwrap());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(recover_stale_owner(&mut lease).unwrap());
     }
 }

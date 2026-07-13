@@ -413,11 +413,11 @@ fn append_project(
         };
         if markers.android {
             out.push_str(&format!(
-                "\n[resource.{prefix}android-emulator]\nscope = \"host\"\ncapacity = 1\nenv = \"EMULATOR_SLOT\"\n\n[task.{prefix}android-test]\ncmd = \"{executable} test\"\n{gradle_cwd_line}{step}resources = [\"{prefix}android-emulator\"]\ntimeout = 1200\n"
+                "\n[resource.{prefix}android-emulator]\nscope = \"host\"\ncapacity = 1\nenv = \"EMULATOR_SLOT\"\n\n[task.{prefix}android-test]\ncmd = \"{executable} --no-daemon test\"\n{gradle_cwd_line}{step}resources = [\"{prefix}android-emulator\"]\ntimeout = 1200\n"
             ));
         } else {
             out.push_str(&format!(
-                "\n[task.{prefix}gradle-test]\ncmd = \"{executable} test\"\n{gradle_cwd_line}{step}timeout = 1200\n"
+                "\n[task.{prefix}gradle-test]\ncmd = \"{executable} --no-daemon test\"\n{gradle_cwd_line}{step}timeout = 1200\n"
             ));
         }
     }

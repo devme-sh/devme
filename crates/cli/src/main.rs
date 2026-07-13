@@ -39,6 +39,17 @@ fn interactive_input() -> bool {
 }
 
 fn main() {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__supervisor")) {
+        if let Err(error) = devme_supervisor::runtime::run() {
+            eprintln!("devme-supervisor: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__shared-supervisor")) {
+        devme_shared_supervisor::run();
+        return;
+    }
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error)

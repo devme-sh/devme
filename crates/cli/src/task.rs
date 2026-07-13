@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -727,7 +729,7 @@ async fn execute_one_attempt(
     } else if cancelled {
         130
     } else {
-        status.code().unwrap_or(1)
+        raw_exit_code(status)
     };
     let result = TaskResult {
         task: name.to_string(),
@@ -757,6 +759,20 @@ async fn execute_one_attempt(
         },
     };
     Ok(result)
+}
+
+fn raw_exit_code(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    1
 }
 
 struct StreamCapture {
@@ -1242,6 +1258,7 @@ fn try_acquire(dir: &Path, resource: &Resource, task: &str, root: &Path) -> Resu
                     now_ms()
                 )?;
                 file.flush()?;
+                inherit_lease_into_task_group(&file)?;
                 return Ok(Some(Lease {
                     _file: file,
                     id,
@@ -1255,6 +1272,31 @@ fn try_acquire(dir: &Path, resource: &Resource, task: &str, root: &Path) -> Resu
         }
     }
     Ok(None)
+}
+
+/// Keep the kernel lock alive in the spawned task process group. If the
+/// orchestrating CLI is killed abruptly, descendants retain the lease until
+/// they exit instead of allowing the same scarce resource to be allocated
+/// twice. Normal completion and process-group cancellation close the inherited
+/// descriptor and release it automatically.
+#[cfg(unix)]
+fn inherit_lease_into_task_group(file: &File) -> std::io::Result<()> {
+    let fd = file.as_raw_fd();
+    // SAFETY: fcntl only reads and updates descriptor flags for this valid,
+    // open file descriptor. Clearing FD_CLOEXEC is intentional here.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn inherit_lease_into_task_group(_file: &File) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn resource_dir(root: &Path, name: &str, resource: &Resource) -> Result<PathBuf> {

@@ -53,12 +53,20 @@ sessions="$(run_devme sessions --output json)"
 printf '%s' "$sessions" | grep -Eq '"name"[[:space:]]*:[[:space:]]*"ios::dev"'
 printf '%s' "$sessions" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"ready"'
 
-pane="$(tmux capture-pane -t "$SESSION" -p)"
-if ! printf '%s' "$pane" | grep -q 'device-logs'; then
-  echo "focused TUI did not render the session log service" >&2
-  printf '%s\n' "$pane" >&2
-  exit 1
-fi
+tmux send-keys -t "$SESSION" d
+deadline=$((SECONDS + 10))
+while true; do
+  pane="$(tmux capture-pane -t "$SESSION" -p)"
+  if printf '%s' "$pane" | grep -q 'device-logs'; then
+    break
+  fi
+  if (( SECONDS >= deadline )); then
+    echo "focused TUI dashboard did not render the session log service" >&2
+    printf '%s\n' "$pane" >&2
+    exit 1
+  fi
+  sleep 0.2
+done
 tmux send-keys -t "$SESSION" q
 sleep 0.2
 tmux send-keys -t "$SESSION" q

@@ -22,7 +22,7 @@ restart = "on-failure"
 [task.test]
 kind = "check"
 description = "Verify the Android app"
-cmd = "GRADLE_USER_HOME=\"{worktree}/.devme/gradle-${ANDROID_RUNTIME_SLOT}\" ./gradlew test connectedCheck"
+cmd = "GRADLE_USER_HOME=\"{worktree}/.devme/gradle-${ANDROID_RUNTIME_SLOT}\" ./gradlew --no-daemon test connectedCheck"
 steps = ["java"]
 services = ["backend::api"]
 resources = ["root::android-runtime"]
