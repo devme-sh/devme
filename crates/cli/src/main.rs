@@ -1635,7 +1635,7 @@ async fn ensure_task_services(
         ensure_shared_daemon(&cwd).await?;
     }
     let sock = socket_path();
-    ensure_daemon(&sock).await?;
+    ensure_daemon_for_targets(&sock, services).await?;
     let mut client = devme_client::Client::connect(&sock).await?;
     let initial = client
         .request(ClientMessage::Subscribe {
@@ -3457,7 +3457,11 @@ fn focused_runtime_stack(resolved: &devme_config::ResolvedWorkspace) -> Stack {
     let Some(targets) = resolved.focus_services() else {
         return resolved.stack().clone();
     };
-    let graph = devme_config::Graph::from_stack(resolved.stack());
+    runtime_stack_for_targets(resolved.stack(), &targets)
+}
+
+fn runtime_stack_for_targets(stack: &Stack, targets: &[String]) -> Stack {
+    let graph = devme_config::Graph::from_stack(stack);
     let mut keep = std::collections::HashSet::new();
     fn visit(
         name: &str,
@@ -3476,14 +3480,14 @@ fn focused_runtime_stack(resolved: &devme_config::ResolvedWorkspace) -> Stack {
         }
     }
     for target in targets {
-        visit(&target, &graph, &mut keep);
+        visit(target, &graph, &mut keep);
     }
-    let mut stack = resolved.stack().clone();
-    stack.step.retain(|name, _| keep.contains(name));
-    stack.service.retain(|name, _| keep.contains(name));
-    stack.task.clear();
-    stack.resource.clear();
-    stack
+    let mut focused = stack.clone();
+    focused.step.retain(|name, _| keep.contains(name));
+    focused.service.retain(|name, _| keep.contains(name));
+    focused.task.clear();
+    focused.resource.clear();
+    focused
 }
 
 use devme_supervisor::spawn::{ensure_daemon as ensure_daemon_inner, ensure_shared_daemon};
@@ -3496,6 +3500,20 @@ use devme_supervisor::spawn::{ensure_daemon as ensure_daemon_inner, ensure_share
 /// from `devme.toml` — prompting the user for missing values while we
 /// still have a terminal attached (ADR-0014).
 async fn ensure_daemon(sock: &std::path::Path) -> anyhow::Result<bool> {
+    ensure_daemon_with_preflight_targets(sock, None).await
+}
+
+async fn ensure_daemon_for_targets(
+    sock: &std::path::Path,
+    targets: &[String],
+) -> anyhow::Result<bool> {
+    ensure_daemon_with_preflight_targets(sock, Some(targets)).await
+}
+
+async fn ensure_daemon_with_preflight_targets(
+    sock: &std::path::Path,
+    targets: Option<&[String]>,
+) -> anyhow::Result<bool> {
     let cwd = std::env::current_dir()?;
 
     // Re-entrant `up` (daemon already listening): skip the boot preflight —
@@ -3515,7 +3533,10 @@ async fn ensure_daemon(sock: &std::path::Path) -> anyhow::Result<bool> {
         .or_else(|| devme_config::ResolvedWorkspace::resolve(&cwd).ok());
     if let Some(resolved) = resolved {
         let stack = resolved.stack().clone();
-        let focused = focused_runtime_stack(&resolved);
+        let focused = targets.map_or_else(
+            || focused_runtime_stack(&resolved),
+            |targets| runtime_stack_for_targets(resolved.stack(), targets),
+        );
         if !stack.env.is_empty() {
             // Honour `[stack] env_file` (ADR-0014) — compute the target
             // path before moving `stack.env` out below.

@@ -165,6 +165,24 @@ fn ios_task_starts_only_its_backend_service_closure_and_cleans_up() {
 }
 
 #[test]
+fn root_qualified_ios_task_does_not_preflight_unrelated_android_steps() {
+    let fixture = Fixture::portable();
+
+    let output = fixture.run_from(".", &["run", "ios::verify", "--output", "json"]);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("android::sdk"),
+        "root-qualified iOS task preflighted an unrelated Android step:\n{stderr}"
+    );
+}
+
+#[test]
 fn ios_session_cli_holds_a_resource_for_backend_logs_and_launch() {
     let fixture = Fixture::portable();
     let launched = fixture.run_from("apps/ios", &["session", "dev", "--output", "json"]);

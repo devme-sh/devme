@@ -1,5 +1,10 @@
 schema_version = 1
 
+[step.sdk]
+check = "false"
+provision = "false"
+trust = "manual"
+
 [service.emulator]
 cmd = "test -n \"$ANDROID_RUNTIME_SLOT\"; touch .started; sleep 30"
 scope = "session"
