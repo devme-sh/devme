@@ -72,6 +72,40 @@ async fn run(cli: Cli) -> i32 {
 
     let result = match cli.command {
         None => return launch_default(cli.local, remote_flags).await,
+        Some(Command::Run { task, output, args }) => {
+            let output = if cli.json { devme_cli::OutputFormat::Json } else { output };
+            let cwd = match std::env::current_dir() {
+                Ok(value) => value,
+                Err(e) => { devme_ui::error(e); return 1; }
+            };
+            let stack = match devme_cli::task::load(&cwd) {
+                Ok(value) => value,
+                Err(e) => { devme_ui::error(e); return 1; }
+            };
+            let services = match devme_cli::task::services_for(&stack, &task) {
+                Ok(value) => value,
+                Err(e) => { devme_ui::error(e); return 1; }
+            };
+            if !services.is_empty()
+                && let Err(e) = up(services, true, true, 60).await
+            {
+                devme_ui::error(e);
+                return 1;
+            }
+            return match devme_cli::task::execute(&stack, &cwd, &task, &args, output).await {
+                Ok(result) => result.exit_code,
+                Err(e) => { devme_ui::error(e); 1 }
+            };
+        }
+        Some(Command::Tasks { action, output }) => {
+            let output = if cli.json { devme_cli::OutputFormat::Json } else { output };
+            match std::env::current_dir().map_err(anyhow::Error::from)
+                .and_then(|cwd| devme_cli::task::load(&cwd))
+            {
+                Ok(stack) => devme_cli::task::show(&stack, action, output),
+                Err(e) => Err(e),
+            }
+        }
         Some(Command::Status { all }) => {
             if all {
                 status_all(cli.json).await

@@ -17,4 +17,17 @@ pub enum ConfigError {
 
     #[error("service '{name}' is declared as external but has no `health` field")]
     ExternalServiceMissingHealth { name: String },
+
+    #[error("task '{task}' references unknown {kind} '{name}'")]
+    UnknownTaskReference {
+        task: String,
+        kind: &'static str,
+        name: String,
+    },
+
+    #[error("task dependency cycle: {cycle}")]
+    TaskCycle { cycle: String },
+
+    #[error("resource '{name}' has capacity 0; capacity must be at least 1")]
+    InvalidResourceCapacity { name: String },
 }

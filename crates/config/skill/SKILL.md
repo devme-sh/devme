@@ -32,6 +32,15 @@ Route on `$action`. Default to diagnostics when none is given.
 - Each line is stream-tagged: errors/tracebacks live on `stderr`, routine chatter on `stdout` — filter on that before reading everything.
 - `logs` is **services only**: `devme logs <step>` errors and points you to `devme doctor <step>`, where step check/provision output lives. Unknown names error immediately — don't wait for output that will never come.
 
+### action "run" — execute a one-shot task
+
+- `devme tasks --output toon` lists the root command contract from `devme.toml`.
+- `devme tasks show <name> --output toon` shows dependencies, services, resources, and timeout.
+- `devme run <name> --output toon` runs a task. Use `--output json` for existing JSON consumers. Arguments after `--` are passed to the native command.
+- A task with no required services runs without a supervisor. A task with services starts this worktree's supervisor and waits for readiness first.
+- Exit codes are authoritative: wrapped failures retain their code, timeout is 124, and cancellation is 130. Do not infer success by scraping output.
+- Host/repo/worktree resource leases wait atomically and release automatically after exit or crash. Task results are bounded and secret-shaped task environment values are redacted before persistence.
+
 ### action "setup" — generate devme.toml
 
 Detect the stack from `package.json` (scripts.dev, drizzle/prisma), `Cargo.toml`, `pyproject.toml`/`requirements.txt`, `go.mod`, `docker-compose.yml`, `Dockerfile`, `.env`/`.env.example`, and DB references. Then write a `devme.toml`:
@@ -73,6 +82,22 @@ url = "http://{host}:{port}"
 depends_on = ["deps"]
 ```
 
+One-shot tasks delegate to their native build tools. Omit `cmd` for an aggregate:
+
+```toml
+[resource.device]
+scope = "host"
+capacity = 2
+env = "DEVICE_SLOT"
+
+[task.test]
+cmd = "bun test"
+steps = ["deps"]
+services = ["postgres"]
+resources = ["device"]
+timeout = 300
+```
+
 Rules:
 - `bun` for JS/TS (not npm/node).
 - Docker services: prefix `cmd` with `docker rm -f <name> 2>/dev/null;` and run `--rm --name <project>-<service>` to survive stale containers.
@@ -96,6 +121,8 @@ Rules:
 | `devme worktree rm <target>` | Stop stack, `git worktree remove`, release the port slot. Target by path/dir/branch; `-f` forces dirty. Branch + commits are kept |
 | `devme config [set <k> <v>] [check]` | Show / set global config; `check` lints `devme.toml` (`--json`, non-zero on errors) |
 | `devme skill install [-g]` | (Re)install this skill into `.claude/skills/devme/` (`-g` = `~/.claude/`); embedded, always matches the binary |
+| `devme tasks [show <name>] [--output toon\|json]` | List concise task contracts or show one task's full execution requirements |
+| `devme run <name> [--output toon\|json] [-- <args>...]` | Run a task DAG with readiness, scoped leases, process-tree timeout/cancellation, persisted results, and raw exit semantics |
 
 ### Notes
 

@@ -53,6 +53,7 @@ portable-pty = "0.9"
 
 # Process / system
 process_alive = "0.1"
+fs2 = "0.4"
 tempfile = "3"
 notify = "8"
 
