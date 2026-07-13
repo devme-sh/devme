@@ -22,8 +22,6 @@ A oneshot node in the [[Stack]] graph. Considered satisfied when its `check` com
 
 A long-running node in the [[Stack]] graph. Spawned and kept alive by a [[Daemon]]; the supervisor manages its lifecycle (start, stop, restart, crash recovery). Examples: backend HTTP server, frontend dev server, local database.
 
-### Scope
-
 ### Task kind
 
 Semantic discovery metadata for a one-shot task: `launch`, `check`, or `utility`. It controls grouping on the interactive [[Home screen]] but never changes execution. Existing tasks default to `utility`.

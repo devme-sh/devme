@@ -48,6 +48,11 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     // the sidebar/tabs (copy, zoom) simply leave it empty, so clicks no-op.
     state.begin_frame_hits();
 
+    if state.home_visible() {
+        render_home(frame, area, state);
+        return;
+    }
+
     if state.copy_mode() {
         render_copy_mode(frame, area, state);
         return;
@@ -114,6 +119,149 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     } else if state.help_visible() {
         render_help_overlay(frame, area);
     }
+}
+
+fn render_home(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
+    let p = *state.palette();
+    let block = Block::default()
+        .title(Span::styled(
+            " devme home ",
+            Style::default().fg(p.mauve).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(p.surface1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width < 38 || inner.height < 10 {
+        frame.render_widget(
+            Paragraph::new("Terminal too small - resize to at least 40×10"),
+            inner,
+        );
+        return;
+    }
+    let health = state
+        .services()
+        .iter()
+        .filter(|service| matches!(service.state, ServiceState::Running { .. }))
+        .count();
+    let total = state.services().len();
+    let Some(home) = state.home().cloned() else {
+        return;
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(5),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                "What do you want to do?",
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                format!("Service health: {health}/{total} healthy"),
+                Style::default().fg(if health == total { p.green } else { p.yellow }),
+            ),
+        ]),
+        chunks[0],
+    );
+    let mut lines = Vec::new();
+    let mut last_kind = None;
+    let mut row = chunks[1].y;
+    for (index, action) in home.actions.iter().enumerate() {
+        if last_kind != Some(action.kind) {
+            lines.push(Line::styled(
+                action.kind.label(),
+                Style::default().fg(p.subtext0).add_modifier(Modifier::BOLD),
+            ));
+            row += 1;
+            last_kind = Some(action.kind);
+        }
+        let selected = index == home.selected;
+        let marker = if selected { "  ▸ " } else { "    " };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{marker}{:<14}", action.label),
+                Style::default()
+                    .fg(if selected { p.text } else { p.subtext0 })
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(action.description.clone(), Style::default().fg(p.overlay0)),
+        ]));
+        state.push_click_region(
+            chunks[1].x,
+            row,
+            chunks[1].width,
+            1,
+            crate::state::ClickTarget::HomeAction(index),
+        );
+        row += 1;
+    }
+    if lines.is_empty() {
+        lines.push(Line::styled(
+            "No tasks declared - add [task.<name>] to devme.toml",
+            Style::default().fg(p.overlay0),
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines), chunks[1]);
+    let (activity, title) = if let Some(task) = &home.running {
+        let lines = home
+            .logs
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .cloned()
+            .map(Line::from)
+            .collect::<Vec<_>>();
+        let lines = if lines.is_empty() {
+            vec![Line::styled(
+                "Preparing dependencies and services…",
+                Style::default().fg(p.overlay0),
+            )]
+        } else {
+            lines
+        };
+        (lines, format!("Running {task}"))
+    } else {
+        let lines = home
+            .recent
+            .iter()
+            .rev()
+            .take(3)
+            .map(|result| Line::from(format!("{}  {}", result.task, result.wording())))
+            .collect::<Vec<_>>();
+        let lines = if lines.is_empty() {
+            vec![Line::styled(
+                "No task results yet",
+                Style::default().fg(p.overlay0),
+            )]
+        } else {
+            lines
+        };
+        (
+            lines,
+            "Recent activity - Enter reruns the selected action".into(),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(activity).block(Block::default().title(title).borders(Borders::TOP)),
+        chunks[2],
+    );
+    frame.render_widget(
+        Paragraph::new("↑↓ navigate   Enter run   Esc cancel   d dashboard   q quit"),
+        chunks[3],
+    );
 }
 
 /// Stack-info modal (`i`): the focused stack's identity (branch, worktree
@@ -2405,6 +2553,26 @@ mod tests {
             restart_count: 0,
             readiness: None,
         }
+    }
+
+    #[test]
+    fn home_renders_grouped_actions_health_and_truthful_history() {
+        let stack = devme_config::Stack::parse("schema_version=1\n[task.ios]\nkind=\"launch\"\ndescription=\"Run on Simulator\"\ncmd=\"true\"\n[task.verify]\nkind=\"check\"\ncmd=\"true\"\n").unwrap();
+        let mut state = TuiState::default();
+        state.set_home(crate::home::HomeState::from_stack(
+            &stack,
+            vec![crate::home::RecentResult {
+                task: "ios".into(),
+                kind: devme_config::TaskKind::Launch,
+                status: "passed".into(),
+                finished_at: 1,
+            }],
+        ));
+        let text = render_to_text(&mut state, 90, 24);
+        assert!(text.contains("What do you want to do?"));
+        assert!(text.contains("Run on Simulator"));
+        assert!(text.contains("last launch succeeded"));
+        assert!(!text.contains("currently running"));
     }
 
     #[test]

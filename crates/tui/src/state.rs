@@ -14,6 +14,7 @@ use base64::Engine;
 use devme_config::GlobalConfig;
 use devme_core::{InstanceInfo, ServerMessage, ServiceSnapshot, ServiceState, StepSnapshot};
 
+use crate::home::HomeState;
 use crate::theme::Palette;
 
 /// Per-service log cap inside the TUI. The daemon's ring is the source of
@@ -484,6 +485,7 @@ fn logs_show_addr_in_use(logs: &VecDeque<String>) -> bool {
 /// so clicks would otherwise be discarded). Coordinates are screen cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClickTarget {
+    HomeAction(usize),
     /// Select the stack (instance) at this index in the sidebar.
     Stack(usize),
     /// Select the "shared" sidebar row.
@@ -627,6 +629,7 @@ struct SidebarDivider {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiState {
+    home: Option<HomeState>,
     instances: Vec<InstanceData>,
     selected_instance: Option<usize>,
     /// Shared (repo-scoped) daemon state with its own sidebar row.
@@ -750,6 +753,7 @@ pub struct TuiState {
 impl Default for TuiState {
     fn default() -> Self {
         Self {
+            home: None,
             instances: Vec::new(),
             selected_instance: None,
             shared: SharedData::default(),
@@ -792,6 +796,21 @@ impl Default for TuiState {
             tab_ctx: None,
             tab_row: None,
         }
+    }
+}
+
+impl TuiState {
+    pub fn set_home(&mut self, home: HomeState) {
+        self.home = Some(home);
+    }
+    pub fn home(&self) -> Option<&HomeState> {
+        self.home.as_ref()
+    }
+    pub fn home_mut(&mut self) -> Option<&mut HomeState> {
+        self.home.as_mut()
+    }
+    pub fn home_visible(&self) -> bool {
+        self.home.as_ref().is_some_and(|home| home.visible)
     }
 }
 
@@ -2822,6 +2841,11 @@ impl TuiState {
             return false;
         };
         match region.target {
+            ClickTarget::HomeAction(i) => {
+                if let Some(home) = self.home.as_mut() {
+                    home.selected = i;
+                }
+            }
             ClickTarget::Stack(i) => {
                 self.shared_selected = false;
                 self.selected_instance = Some(i);
@@ -4339,6 +4363,19 @@ mod tests {
         assert!(s.shared_selected());
 
         assert!(!s.click_at(50, 50)); // nothing there
+    }
+
+    #[test]
+    fn click_selects_home_action_like_keyboard_navigation() {
+        let stack = devme_config::Stack::parse("schema_version=1\n[task.ios]\nkind=\"launch\"\ncmd=\"true\"\n[task.verify]\nkind=\"check\"\ncmd=\"true\"\n").unwrap();
+        let mut state = TuiState::default();
+        state.set_home(crate::home::HomeState::from_stack(&stack, vec![]));
+        state.push_click_region(2, 4, 30, 1, ClickTarget::HomeAction(1));
+        assert!(state.click_at(5, 4));
+        assert_eq!(
+            state.home().unwrap().selected_task().as_deref(),
+            Some("verify")
+        );
     }
 
     #[test]

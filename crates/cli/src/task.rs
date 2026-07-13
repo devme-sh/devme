@@ -140,6 +140,7 @@ pub fn show(stack: &Stack, action: Option<TaskAction>, format: OutputFormat) -> 
                     crate::output::print_toon(&serde_json::json!({
                         "task": {
                             "name": task,
+                            "kind": value.kind,
                             "description": value.description,
                             "command": value.cmd,
                             "cwd": value.cwd,
@@ -159,7 +160,7 @@ pub fn show(stack: &Stack, action: Option<TaskAction>, format: OutputFormat) -> 
         None => match format {
             OutputFormat::Json => {
                 let rows: Vec<_> = stack.task.iter().map(|(name, task)| serde_json::json!({
-                        "name": name, "description": task.description, "has_command": task.cmd.is_some()
+                        "name": name, "task_kind": task.kind, "description": task.description, "has_command": task.cmd.is_some()
                     })).collect();
                 devme_ui::json(&serde_json::json!({
                     "schema_version": 1,
@@ -169,21 +170,26 @@ pub fn show(stack: &Stack, action: Option<TaskAction>, format: OutputFormat) -> 
             }
             OutputFormat::Toon => {
                 let mut output = format!(
-                    "count: {}\ntasks[{}]{{name,description,kind}}:",
+                    "count: {}\ntasks[{}]{{name,description,kind,task_kind}}:",
                     stack.task.len(),
                     stack.task.len()
                 );
                 for (name, task) in &stack.task {
-                    let kind = if task.cmd.is_some() {
-                        "command"
-                    } else {
-                        "aggregate"
+                    let task_kind = match task.kind {
+                        devme_config::TaskKind::Launch => "launch",
+                        devme_config::TaskKind::Check => "check",
+                        devme_config::TaskKind::Utility => "utility",
                     };
                     output.push_str(&format!(
-                        "\n  {},{},{}",
+                        "\n  {},{},{},{}",
                         toon_string(name),
                         toon_string(task.description.as_deref().unwrap_or("")),
-                        kind
+                        if task.cmd.is_some() {
+                            "command"
+                        } else {
+                            "aggregate"
+                        },
+                        task_kind,
                     ));
                 }
                 if stack.task.is_empty() {
@@ -222,7 +228,61 @@ pub async fn execute(
     args: &[String],
     format: OutputFormat,
 ) -> Result<TaskResult> {
-    execute_with_env(stack, root, name, args, format, &BTreeMap::new()).await
+    execute_inner(
+        stack,
+        root,
+        name,
+        args,
+        format,
+        &BTreeMap::new(),
+        true,
+        None,
+        None,
+    )
+    .await
+}
+
+/// Execute through the same runner semantics without writing over a TUI frame.
+pub async fn execute_silent(
+    stack: &Stack,
+    root: &Path,
+    name: &str,
+    args: &[String],
+) -> Result<TaskResult> {
+    execute_inner(
+        stack,
+        root,
+        name,
+        args,
+        OutputFormat::Human,
+        &BTreeMap::new(),
+        false,
+        None,
+        None,
+    )
+    .await
+}
+
+pub async fn execute_streaming(
+    stack: &Stack,
+    root: &Path,
+    name: &str,
+    args: &[String],
+    updates: tokio::sync::mpsc::UnboundedSender<TaskOutputEvent>,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<TaskResult> {
+    execute_inner(
+        stack,
+        root,
+        name,
+        args,
+        OutputFormat::Human,
+        &BTreeMap::new(),
+        false,
+        Some(updates),
+        cancellation,
+    )
+    .await
 }
 
 /// Execute a task with identifiers allocated by an already-held session.
@@ -236,6 +296,32 @@ pub async fn execute_with_env(
     format: OutputFormat,
     injected_env: &BTreeMap<String, String>,
 ) -> Result<TaskResult> {
+    execute_inner(
+        stack,
+        root,
+        name,
+        args,
+        format,
+        injected_env,
+        true,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_inner(
+    stack: &Stack,
+    root: &Path,
+    name: &str,
+    args: &[String],
+    format: OutputFormat,
+    injected_env: &BTreeMap<String, String>,
+    emit: bool,
+    updates: Option<tokio::sync::mpsc::UnboundedSender<TaskOutputEvent>>,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<TaskResult> {
     let order = execution_order(stack, name)?;
     let retention = retention_bytes(stack);
     let slot = match SlotClaim::acquire(root) {
@@ -243,15 +329,28 @@ pub async fn execute_with_env(
         Err(error) => {
             let result = failed_result(name, &error.to_string(), 1, false, now_ms(), 0);
             persist(root, &result, retention)?;
-            emit_result(&result, format)?;
+            if emit {
+                emit_result(&result, format)?;
+            }
             return Ok(result);
         }
     };
     let mut final_result = None;
     for current in order {
         let pass = if current == name { args } else { &[] };
-        let result =
-            execute_one(stack, root, current, pass, format, slot.value, injected_env).await?;
+        let result = execute_one(
+            stack,
+            root,
+            current,
+            pass,
+            format,
+            slot.value,
+            injected_env,
+            emit,
+            updates.clone(),
+            cancellation.clone(),
+        )
+        .await?;
         let failed = result.exit_code != 0;
         let failed_dependency = current != name && failed;
         final_result = Some(result);
@@ -278,7 +377,9 @@ pub async fn execute_with_env(
         }
     }
     let result = final_result.expect("execution order is never empty");
-    emit_result(&result, format)?;
+    if emit {
+        emit_result(&result, format)?;
+    }
     Ok(result)
 }
 
@@ -291,7 +392,25 @@ pub fn record_preflight_failure(
     error: &anyhow::Error,
     format: OutputFormat,
 ) -> Result<TaskResult> {
-    record_preflight_result(stack, root, name, error, format, false, None)
+    record_preflight_result(stack, root, name, error, format, false, None, true)
+}
+
+pub fn record_preflight_failure_silent(
+    stack: &Stack,
+    root: &Path,
+    name: &str,
+    error: &anyhow::Error,
+) -> Result<TaskResult> {
+    record_preflight_result(
+        stack,
+        root,
+        name,
+        error,
+        OutputFormat::Human,
+        false,
+        None,
+        false,
+    )
 }
 
 /// Persist and emit cancellation that occurs while converging a task's
@@ -314,9 +433,31 @@ pub fn record_preflight_cancellation(
         format,
         true,
         Some((started_at, duration_ms)),
+        true,
     )
 }
 
+pub fn record_preflight_cancellation_silent(
+    stack: &Stack,
+    root: &Path,
+    name: &str,
+    error: &anyhow::Error,
+    started_at: u64,
+    duration_ms: u64,
+) -> Result<TaskResult> {
+    record_preflight_result(
+        stack,
+        root,
+        name,
+        error,
+        OutputFormat::Human,
+        true,
+        Some((started_at, duration_ms)),
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn record_preflight_result(
     stack: &Stack,
     root: &Path,
@@ -325,6 +466,7 @@ fn record_preflight_result(
     format: OutputFormat,
     cancelled: bool,
     timing: Option<(u64, u64)>,
+    emit: bool,
 ) -> Result<TaskResult> {
     let (started_at, duration_ms) = timing.unwrap_or_else(|| (now_ms(), 0));
     let redactor =
@@ -350,7 +492,9 @@ fn record_preflight_result(
         duration_ms,
     );
     persist(root, &result, retention_bytes(stack))?;
-    emit_result(&result, format)?;
+    if emit {
+        emit_result(&result, format)?;
+    }
     Ok(result)
 }
 
@@ -391,6 +535,7 @@ fn execution_order<'a>(stack: &'a Stack, root: &'a str) -> Result<Vec<&'a str>> 
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_one(
     stack: &Stack,
     root: &Path,
@@ -399,6 +544,9 @@ async fn execute_one(
     format: OutputFormat,
     slot: u8,
     injected_env: &BTreeMap<String, String>,
+    emit: bool,
+    updates: Option<tokio::sync::mpsc::UnboundedSender<TaskOutputEvent>>,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<TaskResult> {
     let task = &stack.task[name];
     let retention = retention_bytes(stack);
@@ -437,6 +585,8 @@ async fn execute_one(
         started_at,
         &started,
         injected_env,
+        updates,
+        cancellation,
     )
     .await;
     let result = match attempt {
@@ -454,7 +604,7 @@ async fn execute_one(
             )
         }
     };
-    if format == OutputFormat::Human {
+    if emit && format == OutputFormat::Human {
         print!("{}", result.stdout);
         eprint!("{}", result.stderr);
     }
@@ -475,6 +625,8 @@ async fn execute_one_attempt(
     started_at: u64,
     started: &std::time::Instant,
     injected_env: &BTreeMap<String, String>,
+    updates: Option<tokio::sync::mpsc::UnboundedSender<TaskOutputEvent>>,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<TaskResult> {
     let task = &stack.task[name];
     for step in &task.steps {
@@ -496,7 +648,8 @@ async fn execute_one_attempt(
         return Ok(empty_result(name));
     }
 
-    let leases = acquire_resources(stack, root, name, &task.resources).await?;
+    let leases =
+        acquire_resources(stack, root, name, &task.resources, cancellation.clone()).await?;
     let cwd = match &task.cwd {
         Some(value) => root.join(devme_config::interpolate(value, ctx)?),
         None => root.to_path_buf(),
@@ -545,6 +698,7 @@ async fn execute_one_attempt(
         devme_core::LogStream::Stdout,
         secret_values.to_vec(),
         persistence_patterns.to_vec(),
+        updates.clone(),
     ));
     let err_reader = tokio::spawn(read_stream(
         stderr,
@@ -552,6 +706,7 @@ async fn execute_one_attempt(
         devme_core::LogStream::Stderr,
         secret_values.to_vec(),
         persistence_patterns.to_vec(),
+        updates,
     ));
 
     let deadline = if task.timeout == 0 {
@@ -563,6 +718,7 @@ async fn execute_one_attempt(
         value = child.wait() => (value?, false, false),
         _ = tokio::time::sleep(deadline) => { terminate_group(pid, &mut child).await?; (child.wait().await?, true, false) },
         _ = tokio::signal::ctrl_c() => { terminate_group(pid, &mut child).await?; (child.wait().await?, false, true) },
+        _ = wait_for_cancel(cancellation) => { terminate_group(pid, &mut child).await?; (child.wait().await?, false, true) },
     };
     let out = out_reader.await??;
     let err = err_reader.await??;
@@ -615,6 +771,7 @@ async fn read_stream<R>(
     stream: devme_core::LogStream,
     literals: Vec<String>,
     patterns: Vec<String>,
+    updates: Option<tokio::sync::mpsc::UnboundedSender<TaskOutputEvent>>,
 ) -> std::io::Result<StreamCapture>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -653,6 +810,7 @@ where
                         &mut events,
                         &mut event_bytes,
                         &mut truncated,
+                        updates.as_ref(),
                     );
                     dropping_frame = false;
                 }
@@ -669,6 +827,7 @@ where
                         &mut events,
                         &mut event_bytes,
                         &mut truncated,
+                        updates.as_ref(),
                     );
                 }
             } else {
@@ -687,6 +846,7 @@ where
                         &mut events,
                         &mut event_bytes,
                         &mut truncated,
+                        updates.as_ref(),
                     );
                     frame.clear();
                 }
@@ -703,6 +863,7 @@ where
             &mut events,
             &mut event_bytes,
             &mut truncated,
+            updates.as_ref(),
         );
     } else if !frame.is_empty() {
         let redacted = if redact_all {
@@ -718,6 +879,7 @@ where
             &mut events,
             &mut event_bytes,
             &mut truncated,
+            updates.as_ref(),
         );
     }
     Ok(StreamCapture {
@@ -736,6 +898,7 @@ fn push_redacted_frame(
     events: &mut VecDeque<TaskOutputEvent>,
     event_bytes: &mut usize,
     truncated: &mut bool,
+    updates: Option<&tokio::sync::mpsc::UnboundedSender<TaskOutputEvent>>,
 ) {
     let mut text = String::from_utf8_lossy(bytes).into_owned();
     if text.len() > limit {
@@ -748,11 +911,15 @@ fn push_redacted_frame(
         *truncated = true;
     }
     *event_bytes += text.len();
-    events.push_back(TaskOutputEvent {
+    let event = TaskOutputEvent {
         ts: now_ms(),
         stream,
         text,
-    });
+    };
+    if let Some(updates) = updates {
+        let _ = updates.send(event.clone());
+    }
+    events.push_back(event);
     while *event_bytes > limit && events.len() > 1 {
         if let Some(removed) = events.pop_front() {
             *event_bytes = event_bytes.saturating_sub(removed.text.len());
@@ -982,6 +1149,7 @@ async fn acquire_resources(
     root: &Path,
     task: &str,
     names: &[String],
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<Vec<Lease>> {
     let mut ordered = names.to_vec();
     ordered.sort();
@@ -1030,9 +1198,24 @@ async fn acquire_resources(
                 _ = tokio::signal::ctrl_c() => {
                     return Err(ResourceWaitCancelled { resource }.into());
                 },
+                _ = wait_for_cancel(cancellation.clone()) => {
+                    return Err(ResourceWaitCancelled { resource }.into());
+                },
             }
         } else {
             return Ok(leases);
+        }
+    }
+}
+
+async fn wait_for_cancel(mut cancellation: Option<tokio::sync::watch::Receiver<bool>>) {
+    let Some(receiver) = cancellation.as_mut() else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    while !*receiver.borrow() {
+        if receiver.changed().await.is_err() {
+            return;
         }
     }
 }
@@ -1359,11 +1542,57 @@ mod tests {
             devme_core::LogStream::Stdout,
             Vec::new(),
             Vec::new(),
+            None,
         )
         .await
         .unwrap();
         assert_eq!(capture.text, "6789");
         assert!(capture.truncated);
+    }
+
+    #[tokio::test]
+    async fn stream_capture_publishes_redacted_output_before_completion() {
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let capture = tokio::spawn(read_stream(
+            reader,
+            64,
+            devme_core::LogStream::Stdout,
+            vec!["secret".into()],
+            vec![],
+            Some(tx),
+        ));
+        writer.write_all(b"token=secret\n").await.unwrap();
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event.text, "token=[REDACTED]\n");
+        drop(writer);
+        capture.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tui_cancellation_token_uses_the_same_process_group_semantics() {
+        let root = tempfile::tempdir().unwrap();
+        let stack = Stack::parse("schema_version=1\n[task.slow]\ncmd=\"sleep 30\"\n").unwrap();
+        let (updates, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (cancel, cancellation) = tokio::sync::watch::channel(false);
+        let run = tokio::spawn(async move {
+            execute_streaming(
+                &stack,
+                root.path(),
+                "slow",
+                &[],
+                updates,
+                Some(cancellation),
+            )
+            .await
+            .unwrap()
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.send(true).unwrap();
+        let result = run.await.unwrap();
+        assert_eq!(result.exit_code, 130);
+        assert!(result.cancelled);
     }
 
     #[test]
