@@ -29,6 +29,14 @@ Resource leases are file-locked slots with host, repository, or worktree
 scope. The OS releases locks after crashes, owner metadata remains inspectable,
 and a configured environment variable exposes the allocated zero-based slot.
 Names are acquired in sorted order to prevent multi-resource deadlock.
+Task process groups inherit their lease descriptors, so an abrupt CLI death
+cannot make a still-running task's resource available for double allocation.
+Session sidecars start behind a supervisor-owned gate: Devme records each
+process-group PID and OS start-time identity before releasing the gate. After a
+supervisor crash, the replacement verifies those identities, kills and waits
+for matching orphan groups, and only then reassigns the lease. PID reuse is
+treated as an already-gone orphan rather than permission to signal an unrelated
+process. Runtime state is private to the current user with mode 0700.
 
 `[session.<name>]` is a narrow composition over existing service closures,
 resources, and an optional launch task. It holds resource leases while

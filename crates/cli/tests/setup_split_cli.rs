@@ -149,6 +149,6 @@ fn root_gradle_wrapper_executes_android_member_task_from_the_build_root() {
     );
     assert_eq!(
         std::fs::read_to_string(dir.path().join("gradle-args")).unwrap(),
-        "test"
+        "--no-daemon test"
     );
 }

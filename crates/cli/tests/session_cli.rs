@@ -7,7 +7,7 @@ fn bin() -> &'static str {
 }
 
 fn fixture(config: &str) -> TempDir {
-    let dir = TempDir::new().unwrap();
+    let dir = TempDir::new_in("/tmp").unwrap();
     std::fs::write(dir.path().join("devme.toml"), config).unwrap();
     dir
 }
@@ -17,6 +17,17 @@ fn run(dir: &TempDir, args: &[&str]) -> Output {
         .args(args)
         .current_dir(dir.path())
         .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", dir.path().join(".runtime"))
+        .output()
+        .unwrap()
+}
+
+fn run_with_runtime(dir: &TempDir, runtime: &TempDir, args: &[&str]) -> Output {
+    Command::new(bin())
+        .args(args)
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
         .output()
         .unwrap()
 }
@@ -78,6 +89,88 @@ linger=30
     let second: serde_json::Value = serde_json::from_slice(&stopped_again.stdout).unwrap();
     assert_eq!(second["already_stopped"], true);
     let _ = run(&dir, &["down"]);
+}
+
+#[test]
+fn killed_supervisor_cleans_orphan_sidecar_before_reassigning_session_lease() {
+    let runtime = TempDir::new_in("/tmp").unwrap();
+    let dir = fixture(
+        r#"schema_version=1
+[resource.device]
+scope="worktree"
+[service.sidecar]
+cmd="echo $$ > sidecar.pid; sleep 30 & echo $! > grandchild.pid; wait"
+scope="session"
+[session.dev]
+needs=["sidecar"]
+resources=["device"]
+linger=30
+"#,
+    );
+    let first = run_with_runtime(&dir, &runtime, &["session", "dev", "--output", "json"]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let orphan_pid: i32 = std::fs::read_to_string(dir.path().join("sidecar.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let orphan_grandchild_pid: i32 = std::fs::read_to_string(dir.path().join("grandchild.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let registry = std::fs::read_to_string(runtime.path().join("devme/slots.json")).unwrap();
+    let supervisor_pid: i32 = registry
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("pid = "))
+        .and_then(|value| value.parse().ok())
+        .expect("slot registry contains the supervisor pid");
+
+    // SAFETY: the test owns this isolated supervisor process.
+    unsafe {
+        libc::kill(supervisor_pid, libc::SIGKILL);
+    }
+    for _ in 0..100 {
+        if unsafe { libc::kill(supervisor_pid, 0) } == -1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let recovered = run_with_runtime(&dir, &runtime, &["session", "dev", "--output", "json"]);
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(
+        unsafe { libc::kill(orphan_pid, 0) },
+        -1,
+        "the replacement supervisor reassigned a lease before killing its orphan"
+    );
+    for _ in 0..100 {
+        if unsafe { libc::kill(orphan_grandchild_pid, 0) } == -1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        unsafe { libc::kill(orphan_grandchild_pid, 0) },
+        -1,
+        "the orphan process group retained a live grandchild"
+    );
+    let replacement_pid: i32 = std::fs::read_to_string(dir.path().join("sidecar.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_ne!(replacement_pid, orphan_pid);
+
+    let _ = run_with_runtime(&dir, &runtime, &["down"]);
 }
 
 #[test]

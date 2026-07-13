@@ -40,6 +40,8 @@ grid — `tmux new-session -d -x W -y H '…devme'`, `send-keys`, `capture-pane 
   isolated fixture under /tmp.
 - `scripts/native-workspace-session-smoke.sh` - bare Devme from an iOS workspace
   member, focused session launch, TUI-held resource lifetime, and clean quit.
+- `scripts/native-toolchain-smoke.sh` - workspace delegation through real
+  `xcodebuild` and Gradle executables using hermetic generated probe projects.
 
 ## Releasing
 

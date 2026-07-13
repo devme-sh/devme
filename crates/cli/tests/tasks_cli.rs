@@ -284,6 +284,17 @@ fn timeout_returns_124_and_kills_process_tree() {
     assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
 }
 
+#[cfg(unix)]
+#[test]
+fn signal_terminated_task_preserves_the_shell_exit_convention() {
+    let dir = fixture("schema_version=1\n[task.signal]\ncmd=\"kill -TERM $$\"\n");
+    let output = run(&dir, &["run", "signal", "--output", "json"]);
+    assert_eq!(output.status.code(), Some(143));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["exit_code"], 143);
+    assert_eq!(result["status"], "failed");
+}
+
 #[test]
 fn host_lease_waits_across_two_worktrees() {
     let runtime = std::path::PathBuf::from(format!("/tmp/devme-contention-{}", std::process::id()));
@@ -377,7 +388,7 @@ resources=["a"]
 }
 
 #[test]
-fn host_lease_recovers_after_owner_process_is_killed() {
+fn host_lease_survives_owner_crash_until_spawned_group_exits() {
     let runtime =
         std::path::PathBuf::from(format!("/tmp/devme-crash-recovery-{}", std::process::id()));
     std::fs::create_dir_all(&runtime).unwrap();
@@ -408,20 +419,28 @@ fn host_lease_recovers_after_owner_process_is_killed() {
     }
     let _ = owner.wait();
 
-    let started = Instant::now();
-    let recovered = Command::new(bin())
+    let mut recovered = Command::new(bin())
         .args(["run", "quick", "--output", "json"])
         .current_dir(dir.path())
         .env("HOME", dir.path())
         .env("XDG_RUNTIME_DIR", &runtime)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
-    assert!(recovered.status.success());
-    assert!(started.elapsed() < Duration::from_secs(2));
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(
+        recovered.try_wait().unwrap().is_none(),
+        "a live orphaned task group must retain its resource lease"
+    );
 
     unsafe {
         libc::kill(-task_pid, libc::SIGKILL);
     }
+    let started = Instant::now();
+    let recovered = recovered.wait_with_output().unwrap();
+    assert!(recovered.status.success());
+    assert!(started.elapsed() < Duration::from_secs(2));
     let _ = std::fs::remove_dir_all(runtime);
 }
 

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+use anyhow::Context;
 use base64::Engine;
 use devme_config::{Graph, InterpContext, Session, Stack, interpolate};
 use devme_core::{
@@ -1990,39 +1991,74 @@ fn enact_actions(
                 let env_slice: Vec<(&str, &str)> =
                     env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
-                let parts = match ChildProcess::spawn_parts::<&str>(&cmd, &cwd, &env_slice) {
+                let owning_sessions = if svc.scope == devme_core::Scope::Session {
+                    state
+                        .sessions
+                        .iter()
+                        .filter(|(_, session)| {
+                            session.services.iter().any(|service| service == &name)
+                        })
+                        .map(|(session, _)| session.clone())
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                let (spawn_cmd, gate) = if owning_sessions.is_empty() {
+                    (cmd, None)
+                } else {
+                    match session_gated_command(&name, &cmd, generation) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            work.extend(service_spawn_failed(
+                                state,
+                                &name,
+                                port,
+                                format!("prepare session spawn gate for {name}: {error}"),
+                            ));
+                            continue;
+                        }
+                    }
+                };
+                let spawned = ChildProcess::spawn_parts::<&str>(&spawn_cmd, &cwd, &env_slice);
+                let parts = match spawned {
                     Ok(p) => p,
                     Err(e) => {
-                        state.broadcast(
-                            None,
-                            ServerMessage::Notice {
-                                level: NoticeLevel::Error,
-                                message: format!("spawn {name}: {e}"),
-                            },
-                        );
-                        // The executor marked the node Starting when it
-                        // emitted this action; with no child there will
-                        // never be an exit event to move it on, so record
-                        // the failure now — otherwise the service shows
-                        // "starting" forever.
-                        let failed = state.executor.handle(ExecEvent::ServiceExited {
-                            name: name.clone(),
-                            exit_code: None,
-                        });
-                        state.broadcast(
-                            Some(&name),
-                            ServerMessage::StatusUpdate {
-                                service: name.clone(),
-                                state: ServiceState::Failed { exit_code: None },
-                                pid: None,
-                                port,
-                                restart_count: 0,
-                            },
-                        );
-                        work.extend(failed);
+                        work.extend(service_spawn_failed(
+                            state,
+                            &name,
+                            port,
+                            format!("spawn {name}: {e}"),
+                        ));
                         continue;
                     }
                 };
+                let handoff = owning_sessions.iter().try_for_each(|session| {
+                    state.sessions[session]._leases.record_child(parts.pid)
+                });
+                let handoff = handoff.and_then(|_| {
+                    if let Some(path) = &gate {
+                        std::fs::write(path, b"ready").with_context(|| {
+                            format!("release session spawn gate {}", path.display())
+                        })?;
+                    }
+                    Ok(())
+                });
+                if let Err(error) = handoff {
+                    crate::process::send_sigkill(parts.pid);
+                    if let Some(path) = &gate {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    work.extend(service_spawn_failed(
+                        state,
+                        &name,
+                        port,
+                        format!("persist session process ownership for {name}: {error}"),
+                    ));
+                    continue;
+                }
+                for session in &owning_sessions {
+                    debug_assert!(state.sessions[session].services.contains(&name));
+                }
 
                 let restart_count = *state.restart_counts.get(&name).unwrap_or(&0);
                 state.children.insert(
@@ -2284,6 +2320,70 @@ fn enact_actions(
             }
         }
     }
+}
+
+static NEXT_SESSION_GATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn session_gated_command(
+    service: &str,
+    cmd: &str,
+    generation: u64,
+) -> anyhow::Result<(String, Option<PathBuf>)> {
+    let gate_id = NEXT_SESSION_GATE.fetch_add(1, Ordering::Relaxed);
+    let service = service
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .take(24)
+        .collect::<String>();
+    let gate = devme_config::paths::runtime_dir()?.join(format!(
+        "session-gate-{}-{generation}-{gate_id}-{service}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&gate);
+    let gate = gate.display().to_string();
+    let parent = std::process::id();
+    let wrapped = format!(
+        "attempts=0; while [ ! -e {gate} ]; do kill -0 {parent} 2>/dev/null || exit 125; attempts=$((attempts + 1)); [ \"$attempts\" -lt 200 ] || exit 125; sleep 0.05; done; rm -f {gate}; exec sh -c {cmd}",
+        gate = shell_quote(&gate),
+        cmd = shell_quote(cmd),
+    );
+    Ok((wrapped, Some(PathBuf::from(gate))))
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn service_spawn_failed(
+    state: &mut DaemonState,
+    name: &str,
+    port: Option<u16>,
+    message: String,
+) -> Vec<Action> {
+    state.broadcast(
+        None,
+        ServerMessage::Notice {
+            level: NoticeLevel::Error,
+            message,
+        },
+    );
+    // The executor marked the node Starting when it emitted this action. With
+    // no tracked child, record failure now instead of leaving it Starting.
+    let failed = state.executor.handle(ExecEvent::ServiceExited {
+        name: name.to_string(),
+        exit_code: None,
+    });
+    state.broadcast(
+        Some(name),
+        ServerMessage::StatusUpdate {
+            service: name.to_string(),
+            state: ServiceState::Failed { exit_code: None },
+            pid: None,
+            port,
+            restart_count: 0,
+        },
+    );
+    failed
 }
 
 fn encode_line(line: &str) -> String {
@@ -3896,6 +3996,35 @@ linger=30
         // 500 * 64 = 32000 would exceed the 30s cap.
         assert_eq!(backoff_for(7), RESTART_BACKOFF_MAX_MS);
         assert_eq!(backoff_for(100), RESTART_BACKOFF_MAX_MS);
+    }
+
+    #[test]
+    fn session_sidecar_waits_for_persisted_ownership_gate() {
+        let dir = TempDir::new().unwrap();
+        let started = dir.path().join("started");
+        let command = format!("touch {}", shell_quote(&started.display().to_string()));
+        let (wrapped, gate) = session_gated_command("simulator-logs", &command, 9_876_543).unwrap();
+        let gate = gate.unwrap();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", &wrapped])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !started.exists(),
+            "sidecar ran before ownership was durable"
+        );
+        std::fs::write(&gate, b"ready").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(started.exists());
+        assert!(!gate.exists());
+    }
+
+    #[test]
+    fn concurrent_session_sidecars_receive_distinct_gate_paths() {
+        let (_, first) = session_gated_command("logs", "true", 42).unwrap();
+        let (_, second) = session_gated_command("logs", "true", 42).unwrap();
+        assert_ne!(first, second);
     }
 
     #[tokio::test]
