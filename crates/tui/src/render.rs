@@ -174,6 +174,12 @@ fn render_home(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
     let mut lines = Vec::new();
     let mut last_kind = None;
     let mut row = chunks[1].y;
+    let label_width = home
+        .actions
+        .iter()
+        .map(|action| action.label.chars().count())
+        .max()
+        .unwrap_or_default();
     for (index, action) in home.actions.iter().enumerate() {
         if last_kind != Some(action.kind) {
             lines.push(Line::styled(
@@ -187,7 +193,7 @@ fn render_home(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
         let marker = if selected { "  ▸ " } else { "    " };
         lines.push(Line::from(vec![
             Span::styled(
-                format!("{marker}{:<14}", action.label),
+                format!("{marker}{:<label_width$}  ", action.label),
                 Style::default()
                     .fg(if selected { p.text } else { p.subtext0 })
                     .add_modifier(if selected {
@@ -2557,7 +2563,7 @@ mod tests {
 
     #[test]
     fn home_renders_grouped_actions_health_and_truthful_history() {
-        let stack = devme_config::Stack::parse("schema_version=1\n[task.ios]\nkind=\"launch\"\ndescription=\"Run on Simulator\"\ncmd=\"true\"\n[task.verify]\nkind=\"check\"\ncmd=\"true\"\n").unwrap();
+        let stack = devme_config::Stack::parse("schema_version=1\n[task.ios]\nkind=\"launch\"\ndescription=\"Run on Simulator\"\ncmd=\"true\"\n[task.verify]\nkind=\"check\"\ncmd=\"true\"\n[task.typescript-check]\nkind=\"check\"\ndescription=\"Format-check TypeScript\"\ncmd=\"true\"\n").unwrap();
         let mut state = TuiState::default();
         state.set_home(crate::home::HomeState::from_stack(
             &stack,
@@ -2571,6 +2577,7 @@ mod tests {
         let text = render_to_text(&mut state, 90, 24);
         assert!(text.contains("What do you want to do?"));
         assert!(text.contains("Run on Simulator"));
+        assert!(text.contains("typescript check  Format-check TypeScript"));
         assert!(text.contains("last launch succeeded"));
         assert!(!text.contains("currently running"));
     }

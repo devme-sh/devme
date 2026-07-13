@@ -29,6 +29,11 @@ fn native_fixture() -> TempDir {
     .unwrap();
     std::fs::write(dir.path().join("backend/convex.json"), "").unwrap();
     std::fs::write(dir.path().join("web/vite.config.ts"), "").unwrap();
+    std::fs::write(
+        dir.path().join("web/package.json"),
+        r#"{"scripts":{"dev":"vite"},"devDependencies":{"vite":"7.0.0"}}"#,
+    )
+    .unwrap();
     dir
 }
 
@@ -151,4 +156,94 @@ fn root_gradle_wrapper_executes_android_member_task_from_the_build_root() {
         std::fs::read_to_string(dir.path().join("gradle-args")).unwrap(),
         "--no-daemon test"
     );
+}
+
+#[test]
+fn nested_android_module_stays_inside_its_gradle_workspace_member() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("apps/android/app")).unwrap();
+    std::fs::write(
+        dir.path().join("apps/android/settings.gradle.kts"),
+        "include(\":app\")\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("apps/android/gradlew"), "#!/bin/sh\n").unwrap();
+    std::fs::write(
+        dir.path().join("apps/android/build.gradle.kts"),
+        "plugins { id(\"com.android.application\") apply false }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("apps/android/app/build.gradle.kts"),
+        "plugins { id(\"com.android.application\") }\n",
+    )
+    .unwrap();
+
+    let output = run(dir.path(), &["setup", "split", "--dry-run"]);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("android = \"apps/android\""), "{stdout}");
+    assert!(
+        stdout.contains("==> apps/android/devme.toml <=="),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("apps/android/app/devme.toml"), "{stdout}");
+}
+
+#[test]
+fn split_detection_ignores_generated_devme_state() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("apps/ios")).unwrap();
+    std::fs::create_dir_all(
+        dir.path()
+            .join(".devme/SourcePackages/checkouts/convex-swift"),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("apps/ios/App.xcodeproj"), "").unwrap();
+    std::fs::write(
+        dir.path()
+            .join(".devme/SourcePackages/checkouts/convex-swift/Package.swift"),
+        "",
+    )
+    .unwrap();
+
+    let output = run(dir.path(), &["setup", "split", "--dry-run"]);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("convex-swift"), "{stdout}");
+    assert!(!stdout.contains(".devme/"), "{stdout}");
+}
+
+#[test]
+fn vite_tooling_without_a_dev_script_does_not_invent_a_web_service() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("apps/ios")).unwrap();
+    std::fs::write(dir.path().join("apps/ios/App.xcodeproj"), "").unwrap();
+    std::fs::write(dir.path().join("vite.config.ts"), "").unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"scripts":{"check":"vp check"},"devDependencies":{"vite-plus":"0.2.4"}}"#,
+    )
+    .unwrap();
+
+    let output = run(dir.path(), &["setup", "split", "--dry-run"]);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("[service.web]"), "{stdout}");
+    assert!(!stdout.contains("bun run dev"), "{stdout}");
 }

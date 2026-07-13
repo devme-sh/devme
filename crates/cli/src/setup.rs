@@ -61,18 +61,20 @@ struct Markers {
     gradle_wrapper: bool,
     gradle_settings: bool,
     package_json: bool,
+    dev_script: bool,
 }
 
 impl Markers {
     fn any(self) -> bool {
-        self.swift || self.xcode || self.gradle || self.convex || self.vite
+        self.swift || self.xcode || self.gradle || self.convex || (self.vite && self.dev_script)
     }
 }
 
 /// Produce the compatible single-file setup preview. Commands are emitted
 /// with explicit `cwd` values when their marker belongs to a nested app.
 pub fn detect(root: &Path) -> Result<String> {
-    let projects = discover(root)?;
+    let mut projects = discover(root)?;
+    coalesce_gradle_projects(&mut projects);
     let names = project_names(projects.keys());
     let mut out = header();
     for (relative, markers) in &projects {
@@ -99,7 +101,8 @@ pub fn detect(root: &Path) -> Result<String> {
 /// directory gets a local child config; Devme still does not infer edges
 /// between tools or reproduce their build graphs.
 pub fn detect_split(root: &Path) -> Result<SetupPlan> {
-    let projects = discover(root)?;
+    let mut projects = discover(root)?;
+    coalesce_gradle_projects(&mut projects);
     reject_overlapping_projects(projects.keys())?;
     let names = project_names(projects.keys());
     let members = projects
@@ -198,6 +201,10 @@ fn discover(root: &Path) -> Result<BTreeMap<PathBuf, Markers>> {
                 marker.package_json = true;
                 marker.convex |= package.contains("\"convex\"");
                 marker.vite |= package.contains("\"vite\"") || package.contains("vite-plus");
+                marker.dev_script |= serde_json::from_str::<serde_json::Value>(&package)
+                    .ok()
+                    .and_then(|value| value.pointer("/scripts/dev")?.as_str().map(str::to_owned))
+                    .is_some_and(|command| !command.trim().is_empty());
             }
             "convex.config.ts" if owner.file_name().is_some_and(|name| name == "convex") => {
                 let project = owner.parent().unwrap_or(root);
@@ -228,6 +235,7 @@ fn walk(root: &Path, depth: usize) -> Vec<PathBuf> {
             let file_type = entry.file_type().ok();
             if path.file_name().is_some_and(|name| {
                 name == ".git"
+                    || name == ".devme"
                     || name == "node_modules"
                     || name == "target"
                     || name == "DerivedData"
@@ -319,6 +327,45 @@ fn reject_overlapping_projects<'a>(paths: impl Iterator<Item = &'a PathBuf>) -> 
     Ok(())
 }
 
+/// Treat modules owned by one Gradle settings file as one detected project.
+/// Gradle remains authoritative for the module graph, while Devme sees only
+/// the explicit build root that can safely become a workspace member.
+fn coalesce_gradle_projects(projects: &mut BTreeMap<PathBuf, Markers>) {
+    let paths = projects.keys().cloned().collect::<Vec<_>>();
+    for path in paths {
+        let Some(markers) = projects.get(&path).copied() else {
+            continue;
+        };
+        if !markers.gradle {
+            continue;
+        }
+        let owner = projects
+            .iter()
+            .filter(|(candidate, candidate_markers)| {
+                candidate_markers.gradle_settings
+                    && !candidate.as_os_str().is_empty()
+                    && path.starts_with(candidate)
+                    && candidate.as_path() != path
+            })
+            .max_by_key(|(candidate, _)| candidate.components().count())
+            .map(|(candidate, _)| candidate.clone());
+        let Some(owner) = owner else {
+            continue;
+        };
+
+        if let Some(owner_markers) = projects.get_mut(&owner) {
+            owner_markers.android |= markers.android;
+        }
+        if let Some(module_markers) = projects.get_mut(&path) {
+            module_markers.gradle = false;
+            module_markers.android = false;
+            module_markers.gradle_wrapper = false;
+            module_markers.gradle_settings = false;
+        }
+    }
+    projects.retain(|_, markers| markers.any());
+}
+
 fn gradle_owner(projects: &BTreeMap<PathBuf, Markers>, project: &Path) -> PathBuf {
     let settings_owner = projects
         .iter()
@@ -366,13 +413,13 @@ fn append_project(
 ) {
     let (cwd_line, shell_prefix) = cwd_fragments(cwd);
 
-    if markers.convex || markers.vite {
+    if markers.convex || (markers.vite && markers.dev_script) {
         out.push_str(&format!(
             "\n[step.{prefix}bun]\ncheck = \"command -v bun >/dev/null || test -x \\\"$HOME/.bun/bin/bun\\\"\"\nprovision = \"curl -fsSL https://bun.sh/install | bash\"\n"
         ));
     }
 
-    if markers.package_json && (markers.convex || markers.vite) {
+    if markers.package_json && (markers.convex || (markers.vite && markers.dev_script)) {
         let check = toml_string(&format!("{shell_prefix}test -d node_modules"));
         let provision = toml_string(&format!("{shell_prefix}{}", bun_command("install")));
         out.push_str(&format!(
@@ -436,7 +483,7 @@ fn append_project(
             "\n[service.{prefix}convex]\ncmd = {command}\n{cwd_line}{dependencies}health = {{ shell = {health} }}\nreadiness = {{ interval_ms = 1000, timeout_ms = 5000, retries = 60 }}\n"
         ));
     }
-    if markers.vite {
+    if markers.vite && markers.dev_script {
         let command = toml_string(&bun_command("run dev -- --port {port}"));
         let dependencies = if markers.package_json {
             format!("depends_on = [\"{prefix}dependencies\"]\n")
@@ -500,6 +547,11 @@ mod tests {
                 std::fs::write(path, "").unwrap();
             }
         }
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"dev":"vite"},"dependencies":{"convex":"1.0.0"},"devDependencies":{"vite":"7.0.0"}}"#,
+        )
+        .unwrap();
         let config = detect(dir.path()).unwrap();
         let stack = devme_config::Stack::parse(&config).unwrap();
         devme_config::validate(&stack).unwrap();
@@ -560,6 +612,11 @@ mod tests {
         .unwrap();
         std::fs::write(dir.path().join("backend/convex.json"), "").unwrap();
         std::fs::write(dir.path().join("web/vite.config.ts"), "").unwrap();
+        std::fs::write(
+            dir.path().join("web/package.json"),
+            r#"{"scripts":{"dev":"vite"},"devDependencies":{"vite":"7.0.0"}}"#,
+        )
+        .unwrap();
 
         let plan = detect_split(dir.path()).unwrap();
         let root = plan.file(Path::new("devme.toml")).unwrap();

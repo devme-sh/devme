@@ -20,6 +20,7 @@ if [[ ! -x "$DEVME" ]]; then
   echo "devme binary not found at $DEVME — run 'cargo build --release -p devme -p devme-supervisor -p devme-tui' first" >&2
   exit 2
 fi
+DEVME="$(cd "$(dirname "$DEVME")" && pwd)/$(basename "$DEVME")"
 if [[ ! -d "$SMOKE_SRC" ]]; then
   echo "smoke env missing at $SMOKE_SRC" >&2
   exit 2

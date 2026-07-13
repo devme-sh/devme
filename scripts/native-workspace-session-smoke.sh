@@ -16,6 +16,7 @@ if [[ ! -x "$DEVME" ]]; then
   echo "devme binary not found at $DEVME" >&2
   exit 2
 fi
+DEVME="$(cd "$(dirname "$DEVME")" && pwd)/$(basename "$DEVME")"
 command -v tmux >/dev/null || { echo "tmux required" >&2; exit 2; }
 
 cp -R "$FIXTURE/." "$ROOT/project"

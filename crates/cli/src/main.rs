@@ -493,14 +493,19 @@ fn focus_up_services(services: Vec<String>) -> Vec<String> {
 }
 
 fn focused_task_view(stack: &Stack, list: bool) -> Stack {
+    let focus = PROJECT_WORKSPACE
+        .get()
+        .map_or(&devme_config::Focus::Root, |workspace| workspace.focus());
+    task_view_for_focus(stack, focus, list)
+}
+
+fn task_view_for_focus(stack: &Stack, focus: &devme_config::Focus, list: bool) -> Stack {
+    let devme_config::Focus::Member(member) = focus else {
+        return stack.clone();
+    };
     if !list {
         return stack.clone();
     }
-    let Some(devme_config::Focus::Member(member)) =
-        PROJECT_WORKSPACE.get().map(|workspace| workspace.focus())
-    else {
-        return stack.clone();
-    };
     let prefix = format!("{member}::");
     let mut view = stack.clone();
     view.task.retain(|name, _| name.starts_with(&prefix));
@@ -3349,7 +3354,14 @@ async fn launch_tui(session_owns_home: bool) -> anyhow::Result<i32> {
             .and_then(devme_config::ResolvedWorkspace::focus_services)
     };
     if let Some(resolved) = &resolved {
-        let history = devme_cli::task::read_history(&cwd, None, None).unwrap_or_default();
+        let home_stack = task_view_for_focus(resolved.stack(), resolved.focus(), true);
+        let home_task_names = home_stack
+            .task
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let history =
+            devme_cli::task::read_history(&cwd, Some(&home_task_names), None).unwrap_or_default();
         let recent = history
             .into_iter()
             .rev()
@@ -3370,9 +3382,8 @@ async fn launch_tui(session_owns_home: bool) -> anyhow::Result<i32> {
                 }
             })
             .collect();
-        let home = devme_tui::home::HomeState::from_stack(resolved.stack(), recent);
-        let kinds = resolved
-            .stack()
+        let home = devme_tui::home::HomeState::from_stack(&home_stack, recent);
+        let kinds = home_stack
             .task
             .iter()
             .map(|(name, task)| (name.clone(), task.kind))
@@ -3833,5 +3844,24 @@ mod tests {
 
         assert_eq!(lines.len(), 2);
         assert!(lines.iter().all(|line| line.origin == LogOrigin::Instance));
+    }
+
+    #[test]
+    fn member_home_task_view_excludes_root_and_sibling_actions() {
+        let stack = Stack::parse(
+            "schema_version=1\n[task.verify]\ncmd=\"true\"\n[task.\"ios::launch\"]\ncmd=\"true\"\n[task.\"android::launch\"]\ncmd=\"true\"\n",
+        )
+        .unwrap();
+
+        let view = task_view_for_focus(
+            &stack,
+            &devme_config::Focus::Member("ios".to_string()),
+            true,
+        );
+
+        assert_eq!(
+            view.task.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["ios::launch"]
+        );
     }
 }
