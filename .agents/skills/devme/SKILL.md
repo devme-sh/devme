@@ -50,8 +50,10 @@ Run `devme setup` to preview conservative single-file detection, or
 preview an explicit root plus child configs and `devme setup split --write` to
 opt in. Native detection covers Xcode projects/workspaces, Package.swift,
 Gradle Kotlin/Android, Convex, and Vite+ without reconstructing their build
-graphs. Bun and project dependency checks are emitted as ordinary provision
-steps. Review every generated command before running it.
+graphs. It ignores generated `.devme` state and keeps modules owned by one
+Gradle settings root in a single member. Bun and project dependency checks are
+emitted as ordinary provision steps. Review every generated command before
+running it.
 
 Detect the stack from `package.json` (scripts.dev, drizzle/prisma), `Cargo.toml`, `pyproject.toml`/`requirements.txt`, `go.mod`, `docker-compose.yml`, `Dockerfile`, `.env`/`.env.example`, and DB references. Then write a `devme.toml`:
 
@@ -162,7 +164,7 @@ Rules:
 
 - **Which command answers which question.** `devme config check` = "is the toml valid" (static). `devme status` = "what's running where" (states + ports, no logs). `devme logs` = "what are the services saying" (runtime streams only). `devme doctor` = "why is it broken" (error digest + step output). Don't read full logs to find errors - `doctor` or a `--json` stderr filter is cheaper.
 - **Worktree-aware.** Each git worktree runs its own supervisor, slot, and ports. `up`/`down`/`doctor`/`status`/`logs`/`url` act on the worktree you're in - just call them. `devme down --all` stops every worktree's stack (and the shared services); `devme status --all` shows every worktree's ports; `devme url <svc>` gives a ready link without guessing the slot.
-- **Workspace-aware.** A root may explicitly list one level of child `devme.toml` files. From `apps/ios`, `devme run test` means `ios::test`; cross-member names stay qualified, and `root::check` selects a root node. Bare interactive Devme opens the member's sole declared session and keeps its leases alive with the TUI. Multiple local sessions require an explicit `devme session <name>` choice.
+- **Workspace-aware.** A root may explicitly list one level of child `devme.toml` files. From `apps/ios`, `devme run test` means `ios::test`; cross-member names stay qualified, and `root::check` selects a root node. Home actions and recent task history focus on the current member. Bare interactive Devme opens the member's sole declared session and keeps its leases alive with the TUI. Multiple local sessions require an explicit `devme session <name>` choice.
 - **Worktrees converge - no lifecycle hooks.** There is no per-worktree setup or teardown hook (`[stack] on_create`/`on_destroy` parse for back-compat but never run - `config check` flags them). Per-worktree setup is a `[step]` check/provision: idempotent, so *any* worktree - created by `devme worktree add`, the TUI's `w`, or a bare `git worktree add` - converges on its first `devme up`. Removal is mechanical (stop, `git worktree remove`, release slot); a bare `git worktree remove` is reaped to the same end state. Make slot-scoped provisions idempotent (e.g. `dropdb --if-exists app_slot{slot} && createdb app_slot{slot}`) so a reused slot starts clean.
 - **Restart cascades.** Services have dependency ordering; restarting a DB can cascade to dependents.
 - **Remote context is external.** devme owns stack/runtime supervision: steps, services, logs, status, URLs, and the TUI. Remote project context is owned by the separate `devme-sh/devcloud` tool/repository. v1 remote work uses Git as the sync boundary; there is no live Mutagen sync, transparent remote proxy, Herdr attach preset, Codex/Claude session transfer, or remote URL rewriting in the active devme contract.
