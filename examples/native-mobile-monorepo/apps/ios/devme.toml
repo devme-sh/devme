@@ -13,6 +13,8 @@ depends_on = ["backend::api"]
 restart = "on-failure"
 
 [task.test]
+kind = "check"
+description = "Verify the iOS app"
 cmd = "xcodebuild test -workspace App.xcworkspace -scheme App -derivedDataPath \"{worktree}/.devme/DerivedData-ios-${IOS_RUNTIME_SLOT}\""
 steps = ["xcode"]
 services = ["backend::api"]
@@ -21,6 +23,8 @@ timeout = 1200
 readiness_timeout = 90
 
 [task.launch]
+kind = "launch"
+description = "Run the iOS app in Simulator"
 cmd = "xcodebuild -workspace App.xcworkspace -scheme App -derivedDataPath \"{worktree}/.devme/DerivedData-ios-${IOS_RUNTIME_SLOT}\" build"
 steps = ["xcode"]
 services = ["backend::api"]

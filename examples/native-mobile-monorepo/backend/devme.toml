@@ -24,6 +24,15 @@ readiness = { interval_ms = 500, timeout_ms = 2000, retries = 60 }
 env = { DEVME_STATE_DIR = "{worktree}/.devme/backend-{slot}" }
 
 [task.test]
+kind = "check"
+description = "Verify the backend"
 cmd = "bun test"
 steps = ["dependencies"]
 timeout = 300
+
+[task.launch]
+kind = "launch"
+description = "Start and verify backend services"
+cmd = "true"
+services = ["api"]
+readiness_timeout = 90

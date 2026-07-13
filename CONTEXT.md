@@ -22,6 +22,14 @@ A oneshot node in the [[Stack]] graph. Considered satisfied when its `check` com
 
 A long-running node in the [[Stack]] graph. Spawned and kept alive by a [[Daemon]]; the supervisor manages its lifecycle (start, stop, restart, crash recovery). Examples: backend HTTP server, frontend dev server, local database.
 
+### Task kind
+
+Semantic discovery metadata for a one-shot task: `launch`, `check`, or `utility`. It controls grouping on the interactive [[Home screen]] but never changes execution. Existing tasks default to `utility`.
+
+### Home screen
+
+The first interactive TUI view for bare `devme`. It groups curated one-shot actions into Run, Check, and Utilities, shows service health and recent results, and delegates execution to the same task runner used by `devme run`. It reports completed launches as historical results, not observable runtime state.
+
 ### Scope
 
 A property of every [[Step]] and [[Service]]:

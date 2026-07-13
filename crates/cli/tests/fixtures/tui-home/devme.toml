@@ -1,0 +1,11 @@
+schema_version = 1
+
+[task.ios]
+kind = "launch"
+description = "Run iOS"
+cmd = "printf 'building iOS\\n'; sleep 30"
+
+[task.verify]
+kind = "check"
+description = "Verify everything"
+cmd = "printf 'checking\\n'"

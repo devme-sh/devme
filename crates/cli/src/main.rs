@@ -239,53 +239,7 @@ async fn run(cli: Cli) -> i32 {
             } else {
                 output
             };
-            let cwd = match std::env::current_dir() {
-                Ok(value) => value,
-                Err(e) => return emit_command_error(output, &e.into()),
-            };
-            let stack = match devme_cli::task::load(&cwd) {
-                Ok(value) => value,
-                Err(e) => return emit_command_error(output, &e),
-            };
-            if let Err(error) = converge_task_steps(&stack, &task, &cwd) {
-                return match devme_cli::task::record_preflight_failure(
-                    &stack, &cwd, &task, &error, output,
-                ) {
-                    Ok(result) => result.exit_code,
-                    Err(record_error) => emit_command_error(output, &record_error),
-                };
-            }
-            let services = match devme_cli::task::services_for(&stack, &task) {
-                Ok(value) => value,
-                Err(e) => return emit_command_error(output, &e),
-            };
-            let readiness_timeout =
-                devme_cli::task::readiness_timeout_for(&stack, &task).unwrap_or(60);
-            if !services.is_empty()
-                && let Err(e) = ensure_task_services(&stack, &services, readiness_timeout).await
-            {
-                let record = if e.downcast_ref::<TaskReadinessCancelled>().is_some() {
-                    let cancellation = e
-                        .downcast_ref::<TaskReadinessCancelled>()
-                        .expect("cancellation was just identified");
-                    devme_cli::task::record_preflight_cancellation(
-                        &stack,
-                        &cwd,
-                        &task,
-                        &e,
-                        output,
-                        cancellation.started_at,
-                        cancellation.duration_ms,
-                    )
-                } else {
-                    devme_cli::task::record_preflight_failure(&stack, &cwd, &task, &e, output)
-                };
-                return match record {
-                    Ok(result) => result.exit_code,
-                    Err(record_error) => emit_command_error(output, &record_error),
-                };
-            }
-            return match devme_cli::task::execute(&stack, &cwd, &task, &args, output).await {
+            return match run_task(&task, &args, output, true, None, None).await {
                 Ok(result) => result.exit_code,
                 Err(e) => emit_command_error(output, &e),
             };
@@ -392,6 +346,88 @@ async fn run(cli: Cli) -> i32 {
     match result {
         Ok(()) => 0,
         Err(e) => emit_command_error(error_output, &e),
+    }
+}
+
+async fn run_task(
+    task: &str,
+    args: &[String],
+    output: devme_cli::OutputFormat,
+    emit: bool,
+    tui_updates: Option<tokio::sync::mpsc::UnboundedSender<devme_tui::home::TaskUpdate>>,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+) -> anyhow::Result<devme_cli::task::TaskResult> {
+    let cwd = std::env::current_dir()?;
+    let stack = devme_cli::task::load(&cwd)?;
+    if let Err(error) = converge_task_steps(&stack, task, &cwd) {
+        return if emit {
+            devme_cli::task::record_preflight_failure(&stack, &cwd, task, &error, output)
+        } else {
+            devme_cli::task::record_preflight_failure_silent(&stack, &cwd, task, &error)
+        };
+    }
+    let services = devme_cli::task::services_for(&stack, task)?;
+    let readiness_timeout = devme_cli::task::readiness_timeout_for(&stack, task).unwrap_or(60);
+    if !services.is_empty()
+        && let Err(error) =
+            ensure_task_services(&stack, &services, readiness_timeout, cancellation.clone()).await
+    {
+        return if let Some(cancellation) = error.downcast_ref::<TaskReadinessCancelled>() {
+            if emit {
+                devme_cli::task::record_preflight_cancellation(
+                    &stack,
+                    &cwd,
+                    task,
+                    &error,
+                    output,
+                    cancellation.started_at,
+                    cancellation.duration_ms,
+                )
+            } else {
+                devme_cli::task::record_preflight_cancellation_silent(
+                    &stack,
+                    &cwd,
+                    task,
+                    &error,
+                    cancellation.started_at,
+                    cancellation.duration_ms,
+                )
+            }
+        } else {
+            if emit {
+                devme_cli::task::record_preflight_failure(&stack, &cwd, task, &error, output)
+            } else {
+                devme_cli::task::record_preflight_failure_silent(&stack, &cwd, task, &error)
+            }
+        };
+    }
+    if emit {
+        devme_cli::task::execute(&stack, &cwd, task, args, output).await
+    } else if let Some(tui_updates) = tui_updates {
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<devme_cli::task::TaskOutputEvent>();
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                for line in event.text.lines() {
+                    let _ = tui_updates.send(devme_tui::home::TaskUpdate::Output(line.to_string()));
+                }
+            }
+        });
+        devme_cli::task::execute_streaming(&stack, &cwd, task, args, tx, cancellation).await
+    } else {
+        devme_cli::task::execute_silent(&stack, &cwd, task, args).await
+    }
+}
+
+async fn wait_for_task_cancel(mut cancellation: Option<tokio::sync::watch::Receiver<bool>>) {
+    let Some(receiver) = cancellation.as_mut() else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    while !*receiver.borrow() {
+        if receiver.changed().await.is_err() {
+            return;
+        }
     }
 }
 
@@ -1547,6 +1583,7 @@ async fn ensure_task_services(
     stack: &Stack,
     services: &[String],
     timeout_secs: u64,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> anyhow::Result<()> {
     let wait_started_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1688,6 +1725,10 @@ async fn ensure_task_services(
                     started_at: wait_started_at,
                     duration_ms: wait_started.elapsed().as_millis() as u64,
                 }.into());
+            }
+            _ = wait_for_task_cancel(cancellation.clone()) => {
+                stop_task_started_services(&mut client, &closure, &started_here, &preexisting_targets).await;
+                return Err(TaskReadinessCancelled { started_at: wait_started_at, duration_ms: wait_started.elapsed().as_millis() as u64 }.into());
             }
         };
         match event {
@@ -3296,7 +3337,67 @@ async fn launch_tui(session_owns_home: bool) -> anyhow::Result<i32> {
             .as_ref()
             .and_then(devme_config::ResolvedWorkspace::focus_services)
     };
-    devme_tui::launch_targets(false, targets).await?;
+    if let Some(resolved) = &resolved {
+        let history = devme_cli::task::read_history(&cwd, None, None).unwrap_or_default();
+        let recent = history
+            .into_iter()
+            .rev()
+            .take(5)
+            .rev()
+            .map(|result| {
+                let kind = resolved
+                    .stack()
+                    .task
+                    .get(&result.task)
+                    .map(|task| task.kind)
+                    .unwrap_or_default();
+                devme_tui::home::RecentResult {
+                    task: result.task,
+                    kind,
+                    status: result.status,
+                    finished_at: result.finished_at,
+                }
+            })
+            .collect();
+        let home = devme_tui::home::HomeState::from_stack(resolved.stack(), recent);
+        let kinds = resolved
+            .stack()
+            .task
+            .iter()
+            .map(|(name, task)| (name.clone(), task.kind))
+            .collect::<std::collections::HashMap<_, _>>();
+        let runner: devme_tui::home::TaskRunner =
+            std::sync::Arc::new(move |task, updates, cancellation| {
+                let kind = kinds.get(&task).copied().unwrap_or_default();
+                Box::pin(async move {
+                    let _ = updates.send(devme_tui::home::TaskUpdate::Progress(format!(
+                        "Preparing {task}"
+                    )));
+                    let result = run_task(
+                        &task,
+                        &[],
+                        devme_cli::OutputFormat::Human,
+                        false,
+                        Some(updates.clone()),
+                        Some(cancellation),
+                    )
+                    .await?;
+                    let recent = devme_tui::home::RecentResult {
+                        task: result.task,
+                        kind,
+                        status: result.status,
+                        finished_at: result.finished_at,
+                    };
+                    let _ = updates.send(devme_tui::home::TaskUpdate::Finished(recent.clone()));
+                    Ok(recent)
+                })
+            });
+        // Home is passive: selecting an action converges only that task's
+        // required service closure through the shared runner.
+        devme_tui::launch_with_home(false, Some(Vec::new()), home, runner).await?;
+    } else {
+        devme_tui::launch_targets(false, targets).await?;
+    }
     maybe_show_skills_hint();
     Ok(0)
 }

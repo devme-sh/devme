@@ -89,7 +89,10 @@ impl Drop for Fixture {
 }
 
 fn wait_for_correlated_logs(fixture: &Fixture) -> Vec<serde_json::Value> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Full-workspace runs compile and start several supervisor fixtures in
+    // parallel. Wait on the observable log contract rather than assuming the
+    // shared daemon flushes within ten seconds on a loaded CI host.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let records = fixture.json_logs(&["logs", "--tail", "0", "--json"]);
         let sources = records
@@ -107,7 +110,7 @@ fn wait_for_correlated_logs(fixture: &Fixture) -> Vec<serde_json::Value> {
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for all log sources"
+            "timed out waiting for all log sources; last sources: {sources:?}"
         );
         std::thread::sleep(Duration::from_millis(50));
     }

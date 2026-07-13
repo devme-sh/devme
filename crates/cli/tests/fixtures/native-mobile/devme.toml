@@ -20,17 +20,22 @@ capacity = 2
 env = "ANDROID_RUNTIME_SLOT"
 
 [task.ios-test]
+kind = "check"
+description = "Verify iOS"
 cmd = "test -f schema-published; printf 'ios slot=%s\\n' \"$IOS_RUNTIME_SLOT\""
 services = ["backend"]
 resources = ["ios-runtime"]
 readiness_timeout = 5
 
 [task.android-test]
+kind = "check"
+description = "Verify Android"
 cmd = "test -f schema-published; printf 'android slot=%s\\n' \"$ANDROID_RUNTIME_SLOT\""
 services = ["backend"]
 resources = ["android-runtime"]
 readiness_timeout = 5
 
 [task.check]
+kind = "check"
 description = "Portable backend, iOS, and Android orchestration fixture"
 depends_on = ["ios-test", "android-test"]

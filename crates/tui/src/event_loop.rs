@@ -12,6 +12,7 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
 use crate::discovery::Registry;
+use crate::home::{HomeState, TaskRunner, TaskUpdate};
 use crate::keymap;
 use crate::render::render;
 use crate::state::{PointerShape, TuiState};
@@ -64,6 +65,24 @@ pub async fn launch_targets(
     no_shutdown: bool,
     home_targets: Option<Vec<String>>,
 ) -> anyhow::Result<()> {
+    launch_impl(no_shutdown, home_targets, None, None).await
+}
+
+pub async fn launch_with_home(
+    no_shutdown: bool,
+    home_targets: Option<Vec<String>>,
+    home: HomeState,
+    runner: TaskRunner,
+) -> anyhow::Result<()> {
+    launch_impl(no_shutdown, home_targets, Some(home), Some(runner)).await
+}
+
+async fn launch_impl(
+    no_shutdown: bool,
+    home_targets: Option<Vec<String>>,
+    home: Option<HomeState>,
+    runner: Option<TaskRunner>,
+) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let repo_dir = devme_config::paths::repo_socket_dir(&cwd)?;
     let home_id = devme_config::paths::instance_id(&cwd);
@@ -72,6 +91,9 @@ pub async fn launch_targets(
     let (wt_tx, wt_rx) = mpsc::unbounded_channel::<WorktreeEvent>();
     let _spawner = AutoSpawner::bind(&cwd, wt_tx).await?;
     let mut state = TuiState::default();
+    if let Some(home) = home {
+        state.set_home(home);
+    }
     // Queue a skill prompt before entering the alt-screen loop: offer to
     // install when nothing's there, or to refresh a stale devme-managed copy
     // (or silently refresh when auto-update is on).
@@ -105,9 +127,12 @@ pub async fn launch_targets(
         &mut state,
         &mut registry,
         wt_rx,
-        &home_id,
-        no_shutdown,
-        home_targets.as_deref(),
+        RunOptions {
+            home_id: &home_id,
+            no_shutdown,
+            home_targets: home_targets.as_deref(),
+            runner,
+        },
     )
     .await;
 
@@ -119,15 +144,26 @@ pub async fn launch_targets(
     result
 }
 
+struct RunOptions<'a> {
+    home_id: &'a str,
+    no_shutdown: bool,
+    home_targets: Option<&'a [String]>,
+    runner: Option<TaskRunner>,
+}
+
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     state: &mut TuiState,
     registry: &mut Registry,
     mut wt_rx: mpsc::UnboundedReceiver<WorktreeEvent>,
-    home_id: &str,
-    no_shutdown: bool,
-    home_targets: Option<&[String]>,
+    options: RunOptions<'_>,
 ) -> anyhow::Result<()> {
+    let RunOptions {
+        home_id,
+        no_shutdown,
+        home_targets,
+        runner,
+    } = options;
     let (key_tx, mut key_rx) = mpsc::unbounded_channel::<Event>();
     tokio::task::spawn_blocking(move || {
         while let Ok(evt) = crossterm::event::read() {
@@ -170,6 +206,8 @@ async fn run(
     // Worktree add/remove run async (a removal stops a daemon, gated on a
     // 10s grace); their outcomes come back here.
     let (wt_op_tx, mut wt_op_rx) = mpsc::unbounded_channel::<WorktreeOp>();
+    let (task_update_tx, mut task_update_rx) = mpsc::unbounded_channel::<TaskUpdate>();
+    let mut task_cancel: Option<tokio::sync::watch::Sender<bool>> = None;
 
     loop {
         terminal.draw(|f| render(f, state))?;
@@ -189,6 +227,36 @@ async fn run(
             evt = key_rx.recv() => match evt {
                 Some(Event::Key(k)) => {
                     if matches!(k.kind, KeyEventKind::Release) {
+                        continue;
+                    }
+                    if state.home_visible() {
+                        match k.code {
+                            KeyCode::Up | KeyCode::Char('k') => state.home_mut().unwrap().move_previous(),
+                            KeyCode::Down | KeyCode::Char('j') => state.home_mut().unwrap().move_next(),
+                            KeyCode::Enter => {
+                                if state.home().and_then(|home| home.running.as_ref()).is_none()
+                                    && let (Some(task), Some(runner)) = (state.home().and_then(HomeState::selected_task), runner.clone())
+                                {
+                                    let tx = task_update_tx.clone();
+                                    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                                    task_cancel = Some(cancel_tx);
+                                    let task_for_state = task.clone();
+                                    state.home_mut().unwrap().running = Some(task_for_state);
+                                    state.home_mut().unwrap().logs.clear();
+                                    tokio::spawn(async move {
+                                        if let Err(error) = runner(task.clone(), tx.clone(), cancel_rx).await {
+                                            let _ = tx.send(TaskUpdate::Progress(format!("failed to run {task}: {error}")));
+                                        }
+                                    });
+                                }
+                            }
+                            KeyCode::Char('d') => state.home_mut().unwrap().visible = false,
+                            KeyCode::Esc if state.home().and_then(|home| home.running.as_ref()).is_some() => {
+                                if let Some(cancel) = &task_cancel { let _ = cancel.send(true); }
+                            }
+                            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                            _ => {}
+                        }
                         continue;
                     }
                     match k.code {
@@ -816,6 +884,20 @@ async fn run(
                 }
                 Some(_) => {}
                 None => return Ok(()),
+            },
+            update = task_update_rx.recv() => if let Some(update) = update
+                && let Some(home) = state.home_mut() {
+                    match update {
+                        TaskUpdate::Progress(line) | TaskUpdate::Output(line) => {
+                            home.logs.push(line);
+                            if home.logs.len() > 1_000 { home.logs.remove(0); }
+                        }
+                        TaskUpdate::Finished(result) => {
+                            task_cancel = None;
+                            home.running = None;
+                            home.recent.push(result);
+                        }
+                    }
             },
             tagged = registry.recv() => match tagged {
                 Some(t) => {

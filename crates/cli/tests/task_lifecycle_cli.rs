@@ -8,9 +8,17 @@ fn bin() -> &'static str {
 }
 
 fn fixture(config: &str) -> TempDir {
-    let dir = TempDir::new().unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("devme-task-")
+        .tempdir_in("/tmp")
+        .unwrap();
     std::fs::write(dir.path().join("devme.toml"), config).unwrap();
+    std::fs::create_dir(dir.path().join("runtime")).unwrap();
     dir
+}
+
+fn runtime(dir: &TempDir) -> std::path::PathBuf {
+    dir.path().join("runtime")
 }
 
 fn run(dir: &TempDir, args: &[&str]) -> Output {
@@ -18,6 +26,7 @@ fn run(dir: &TempDir, args: &[&str]) -> Output {
         .args(args)
         .current_dir(dir.path())
         .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", runtime(dir))
         .output()
         .unwrap()
 }
@@ -159,8 +168,9 @@ readiness_timeout=30
     let unrelated = run(&dir, &["up", "unrelated", "-d"]);
     assert!(
         unrelated.status.success(),
-        "{}",
-        String::from_utf8_lossy(&unrelated.stderr)
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&unrelated.stdout),
+        String::from_utf8_lossy(&unrelated.stderr),
     );
     wait_for(&dir.path().join("unrelated.pid"));
     let unrelated_pid: i32 = std::fs::read_to_string(dir.path().join("unrelated.pid"))
@@ -173,6 +183,7 @@ readiness_timeout=30
         .args(["run", "check", "--output", "json"])
         .current_dir(dir.path())
         .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", runtime(&dir))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -403,6 +414,7 @@ env={ CERTIFICATE_DATA="ultra-secret-cert" }
         .args(["run", "leak", "--output", "json"])
         .current_dir(dir.path())
         .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", runtime(&dir))
         .env("API_TOKEN", "runtime-secret-token")
         .output()
         .unwrap();
@@ -421,6 +433,7 @@ env={ CERTIFICATE_DATA="ultra-secret-cert" }
         .args(["logs", "leak", "--tail", "0", "--json"])
         .current_dir(dir.path())
         .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", runtime(&dir))
         .env("API_TOKEN", "runtime-secret-token")
         .output()
         .unwrap();
@@ -432,6 +445,7 @@ env={ CERTIFICATE_DATA="ultra-secret-cert" }
         .args(["doctor", "leak"])
         .current_dir(dir.path())
         .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", runtime(&dir))
         .env("API_TOKEN", "runtime-secret-token")
         .output()
         .unwrap();

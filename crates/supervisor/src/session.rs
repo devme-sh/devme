@@ -65,6 +65,12 @@ impl SessionLeases {
                 .with_context(|| format!("create resource lease directory {}", dir.display()))?;
 
             let Some((file, id)) = try_pool(&dir, resource.capacity, session, root)? else {
+                // Release partial acquisition explicitly before another
+                // attempt in this process. Relying on descriptor drop alone
+                // can leave flock visibility racy on macOS.
+                for file in &files {
+                    let _ = FileExt::unlock(file);
+                }
                 return Ok(None);
             };
             if let Some(variable) = &resource.env {
