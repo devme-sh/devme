@@ -217,6 +217,11 @@ fn update_codex_feature(root: &Path, install: bool) -> Result<()> {
         toml::from_str(&text).with_context(|| format!("invalid {}", path.display()))?
     };
     if install && !codex_feature_enabled(root) {
+        let previous = value
+            .get("features")
+            .and_then(|features| features.get("hooks"))
+            .and_then(toml::Value::as_bool)
+            .map_or("absent", |enabled| if enabled { "true" } else { "false" });
         value
             .as_table_mut()
             .context("Codex config root must be a table")?
@@ -227,13 +232,25 @@ fn update_codex_feature(root: &Path, install: bool) -> Result<()> {
             .insert("hooks".into(), toml::Value::Boolean(true));
         std::fs::create_dir_all(path.parent().unwrap())?;
         std::fs::write(&path, toml::to_string_pretty(&value)?)?;
-        std::fs::write(marker, MARKER)?;
+        std::fs::write(marker, format!("{MARKER}\nprevious={previous}\n"))?;
     } else if !install && marker.exists() {
+        let previous = std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix("previous="))
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "absent".to_string());
         if let Some(features) = value
             .get_mut("features")
             .and_then(toml::Value::as_table_mut)
         {
-            features.remove("hooks");
+            if previous == "false" {
+                features.insert("hooks".into(), toml::Value::Boolean(false));
+            } else {
+                features.remove("hooks");
+            }
         }
         std::fs::write(&path, toml::to_string_pretty(&value)?)?;
         std::fs::remove_file(marker)?;
@@ -292,5 +309,20 @@ mod tests {
             vec![("claude".into(), "absent")]
         );
         assert!(!dir.path().join(".claude").exists());
+    }
+
+    #[test]
+    fn codex_remove_restores_an_explicitly_disabled_hooks_feature() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".codex/config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[features]\nhooks = false\n").unwrap();
+
+        setup(dir.path(), AgentTarget::Codex).unwrap();
+        assert!(codex_feature_enabled(dir.path()));
+        remove(dir.path(), AgentTarget::Codex).unwrap();
+
+        let value: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(value["features"]["hooks"].as_bool(), Some(false));
     }
 }

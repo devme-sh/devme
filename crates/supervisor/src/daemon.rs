@@ -8,17 +8,18 @@
 //!
 //! See ADR-0003 (daemon lifecycle) and ADR-0010 (architecture).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
-use devme_config::{Graph, InterpContext, Stack, interpolate};
+use devme_config::{Graph, InterpContext, Session, Stack, interpolate};
 use devme_core::{
     ClientMessage, Envelope, ErrorCode, HealthCheck, InstanceInfo, LogStream, NoticeLevel,
-    ReadinessSnapshot, RestartPolicy, ServerMessage, ServiceSnapshot, ServiceState, Slot,
-    StepSnapshot, StepState,
+    ReadinessSnapshot, RestartPolicy, ServerMessage, ServiceSnapshot, ServiceState,
+    SessionSnapshot, SessionState, Slot, StepSnapshot, StepState,
 };
 use devme_executor::{Action, Event as ExecEvent, Executor, NodeStatus};
 use devme_ipc::FrameCodec;
@@ -30,6 +31,7 @@ use tokio_util::codec::Framed;
 use crate::health::probe;
 use crate::logstore::LogStore;
 use crate::process::{ChildProcess, process_is_alive, send_sigkill, send_sigterm};
+use crate::session::SessionLeases;
 
 /// Per-service log ring capacity. ~2000 lines is enough to scroll back a
 /// minute or two of moderately chatty output without unbounded memory.
@@ -133,6 +135,40 @@ enum InternalEvent {
     /// `git worktree remove`, or a herdr/agent tool removing the checkout).
     /// Triggers self-shutdown so the daemon doesn't linger as an orphan.
     WorktreeVanished,
+    SessionAcquired {
+        session: String,
+        generation: u64,
+        leases: SessionLeases,
+    },
+    SessionAcquireFailed {
+        session: String,
+        generation: u64,
+        message: String,
+    },
+    SessionLingerExpired {
+        session: String,
+        generation: u64,
+    },
+}
+
+struct PendingSession {
+    generation: u64,
+    original: ClientId,
+    clients: HashSet<ClientId>,
+    cancel: Arc<AtomicBool>,
+    config: Session,
+}
+
+struct LiveSession {
+    generation: u64,
+    clients: HashSet<ClientId>,
+    stop_waiters: HashSet<ClientId>,
+    config: Session,
+    services: Vec<String>,
+    env: BTreeMap<String, String>,
+    /// Held, but intentionally never inspected, until sidecar shutdown.
+    _leases: SessionLeases,
+    state: SessionState,
 }
 
 struct ChildRecord {
@@ -216,6 +252,8 @@ struct DaemonState {
     failure_reasons: HashMap<String, String>,
     /// Latest probe state, exposed in status and doctor snapshots.
     readiness: HashMap<String, ReadinessSnapshot>,
+    pending_sessions: HashMap<String, PendingSession>,
+    sessions: HashMap<String, LiveSession>,
     next_generation: u64,
     next_client_id: u64,
     shutting_down: bool,
@@ -227,11 +265,12 @@ impl DaemonState {
         let worktree = instance.cwd.clone();
         let branch = current_git_branch(Path::new(&worktree)).unwrap_or_default();
         let policy = stack.logs.clone().unwrap_or_default();
+        let redactions = devme_config::persistence_redaction_patterns(&stack);
         let log_store = LogStore::new(
             devme_config::paths::instance_log_dir(Path::new(&worktree))
                 .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/devme/orphan-logs")),
         )
-        .with_policy(policy.retention_bytes, policy.redact);
+        .with_policy(policy.retention_bytes, redactions);
         Self {
             stack,
             executor: Executor::new(graph),
@@ -250,6 +289,8 @@ impl DaemonState {
             rapid_exits: HashMap::new(),
             failure_reasons: HashMap::new(),
             readiness: HashMap::new(),
+            pending_sessions: HashMap::new(),
+            sessions: HashMap::new(),
             next_generation: 0,
             next_client_id: 0,
             shutting_down: false,
@@ -633,6 +674,7 @@ fn process_event(
         InternalEvent::ClientDisconnected { id } => {
             state.clients.remove(&id);
             state.subscriptions.remove(&id);
+            detach_session_client(state, id, tx);
         }
         InternalEvent::ClientMessage { id, msg } => handle_client_message(state, id, msg, tx),
         InternalEvent::WorktreeVanished => handle_worktree_vanished(state),
@@ -766,7 +808,48 @@ fn process_event(
             );
             enact_actions(state, actions, tx);
         }
+        InternalEvent::SessionAcquired {
+            session,
+            generation,
+            leases,
+        } => handle_session_acquired(state, session, generation, leases, tx),
+        InternalEvent::SessionAcquireFailed {
+            session,
+            generation,
+            message,
+        } => {
+            if state
+                .pending_sessions
+                .get(&session)
+                .is_some_and(|pending| pending.generation == generation)
+                && let Some(pending) = state.pending_sessions.remove(&session)
+            {
+                for id in pending.clients {
+                    send_to(
+                        state,
+                        id,
+                        ServerMessage::Error {
+                            code: ErrorCode::Internal,
+                            message: message.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        InternalEvent::SessionLingerExpired {
+            session,
+            generation,
+        } => {
+            if state
+                .sessions
+                .get(&session)
+                .is_some_and(|live| live.generation == generation && live.clients.is_empty())
+            {
+                begin_session_stop(state, &session, None, tx);
+            }
+        }
     }
+    advance_sessions(state, tx);
 }
 
 /// The daemon's worktree directory was removed. Graceful per-service `stop`
@@ -803,6 +886,390 @@ fn handle_auto_restart(
     }
     let actions = state.executor.reset(&service);
     enact_actions(state, actions, tx);
+}
+
+fn send_to(state: &DaemonState, id: ClientId, message: ServerMessage) {
+    if let Some(client) = state.clients.get(&id) {
+        let _ = client.send(message);
+    }
+}
+
+fn open_session(
+    state: &mut DaemonState,
+    id: ClientId,
+    name: String,
+    tx: &mpsc::UnboundedSender<InternalEvent>,
+) {
+    let Some(config) = state.stack.session.get(&name).cloned() else {
+        send_to(
+            state,
+            id,
+            ServerMessage::Error {
+                code: ErrorCode::NotFound,
+                message: format!("unknown session {name:?}"),
+            },
+        );
+        return;
+    };
+
+    if let Some(live) = state.sessions.get_mut(&name) {
+        if live.state == SessionState::Stopping {
+            send_to(
+                state,
+                id,
+                ServerMessage::Error {
+                    code: ErrorCode::Conflict,
+                    message: format!("session {name:?} is stopping; retry after it has stopped"),
+                },
+            );
+            return;
+        }
+        live.clients.insert(id);
+        live.generation = live.generation.saturating_add(1);
+        let message = if live.state == SessionState::Ready {
+            ServerMessage::SessionReady {
+                session: name,
+                joined: true,
+                services: live.config.needs.clone(),
+                env: live.env.clone(),
+                run: live.config.run.clone(),
+            }
+        } else {
+            ServerMessage::SessionPending {
+                session: name,
+                resources: config.resources,
+            }
+        };
+        send_to(state, id, message);
+        return;
+    }
+
+    if let Some(pending) = state.pending_sessions.get_mut(&name) {
+        pending.clients.insert(id);
+        send_to(
+            state,
+            id,
+            ServerMessage::SessionPending {
+                session: name,
+                resources: config.resources,
+            },
+        );
+        return;
+    }
+
+    let generation = state.alloc_generation();
+    let cancel = Arc::new(AtomicBool::new(false));
+    state.pending_sessions.insert(
+        name.clone(),
+        PendingSession {
+            generation,
+            original: id,
+            clients: HashSet::from([id]),
+            cancel: cancel.clone(),
+            config: config.clone(),
+        },
+    );
+    send_to(
+        state,
+        id,
+        ServerMessage::SessionPending {
+            session: name.clone(),
+            resources: config.resources.clone(),
+        },
+    );
+
+    let resources = state.stack.resource.clone();
+    let root = PathBuf::from(&state.worktree);
+    let event_tx = tx.clone();
+    tokio::task::spawn_blocking(move || {
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return;
+            }
+            match SessionLeases::try_acquire(&resources, &root, &name, &config.resources) {
+                Ok(Some(leases)) => {
+                    if cancel.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let _ = event_tx.send(InternalEvent::SessionAcquired {
+                        session: name,
+                        generation,
+                        leases,
+                    });
+                    return;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                Err(error) => {
+                    let _ = event_tx.send(InternalEvent::SessionAcquireFailed {
+                        session: name,
+                        generation,
+                        message: format!("session resource acquisition failed: {error}"),
+                    });
+                    return;
+                }
+            }
+        }
+    });
+}
+
+fn handle_session_acquired(
+    state: &mut DaemonState,
+    name: String,
+    generation: u64,
+    leases: SessionLeases,
+    tx: &mpsc::UnboundedSender<InternalEvent>,
+) {
+    let Some(pending) = state.pending_sessions.remove(&name) else {
+        return;
+    };
+    if pending.generation != generation || pending.clients.is_empty() {
+        return;
+    }
+    let services = session_scoped_services(&state.stack, &pending.config.needs);
+    state.sessions.insert(
+        name.clone(),
+        LiveSession {
+            generation,
+            clients: pending.clients,
+            stop_waiters: HashSet::new(),
+            config: pending.config.clone(),
+            services,
+            env: leases.env().clone(),
+            _leases: leases,
+            state: SessionState::Starting,
+        },
+    );
+    let actions = state.executor.handle(ExecEvent::StartSessionTargets {
+        names: pending.config.needs,
+    });
+    enact_actions(state, actions, tx);
+    // Preserve who created the session so queued joiners get an accurate
+    // idempotence signal when readiness completes.
+    if let Some(live) = state.sessions.get_mut(&name) {
+        live.stop_waiters.insert(pending.original);
+    }
+}
+
+fn session_scoped_services(stack: &Stack, roots: &[String]) -> Vec<String> {
+    let mut closure = HashSet::new();
+    let mut pending = roots.to_vec();
+    while let Some(name) = pending.pop() {
+        if !closure.insert(name.clone()) {
+            continue;
+        }
+        if let Some(service) = stack.service.get(&name) {
+            pending.extend(
+                service
+                    .depends_on
+                    .iter()
+                    .filter(|dependency| dependency.required)
+                    .filter(|dependency| stack.service.contains_key(&dependency.name))
+                    .map(|dependency| dependency.name.clone()),
+            );
+        }
+    }
+    stack
+        .service
+        .keys()
+        .filter(|name| {
+            closure.contains(*name) && stack.service[*name].scope == devme_core::Scope::Session
+        })
+        .cloned()
+        .collect()
+}
+
+fn detach_session_client(
+    state: &mut DaemonState,
+    id: ClientId,
+    tx: &mpsc::UnboundedSender<InternalEvent>,
+) {
+    let pending_names = state
+        .pending_sessions
+        .iter_mut()
+        .filter_map(|(name, pending)| {
+            pending.clients.remove(&id);
+            pending.clients.is_empty().then(|| name.clone())
+        })
+        .collect::<Vec<_>>();
+    for name in pending_names {
+        if let Some(pending) = state.pending_sessions.remove(&name) {
+            pending.cancel.store(true, Ordering::Release);
+        }
+    }
+
+    let mut expiry = Vec::new();
+    for (name, live) in &mut state.sessions {
+        if live.clients.remove(&id)
+            && live.clients.is_empty()
+            && live.state != SessionState::Stopping
+        {
+            expiry.push((name.clone(), live.generation, live.config.linger));
+        }
+    }
+    for (session, generation, linger) in expiry {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(linger)).await;
+            let _ = tx.send(InternalEvent::SessionLingerExpired {
+                session,
+                generation,
+            });
+        });
+    }
+}
+
+fn begin_session_stop(
+    state: &mut DaemonState,
+    name: &str,
+    waiter: Option<ClientId>,
+    tx: &mpsc::UnboundedSender<InternalEvent>,
+) {
+    let Some(live) = state.sessions.get_mut(name) else {
+        if let Some(waiter) = waiter {
+            send_to(
+                state,
+                waiter,
+                ServerMessage::SessionStopped {
+                    session: name.to_string(),
+                    already_stopped: true,
+                },
+            );
+        }
+        return;
+    };
+    if let Some(waiter) = waiter {
+        live.stop_waiters.insert(waiter);
+    }
+    if live.state == SessionState::Stopping {
+        return;
+    }
+    live.state = SessionState::Stopping;
+    live.generation = live.generation.saturating_add(1);
+    live.clients.clear();
+    let services = live.services.clone();
+    for service in services {
+        if state.children.contains_key(&service) {
+            state.intentional_stops.insert(service.clone());
+        }
+        let actions = state.executor.handle(ExecEvent::UserStop { name: service });
+        enact_actions(state, actions, tx);
+    }
+}
+
+fn advance_sessions(state: &mut DaemonState, tx: &mpsc::UnboundedSender<InternalEvent>) {
+    let starting = state
+        .sessions
+        .iter()
+        .filter(|(_, live)| live.state == SessionState::Starting)
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    for name in starting {
+        let Some(live) = state.sessions.get(&name) else {
+            continue;
+        };
+        let failure = live.config.needs.iter().find_map(|service| {
+            let status = state.current_service_state(service);
+            matches!(
+                status,
+                ServiceState::Failed { .. } | ServiceState::CrashLoop { .. }
+            )
+            .then(|| format!("required service {service:?} failed while starting session {name:?}"))
+        });
+        if let Some(message) = failure {
+            let clients = live.clients.clone();
+            for id in clients {
+                send_to(
+                    state,
+                    id,
+                    ServerMessage::Error {
+                        code: ErrorCode::Internal,
+                        message: message.clone(),
+                    },
+                );
+            }
+            begin_session_stop(state, &name, None, tx);
+            continue;
+        }
+        let ready = live
+            .config
+            .needs
+            .iter()
+            .all(|service| state.current_service_state(service).is_up());
+        if ready {
+            let live = state.sessions.get_mut(&name).expect("session exists");
+            live.state = SessionState::Ready;
+            let original = live.stop_waiters.iter().next().copied();
+            live.stop_waiters.clear();
+            let clients = live.clients.clone();
+            let services = live.config.needs.clone();
+            let env = live.env.clone();
+            let run = live.config.run.clone();
+            for id in clients {
+                send_to(
+                    state,
+                    id,
+                    ServerMessage::SessionReady {
+                        session: name.clone(),
+                        joined: Some(id) != original,
+                        services: services.clone(),
+                        env: env.clone(),
+                        run: run.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    let finished = state
+        .sessions
+        .iter()
+        .filter(|(_, live)| {
+            live.state == SessionState::Stopping
+                && live
+                    .services
+                    .iter()
+                    .all(|service| !state.children.contains_key(service))
+        })
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    for name in finished {
+        if let Some(live) = state.sessions.remove(&name) {
+            for id in live.stop_waiters.iter().copied() {
+                send_to(
+                    state,
+                    id,
+                    ServerMessage::SessionStopped {
+                        session: name.clone(),
+                        already_stopped: false,
+                    },
+                );
+            }
+            // `live.leases` drops here, after all session-scoped children have
+            // exited and their optional stop hooks completed.
+            drop(live);
+        }
+    }
+}
+
+fn list_sessions(state: &DaemonState) -> Vec<SessionSnapshot> {
+    let mut sessions = state
+        .pending_sessions
+        .iter()
+        .map(|(name, pending)| SessionSnapshot {
+            name: name.clone(),
+            state: SessionState::Waiting,
+            clients: pending.clients.len(),
+            services: pending.config.needs.clone(),
+        })
+        .chain(state.sessions.iter().map(|(name, live)| SessionSnapshot {
+            name: name.clone(),
+            state: live.state,
+            clients: live.clients.len(),
+            services: live.config.needs.clone(),
+        }))
+        .collect::<Vec<_>>();
+    sessions.sort_by(|left, right| left.name.cmp(&right.name));
+    sessions
 }
 
 fn handle_client_message(
@@ -949,11 +1416,57 @@ fn handle_client_message(
                 }
                 return;
             }
+            let session_only: Vec<_> = services
+                .iter()
+                .filter(|name| {
+                    state
+                        .stack
+                        .service
+                        .get(*name)
+                        .is_some_and(|service| service.scope == devme_core::Scope::Session)
+                })
+                .cloned()
+                .collect();
+            if !session_only.is_empty() {
+                if let Some(client) = state.clients.get(&id) {
+                    let _ = client.send(ServerMessage::Error {
+                        code: ErrorCode::Usage,
+                        message: format!(
+                            "session-scoped services require `devme session <name>`: {}",
+                            session_only.join(", ")
+                        ),
+                    });
+                }
+                return;
+            }
             let actions = state
                 .executor
                 .handle(ExecEvent::StartTargets { names: services });
             enact_actions(state, actions, tx);
         }
+        ClientMessage::OpenSession { session } => open_session(state, id, session, tx),
+        ClientMessage::StopSession { session } => {
+            if let Some(pending) = state.pending_sessions.remove(&session) {
+                pending.cancel.store(true, Ordering::Release);
+                send_to(
+                    state,
+                    id,
+                    ServerMessage::SessionStopped {
+                        session,
+                        already_stopped: false,
+                    },
+                );
+            } else {
+                begin_session_stop(state, &session, Some(id), tx);
+            }
+        }
+        ClientMessage::ListSessions => send_to(
+            state,
+            id,
+            ServerMessage::Sessions {
+                sessions: list_sessions(state),
+            },
+        ),
         ClientMessage::Stop { service } => {
             state.restart_counts.remove(&service);
             state.rapid_exits.remove(&service);
@@ -1444,6 +1957,23 @@ fn enact_actions(
                         Err(e) => {
                             env_error = Some(format!("service {name}: env {k}: {e}"));
                             break;
+                        }
+                    }
+                }
+                if svc.scope == devme_core::Scope::Session {
+                    let session_env = state
+                        .sessions
+                        .values()
+                        .find(|session| session.services.iter().any(|service| service == &name))
+                        .map(|session| session.env.clone())
+                        .unwrap_or_default();
+                    for (key, value) in session_env {
+                        if let Some((_, configured)) =
+                            env.iter_mut().find(|(configured, _)| configured == &key)
+                        {
+                            *configured = value;
+                        } else {
+                            env.push((key, value));
                         }
                     }
                 }
@@ -1943,6 +2473,23 @@ mod tests {
         let bytes = conn.next().await.expect("frame").unwrap();
         let env: Envelope<ServerMessage> = serde_json::from_slice(&bytes).unwrap();
         env.payload
+    }
+
+    async fn recv_until(
+        conn: &mut Framed<UnixStream, FrameCodec>,
+        timeout: Duration,
+        predicate: impl Fn(&ServerMessage) -> bool,
+    ) -> ServerMessage {
+        tokio::time::timeout(timeout, async {
+            loop {
+                let message = recv_msg(conn).await;
+                if predicate(&message) {
+                    return message;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for matching daemon message")
     }
 
     fn make_stack(s: &str) -> Stack {
@@ -3060,6 +3607,283 @@ health = {{ shell = "{probe_cmd}" }}
 
         send_msg(&mut conn, ClientMessage::Shutdown).await;
         let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn sessions_join_inject_env_wait_for_resources_and_release_after_sidecar_stop() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("d.sock");
+        let first_env = dir.path().join("first-env");
+        let second_env = dir.path().join("second-env");
+        let stopped = dir.path().join("first-stopped");
+        let toml = format!(
+            r#"schema_version=1
+[resource.device]
+scope="worktree"
+capacity=1
+env="DEVICE_ID"
+
+[service.first_logs]
+cmd="printf \"$DEVICE_ID\" > '{first_env}'; sleep 30"
+stop="sleep 1; touch '{stopped}'"
+scope="session"
+
+[service.second_logs]
+cmd="printf \"$DEVICE_ID\" > '{second_env}'; sleep 30"
+scope="session"
+
+[session.first]
+needs=["first_logs"]
+resources=["device"]
+linger=0
+
+[session.second]
+needs=["second_logs"]
+resources=["device"]
+linger=0
+"#,
+            first_env = first_env.display(),
+            second_env = second_env.display(),
+            stopped = stopped.display(),
+        );
+        let stack = make_stack(&toml);
+        devme_config::validate(&stack).unwrap();
+        let server = DaemonServer::bind_with_instance(
+            &sock,
+            stack,
+            Slot::ZERO,
+            InstanceInfo {
+                id: "session-test".into(),
+                label: "session-test".into(),
+                cwd: dir.path().display().to_string(),
+            },
+        )
+        .unwrap();
+        let server_task = tokio::spawn(server.serve());
+
+        let mut first = connect(&sock).await;
+        send_msg(
+            &mut first,
+            ClientMessage::OpenSession {
+                session: "first".into(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv_msg(&mut first).await,
+            ServerMessage::SessionPending { .. }
+        ));
+        let ready = recv_until(&mut first, Duration::from_secs(5), |message| {
+            matches!(message, ServerMessage::SessionReady { session, .. } if session == "first")
+        })
+        .await;
+        let first_allocated = match ready {
+            ServerMessage::SessionReady { env, joined, .. } => {
+                assert!(!joined);
+                env["DEVICE_ID"].clone()
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            std::fs::read_to_string(&first_env).unwrap(),
+            first_allocated
+        );
+
+        let mut joiner = connect(&sock).await;
+        send_msg(
+            &mut joiner,
+            ClientMessage::OpenSession {
+                session: "first".into(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv_msg(&mut joiner).await,
+            ServerMessage::SessionReady {
+                joined: true,
+                ref env,
+                ..
+            } if env["DEVICE_ID"] == first_allocated
+        ));
+
+        let mut second = connect(&sock).await;
+        send_msg(
+            &mut second,
+            ClientMessage::OpenSession {
+                session: "second".into(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv_msg(&mut second).await,
+            ServerMessage::SessionPending { .. }
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), recv_msg(&mut second))
+                .await
+                .is_err(),
+            "contending session became ready while the first held its lease"
+        );
+
+        send_msg(
+            &mut first,
+            ClientMessage::StopSession {
+                session: "first".into(),
+            },
+        )
+        .await;
+        let _ = recv_until(&mut first, Duration::from_secs(5), |message| {
+            matches!(message, ServerMessage::SessionStopped { session, .. } if session == "first")
+        })
+        .await;
+        assert!(
+            stopped.exists(),
+            "stop hook must finish before SessionStopped and lease release"
+        );
+
+        let second_ready = recv_until(&mut second, Duration::from_secs(5), |message| {
+            matches!(message, ServerMessage::SessionReady { session, .. } if session == "second")
+        })
+        .await;
+        assert!(matches!(
+            second_ready,
+            ServerMessage::SessionReady { ref env, .. }
+                if env["DEVICE_ID"] == first_allocated
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&second_env).unwrap(),
+            first_allocated
+        );
+
+        send_msg(&mut first, ClientMessage::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(6), server_task).await;
+    }
+
+    #[tokio::test]
+    async fn disconnected_session_lingers_then_stops_and_releases() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("d.sock");
+        let stopped = dir.path().join("stopped");
+        let toml = format!(
+            r#"schema_version=1
+[resource.device]
+scope="worktree"
+[service.logs]
+cmd="sleep 30"
+stop="touch '{stopped}'"
+scope="session"
+[session.dev]
+needs=["logs"]
+resources=["device"]
+linger=1
+"#,
+            stopped = stopped.display(),
+        );
+        let stack = make_stack(&toml);
+        devme_config::validate(&stack).unwrap();
+        let server = DaemonServer::bind_with_instance(
+            &sock,
+            stack,
+            Slot::ZERO,
+            InstanceInfo {
+                id: "linger-test".into(),
+                label: "linger-test".into(),
+                cwd: dir.path().display().to_string(),
+            },
+        )
+        .unwrap();
+        let server_task = tokio::spawn(server.serve());
+
+        let mut owner = connect(&sock).await;
+        send_msg(
+            &mut owner,
+            ClientMessage::OpenSession {
+                session: "dev".into(),
+            },
+        )
+        .await;
+        let _ = recv_until(&mut owner, Duration::from_secs(5), |message| {
+            matches!(message, ServerMessage::SessionReady { .. })
+        })
+        .await;
+        drop(owner);
+
+        let mut observer = connect(&sock).await;
+        send_msg(&mut observer, ClientMessage::ListSessions).await;
+        assert!(matches!(
+            recv_msg(&mut observer).await,
+            ServerMessage::Sessions { ref sessions }
+                if sessions.iter().any(|session| session.name == "dev")
+        ));
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        send_msg(&mut observer, ClientMessage::ListSessions).await;
+        let empty = recv_until(&mut observer, Duration::from_secs(5), |message| {
+            matches!(message, ServerMessage::Sessions { sessions } if sessions.is_empty())
+        })
+        .await;
+        assert!(matches!(empty, ServerMessage::Sessions { .. }));
+        assert!(stopped.exists());
+
+        send_msg(&mut observer, ClientMessage::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), server_task).await;
+    }
+
+    #[tokio::test]
+    async fn daemon_crash_releases_session_lease_for_recovery() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("d.sock");
+        let toml = r#"schema_version=1
+[resource.device]
+scope="worktree"
+[session.dev]
+resources=["device"]
+linger=30
+"#;
+        let instance = InstanceInfo {
+            id: "crash-recovery".into(),
+            label: "crash-recovery".into(),
+            cwd: dir.path().display().to_string(),
+        };
+        let server =
+            DaemonServer::bind_with_instance(&sock, make_stack(toml), Slot::ZERO, instance.clone())
+                .unwrap();
+        let server_task = tokio::spawn(server.serve());
+        let mut owner = connect(&sock).await;
+        send_msg(
+            &mut owner,
+            ClientMessage::OpenSession {
+                session: "dev".into(),
+            },
+        )
+        .await;
+        let _ = recv_until(&mut owner, Duration::from_secs(3), |message| {
+            matches!(message, ServerMessage::SessionReady { .. })
+        })
+        .await;
+
+        server_task.abort();
+        let _ = server_task.await;
+        drop(owner);
+
+        let recovered =
+            DaemonServer::bind_with_instance(&sock, make_stack(toml), Slot::ZERO, instance)
+                .unwrap();
+        let recovered_task = tokio::spawn(recovered.serve());
+        let mut client = connect(&sock).await;
+        send_msg(
+            &mut client,
+            ClientMessage::OpenSession {
+                session: "dev".into(),
+            },
+        )
+        .await;
+        let _ = recv_until(&mut client, Duration::from_secs(3), |message| {
+            matches!(message, ServerMessage::SessionReady { .. })
+        })
+        .await;
+
+        send_msg(&mut client, ClientMessage::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), recovered_task).await;
     }
 
     #[test]

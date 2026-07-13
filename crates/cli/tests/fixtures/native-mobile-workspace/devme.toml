@@ -1,0 +1,28 @@
+schema_version = 1
+
+[stack]
+name = "portable-native-workspace"
+description = "Backend, iOS, and Android workspace fixture"
+
+[workspace.members]
+backend = "backend"
+ios = "apps/ios"
+android = "apps/android"
+
+[logs]
+redact = ["fixture-secret-[0-9]+"]
+retention_bytes = 16384
+
+[resource.ios-runtime]
+scope = "host"
+capacity = 2
+env = "IOS_RUNTIME_SLOT"
+
+[resource.android-runtime]
+scope = "host"
+capacity = 2
+env = "ANDROID_RUNTIME_SLOT"
+
+[task.check]
+description = "Run every member verification task"
+depends_on = ["backend::test", "ios::verify", "android::verify"]

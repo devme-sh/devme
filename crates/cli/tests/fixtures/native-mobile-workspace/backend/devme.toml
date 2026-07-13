@@ -1,0 +1,17 @@
+schema_version = 1
+
+[step.dependencies]
+check = "test -f .dependencies"
+provision = "touch .dependencies"
+trust = "auto"
+
+[service.api]
+cmd = "sleep 0.1; touch .schema-published; printf 'backend ready\\n'; sleep 30"
+depends_on = ["dependencies"]
+health = { shell = "test -f .schema-published" }
+readiness = { interval_ms = 20, timeout_ms = 100, retries = 50 }
+env = { DEVME_STATE_DIR = "{worktree}/.devme/backend-{slot}" }
+
+[task.test]
+cmd = "test -f .dependencies"
+steps = ["dependencies"]

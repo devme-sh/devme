@@ -27,14 +27,15 @@ use std::path::{Path, PathBuf};
 use crate::{GlobalConfig, SkillInstall};
 
 /// The canonical skill, embedded at compile time. Source of truth lives at
-/// `crates/config/skill/SKILL.md`; the published `devme-sh/skills` repo
-/// mirrors it.
-pub const AGENT_GUIDANCE: &str = include_str!("../skill/GUIDANCE.md");
-pub const SKILL_MD: &str = concat!(
-    include_str!("../skill/SKILL.md"),
-    "\n",
-    include_str!("../skill/GUIDANCE.md")
-);
+/// `crates/config/skill/SKILL.md`; the checked-in and published skill mirrors
+/// are exact copies.
+pub const SKILL_MD: &str = include_str!("../skill/SKILL.md");
+
+/// Compact static guidance for session-start context.
+///
+/// `build.rs` extracts this from the `## Live agent guidance` section of the
+/// canonical skill so the ambient context and installable skill cannot drift.
+pub const AGENT_GUIDANCE: &str = include_str!(concat!(env!("OUT_DIR"), "/agent-guidance.md"));
 
 /// The skill's identity for display/state is the binary version — the skill
 /// ships with the binary, so "which devme is this skill for" is the honest
@@ -302,12 +303,16 @@ mod tests {
     #[test]
     fn embedded_skill_has_expected_frontmatter() {
         assert!(SKILL_MD.starts_with("---\nname: devme\n"));
+        assert!(SKILL_MD.contains("description: Manage dev environments with devme. Use when"));
         assert!(SKILL_MD.contains("### CLI reference"));
     }
 
     #[test]
-    fn embedded_skill_contains_the_canonical_live_guidance_verbatim() {
-        assert!(SKILL_MD.ends_with(AGENT_GUIDANCE));
+    fn live_guidance_is_extracted_from_the_canonical_skill() {
+        let (_, expected) = SKILL_MD
+            .split_once("\n## Live agent guidance\n")
+            .expect("canonical skill has live guidance");
+        assert_eq!(AGENT_GUIDANCE, expected);
         for command in AGENT_GUIDANCE
             .lines()
             .filter_map(|line| line.strip_prefix("- "))

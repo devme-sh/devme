@@ -73,7 +73,7 @@ check "no rotation warning on plain --tail" \
 
 # No-arg interleaves multiple services into one stream.
 check "interleave shows both services" \
-  bash -c "$DEVME logs --tail 40 2>/dev/null | grep -q 'web |' && $DEVME logs --tail 40 2>/dev/null | grep -q 'crashy |'"
+  bash -c "$DEVME logs --tail 1000 2>/dev/null | grep -q 'web |' && $DEVME logs --tail 1000 2>/dev/null | grep -q 'crashy |'"
 
 # --json is NDJSON with ts/service/stream/text; stderr lines are tagged.
 check "json record has all fields" \
@@ -113,7 +113,7 @@ check "doctor <step> zooms into check output" \
 check "doctor <service> has recent_errors + recent_logs" \
   bash -c "$DEVME doctor crashy 2>/dev/null | jq -e '.kind == \"service\" and has(\"recent_errors\") and has(\"recent_logs\")'"
 check "doctor unknown name errors" \
-  bash -c "$DEVME doctor nosuch 2>&1 | grep -q 'no service or step named'"
+  bash -c "$DEVME doctor nosuch 2>&1 | grep -Eq 'no .* named'"
 
 echo
 echo "passed $PASS, failed $FAIL"

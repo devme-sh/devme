@@ -1,13 +1,13 @@
 //! One-shot task execution, result history, and generic scarce-resource leases.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use devme_config::{Resource, ResourceScope, Stack, Task};
+use devme_config::{ResolvedWorkspace, Resource, ResourceScope, Stack, Task};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
@@ -48,13 +48,23 @@ pub struct TaskResult {
     pub stdout: String,
     pub stderr: String,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_events: Vec<TaskOutputEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskOutputEvent {
+    pub ts: u64,
+    pub stream: devme_core::LogStream,
+    pub text: String,
 }
 
 pub fn load(cwd: &Path) -> Result<Stack> {
-    let path = cwd.join("devme.toml");
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("could not read {}", path.display()))?;
-    Stack::parse(&text).with_context(|| format!("invalid {}", path.display()))
+    Ok(resolve(cwd)?.into_stack())
+}
+
+pub fn resolve(cwd: &Path) -> Result<ResolvedWorkspace> {
+    ResolvedWorkspace::resolve(cwd).context("could not resolve Devme workspace")
 }
 
 pub fn services_for(stack: &Stack, name: &str) -> Result<Vec<String>> {
@@ -69,6 +79,37 @@ pub fn services_for(stack: &Stack, name: &str) -> Result<Vec<String>> {
             if seen.insert(service.clone()) {
                 result.push(service.clone());
             }
+        }
+    }
+    Ok(result)
+}
+
+/// Setup-step closure required by a task and all task dependencies.
+pub fn steps_for(stack: &Stack, name: &str) -> Result<Vec<String>> {
+    fn visit_step(stack: &Stack, name: &str, seen: &mut HashSet<String>, out: &mut Vec<String>) {
+        if !seen.insert(name.to_string()) {
+            return;
+        }
+        let Some(step) = stack.step.get(name) else {
+            return;
+        };
+        for dependency in &step.depends_on {
+            if stack.step.contains_key(&dependency.name) {
+                visit_step(stack, &dependency.name, seen, out);
+            }
+        }
+        out.push(name.to_string());
+    }
+
+    let order = execution_order(stack, name)?;
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for task in order {
+        for step in &stack.task[task].steps {
+            if !stack.step.contains_key(step) {
+                bail!("task {task:?} requires unknown step {step:?}");
+            }
+            visit_step(stack, step, &mut seen, &mut result);
         }
     }
     Ok(result)
@@ -96,15 +137,21 @@ pub fn show(stack: &Stack, action: Option<TaskAction>, format: OutputFormat) -> 
                     "task": value,
                 })),
                 OutputFormat::Toon => {
-                    print!(
-                        "task:\n  name: {}\n  command: {}\n  dependencies: {}\n  services: {}\n  resources: {}\n  timeout_seconds: {}",
-                        toon_string(&task),
-                        toon_string(value.cmd.as_deref().unwrap_or("")),
-                        toon_array(&value.depends_on),
-                        toon_array(&value.services),
-                        toon_array(&value.resources),
-                        value.timeout
-                    );
+                    crate::output::print_toon(&serde_json::json!({
+                        "task": {
+                            "name": task,
+                            "description": value.description,
+                            "command": value.cmd,
+                            "cwd": value.cwd,
+                            "environment": value.env,
+                            "dependencies": value.depends_on,
+                            "steps": value.steps,
+                            "services": value.services,
+                            "resources": value.resources,
+                            "timeout_seconds": value.timeout,
+                            "readiness_timeout_seconds": value.readiness_timeout,
+                        }
+                    }))?;
                 }
                 OutputFormat::Human => println!("{}", toml::to_string_pretty(value)?),
             }
@@ -175,19 +222,134 @@ pub async fn execute(
     args: &[String],
     format: OutputFormat,
 ) -> Result<TaskResult> {
+    execute_with_env(stack, root, name, args, format, &BTreeMap::new()).await
+}
+
+/// Execute a task with identifiers allocated by an already-held session.
+/// Session config validation requires the task itself to declare no resources,
+/// so this path cannot reacquire and deadlock on the session's leases.
+pub async fn execute_with_env(
+    stack: &Stack,
+    root: &Path,
+    name: &str,
+    args: &[String],
+    format: OutputFormat,
+    injected_env: &BTreeMap<String, String>,
+) -> Result<TaskResult> {
     let order = execution_order(stack, name)?;
-    let slot = SlotClaim::acquire(root)?;
+    let retention = retention_bytes(stack);
+    let slot = match SlotClaim::acquire(root) {
+        Ok(slot) => slot,
+        Err(error) => {
+            let result = failed_result(name, &error.to_string(), 1, false, now_ms(), 0);
+            persist(root, &result, retention)?;
+            emit_result(&result, format)?;
+            return Ok(result);
+        }
+    };
     let mut final_result = None;
     for current in order {
         let pass = if current == name { args } else { &[] };
-        let result = execute_one(stack, root, current, pass, format, slot.value).await?;
+        let result =
+            execute_one(stack, root, current, pass, format, slot.value, injected_env).await?;
         let failed = result.exit_code != 0;
+        let failed_dependency = current != name && failed;
         final_result = Some(result);
+        if failed_dependency {
+            let dependency = final_result.as_ref().expect("result was just assigned");
+            let message = format!(
+                "dependency {current:?} failed with exit code {}",
+                dependency.exit_code
+            );
+            let root_result = failed_result(
+                name,
+                &message,
+                dependency.exit_code,
+                dependency.cancelled,
+                dependency.started_at,
+                dependency.duration_ms,
+            );
+            persist(root, &root_result, retention)?;
+            final_result = Some(root_result);
+            break;
+        }
         if failed {
             break;
         }
     }
     let result = final_result.expect("execution order is never empty");
+    emit_result(&result, format)?;
+    Ok(result)
+}
+
+/// Persist and emit a failure that occurs after task selection but before its
+/// process can be spawned, such as required-service readiness failure.
+pub fn record_preflight_failure(
+    stack: &Stack,
+    root: &Path,
+    name: &str,
+    error: &anyhow::Error,
+    format: OutputFormat,
+) -> Result<TaskResult> {
+    record_preflight_result(stack, root, name, error, format, false, None)
+}
+
+/// Persist and emit cancellation that occurs while converging a task's
+/// required services. This keeps Ctrl-C compatible with shell cancellation
+/// conventions even though the task process itself has not started yet.
+pub fn record_preflight_cancellation(
+    stack: &Stack,
+    root: &Path,
+    name: &str,
+    error: &anyhow::Error,
+    format: OutputFormat,
+    started_at: u64,
+    duration_ms: u64,
+) -> Result<TaskResult> {
+    record_preflight_result(
+        stack,
+        root,
+        name,
+        error,
+        format,
+        true,
+        Some((started_at, duration_ms)),
+    )
+}
+
+fn record_preflight_result(
+    stack: &Stack,
+    root: &Path,
+    name: &str,
+    error: &anyhow::Error,
+    format: OutputFormat,
+    cancelled: bool,
+    timing: Option<(u64, u64)>,
+) -> Result<TaskResult> {
+    let (started_at, duration_ms) = timing.unwrap_or_else(|| (now_ms(), 0));
+    let redactor =
+        devme_config::Redactor::new(&devme_config::persistence_redaction_patterns(stack))
+            .context("invalid logs.redact pattern")?;
+    let task = stack
+        .task
+        .get(name)
+        .ok_or_else(|| unknown_task(stack, name))?;
+    let secret_values = redaction_values(
+        stack,
+        task,
+        &interpolation_context(root, 0),
+        &BTreeMap::new(),
+    );
+    let message = redact(error.to_string().as_bytes(), &secret_values, &redactor);
+    let result = failed_result(
+        name,
+        &message,
+        if cancelled { 130 } else { 1 },
+        cancelled,
+        started_at,
+        duration_ms,
+    );
+    persist(root, &result, retention_bytes(stack))?;
     emit_result(&result, format)?;
     Ok(result)
 }
@@ -236,22 +398,85 @@ async fn execute_one(
     args: &[String],
     format: OutputFormat,
     slot: u8,
+    injected_env: &BTreeMap<String, String>,
 ) -> Result<TaskResult> {
     let task = &stack.task[name];
-    let retention = stack
-        .logs
-        .as_ref()
-        .map(|policy| policy.retention_bytes)
-        .unwrap_or(8 * 1024 * 1024);
+    let retention = retention_bytes(stack);
     let capture_limit = CAPTURE_LIMIT.min((retention / 4).max(256) as usize);
-    let redactor = devme_config::Redactor::new(
-        &stack
-            .logs
-            .as_ref()
-            .map(|policy| policy.redact.clone())
-            .unwrap_or_default(),
+    let started_at = now_ms();
+    let started = std::time::Instant::now();
+    let persistence_patterns = devme_config::persistence_redaction_patterns(stack);
+    let redactor = match devme_config::Redactor::new(&persistence_patterns)
+        .context("invalid logs.redact pattern")
+    {
+        Ok(redactor) => redactor,
+        Err(error) => {
+            let result = failed_result(
+                name,
+                &error.to_string(),
+                1,
+                false,
+                started_at,
+                started.elapsed().as_millis() as u64,
+            );
+            persist(root, &result, retention)?;
+            return Ok(result);
+        }
+    };
+    let ctx = interpolation_context(root, slot);
+    let secret_values = redaction_values(stack, task, &ctx, injected_env);
+    let attempt = execute_one_attempt(
+        stack,
+        root,
+        name,
+        args,
+        capture_limit,
+        &secret_values,
+        &persistence_patterns,
+        &ctx,
+        started_at,
+        &started,
+        injected_env,
     )
-    .context("invalid logs.redact pattern")?;
+    .await;
+    let result = match attempt {
+        Ok(result) => result,
+        Err(error) => {
+            let cancelled = error.downcast_ref::<ResourceWaitCancelled>().is_some();
+            let message = redact(error.to_string().as_bytes(), &secret_values, &redactor);
+            failed_result(
+                name,
+                &message,
+                if cancelled { 130 } else { 1 },
+                cancelled,
+                started_at,
+                started.elapsed().as_millis() as u64,
+            )
+        }
+    };
+    if format == OutputFormat::Human {
+        print!("{}", result.stdout);
+        eprint!("{}", result.stderr);
+    }
+    persist(root, &result, retention)?;
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_one_attempt(
+    stack: &Stack,
+    root: &Path,
+    name: &str,
+    args: &[String],
+    capture_limit: usize,
+    secret_values: &[String],
+    persistence_patterns: &[String],
+    ctx: &devme_config::InterpContext,
+    started_at: u64,
+    started: &std::time::Instant,
+    injected_env: &BTreeMap<String, String>,
+) -> Result<TaskResult> {
+    let task = &stack.task[name];
     for step in &task.steps {
         let configured = stack
             .step
@@ -260,29 +485,25 @@ async fn execute_one(
         let status = std::process::Command::new("sh")
             .args(["-c", &configured.check])
             .current_dir(root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()?;
         if !status.success() {
             bail!("required step {step:?} is not satisfied; run `devme up` to provision it");
         }
     }
     if task.cmd.is_none() {
-        let result = empty_result(name);
-        persist(root, &result, retention)?;
-        return Ok(result);
+        return Ok(empty_result(name));
     }
 
     let leases = acquire_resources(stack, root, name, &task.resources).await?;
-    let started_at = now_ms();
-    let started = std::time::Instant::now();
-    let ctx = interpolation_context(root, slot);
-    let secret_values = redaction_values(task, &ctx);
     let cwd = match &task.cwd {
-        Some(value) => root.join(devme_config::interpolate(value, &ctx)?),
+        Some(value) => root.join(devme_config::interpolate(value, ctx)?),
         None => root.to_path_buf(),
     };
     let mut command = tokio::process::Command::new("sh");
     let full_command = append_args(
-        &devme_config::interpolate(task.cmd.as_deref().unwrap(), &ctx)?,
+        &devme_config::interpolate(task.cmd.as_deref().unwrap(), ctx)?,
         args,
     );
     command
@@ -292,8 +513,11 @@ async fn execute_one(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     for (key, value) in &task.env {
-        command.env(key, devme_config::interpolate(value, &ctx)?);
+        command.env(key, devme_config::interpolate(value, ctx)?);
     }
+    // Allocated identifiers are authoritative for the held session and
+    // intentionally override static task env with the same key.
+    command.envs(injected_env);
     for lease in &leases {
         if let Some(env) = &lease.env {
             command.env(env, lease.id.to_string());
@@ -315,8 +539,20 @@ async fn execute_one(
         .ok_or_else(|| anyhow!("task process has no pid"))? as i32;
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
-    let out_reader = tokio::spawn(read_tail(stdout, capture_limit));
-    let err_reader = tokio::spawn(read_tail(stderr, capture_limit));
+    let out_reader = tokio::spawn(read_stream(
+        stdout,
+        capture_limit,
+        devme_core::LogStream::Stdout,
+        secret_values.to_vec(),
+        persistence_patterns.to_vec(),
+    ));
+    let err_reader = tokio::spawn(read_stream(
+        stderr,
+        capture_limit,
+        devme_core::LogStream::Stderr,
+        secret_values.to_vec(),
+        persistence_patterns.to_vec(),
+    ));
 
     let deadline = if task.timeout == 0 {
         Duration::from_secs(365 * 24 * 3600)
@@ -328,14 +564,8 @@ async fn execute_one(
         _ = tokio::time::sleep(deadline) => { terminate_group(pid, &mut child).await?; (child.wait().await?, true, false) },
         _ = tokio::signal::ctrl_c() => { terminate_group(pid, &mut child).await?; (child.wait().await?, false, true) },
     };
-    let (raw_out, out_cut) = out_reader.await??;
-    let (raw_err, err_cut) = err_reader.await??;
-    let stdout = redact(&raw_out, &secret_values, &redactor);
-    let stderr = redact(&raw_err, &secret_values, &redactor);
-    if format == OutputFormat::Human {
-        print!("{stdout}");
-        eprint!("{stderr}");
-    }
+    let out = out_reader.await??;
+    let err = err_reader.await??;
     let exit_code = if timed_out {
         124
     } else if cancelled {
@@ -360,19 +590,45 @@ async fn execute_one(
         duration_ms: started.elapsed().as_millis() as u64,
         timed_out,
         cancelled,
-        stdout,
-        stderr,
-        truncated: out_cut || err_cut,
+        stdout: out.text,
+        stderr: err.text,
+        truncated: out.truncated || err.truncated,
+        output_events: {
+            let mut events = out.events;
+            events.extend(err.events);
+            events.sort_by_key(|event| event.ts);
+            events
+        },
     };
-    persist(root, &result, retention)?;
     Ok(result)
 }
 
-async fn read_tail<R>(mut reader: R, limit: usize) -> std::io::Result<(Vec<u8>, bool)>
+struct StreamCapture {
+    text: String,
+    events: Vec<TaskOutputEvent>,
+    truncated: bool,
+}
+
+async fn read_stream<R>(
+    mut reader: R,
+    limit: usize,
+    stream: devme_core::LogStream,
+    literals: Vec<String>,
+    patterns: Vec<String>,
+) -> std::io::Result<StreamCapture>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut output = Vec::with_capacity(limit);
+    let redactor = devme_config::Redactor::new(&patterns).map_err(std::io::Error::other)?;
+    let redact_all = literals
+        .iter()
+        .any(|literal| literal.contains(['\n', '\r']));
+    let raw_frame_limit = limit.saturating_mul(4).max(8192);
+    let mut output = String::with_capacity(limit);
+    let mut events = VecDeque::new();
+    let mut event_bytes = 0;
+    let mut frame = Vec::new();
+    let mut dropping_frame = false;
     let mut buffer = [0_u8; 8192];
     let mut truncated = false;
     loop {
@@ -380,19 +636,137 @@ where
         if read == 0 {
             break;
         }
-        if output.len() + read > limit {
-            truncated = true;
-            let overflow = output.len() + read - limit;
-            if overflow >= output.len() {
-                output.clear();
+        let mut offset = 0;
+        while offset < read {
+            let end = buffer[offset..read]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(read, |position| offset + position + 1);
+            let segment = &buffer[offset..end];
+            if dropping_frame {
+                if segment.ends_with(b"\n") {
+                    push_redacted_frame(
+                        b"[REDACTED oversized output frame]\n",
+                        stream,
+                        limit,
+                        &mut output,
+                        &mut events,
+                        &mut event_bytes,
+                        &mut truncated,
+                    );
+                    dropping_frame = false;
+                }
+            } else if frame.len().saturating_add(segment.len()) > raw_frame_limit {
+                frame.clear();
+                truncated = true;
+                dropping_frame = !segment.ends_with(b"\n");
+                if !dropping_frame {
+                    push_redacted_frame(
+                        b"[REDACTED oversized output frame]\n",
+                        stream,
+                        limit,
+                        &mut output,
+                        &mut events,
+                        &mut event_bytes,
+                        &mut truncated,
+                    );
+                }
             } else {
-                output.drain(..overflow);
+                frame.extend_from_slice(segment);
+                if segment.ends_with(b"\n") {
+                    let redacted = if redact_all {
+                        b"[REDACTED multiline secret output]\n".to_vec()
+                    } else {
+                        redact(&frame, &literals, &redactor).into_bytes()
+                    };
+                    push_redacted_frame(
+                        &redacted,
+                        stream,
+                        limit,
+                        &mut output,
+                        &mut events,
+                        &mut event_bytes,
+                        &mut truncated,
+                    );
+                    frame.clear();
+                }
             }
+            offset = end;
         }
-        let start = read.saturating_sub(limit);
-        output.extend_from_slice(&buffer[start..read]);
     }
-    Ok((output, truncated))
+    if dropping_frame {
+        push_redacted_frame(
+            b"[REDACTED oversized output frame]",
+            stream,
+            limit,
+            &mut output,
+            &mut events,
+            &mut event_bytes,
+            &mut truncated,
+        );
+    } else if !frame.is_empty() {
+        let redacted = if redact_all {
+            b"[REDACTED multiline secret output]".to_vec()
+        } else {
+            redact(&frame, &literals, &redactor).into_bytes()
+        };
+        push_redacted_frame(
+            &redacted,
+            stream,
+            limit,
+            &mut output,
+            &mut events,
+            &mut event_bytes,
+            &mut truncated,
+        );
+    }
+    Ok(StreamCapture {
+        text: output,
+        events: events.into(),
+        truncated,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_redacted_frame(
+    bytes: &[u8],
+    stream: devme_core::LogStream,
+    limit: usize,
+    output: &mut String,
+    events: &mut VecDeque<TaskOutputEvent>,
+    event_bytes: &mut usize,
+    truncated: &mut bool,
+) {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    if text.len() > limit {
+        keep_utf8_tail(&mut text, limit);
+        *truncated = true;
+    }
+    output.push_str(&text);
+    if output.len() > limit {
+        keep_utf8_tail(output, limit);
+        *truncated = true;
+    }
+    *event_bytes += text.len();
+    events.push_back(TaskOutputEvent {
+        ts: now_ms(),
+        stream,
+        text,
+    });
+    while *event_bytes > limit && events.len() > 1 {
+        if let Some(removed) = events.pop_front() {
+            *event_bytes = event_bytes.saturating_sub(removed.text.len());
+            *truncated = true;
+        }
+    }
+}
+
+fn keep_utf8_tail(value: &mut String, limit: usize) {
+    let mut start = value.len().saturating_sub(limit);
+    while start < value.len() && !value.is_char_boundary(start) {
+        start += 1;
+    }
+    value.drain(..start);
 }
 
 fn interpolation_context(root: &Path, slot: u8) -> devme_config::InterpContext {
@@ -480,6 +854,129 @@ struct Lease {
     env: Option<String>,
 }
 
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self._file);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceWaitRecord {
+    pub pid: u32,
+    pub task: String,
+    pub resource: String,
+    pub worktree: PathBuf,
+    pub waiting_since: u64,
+}
+
+struct ResourceWaitGuard {
+    path: PathBuf,
+    record: ResourceWaitRecord,
+}
+
+impl ResourceWaitGuard {
+    fn create(root: &Path, task: &str, resource: &str) -> Result<Self> {
+        let directory = resource_waiter_dir()?;
+        std::fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("{}-{}.json", std::process::id(), sanitize(task)));
+        let guard = Self {
+            path,
+            record: ResourceWaitRecord {
+                pid: std::process::id(),
+                task: task.to_string(),
+                resource: resource.to_string(),
+                worktree: root.to_path_buf(),
+                waiting_since: now_ms(),
+            },
+        };
+        guard.persist()?;
+        Ok(guard)
+    }
+
+    fn update(&mut self, resource: &str) -> Result<()> {
+        self.record.resource = resource.to_string();
+        self.persist()
+    }
+
+    fn persist(&self) -> Result<()> {
+        let temporary = self.path.with_extension("json.tmp");
+        std::fs::write(&temporary, serde_json::to_vec(&self.record)?)?;
+        std::fs::rename(temporary, &self.path)?;
+        Ok(())
+    }
+}
+
+impl Drop for ResourceWaitGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(self.path.with_extension("json.tmp"));
+    }
+}
+
+fn resource_waiter_dir() -> Result<PathBuf> {
+    Ok(devme_config::paths::runtime_dir()?
+        .join("resources")
+        .join("waiters"))
+}
+
+/// Return live task waiters, removing records left by crashed owners. When a
+/// worktree is supplied, unrelated repositories/worktrees are excluded.
+pub fn read_resource_waiters(worktree: Option<&Path>) -> Result<Vec<ResourceWaitRecord>> {
+    let directory = resource_waiter_dir()?;
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut records = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|extension| extension != "json") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<ResourceWaitRecord>(&bytes) else {
+            let _ = std::fs::remove_file(path);
+            continue;
+        };
+        if !process_is_live(record.pid) {
+            let _ = std::fs::remove_file(path);
+            continue;
+        }
+        if worktree.is_none_or(|root| record.worktree == root) {
+            records.push(record);
+        }
+    }
+    records.sort_by_key(|record| record.waiting_since);
+    Ok(records)
+}
+
+fn process_is_live(pid: u32) -> bool {
+    if unsafe { libc::kill(pid as i32, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
+}
+
+#[derive(Debug)]
+struct ResourceWaitCancelled {
+    resource: String,
+}
+
+impl std::fmt::Display for ResourceWaitCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "cancelled while waiting for resource {:?}",
+            self.resource
+        )
+    }
+}
+
+impl std::error::Error for ResourceWaitCancelled {}
+
 async fn acquire_resources(
     stack: &Stack,
     root: &Path,
@@ -488,37 +985,59 @@ async fn acquire_resources(
 ) -> Result<Vec<Lease>> {
     let mut ordered = names.to_vec();
     ordered.sort();
-    let mut leases = Vec::new();
-    for name in ordered {
+    ordered.dedup();
+    for name in &ordered {
         let resource = stack
             .resource
-            .get(&name)
+            .get(name)
             .ok_or_else(|| anyhow!("task {task:?} requires unknown resource {name:?}"))?;
         if resource.capacity == 0 {
             bail!("resource {name:?} capacity must be at least 1");
         }
-        let dir = resource_dir(root, &name, resource)?;
-        std::fs::create_dir_all(&dir)?;
-        let mut announced = false;
-        loop {
-            if let Some(lease) = try_acquire(&dir, resource, task)? {
-                leases.push(lease);
-                break;
+        std::fs::create_dir_all(resource_dir(root, name, resource)?)?;
+    }
+
+    let mut announced = std::collections::HashSet::new();
+    let mut wait_record: Option<ResourceWaitGuard> = None;
+    loop {
+        let mut leases = Vec::with_capacity(ordered.len());
+        let mut blocked = None;
+        for name in &ordered {
+            let resource = &stack.resource[name];
+            let dir = resource_dir(root, name, resource)?;
+            match try_acquire(&dir, resource, task, root)? {
+                Some(lease) => leases.push(lease),
+                None => {
+                    blocked = Some(name.clone());
+                    break;
+                }
             }
-            if !announced {
-                devme_ui::info(format!("task {task}: waiting for resource {name}"));
-                announced = true;
+        }
+        if let Some(resource) = blocked {
+            // Atomic means all or none. Releasing this partial attempt before
+            // waiting prevents a task blocked on B from starving users of A.
+            drop(leases);
+            if announced.insert(resource.clone()) {
+                devme_ui::info(format!("task {task}: waiting for resource {resource}"));
+            }
+            match &mut wait_record {
+                Some(record) if record.record.resource != resource => record.update(&resource)?,
+                Some(_) => {}
+                None => wait_record = Some(ResourceWaitGuard::create(root, task, &resource)?),
             }
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {},
-                _ = tokio::signal::ctrl_c() => bail!("cancelled while waiting for resource {name:?}"),
+                _ = tokio::signal::ctrl_c() => {
+                    return Err(ResourceWaitCancelled { resource }.into());
+                },
             }
+        } else {
+            return Ok(leases);
         }
     }
-    Ok(leases)
 }
 
-fn try_acquire(dir: &Path, resource: &Resource, task: &str) -> Result<Option<Lease>> {
+fn try_acquire(dir: &Path, resource: &Resource, task: &str, root: &Path) -> Result<Option<Lease>> {
     for id in 0..resource.capacity {
         let path = dir.join(format!("{id}.lease"));
         let mut file = OpenOptions::new()
@@ -527,22 +1046,29 @@ fn try_acquire(dir: &Path, resource: &Resource, task: &str) -> Result<Option<Lea
             .write(true)
             .truncate(false)
             .open(path)?;
-        if file.try_lock_exclusive().is_ok() {
-            file.set_len(0)?;
-            file.seek(SeekFrom::Start(0))?;
-            write!(
-                file,
-                "pid={}\ntask={}\nacquired_at={}\n",
-                std::process::id(),
-                task,
-                now_ms()
-            )?;
-            file.flush()?;
-            return Ok(Some(Lease {
-                _file: file,
-                id,
-                env: resource.env.clone(),
-            }));
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                file.set_len(0)?;
+                file.seek(SeekFrom::Start(0))?;
+                write!(
+                    file,
+                    "pid={}\ntask={}\nworktree={}\nacquired_at={}\n",
+                    std::process::id(),
+                    task,
+                    root.display(),
+                    now_ms()
+                )?;
+                file.flush()?;
+                return Ok(Some(Lease {
+                    _file: file,
+                    id,
+                    env: resource.env.clone(),
+                }));
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || matches!(error.raw_os_error(), Some(libc::EAGAIN)) => {}
+            Err(error) => return Err(error.into()),
         }
     }
     Ok(None)
@@ -618,17 +1144,38 @@ pub fn read_history(
     Ok(results)
 }
 
-fn redaction_values(task: &Task, ctx: &devme_config::InterpContext) -> Vec<String> {
-    task.env
+fn redaction_values(
+    stack: &Stack,
+    task: &Task,
+    ctx: &devme_config::InterpContext,
+    injected_env: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut values = task
+        .env
         .iter()
-        .filter(|(k, v)| {
-            v.len() >= 4
-                && ["SECRET", "TOKEN", "PASSWORD", "KEY", "CREDENTIAL"]
-                    .iter()
-                    .any(|needle| k.to_ascii_uppercase().contains(needle))
-        })
+        .filter(|(key, value)| devme_config::is_sensitive_key(key) && value.len() >= 4)
         .filter_map(|(_, value)| devme_config::interpolate(value, ctx).ok())
-        .collect()
+        .chain(
+            injected_env
+                .iter()
+                .filter(|(key, value)| devme_config::is_sensitive_key(key) && value.len() >= 4)
+                .map(|(_, value)| value.clone()),
+        )
+        .collect::<Vec<_>>();
+    for name in stack
+        .env
+        .keys()
+        .filter(|name| devme_config::is_sensitive_key(name))
+    {
+        if let Ok(value) = std::env::var(name)
+            && value.len() >= 4
+        {
+            values.push(value);
+        }
+    }
+    values.sort();
+    values.dedup();
+    values
 }
 
 fn redact(bytes: &[u8], literals: &[String], redactor: &devme_config::Redactor) -> String {
@@ -641,6 +1188,47 @@ fn redact(bytes: &[u8], literals: &[String], redactor: &devme_config::Redactor) 
     redactor.apply(&text)
 }
 
+fn retention_bytes(stack: &Stack) -> u64 {
+    stack
+        .logs
+        .as_ref()
+        .map(|policy| policy.retention_bytes)
+        .unwrap_or(8 * 1024 * 1024)
+}
+
+fn failed_result(
+    name: &str,
+    message: &str,
+    exit_code: i32,
+    cancelled: bool,
+    started_at: u64,
+    duration_ms: u64,
+) -> TaskResult {
+    let finished_at = now_ms();
+    TaskResult {
+        task: name.into(),
+        status: if cancelled {
+            "cancelled".into()
+        } else {
+            "failed".into()
+        },
+        exit_code,
+        started_at,
+        finished_at,
+        duration_ms,
+        timed_out: false,
+        cancelled,
+        stdout: String::new(),
+        stderr: message.into(),
+        truncated: false,
+        output_events: vec![TaskOutputEvent {
+            ts: finished_at,
+            stream: devme_core::LogStream::Stderr,
+            text: message.into(),
+        }],
+    }
+}
+
 fn emit_result(result: &TaskResult, format: OutputFormat) -> Result<()> {
     match format {
         OutputFormat::Human => devme_ui::info(format!(
@@ -649,10 +1237,13 @@ fn emit_result(result: &TaskResult, format: OutputFormat) -> Result<()> {
         )),
         OutputFormat::Json => {
             let mut value = serde_json::to_value(result)?;
-            value
+            let object = value
                 .as_object_mut()
-                .expect("task result serializes as an object")
-                .insert("schema_version".into(), serde_json::json!(1));
+                .expect("task result serializes as an object");
+            // Per-line events are an internal persistence detail. Keep the
+            // established run-result schema compact and compatible.
+            object.remove("output_events");
+            object.insert("schema_version".into(), serde_json::json!(1));
             devme_ui::json(&value);
         }
         OutputFormat::Toon => {
@@ -687,6 +1278,7 @@ fn empty_result(name: &str) -> TaskResult {
         stdout: String::new(),
         stderr: String::new(),
         truncated: false,
+        output_events: Vec::new(),
     }
 }
 fn unknown_task(stack: &Stack, name: &str) -> anyhow::Error {
@@ -713,16 +1305,6 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-fn toon_array(values: &[String]) -> String {
-    format!(
-        "[{}]",
-        values
-            .iter()
-            .map(|v| toon_string(v))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
 }
 fn toon_string(value: &str) -> String {
     format!(
@@ -771,9 +1353,17 @@ mod tests {
     #[tokio::test]
     async fn stream_capture_is_bounded_to_the_tail() {
         let input = tokio::io::BufReader::new(&b"0123456789"[..]);
-        let (bytes, truncated) = read_tail(input, 4).await.unwrap();
-        assert_eq!(bytes, b"6789");
-        assert!(truncated);
+        let capture = read_stream(
+            input,
+            4,
+            devme_core::LogStream::Stdout,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(capture.text, "6789");
+        assert!(capture.truncated);
     }
 
     #[test]
@@ -811,21 +1401,28 @@ mod tests {
             scope: ResourceScope::Host,
             env: Some("DEVICE_SLOT".into()),
         };
-        let name = format!("device-fixture-{}", std::process::id());
+        let name = format!(
+            "device-fixture-{}-{}",
+            std::process::id(),
+            a.path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("temp")
+        );
         let dir_a = resource_dir(a.path(), &name, &resource).unwrap();
         let dir_b = resource_dir(b.path(), &name, &resource).unwrap();
         assert_eq!(dir_a, dir_b);
         std::fs::create_dir_all(&dir_a).unwrap();
-        let first = try_acquire(&dir_a, &resource, "worktree-a")
+        let first = try_acquire(&dir_a, &resource, "worktree-a", a.path())
             .unwrap()
             .unwrap();
         assert!(
-            try_acquire(&dir_b, &resource, "worktree-b")
+            try_acquire(&dir_b, &resource, "worktree-b", b.path())
                 .unwrap()
                 .is_none()
         );
         drop(first);
-        let second = try_acquire(&dir_b, &resource, "worktree-b")
+        let second = try_acquire(&dir_b, &resource, "worktree-b", b.path())
             .unwrap()
             .unwrap();
         assert_eq!(second.id, 0);

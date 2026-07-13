@@ -32,7 +32,7 @@ fn checkable_port(svc: &Service) -> Option<u16> {
         PortSpec::Fixed { fixed } => Some(fixed),
         PortSpec::SlotOffset { .. } => match svc.scope {
             Scope::Repo => Some(svc.port?.resolve(0)),
-            Scope::Instance => None,
+            Scope::Instance | Scope::Session => None,
         },
     }
 }

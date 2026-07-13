@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use devme_config::{InterpContext, Stack, interpolate};
+use devme_config::{InterpContext, ResolvedWorkspace, Stack, interpolate};
 use devme_core::{
     ClientMessage, Envelope, InstanceInfo, LogStream, Scope, ServerMessage, ServiceSnapshot,
     ServiceState,
@@ -58,7 +58,12 @@ fn main() {
 }
 
 async fn real_main() -> anyhow::Result<()> {
-    let cwd = std::env::current_dir()?;
+    let invocation = std::env::current_dir()?;
+    let (cwd, stack) = match ResolvedWorkspace::resolve(&invocation) {
+        Ok(workspace) => (workspace.root().to_path_buf(), Some(workspace.into_stack())),
+        Err(devme_config::WorkspaceError::Missing(_)) => (invocation, None),
+        Err(error) => return Err(anyhow::anyhow!("resolving workspace: {error}")),
+    };
     let repo_id = devme_config::paths::repo_id(&cwd);
     let sock = devme_config::paths::shared_socket(&cwd)?;
 
@@ -90,11 +95,17 @@ async fn real_main() -> anyhow::Result<()> {
     // Parse the stack and pick the repo-scoped services. If devme.toml is
     // missing the daemon still runs (responding to Subscribe with an
     // empty snapshot), so instance daemons can attach harmlessly.
-    let stack = read_stack(&cwd).ok();
     let repo_services: Vec<ResolvedService> = stack
         .as_ref()
         .map(|s| resolve_repo_services(s, &cwd))
         .unwrap_or_default();
+    let mut log_policy = stack
+        .as_ref()
+        .and_then(|stack| stack.logs.clone())
+        .unwrap_or_default();
+    if let Some(stack) = &stack {
+        log_policy.redact = devme_config::persistence_redaction_patterns(stack);
+    }
 
     tracing::info!(
         repo_id = %repo_id,
@@ -103,7 +114,7 @@ async fn real_main() -> anyhow::Result<()> {
         "shared supervisor up"
     );
 
-    let state = SharedState::spawn_all(&cwd, &repo_services).await;
+    let state = SharedState::spawn_all(&cwd, &repo_services, &log_policy).await;
     let result = serve(listener, info, state).await;
     let _ = std::fs::remove_file(&sock);
     result
@@ -126,6 +137,8 @@ struct ResolvedService {
     name: String,
     cmd: String,
     env: Vec<(String, String)>,
+    /// Working directory resolved from the flattened workspace root.
+    cwd: PathBuf,
     /// Resolved listen port (slot 0), surfaced in status snapshots so the TUI
     /// can show it and the open/copy-URL actions have something to act on.
     port: Option<u16>,
@@ -194,6 +207,11 @@ fn resolve_repo_services(stack: &Stack, cwd: &std::path::Path) -> Vec<ResolvedSe
             name: name.clone(),
             cmd,
             env,
+            cwd: svc
+                .cwd
+                .as_ref()
+                .map(|path| cwd.join(path))
+                .unwrap_or_else(|| cwd.to_path_buf()),
             port: svc.port.map(|spec| spec.resolve(0)),
             url: svc.url_template(),
             stop,
@@ -222,12 +240,6 @@ fn current_git_branch(cwd: &std::path::Path) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-fn read_stack(cwd: &std::path::Path) -> anyhow::Result<Stack> {
-    let raw = std::fs::read_to_string(cwd.join("devme.toml"))?;
-    let stack = Stack::parse(&raw)?;
-    Ok(stack)
-}
-
 fn repo_id_short(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
@@ -240,6 +252,7 @@ struct RunningService {
     pid: u32,
     /// Optional teardown command (e.g. `docker compose down`).
     stop: Option<String>,
+    cwd: PathBuf,
 }
 
 /// Grace period between a graceful SIGTERM and the SIGKILL fallback when a
@@ -285,21 +298,25 @@ struct SharedState {
     subscribers: Arc<std::sync::atomic::AtomicUsize>,
     /// Notifies the serve loop when subscriber count changes.
     sub_notify: Arc<tokio::sync::Notify>,
-    /// Repo root — the cwd used to spawn services and to run their `stop`
-    /// teardown commands on shutdown.
-    cwd: PathBuf,
 }
 
 impl SharedState {
-    async fn spawn_all(cwd: &std::path::Path, services: &[ResolvedService]) -> Arc<Self> {
+    async fn spawn_all(
+        cwd: &std::path::Path,
+        services: &[ResolvedService],
+        log_policy: &devme_config::LogPolicy,
+    ) -> Arc<Self> {
         let (events, _) = broadcast::channel(1024);
         let services_map: Arc<Mutex<HashMap<String, RunningService>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let logs: LogRings = Arc::new(Mutex::new(HashMap::new()));
-        let log_store = Arc::new(Mutex::new(LogStore::new(
-            devme_config::paths::shared_log_dir(cwd)
-                .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/devme/orphan-shared-logs")),
-        )));
+        let log_store = Arc::new(Mutex::new(
+            LogStore::new(
+                devme_config::paths::shared_log_dir(cwd)
+                    .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/devme/orphan-shared-logs")),
+            )
+            .with_policy(log_policy.retention_bytes, log_policy.redact.clone()),
+        ));
         let shutdown = Arc::new(Mutex::new(false));
 
         // Spawn each repo-scoped service. Failures are surfaced as Failed
@@ -309,6 +326,7 @@ impl SharedState {
             name,
             cmd,
             env,
+            cwd: service_cwd,
             port,
             url,
             stop,
@@ -316,7 +334,7 @@ impl SharedState {
         {
             let env_slice: Vec<(&str, &str)> =
                 env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-            match ChildProcess::spawn_parts::<&str>(cmd, cwd, &env_slice) {
+            match ChildProcess::spawn_parts::<&str>(cmd, service_cwd, &env_slice) {
                 Ok(parts) => {
                     let pid = parts.pid;
                     spawn_log_forwarder(
@@ -350,6 +368,7 @@ impl SharedState {
                             snapshot: snapshot.clone(),
                             pid,
                             stop: stop.clone(),
+                            cwd: service_cwd.clone(),
                         },
                     );
                 }
@@ -367,7 +386,6 @@ impl SharedState {
             shutdown,
             subscribers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             sub_notify: Arc::new(tokio::sync::Notify::new()),
-            cwd: cwd.to_path_buf(),
         })
     }
 
@@ -393,13 +411,9 @@ impl SharedState {
             let mut svcs = self.services.lock().await;
             svcs.drain().collect()
         };
-        let cwd = self.cwd.clone();
         let handles: Vec<_> = drained
             .into_iter()
-            .map(|(name, rec)| {
-                let cwd = cwd.clone();
-                tokio::spawn(async move { teardown_one(&name, rec, &cwd).await })
-            })
+            .map(|(name, rec)| tokio::spawn(async move { teardown_one(&name, rec).await }))
             .collect();
         for h in handles {
             let _ = h.await;
@@ -409,7 +423,7 @@ impl SharedState {
 
 /// Stop a single repo service: optional `stop` command, then SIGTERM, then
 /// SIGKILL after [`STOP_GRACE`] if it survives.
-async fn teardown_one(name: &str, rec: RunningService, cwd: &std::path::Path) {
+async fn teardown_one(name: &str, rec: RunningService) {
     let pid = rec.pid;
     if let Some(stop_cmd) = &rec.stop {
         // Run the teardown command to completion. Its job (e.g. `docker
@@ -417,7 +431,7 @@ async fn teardown_one(name: &str, rec: RunningService, cwd: &std::path::Path) {
         // exit on its own.
         let status = tokio::process::Command::new("sh")
             .args(["-c", stop_cmd])
-            .current_dir(cwd)
+            .current_dir(&rec.cwd)
             .status()
             .await;
         if let Err(e) = status {

@@ -11,6 +11,10 @@ pub enum Scope {
     Instance,
     /// One copy per repo, shared across all instances of that repo.
     Repo,
+    /// One copy for the lifetime of a named resource-bound session.
+    /// Session services are dormant during ordinary `devme up` and are
+    /// started only through the owning `[session]` composition.
+    Session,
 }
 
 #[cfg(test)]
@@ -29,6 +33,10 @@ mod tests {
             r#""instance""#
         );
         assert_eq!(serde_json::to_string(&Scope::Repo).unwrap(), r#""repo""#);
+        assert_eq!(
+            serde_json::to_string(&Scope::Session).unwrap(),
+            r#""session""#
+        );
     }
 
     #[test]
@@ -40,6 +48,10 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<Scope>(r#""repo""#).unwrap(),
             Scope::Repo
+        );
+        assert_eq!(
+            serde_json::from_str::<Scope>(r#""session""#).unwrap(),
+            Scope::Session
         );
     }
 

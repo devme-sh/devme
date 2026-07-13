@@ -13,4 +13,4 @@ pub mod state;
 pub mod theme;
 pub mod worktree;
 
-pub use event_loop::launch;
+pub use event_loop::{launch, launch_targets};

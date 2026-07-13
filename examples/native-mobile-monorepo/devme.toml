@@ -1,69 +1,38 @@
 schema_version = 1
 
 [stack]
-name = "native-mobile-monorepo"
-description = "Backend, iOS, and Android orchestration without a second root task runner"
+name = "native-mobile-workspace"
+description = "Explicit backend, iOS, and Android workspace orchestration"
 
+[workspace.members]
+backend = "backend"
+ios = "apps/ios"
+android = "apps/android"
+
+# Persistence policy is workspace-wide so task, backend, simulator, and adb
+# records can be correlated safely in one timestamped history.
 [logs]
-redact = ["(?i)authorization: bearer [^[:space:]]+", "CONVEX_DEPLOY_KEY=[^[:space:]]+"]
+redact = [
+  "(?i)authorization: bearer [^[:space:]]+",
+  "CONVEX_DEPLOY_KEY=[^[:space:]]+",
+  "(?i)(development|production):[A-Za-z0-9_-]+\\|[A-Za-z0-9_-]+",
+]
 retention_bytes = 8388608
 
-[step.backend-deps]
-check = "test -d backend/node_modules"
-provision = "cd backend && bun install"
-trust = "auto"
-
-[service.backend]
-cmd = "bun run dev --port {port}"
-cwd = "backend"
-port = { base = 3210, slot_offset = 10 }
-health = { http = "http://localhost:{port}/health" }
-readiness = { interval_ms = 1000, timeout_ms = 5000, retries = 60 }
-env = { DEVME_STATE_DIR = "{worktree}/.devme/backend-{slot}" }
-
-# A normal service can model any correlated device log stream. Devme does not
-# need simulator- or adb-specific policy to persist and interleave its output.
-[service.android-logs]
-cmd = "adb -s ${ANDROID_SERIAL} logcat"
-restart = "on-failure"
-
-[resource.ios-simulator]
+[resource.ios-runtime]
 scope = "host"
 capacity = 2
-env = "SIMULATOR_SLOT"
+env = "IOS_RUNTIME_SLOT"
 
-[resource.android-emulator]
+[resource.android-runtime]
 scope = "host"
 capacity = 2
-env = "EMULATOR_SLOT"
+env = "ANDROID_RUNTIME_SLOT"
 
 [resource.codesigning]
 scope = "host"
 capacity = 1
 
-[task.backend-test]
-cmd = "bun test"
-cwd = "backend"
-steps = ["backend-deps"]
-timeout = 300
-
-[task.ios-test]
-cmd = "xcodebuild test -workspace App.xcworkspace -scheme App -derivedDataPath ../../.devme/DerivedData-${SIMULATOR_SLOT}"
-cwd = "apps/ios"
-services = ["backend"]
-resources = ["ios-simulator"]
-timeout = 1200
-readiness_timeout = 90
-
-[task.android-test]
-cmd = "./gradlew test connectedCheck"
-cwd = "apps/android"
-services = ["backend"]
-resources = ["android-emulator"]
-env = { GRADLE_USER_HOME = "../../.devme/gradle-{slot}" }
-timeout = 1200
-readiness_timeout = 90
-
 [task.check]
 description = "Run backend, iOS, and Android verification"
-depends_on = ["backend-test", "ios-test", "android-test"]
+depends_on = ["backend::test", "ios::test", "android::test"]

@@ -75,6 +75,7 @@ pub fn status(json: bool) -> anyhow::Result<()> {
             .map(|(p, s)| serde_json::json!({ "path": p, "status": s.label() }))
             .collect();
         devme_ui::json(&serde_json::json!({
+            "schema_version": 1,
             "version": skill::embedded_version(),
             "installs": arr,
         }));
@@ -103,6 +104,7 @@ pub fn status(json: bool) -> anyhow::Result<()> {
 fn emit(json: bool, verb: &str, path: &str, version: &str) {
     if json {
         devme_ui::json(&serde_json::json!({
+            "schema_version": 1,
             "action": verb,
             "path": path,
             "version": version,

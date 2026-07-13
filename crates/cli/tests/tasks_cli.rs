@@ -8,7 +8,9 @@ fn bin() -> &'static str {
 }
 
 fn fixture(config: &str) -> TempDir {
-    let dir = TempDir::new().unwrap();
+    // Keep daemon socket paths below macOS's SUN_LEN limit while giving every
+    // parallel test its own runtime registry.
+    let dir = TempDir::new_in("/tmp").unwrap();
     std::fs::write(dir.path().join("devme.toml"), config).unwrap();
     dir
 }
@@ -18,8 +20,16 @@ fn run(dir: &TempDir, args: &[&str]) -> Output {
         .args(args)
         .current_dir(dir.path())
         .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", dir.path().join(".runtime"))
         .output()
         .unwrap()
+}
+
+fn interrupt(child: std::process::Child) -> Output {
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGINT);
+    }
+    child.wait_with_output().unwrap()
 }
 
 #[test]
@@ -90,6 +100,37 @@ cmd="printf 'swordfish'; printf 'bad swordfish' >&2; exit 3"
     let report: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
     assert_eq!(report["kind"], "task");
     assert_eq!(report["status"], "failed");
+}
+
+#[test]
+fn doctor_health_uses_latest_task_result_instead_of_stale_failures() {
+    let dir = fixture(
+        r#"schema_version=1
+[service.keepalive]
+cmd="sleep 30"
+[task.check]
+cmd="test -f passing"
+"#,
+    );
+    assert_eq!(
+        run(&dir, &["run", "check", "--output", "json"])
+            .status
+            .code(),
+        Some(1)
+    );
+    std::fs::write(dir.path().join("passing"), "").unwrap();
+    assert!(
+        run(&dir, &["run", "check", "--output", "json"])
+            .status
+            .success()
+    );
+    assert!(run(&dir, &["up", "-d", "--wait"]).status.success());
+
+    let doctor = run(&dir, &["doctor"]);
+    let report: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(report["status"], "healthy");
+    assert_eq!(report["tasks"][0]["status"], "passed");
+    let _ = run(&dir, &["down"]);
 }
 
 #[test]
@@ -224,6 +265,26 @@ fn cancellation_returns_130_and_kills_process_tree() {
 }
 
 #[test]
+fn timeout_returns_124_and_kills_process_tree() {
+    let dir = fixture(
+        "schema_version=1\n[task.wait]\ncmd=\"sleep 30 & echo $! > timeout-child.pid; wait\"\ntimeout=1\n",
+    );
+    let output = run(&dir, &["run", "wait", "--output", "json"]);
+    assert_eq!(output.status.code(), Some(124));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["timed_out"], true);
+    assert_eq!(result["cancelled"], false);
+
+    let pid: i32 = std::fs::read_to_string(dir.path().join("timeout-child.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+}
+
+#[test]
 fn host_lease_waits_across_two_worktrees() {
     let runtime = std::path::PathBuf::from(format!("/tmp/devme-contention-{}", std::process::id()));
     std::fs::create_dir_all(&runtime).unwrap();
@@ -252,6 +313,70 @@ fn host_lease_waits_across_two_worktrees() {
 }
 
 #[test]
+fn multi_resource_wait_releases_partial_leases_atomically() {
+    let runtime = TempDir::new().unwrap();
+    let dir = fixture(
+        r#"schema_version=1
+[resource.a]
+scope="host"
+[resource.b]
+scope="host"
+[task.hold-b]
+cmd="touch holding-b; sleep 30"
+resources=["b"]
+[task.wait-both]
+cmd="sleep 30"
+resources=["a","b"]
+[task.use-a]
+cmd="true"
+resources=["a"]
+"#,
+    );
+    let holder = Command::new(bin())
+        .args(["run", "hold-b", "--output", "json"])
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if dir.path().join("holding-b").exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(dir.path().join("holding-b").exists());
+
+    let waiter = Command::new(bin())
+        .args(["run", "wait-both", "--output", "json"])
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+
+    let started = Instant::now();
+    let use_a = Command::new(bin())
+        .args(["run", "use-a", "--output", "json"])
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .output()
+        .unwrap();
+    assert!(use_a.status.success());
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "task waiting on b retained its partial a lease"
+    );
+
+    let _ = interrupt(waiter);
+    let _ = interrupt(holder);
+}
+
+#[test]
 fn host_lease_recovers_after_owner_process_is_killed() {
     let runtime =
         std::path::PathBuf::from(format!("/tmp/devme-crash-recovery-{}", std::process::id()));
@@ -267,17 +392,17 @@ fn host_lease_recovers_after_owner_process_is_killed() {
         .stdout(Stdio::null())
         .spawn()
         .unwrap();
-    for _ in 0..100 {
-        if dir.path().join("holder.pid").exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let task_pid: i32 = std::fs::read_to_string(dir.path().join("holder.pid"))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let task_pid = (0..100)
+        .find_map(|_| {
+            let pid = std::fs::read_to_string(dir.path().join("holder.pid"))
+                .ok()
+                .and_then(|value| value.trim().parse::<i32>().ok());
+            if pid.is_none() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            pid
+        })
+        .expect("task did not persist its process id");
     unsafe {
         libc::kill(owner.id() as i32, libc::SIGKILL);
     }
@@ -417,7 +542,22 @@ fn toon_surfaces_have_no_trailing_newline_and_usage_errors_are_structured() {
     );
     assert_eq!(unknown.status.code(), Some(2));
     assert!(unknown.stderr.is_empty());
-    assert!(String::from_utf8_lossy(&unknown.stdout).starts_with("error:\n"));
+    let unknown_error: serde_json::Value =
+        toon_format::decode_strict(std::str::from_utf8(&unknown.stdout).unwrap()).unwrap();
+    assert_eq!(unknown_error["error"]["code"], "invalid_arguments");
+    assert!(
+        unknown_error["error"]["help"]
+            .as_str()
+            .unwrap()
+            .contains("Valid flags for `devme run`")
+    );
+
+    let automatic = run(&dir, &["run", "missing"]);
+    assert_eq!(automatic.status.code(), Some(3));
+    assert!(automatic.stderr.is_empty());
+    let automatic_error: serde_json::Value =
+        toon_format::decode_strict(std::str::from_utf8(&automatic.stdout).unwrap()).unwrap();
+    assert_eq!(automatic_error["error"]["code"], "not_found");
 
     let missing = run(&dir, &["run", "missing", "--output", "json"]);
     assert_eq!(missing.status.code(), Some(3));
@@ -425,6 +565,73 @@ fn toon_surfaces_have_no_trailing_newline_and_usage_errors_are_structured() {
     assert_eq!(error["schema_version"], 1);
     assert_eq!(error["error"]["code"], "not_found");
     assert!(missing.stderr.is_empty());
+}
+
+#[test]
+fn task_detail_is_complete_and_status_doctor_formats_are_compatible() {
+    let dir = fixture(
+        r#"schema_version=1
+[step.tool]
+check="true"
+[service.api]
+cmd="sleep 30"
+[resource.device]
+capacity=2
+[task.detail]
+description="Native verification"
+cmd="true"
+cwd="."
+env={ MODE="test" }
+steps=["tool"]
+services=["api"]
+resources=["device"]
+timeout=10
+readiness_timeout=17
+"#,
+    );
+
+    let detail = run(&dir, &["tasks", "show", "detail", "--output", "toon"]);
+    assert!(detail.status.success());
+    let decoded: serde_json::Value =
+        toon_format::decode_strict(std::str::from_utf8(&detail.stdout).unwrap()).unwrap();
+    assert_eq!(decoded["task"]["description"], "Native verification");
+    assert_eq!(decoded["task"]["cwd"], ".");
+    assert_eq!(decoded["task"]["environment"]["MODE"], "test");
+    assert_eq!(decoded["task"]["steps"][0], "tool");
+    assert_eq!(decoded["task"]["readiness_timeout_seconds"], 17);
+
+    let json_alias = run(&dir, &["doctor", "--json"]);
+    let output_json = run(&dir, &["doctor", "--output", "json"]);
+    let alias_value: serde_json::Value = serde_json::from_slice(&json_alias.stdout).unwrap();
+    let output_value: serde_json::Value = serde_json::from_slice(&output_json.stdout).unwrap();
+    assert_eq!(alias_value, output_value);
+
+    let toon = run(&dir, &["doctor", "--output", "toon"]);
+    let toon_value: serde_json::Value =
+        toon_format::decode_strict(std::str::from_utf8(&toon.stdout).unwrap()).unwrap();
+    assert_eq!(toon_value, output_value);
+}
+
+#[test]
+fn status_json_alias_and_official_toon_output_are_equivalent() {
+    let dir = fixture("schema_version=1\n");
+    let alias = run(&dir, &["status", "--json"]);
+    assert!(alias.status.success());
+    let explicit = run(&dir, &["status", "--output", "json"]);
+    assert!(explicit.status.success());
+    let alias_value: serde_json::Value = serde_json::from_slice(&alias.stdout).unwrap();
+    let explicit_value: serde_json::Value = serde_json::from_slice(&explicit.stdout).unwrap();
+    assert_eq!(alias_value, explicit_value);
+    assert_eq!(explicit_value["sessions"], serde_json::json!([]));
+    assert_eq!(explicit_value["resource_waiters"], serde_json::json!([]));
+
+    let toon = run(&dir, &["status", "--output", "toon"]);
+    assert!(toon.status.success());
+    assert!(!toon.stdout.ends_with(b"\n"));
+    let toon_value: serde_json::Value =
+        toon_format::decode_strict(std::str::from_utf8(&toon.stdout).unwrap()).unwrap();
+    assert_eq!(toon_value, explicit_value);
+    let _ = run(&dir, &["down"]);
 }
 
 #[test]

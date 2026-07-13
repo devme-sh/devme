@@ -2,8 +2,10 @@
 //! formatters live in [`devme_cli`]; this binary dispatches.
 
 use std::io::IsTerminal;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use anyhow::Context;
 use base64::Engine;
 use clap::{CommandFactory, Parser, error::ErrorKind};
 use clap_complete::{Shell, generate};
@@ -17,6 +19,8 @@ use devme_core::{ClientMessage, ServerMessage, ServiceState};
 /// True when `--yes` was passed: promote `prompt` provisions to `auto` so
 /// preflight fixes run without asking. Set once in `main`.
 static ASSUME_YES: AtomicBool = AtomicBool::new(false);
+static NO_INPUT: AtomicBool = AtomicBool::new(false);
+static PROJECT_WORKSPACE: OnceLock<devme_config::ResolvedWorkspace> = OnceLock::new();
 const READINESS_ATTEMPT_TAIL: usize = 32;
 
 /// Should the *stdout* surface (tables, data) use color? Quiet/color
@@ -28,6 +32,10 @@ fn no_color() -> bool {
 
 fn assume_yes() -> bool {
     ASSUME_YES.load(Ordering::Relaxed)
+}
+
+fn interactive_input() -> bool {
+    !NO_INPUT.load(Ordering::Relaxed) && std::io::stdin().is_terminal()
 }
 
 fn main() {
@@ -44,28 +52,29 @@ fn main() {
         Err(error) => {
             let args = std::env::args().skip(1).collect::<Vec<_>>();
             let json = args.iter().any(|arg| arg == "--json")
+                || args.iter().any(|arg| arg == "--output=json")
                 || args.windows(2).any(|pair| pair == ["--output", "json"]);
-            let toon = args.windows(2).any(|pair| pair == ["--output", "toon"])
-                || args.first().is_some_and(|arg| arg == "agent");
+            let explicit_human = args.iter().any(|arg| arg == "--output=human")
+                || args.windows(2).any(|pair| pair == ["--output", "human"]);
+            let toon = !explicit_human
+                && (args.windows(2).any(|pair| pair == ["--output", "toon"])
+                    || args.iter().any(|arg| arg == "--output=toon")
+                    || args.iter().any(|arg| arg == "--no-input")
+                    || !std::io::stdout().is_terminal());
             let message = error.to_string();
+            let report = serde_json::json!({
+                "schema_version": 1,
+                "error": {
+                    "code": "invalid_arguments",
+                    "message": message.trim(),
+                    "help": parse_error_help(&args),
+                }
+            });
             if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "schema_version": 1,
-                        "error": {
-                            "code": "invalid_arguments",
-                            "message": message.trim(),
-                            "help": "Run `devme --help` or the subcommand with `--help`.",
-                        }
-                    })
-                );
+                println!("{report}");
             } else if toon {
-                print!(
-                    "error:\n  code: invalid_arguments\n  message: {}\n  help: {}",
-                    toon_cli_string(message.trim()),
-                    toon_cli_string("Run `devme --help` or the subcommand with `--help`.")
-                );
+                devme_cli::output::print_toon(&report)
+                    .expect("serializing a JSON error report as TOON cannot fail");
             } else {
                 let _ = error.print();
             }
@@ -76,6 +85,8 @@ fn main() {
     // `NO_COLOR`/`FORCE_COLOR`, then each stream's own tty-ness.
     devme_ui::init(cli.quiet, cli.no_color);
     ASSUME_YES.store(cli.yes, Ordering::Relaxed);
+    NO_INPUT.store(cli.no_input, Ordering::Relaxed);
+    initialize_project_context();
 
     let is_tui = cli.command.is_none();
     let mut builder = if is_tui {
@@ -91,6 +102,21 @@ fn main() {
         }
     };
     std::process::exit(runtime.block_on(run(cli)));
+}
+
+/// Resolve an owning workspace once and run project commands from its root.
+/// This preserves the invocation focus while ensuring every daemon, socket,
+/// history file, and port slot is shared by all member directories.
+fn initialize_project_context() {
+    let Ok(invocation) = std::env::current_dir() else {
+        return;
+    };
+    let Ok(workspace) = devme_config::ResolvedWorkspace::resolve(&invocation) else {
+        return;
+    };
+    if std::env::set_current_dir(workspace.root()).is_ok() {
+        let _ = PROJECT_WORKSPACE.set(workspace);
+    }
 }
 
 async fn run(cli: Cli) -> i32 {
@@ -110,10 +136,104 @@ async fn run(cli: Cli) -> i32 {
         yes: cli.yes,
         quiet: cli.quiet,
     };
+    let command_output = match &cli.command {
+        Some(Command::Status { output, .. }) | Some(Command::Doctor { output, .. }) => *output,
+        _ => devme_cli::OutputFormat::Human,
+    };
+    let error_output = if cli.json {
+        devme_cli::OutputFormat::Json
+    } else if command_output != devme_cli::OutputFormat::Human {
+        command_output
+    } else if cli.no_input || !std::io::stdout().is_terminal() {
+        devme_cli::OutputFormat::Toon
+    } else {
+        devme_cli::OutputFormat::Human
+    };
 
     let result = match cli.command {
-        None => return launch_default(cli.local, remote_flags).await,
+        None => {
+            return launch_default(
+                cli.local,
+                remote_flags,
+                if cli.json {
+                    devme_cli::OutputFormat::Json
+                } else {
+                    devme_cli::OutputFormat::Toon
+                },
+            )
+            .await;
+        }
+        Some(Command::Session {
+            session,
+            stop,
+            output,
+        }) => {
+            let output = if cli.json {
+                devme_cli::OutputFormat::Json
+            } else {
+                output
+            };
+            let cwd = match std::env::current_dir() {
+                Ok(cwd) => cwd,
+                Err(error) => return emit_command_error(output, &error.into()),
+            };
+            let stack = match devme_cli::task::load(&cwd) {
+                Ok(stack) => stack,
+                Err(error) => return emit_command_error(output, &error),
+            };
+            let session = focus_name(&session);
+            let result = if stop {
+                devme_cli::session::stop(&stack, &cwd, &session, output).await
+            } else {
+                if let Some(run) = stack
+                    .session
+                    .get(&session)
+                    .and_then(|session| session.run.as_deref())
+                    && let Err(error) = converge_task_steps(&stack, run, &cwd)
+                {
+                    return match devme_cli::task::record_preflight_failure(
+                        &stack, &cwd, run, &error, output,
+                    ) {
+                        Ok(result) => result.exit_code,
+                        Err(record_error) => emit_command_error(output, &record_error),
+                    };
+                }
+                let socket = match devme_config::paths::supervisor_socket(&cwd) {
+                    Ok(socket) => socket,
+                    Err(error) => return emit_command_error(output, &error.into()),
+                };
+                if let Err(error) = ensure_daemon(&socket).await {
+                    return emit_command_error(output, &error);
+                }
+                devme_cli::session::open(&stack, &cwd, &session, output).await
+            };
+            return match result {
+                Ok(exit_code) => exit_code,
+                Err(error) => emit_command_error(output, &error),
+            };
+        }
+        Some(Command::Sessions { output }) => {
+            let output = if cli.json {
+                devme_cli::OutputFormat::Json
+            } else {
+                output
+            };
+            let cwd = match std::env::current_dir() {
+                Ok(cwd) => cwd,
+                Err(error) => return emit_command_error(output, &error.into()),
+            };
+            let stack = match devme_cli::task::load(&cwd) {
+                Ok(stack) => stack,
+                Err(error) => return emit_command_error(output, &error),
+            };
+            return match devme_cli::session::list(&focused_session_view(&stack), &cwd, output).await
+            {
+                Ok(()) => 0,
+                Err(error) => emit_command_error(output, &error),
+            };
+        }
         Some(Command::Run { task, output, args }) => {
+            let task = focus_name(&task);
             let output = if cli.json {
                 devme_cli::OutputFormat::Json
             } else {
@@ -127,6 +247,14 @@ async fn run(cli: Cli) -> i32 {
                 Ok(value) => value,
                 Err(e) => return emit_command_error(output, &e),
             };
+            if let Err(error) = converge_task_steps(&stack, &task, &cwd) {
+                return match devme_cli::task::record_preflight_failure(
+                    &stack, &cwd, &task, &error, output,
+                ) {
+                    Ok(result) => result.exit_code,
+                    Err(record_error) => emit_command_error(output, &record_error),
+                };
+            }
             let services = match devme_cli::task::services_for(&stack, &task) {
                 Ok(value) => value,
                 Err(e) => return emit_command_error(output, &e),
@@ -136,7 +264,26 @@ async fn run(cli: Cli) -> i32 {
             if !services.is_empty()
                 && let Err(e) = ensure_task_services(&stack, &services, readiness_timeout).await
             {
-                return emit_command_error(output, &e);
+                let record = if e.downcast_ref::<TaskReadinessCancelled>().is_some() {
+                    let cancellation = e
+                        .downcast_ref::<TaskReadinessCancelled>()
+                        .expect("cancellation was just identified");
+                    devme_cli::task::record_preflight_cancellation(
+                        &stack,
+                        &cwd,
+                        &task,
+                        &e,
+                        output,
+                        cancellation.started_at,
+                        cancellation.duration_ms,
+                    )
+                } else {
+                    devme_cli::task::record_preflight_failure(&stack, &cwd, &task, &e, output)
+                };
+                return match record {
+                    Ok(result) => result.exit_code,
+                    Err(record_error) => emit_command_error(output, &record_error),
+                };
             }
             return match devme_cli::task::execute(&stack, &cwd, &task, &args, output).await {
                 Ok(result) => result.exit_code,
@@ -144,6 +291,11 @@ async fn run(cli: Cli) -> i32 {
             };
         }
         Some(Command::Tasks { action, output }) => {
+            let action = action.map(|action| match action {
+                devme_cli::TaskAction::Show { task } => devme_cli::TaskAction::Show {
+                    task: focus_name(&task),
+                },
+            });
             let output = if cli.json {
                 devme_cli::OutputFormat::Json
             } else {
@@ -153,18 +305,27 @@ async fn run(cli: Cli) -> i32 {
                 .map_err(anyhow::Error::from)
                 .and_then(|cwd| devme_cli::task::load(&cwd))
             {
-                Ok(stack) => match devme_cli::task::show(&stack, action, output) {
+                Ok(stack) => match devme_cli::task::show(
+                    &focused_task_view(&stack, action.is_none()),
+                    action,
+                    output,
+                ) {
                     Ok(()) => 0,
                     Err(e) => emit_command_error(output, &e),
                 },
                 Err(e) => emit_command_error(output, &e),
             };
         }
-        Some(Command::Status { all }) => {
-            if all {
-                status_all(cli.json).await
+        Some(Command::Status { all, output }) => {
+            let output = if cli.json {
+                devme_cli::OutputFormat::Json
             } else {
-                status(cli.json).await
+                output
+            };
+            if all {
+                status_all(output).await
+            } else {
+                status(output).await
             }
         }
         Some(Command::Down { timeout, all }) => down(timeout, all).await,
@@ -173,23 +334,44 @@ async fn run(cli: Cli) -> i32 {
             detach,
             wait,
             timeout,
-        }) => up(services, detach, wait, timeout).await,
-        Some(Command::Start { service }) => start(service).await,
-        Some(Command::Stop { service }) => stop(service).await,
-        Some(Command::Restart { service }) => restart(service).await,
-        Some(Command::Url { service, open }) => url(service, open).await,
+        }) => up(focus_up_services(services), detach, wait, timeout).await,
+        Some(Command::Start { service }) => start(focus_name(&service)).await,
+        Some(Command::Stop { service }) => stop(focus_name(&service)).await,
+        Some(Command::Restart { service }) => restart(focus_name(&service)).await,
+        Some(Command::Url { service, open }) => url(focus_name(&service), open).await,
         Some(Command::Logs {
             service,
             follow,
             tail,
             since,
             json,
-        }) => logs(service, follow, tail, since, json).await,
+        }) => {
+            logs(
+                service.map(|service| focus_name(&service)),
+                follow,
+                tail,
+                since,
+                json,
+            )
+            .await
+        }
         Some(Command::Completions { shell }) => {
             print_completions(shell);
             Ok(())
         }
-        Some(Command::Doctor { name, tail }) => doctor(name, tail).await,
+        Some(Command::Doctor {
+            name,
+            tail,
+            full,
+            output,
+        }) => {
+            let output = if cli.json {
+                devme_cli::OutputFormat::Json
+            } else {
+                output
+            };
+            doctor(name.map(|name| focus_name(&name)), tail, full, output).await
+        }
         Some(Command::Config { action }) => config_cmd(action, cli.json),
         Some(Command::Worktree { action }) => worktree_cmd(action, cli.json).await,
         Some(Command::Remote { action }) => remote_cmd(action, cli.json, remote_flags),
@@ -205,42 +387,143 @@ async fn run(cli: Cli) -> i32 {
                 Err(e) => emit_command_error(output, &e),
             };
         }
-        Some(Command::Setup { write }) => setup_cmd(write),
+        Some(Command::Setup { action, write }) => setup_cmd(action, write),
     };
     match result {
         Ok(()) => 0,
-        Err(e) => {
-            devme_ui::error(e);
-            1
-        }
+        Err(e) => emit_command_error(error_output, &e),
     }
 }
 
-fn emit_command_error(format: devme_cli::OutputFormat, error: &anyhow::Error) -> i32 {
-    let message = error.to_string();
-    let (code, exit_code) = if error
-        .downcast_ref::<devme_cli::task::UnknownTask>()
-        .is_some()
-    {
-        ("not_found", 3)
+fn converge_task_steps(stack: &Stack, task: &str, cwd: &std::path::Path) -> anyhow::Result<()> {
+    let steps = devme_cli::task::steps_for(stack, task)?;
+    if steps.is_empty() {
+        return Ok(());
+    }
+    let keep = steps.into_iter().collect::<std::collections::HashSet<_>>();
+    let mut focused = stack.clone();
+    focused.step.retain(|name, _| keep.contains(name));
+    focused.task.clear();
+    focused.resource.clear();
+    focused.session.clear();
+    let mut stdin = std::io::BufReader::new(std::io::stdin());
+    run_preflight_quiet_aware(&focused, cwd, &mut stdin, interactive_input());
+    for name in keep {
+        let step = &stack.step[&name];
+        let status = std::process::Command::new("sh")
+            .args(["-c", &step.check])
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .with_context(|| format!("checking required step {name:?}"))?;
+        if !status.success() {
+            anyhow::bail!("required step {name:?} is not satisfied after convergence");
+        }
+    }
+    Ok(())
+}
+
+fn focus_name(name: &str) -> String {
+    PROJECT_WORKSPACE
+        .get()
+        .map_or_else(|| name.to_string(), |workspace| workspace.focus_name(name))
+}
+
+fn focus_names(names: Vec<String>) -> Vec<String> {
+    names.into_iter().map(|name| focus_name(&name)).collect()
+}
+
+fn focus_up_services(services: Vec<String>) -> Vec<String> {
+    if services.is_empty() {
+        PROJECT_WORKSPACE
+            .get()
+            .and_then(devme_config::ResolvedWorkspace::focus_services)
+            .unwrap_or_default()
     } else {
-        ("operation_failed", 1)
+        focus_names(services)
+    }
+}
+
+fn focused_task_view(stack: &Stack, list: bool) -> Stack {
+    if !list {
+        return stack.clone();
+    }
+    let Some(devme_config::Focus::Member(member)) =
+        PROJECT_WORKSPACE.get().map(|workspace| workspace.focus())
+    else {
+        return stack.clone();
     };
+    let prefix = format!("{member}::");
+    let mut view = stack.clone();
+    view.task.retain(|name, _| name.starts_with(&prefix));
+    view
+}
+
+fn focused_session_view(stack: &Stack) -> Stack {
+    let Some(devme_config::Focus::Member(member)) =
+        PROJECT_WORKSPACE.get().map(|workspace| workspace.focus())
+    else {
+        return stack.clone();
+    };
+    let prefix = format!("{member}::");
+    let mut view = stack.clone();
+    view.session.retain(|name, _| name.starts_with(&prefix));
+    view
+}
+
+fn emit_command_error(format: devme_cli::OutputFormat, error: &anyhow::Error) -> i32 {
+    let format = if format == devme_cli::OutputFormat::Human
+        && (NO_INPUT.load(Ordering::Relaxed) || !std::io::stdout().is_terminal())
+    {
+        devme_cli::OutputFormat::Toon
+    } else {
+        format
+    };
+    let message = error.to_string();
+    let (code, exit_code, help) =
+        if let Some(session) = error.downcast_ref::<devme_cli::session::SessionCommandError>() {
+            let code = match session.code {
+                devme_core::ErrorCode::Usage => "invalid_arguments",
+                devme_core::ErrorCode::NotFound => "not_found",
+                devme_core::ErrorCode::Permission => "permission_denied",
+                devme_core::ErrorCode::Conflict => "conflict",
+                devme_core::ErrorCode::Internal => "operation_failed",
+            };
+            (
+                code,
+                session.code.cli_exit_code(),
+                "Run `devme sessions` to inspect configured and live session state.",
+            )
+        } else if error
+            .downcast_ref::<devme_cli::task::UnknownTask>()
+            .is_some()
+        {
+            (
+                "not_found",
+                3,
+                "Run `devme tasks` to list tasks in the current directory scope.",
+            )
+        } else {
+            (
+                "operation_failed",
+                1,
+                "Inspect `devme doctor` or correct the named task/configuration.",
+            )
+        };
+    let report = serde_json::json!({
+        "schema_version": 1,
+        "error": {
+            "code": code,
+            "message": message,
+            "help": help,
+        }
+    });
     match format {
         devme_cli::OutputFormat::Human => devme_ui::error(&message),
-        devme_cli::OutputFormat::Json => devme_ui::json(&serde_json::json!({
-            "schema_version": 1,
-            "error": {
-                "code": code,
-                "message": message,
-                "help": "Inspect `devme doctor` or correct the named task/configuration.",
-            }
-        })),
-        devme_cli::OutputFormat::Toon => print!(
-            "error:\n  code: {code}\n  message: {}\n  help: {}",
-            toon_cli_string(&message),
-            toon_cli_string("Inspect `devme doctor` or correct the named task/configuration.")
-        ),
+        devme_cli::OutputFormat::Json => devme_ui::json(&report),
+        devme_cli::OutputFormat::Toon => devme_cli::output::print_toon(&report)
+            .expect("serializing a JSON error report as TOON cannot fail"),
     }
     exit_code
 }
@@ -257,18 +540,78 @@ fn toon_cli_string(value: &str) -> String {
     )
 }
 
-fn setup_cmd(write: bool) -> anyhow::Result<()> {
+fn parse_error_help(args: &[String]) -> String {
+    let mut command = Cli::command();
+    command.build();
+    let mut path = vec!["devme".to_string()];
+
+    for token in args.iter().filter(|token| !token.starts_with('-')) {
+        let Some(next) = command
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == token.as_str())
+            .cloned()
+        else {
+            break;
+        };
+        path.push(token.clone());
+        command = next;
+    }
+
+    let mut flags = command
+        .get_arguments()
+        .filter_map(|argument| argument.get_long().map(|name| format!("--{name}")))
+        .collect::<Vec<_>>();
+    flags.push("--help".to_string());
+    flags.sort();
+    flags.dedup();
+    let invocation = path.join(" ");
+    format!(
+        "Valid flags for `{invocation}`: {}. Run `{invocation} --help` for complete usage and examples.",
+        flags.join(", ")
+    )
+}
+
+fn setup_cmd(action: Option<devme_cli::SetupAction>, write: bool) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
-    let config = devme_cli::setup::detect(&cwd)?;
-    if write {
-        let path = cwd.join("devme.toml");
-        if path.exists() {
-            anyhow::bail!("{} already exists; refusing to overwrite", path.display());
+    match action {
+        None => {
+            let config = devme_cli::setup::detect(&cwd)?;
+            if write {
+                let path = cwd.join("devme.toml");
+                if path.exists() {
+                    anyhow::bail!("{} already exists; refusing to overwrite", path.display());
+                }
+                std::fs::write(&path, &config)?;
+                devme_ui::success(format!("wrote {}", path.display()));
+            } else {
+                print!("{config}");
+            }
         }
-        std::fs::write(&path, &config)?;
-        devme_ui::success(format!("wrote {}", path.display()));
-    } else {
-        print!("{config}");
+        Some(devme_cli::SetupAction::Split {
+            dry_run,
+            write: split_write,
+        }) => {
+            if write {
+                anyhow::bail!(
+                    "root --write cannot be combined with setup split; put --write after split"
+                );
+            }
+            let plan = devme_cli::setup::detect_split(&cwd)?;
+            if split_write {
+                for path in plan.write(&cwd)? {
+                    devme_ui::success(format!("wrote {}", path.display()));
+                }
+            } else {
+                debug_assert!(dry_run);
+                for file in plan.files {
+                    println!("==> {} <==", file.path.display());
+                    print!("{}", file.contents);
+                    if !file.contents.ends_with('\n') {
+                        println!();
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -286,7 +629,17 @@ async fn agent_cmd(action: devme_cli::AgentAction, json: bool) -> anyhow::Result
         AgentAction::Remove { target } => {
             emit_agent_integrations(devme_cli::agent::remove(&cwd, target)?, json)
         }
-        AgentAction::Context => agent_context(&cwd).await,
+        AgentAction::Context => {
+            agent_context(
+                &cwd,
+                if json {
+                    devme_cli::OutputFormat::Json
+                } else {
+                    devme_cli::OutputFormat::Toon
+                },
+            )
+            .await
+        }
     }
 }
 
@@ -310,19 +663,50 @@ fn emit_agent_integrations(rows: Vec<(String, &'static str)>, json: bool) -> any
     Ok(())
 }
 
-async fn agent_context(cwd: &std::path::Path) -> anyhow::Result<()> {
-    let stack = devme_cli::task::load(cwd)?;
-    let bin = std::env::current_exe()?
-        .display()
-        .to_string()
-        .replace(&std::env::var("HOME").unwrap_or_default(), "~");
-    let history = devme_cli::task::read_history(cwd, None, None)?;
+async fn agent_context(
+    cwd: &std::path::Path,
+    format: devme_cli::OutputFormat,
+) -> anyhow::Result<()> {
+    let resolved = PROJECT_WORKSPACE
+        .get()
+        .cloned()
+        .map(Ok)
+        .unwrap_or_else(|| devme_cli::task::resolve(cwd))?;
+    let stack = resolved.stack();
+    let focus = match resolved.focus() {
+        devme_config::Focus::Root => "root".to_string(),
+        devme_config::Focus::Member(member) => member.clone(),
+    };
+    let mut bin = std::env::current_exe()?.display().to_string();
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        bin = bin.replace(&home, "~");
+    }
+    let focused_task_names = match resolved.focus() {
+        devme_config::Focus::Root => stack.task.keys().cloned().collect(),
+        devme_config::Focus::Member(member) => {
+            let prefix = format!("{member}::");
+            stack
+                .task
+                .keys()
+                .filter(|name| name.starts_with(&prefix))
+                .cloned()
+                .collect()
+        }
+    };
+    let history = devme_cli::task::read_history(cwd, Some(&focused_task_names), None)?;
     let failed = history
         .iter()
         .rev()
         .filter(|run| run.exit_code != 0)
         .take(3)
         .collect::<Vec<_>>();
+    let focused_services = focused_runtime_stack(&resolved)
+        .service
+        .keys()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
     let mut services = Vec::new();
     if let Ok(sock) = devme_config::paths::supervisor_socket(cwd)
         && let Ok(mut client) = devme_client::Client::connect(&sock).await
@@ -332,18 +716,111 @@ async fn agent_context(cwd: &std::path::Path) -> anyhow::Result<()> {
             .request(ClientMessage::Subscribe { services: vec![] })
             .await
     {
-        services = snapshot;
+        services = snapshot
+            .into_iter()
+            .filter(|service| focused_services.contains(&service.name))
+            .collect();
     }
     let active = services
         .iter()
         .filter(|service| service.state.is_up())
         .count();
+    let focused_sessions = match resolved.focus() {
+        devme_config::Focus::Root => stack.session.keys().cloned().collect::<Vec<_>>(),
+        devme_config::Focus::Member(_) => resolved.focus_sessions(),
+    };
+    let mut live_sessions = std::collections::HashMap::new();
+    if let Ok(sock) = devme_config::paths::supervisor_socket(cwd)
+        && let Ok(mut client) = devme_client::Client::connect(&sock).await
+        && let Ok(ServerMessage::Sessions { sessions }) =
+            client.request(ClientMessage::ListSessions).await
+    {
+        live_sessions.extend(
+            sessions
+                .into_iter()
+                .map(|session| (session.name, session.state)),
+        );
+    }
+    let session_rows = focused_sessions
+        .iter()
+        .map(|name| {
+            let session = &stack.session[name];
+            let status = live_sessions
+                .get(name)
+                .map_or("stopped".to_string(), |state| {
+                    format!("{state:?}").to_ascii_lowercase()
+                });
+            (name, status, session.needs.len(), session.resources.len())
+        })
+        .collect::<Vec<_>>();
+    let live_session_count = session_rows
+        .iter()
+        .filter(|(_, status, _, _)| status != "stopped")
+        .count();
+    let resource_waiters = devme_cli::task::read_resource_waiters(Some(cwd))?
+        .into_iter()
+        .filter(|waiter| focused_task_names.contains(&waiter.task))
+        .collect::<Vec<_>>();
+    let commands: Vec<_> = devme_config::skill::AGENT_GUIDANCE
+        .lines()
+        .filter_map(|line| line.strip_prefix("- "))
+        .collect();
+
+    if format == devme_cli::OutputFormat::Json {
+        let failures = failed
+            .iter()
+            .map(|run| {
+                serde_json::json!({
+                    "task": run.task,
+                    "exit_code": run.exit_code,
+                    "finished_at": run.finished_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        let sessions = session_rows
+            .iter()
+            .map(|(name, status, needs, resources)| {
+                serde_json::json!({
+                    "name": name,
+                    "status": status,
+                    "services": needs,
+                    "resources": resources,
+                })
+            })
+            .collect::<Vec<_>>();
+        devme_ui::json(&serde_json::json!({
+            "schema_version": 1,
+            "bin": bin,
+            "description": "Orchestrate this directory's setup, services, tasks, resources, and diagnostics",
+            "focus": focus,
+            "state": {
+                "services_ready": active,
+                "services_total": services.len(),
+                "tasks": focused_task_names.len(),
+                "recent_failures": failed.len(),
+                "sessions_live": live_session_count,
+                "sessions_total": session_rows.len(),
+                "resource_waits": resource_waiters.len(),
+            },
+            "failures": failures,
+            "sessions": sessions,
+            "resource_waiters": resource_waiters,
+            "next_commands": commands,
+        }));
+        return Ok(());
+    }
     let mut out = format!(
-        "bin: {}\ndescription: Orchestrate this directory's setup, services, tasks, resources, and diagnostics\nstate:\n  services: {active}/{} ready\n  tasks: {} declared\n  recent_failures: {}",
+        "bin: {}\ndescription: {}\nfocus: {}\nstate:\n  services: {active}/{} ready\n  tasks: {} declared\n  recent_failures: {}\n  sessions: {live_session_count}/{} live\n  resource_waits: {}",
         toon_cli_string(&bin),
+        toon_cli_string(
+            "Orchestrate this directory's setup, services, tasks, resources, and diagnostics"
+        ),
+        toon_cli_string(&focus),
         services.len(),
-        stack.task.len(),
-        failed.len()
+        focused_task_names.len(),
+        failed.len(),
+        session_rows.len(),
+        resource_waiters.len(),
     );
     if !failed.is_empty() {
         out.push_str(&format!(
@@ -359,13 +836,37 @@ async fn agent_context(cwd: &std::path::Path) -> anyhow::Result<()> {
             ));
         }
     }
-    let commands: Vec<_> = devme_config::skill::AGENT_GUIDANCE
-        .lines()
-        .filter_map(|line| line.strip_prefix("- "))
-        .collect();
-    out.push_str(&format!("\nhelp[{}]:", commands.len()));
+    if !session_rows.is_empty() {
+        out.push_str(&format!(
+            "\nsessions[{}]{{name,status,services,resources}}:",
+            session_rows.len()
+        ));
+        for (name, status, needs, resources) in session_rows {
+            out.push_str(&format!(
+                "\n  {},{},{needs},{resources}",
+                toon_cli_string(name),
+                toon_cli_string(&status)
+            ));
+        }
+    }
+    if !resource_waiters.is_empty() {
+        out.push_str(&format!(
+            "\nresource_waiters[{}]{{task,resource,pid,waiting_since}}:",
+            resource_waiters.len()
+        ));
+        for waiter in resource_waiters {
+            out.push_str(&format!(
+                "\n  {},{},{},{}",
+                toon_cli_string(&waiter.task),
+                toon_cli_string(&waiter.resource),
+                waiter.pid,
+                waiter.waiting_since
+            ));
+        }
+    }
+    out.push_str(&format!("\nnext_commands[{}]:", commands.len()));
     for command in commands {
-        out.push_str(&format!("\n  - {command}"));
+        out.push_str(&format!("\n  - {}", toon_cli_string(command)));
     }
     print!("{out}");
     Ok(())
@@ -563,16 +1064,13 @@ async fn teardown_daemon(
 /// Cross-worktree status (`--all`): every worktree of the repo with its slot
 /// and each service's resolved port. Connects to each worktree's daemon
 /// read-only — never spawns one — so a stopped worktree just shows as such.
-async fn status_all(as_json: bool) -> anyhow::Result<()> {
+async fn status_all(output: devme_cli::OutputFormat) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let mut reports = devme_tui::worktree::gather_worktree_reports(&cwd).await;
     // Repo-scoped services are owned by the shared supervisor, not the
     // per-worktree daemons — overlay its snapshot so the shared column shows
     // a real state + port instead of whatever each instance last probed.
-    if let Some(stack) = std::fs::read_to_string(cwd.join("devme.toml"))
-        .ok()
-        .and_then(|t| Stack::parse(&t).ok())
-    {
+    if let Ok(stack) = devme_cli::task::load(&cwd) {
         for r in reports.iter_mut() {
             if let Some(services) = &mut r.services {
                 overlay_shared_services(services, &stack, &cwd).await;
@@ -584,23 +1082,35 @@ async fn status_all(as_json: bool) -> anyhow::Result<()> {
             devme_cli::resolve_service_urls(services, &devme_cli::remote::advertise_host());
         }
     }
-    if as_json {
-        let worktrees: Vec<serde_json::Value> = reports
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "label": r.label,
-                    "path": r.path.display().to_string(),
-                    "is_cwd": r.is_cwd,
-                    "slot": r.slot,
-                    "running": r.services.is_some(),
-                    "services": r.services,
-                })
-            })
-            .collect();
-        devme_ui::json(&serde_json::json!({ "worktrees": worktrees }));
-    } else {
+    if output == devme_cli::OutputFormat::Human {
         print!("{}", format_status_all(&reports, !no_color()));
+    } else {
+        let mut worktrees = Vec::with_capacity(reports.len());
+        for report in &reports {
+            let stack = devme_cli::task::load(&report.path).ok();
+            let sessions = query_live_sessions(&report.path).await;
+            let waiters =
+                devme_cli::task::read_resource_waiters(Some(&report.path)).unwrap_or_default();
+            worktrees.push(serde_json::json!({
+                "label": report.label,
+                "path": report.path.display().to_string(),
+                "is_cwd": report.is_cwd,
+                "slot": report.slot,
+                "running": report.services.is_some(),
+                "services": report.services,
+                "sessions": session_diagnostics(stack.as_ref(), &sessions),
+                "resource_waiters": waiters,
+            }));
+        }
+        let report = serde_json::json!({
+            "schema_version": 1,
+            "worktrees": worktrees,
+        });
+        match output {
+            devme_cli::OutputFormat::Json => devme_ui::json(&report),
+            devme_cli::OutputFormat::Toon => devme_cli::output::print_toon(&report)?,
+            devme_cli::OutputFormat::Human => unreachable!(),
+        }
     }
     Ok(())
 }
@@ -641,7 +1151,7 @@ async fn url(service: String, open: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn status(as_json: bool) -> anyhow::Result<()> {
+async fn status(output: devme_cli::OutputFormat) -> anyhow::Result<()> {
     let sock = socket_path();
     let cwd = std::env::current_dir()?;
     // Read-only query: like `logs`, skip the provisioning preflight so
@@ -654,9 +1164,7 @@ async fn status(as_json: bool) -> anyhow::Result<()> {
 
     // One stack parse serves both the step-check overlay and the
     // description annotations.
-    let stack = std::fs::read_to_string(cwd.join("devme.toml"))
-        .ok()
-        .and_then(|t| Stack::parse(&t).ok());
+    let stack = devme_cli::task::load(&cwd).ok();
 
     match reply {
         ServerMessage::Subscribed {
@@ -671,14 +1179,40 @@ async fn status(as_json: bool) -> anyhow::Result<()> {
             // Hand out ready-to-use URLs — agents reading `--json` shouldn't
             // have to resolve `{host}`/`{port}` templates themselves.
             devme_cli::resolve_service_urls(&mut services, &devme_cli::remote::advertise_host());
-            if as_json {
-                println!("{}", format_status_json(&services, &steps));
+            let sessions = query_live_sessions(&cwd).await;
+            let resource_waiters =
+                devme_cli::task::read_resource_waiters(Some(&cwd)).unwrap_or_default();
+            let mut report = format_status_json(&services, &steps);
+            report["sessions"] = serde_json::json!(session_diagnostics(stack.as_ref(), &sessions));
+            report["resource_waiters"] = serde_json::json!(resource_waiters);
+            if output == devme_cli::OutputFormat::Json {
+                devme_ui::json(&report);
+            } else if output == devme_cli::OutputFormat::Toon {
+                devme_cli::output::print_toon(&report)?;
             } else {
                 let descriptions = stack.as_ref().map(node_descriptions).unwrap_or_default();
                 print!(
                     "{}",
                     format_status_text(&services, &steps, &descriptions, !no_color())
                 );
+                if !sessions.is_empty() {
+                    println!("sessions:");
+                    for session in &sessions {
+                        println!(
+                            "  {:<20} {:?} ({} client{})",
+                            session.name,
+                            session.state,
+                            session.clients,
+                            if session.clients == 1 { "" } else { "s" }
+                        );
+                    }
+                }
+                if !resource_waiters.is_empty() {
+                    println!("resource waiters:");
+                    for waiter in &resource_waiters {
+                        println!("  {} waiting for {}", waiter.task, waiter.resource);
+                    }
+                }
             }
             Ok(())
         }
@@ -686,6 +1220,41 @@ async fn status(as_json: bool) -> anyhow::Result<()> {
             "daemon replied with unexpected message: {other:?}"
         )),
     }
+}
+
+async fn query_live_sessions(root: &std::path::Path) -> Vec<devme_core::SessionSnapshot> {
+    let Ok(socket) = devme_config::paths::supervisor_socket(root) else {
+        return Vec::new();
+    };
+    let Ok(mut client) = devme_client::Client::connect(&socket).await else {
+        return Vec::new();
+    };
+    match client.request(ClientMessage::ListSessions).await {
+        Ok(ServerMessage::Sessions { sessions }) => sessions,
+        _ => Vec::new(),
+    }
+}
+
+fn session_diagnostics(
+    stack: Option<&Stack>,
+    sessions: &[devme_core::SessionSnapshot],
+) -> Vec<serde_json::Value> {
+    sessions
+        .iter()
+        .map(|session| {
+            let resources = stack
+                .and_then(|stack| stack.session.get(&session.name))
+                .map(|configured| configured.resources.clone())
+                .unwrap_or_default();
+            serde_json::json!({
+                "name": session.name,
+                "state": session.state,
+                "clients": session.clients,
+                "services": session.services,
+                "resources": resources,
+            })
+        })
+        .collect()
 }
 
 /// Overlay repo-scoped (`scope = "repo"`) services with the shared
@@ -789,17 +1358,20 @@ fn overlay_step_checks(
     }
 }
 
-async fn up(_services: Vec<String>, detach: bool, wait: bool, timeout: u64) -> anyhow::Result<()> {
-    // `services` is ignored for v1; the daemon advances the whole graph and
-    // the executor decides what's eligible. Per-service Up filtering would
-    // need a new executor entry point.
-    //
+async fn up(services: Vec<String>, detach: bool, wait: bool, timeout: u64) -> anyhow::Result<()> {
     // Foreground semantics (default): stream every service's log lines with a
     // name prefix in distinct colours until Ctrl-C, which tears the daemon
     // down rather than detaching.
     //
     // Detached (`-d`): kick the graph and exit, leaving the daemon running.
     let sock = socket_path();
+    let cwd = std::env::current_dir()?;
+    let stack = devme_cli::task::load(&cwd)?;
+    let selected = if services.is_empty() {
+        stack.service.keys().cloned().collect::<Vec<_>>()
+    } else {
+        required_service_closure(&stack, &services)
+    };
     // Repo-scoped services (scope = "repo") are owned by the shared
     // supervisor, not this instance daemon — which now treats them as
     // external and only health-checks them. So `up` must make sure the
@@ -807,18 +1379,27 @@ async fn up(_services: Vec<String>, detach: bool, wait: bool, timeout: u64) -> a
     // their dependents wait forever. Non-fatal: a stack with no repo-scoped
     // services simply has no shared daemon to start. The TUI does the same
     // (see tui::worktree).
-    if let Ok(cwd) = std::env::current_dir()
-        && let Err(e) = ensure_shared_daemon(&cwd).await
+    if selected.iter().any(|name| {
+        stack
+            .service
+            .get(name)
+            .is_some_and(|service| service.scope == devme_core::Scope::Repo)
+    }) && let Err(e) = ensure_shared_daemon(&cwd).await
     {
         devme_ui::warn(format!("shared supervisor not started: {e}"));
     }
     let fresh_daemon = ensure_daemon(&sock).await?;
     let mut client = devme_client::Client::connect(&sock).await?;
     client
-        .send(ClientMessage::Subscribe { services: vec![] })
+        .send(ClientMessage::Subscribe {
+            services: selected.clone(),
+        })
         .await?;
-    let snapshot = match client.next_event().await? {
-        Some(ServerMessage::Subscribed { services, .. }) => services,
+    let snapshot: Vec<devme_core::ServiceSnapshot> = match client.next_event().await? {
+        Some(ServerMessage::Subscribed { services, .. }) => services
+            .into_iter()
+            .filter(|service| selected.contains(&service.name))
+            .collect(),
         Some(other) => {
             return Err(anyhow::anyhow!("unexpected initial reply: {other:?}"));
         }
@@ -832,12 +1413,18 @@ async fn up(_services: Vec<String>, detach: bool, wait: bool, timeout: u64) -> a
     // Start is idempotent; safe to send even when re-entering — already-
     // Running services stay Running, services explicitly Stopped this
     // session stay Stopped.
-    client
-        .send(ClientMessage::Start {
-            service: String::new(),
-            skip_deps: false,
-        })
-        .await?;
+    if services.is_empty() {
+        client
+            .send(ClientMessage::Start {
+                service: String::new(),
+                skip_deps: false,
+            })
+            .await?;
+    } else {
+        client
+            .send(ClientMessage::StartTargets { services })
+            .await?;
+    }
 
     if detach {
         if wait {
@@ -961,6 +1548,11 @@ async fn ensure_task_services(
     services: &[String],
     timeout_secs: u64,
 ) -> anyhow::Result<()> {
+    let wait_started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let wait_started = std::time::Instant::now();
     let cwd = std::env::current_dir()?;
     let closure = required_service_closure(stack, services);
     if closure.iter().any(|name| {
@@ -989,6 +1581,22 @@ async fn ensure_task_services(
             .collect(),
         other => anyhow::bail!("unexpected supervisor reply: {other:?}"),
     };
+    let started_here = states
+        .iter()
+        .filter_map(|(name, state)| matches!(state, ServiceState::Stopped).then_some(name.clone()))
+        .collect::<std::collections::HashSet<_>>();
+    let preexisting_targets = states
+        .iter()
+        .filter_map(|(name, state)| {
+            (!matches!(
+                state,
+                ServiceState::Stopped
+                    | ServiceState::Failed { .. }
+                    | ServiceState::CrashLoop { .. }
+            ))
+            .then_some(name.clone())
+        })
+        .collect::<Vec<_>>();
     client
         .send(ClientMessage::StartTargets {
             services: services.to_vec(),
@@ -999,11 +1607,17 @@ async fn ensure_task_services(
         std::collections::HashMap::new();
     let mut omitted_attempts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    if let Some(error) = terminal_task_service_error(stack, &closure, &states, &attempts) {
+        stop_task_started_services(&mut client, &closure, &started_here, &preexisting_targets)
+            .await;
+        return Err(error);
+    }
     loop {
         if services
             .iter()
             .all(|name| states.get(name).is_some_and(ServiceState::is_up))
         {
+            restore_task_service_targets(&mut client, &closure, &preexisting_targets).await;
             return Ok(());
         }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -1044,15 +1658,53 @@ async fn ensure_task_services(
             )
         };
         if remaining.is_zero() {
-            return Err(timeout_error());
+            let error = timeout_error();
+            stop_task_started_services(&mut client, &closure, &started_here, &preexisting_targets)
+                .await;
+            return Err(error);
         }
-        let event = match tokio::time::timeout(remaining, client.next_event()).await {
-            Ok(event) => event?,
-            Err(_) => return Err(timeout_error()),
+        let event = tokio::select! {
+            event = tokio::time::timeout(remaining, client.next_event()) => match event {
+                Ok(event) => event?,
+                Err(_) => {
+                    let error = timeout_error();
+                    stop_task_started_services(
+                        &mut client,
+                        &closure,
+                        &started_here,
+                        &preexisting_targets,
+                    ).await;
+                    return Err(error);
+                }
+            },
+            _ = tokio::signal::ctrl_c() => {
+                stop_task_started_services(
+                    &mut client,
+                    &closure,
+                    &started_here,
+                    &preexisting_targets,
+                ).await;
+                return Err(TaskReadinessCancelled {
+                    started_at: wait_started_at,
+                    duration_ms: wait_started.elapsed().as_millis() as u64,
+                }.into());
+            }
         };
         match event {
             Some(ServerMessage::StatusUpdate { service, state, .. }) => {
                 states.insert(service, state);
+                if let Some(error) =
+                    terminal_task_service_error(stack, &closure, &states, &attempts)
+                {
+                    stop_task_started_services(
+                        &mut client,
+                        &closure,
+                        &started_here,
+                        &preexisting_targets,
+                    )
+                    .await;
+                    return Err(error);
+                }
             }
             Some(ServerMessage::Readiness {
                 service,
@@ -1067,11 +1719,138 @@ async fn ensure_task_services(
                 }
                 service_attempts.push((attempt, error));
             }
-            Some(ServerMessage::Error { message, .. }) => anyhow::bail!("{message}"),
+            Some(ServerMessage::Error { message, .. }) => {
+                stop_task_started_services(
+                    &mut client,
+                    &closure,
+                    &started_here,
+                    &preexisting_targets,
+                )
+                .await;
+                anyhow::bail!("{message}");
+            }
             Some(_) => {}
             None => anyhow::bail!("supervisor stopped while waiting for readiness"),
         }
     }
+}
+
+#[derive(Debug)]
+struct TaskReadinessCancelled {
+    started_at: u64,
+    duration_ms: u64,
+}
+
+impl std::fmt::Display for TaskReadinessCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("task cancelled while waiting for required service readiness")
+    }
+}
+
+impl std::error::Error for TaskReadinessCancelled {}
+
+fn terminal_task_service_error(
+    stack: &Stack,
+    closure: &[String],
+    states: &std::collections::HashMap<String, ServiceState>,
+    attempts: &std::collections::HashMap<String, Vec<(u32, String)>>,
+) -> Option<anyhow::Error> {
+    closure.iter().find_map(|name| {
+        let state = states.get(name)?;
+        let failure = match state {
+            ServiceState::Failed { exit_code } => match exit_code {
+                Some(code) => format!("process exited with code {code}"),
+                None => "process was terminated by a signal".to_string(),
+            },
+            ServiceState::CrashLoop {
+                restart_count,
+                reason,
+            } => format!(
+                "entered a crash loop after {restart_count} restarts{}",
+                reason
+                    .as_deref()
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            ),
+            _ => return None,
+        };
+        let readiness = stack
+            .service
+            .get(name)
+            .and_then(|service| service.readiness.clone())
+            .unwrap_or_default();
+        let probe = attempts
+            .get(name)
+            .and_then(|items| items.last())
+            .map(|(attempt, error)| format!("; probe attempt {attempt}: {error}"))
+            .unwrap_or_default();
+        Some(anyhow::anyhow!(
+            "required service {name:?} failed before it became ready: {failure}{probe} (interval_ms={}, timeout_ms={}, retries={}); run `devme doctor {name}` and `devme logs {name}`",
+            readiness.interval_ms,
+            readiness.timeout_ms,
+            readiness.retries
+        ))
+    })
+}
+
+async fn stop_task_started_services(
+    client: &mut devme_client::Client,
+    closure: &[String],
+    started_here: &std::collections::HashSet<String>,
+    preexisting_targets: &[String],
+) {
+    let mut pending = closure
+        .iter()
+        .filter(|name| started_here.contains(*name))
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    for service in closure.iter().rev().filter(|name| pending.contains(*name)) {
+        if client
+            .send(ClientMessage::Stop {
+                service: service.clone(),
+            })
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !pending.is_empty() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, client.next_event()).await {
+            Ok(Ok(Some(ServerMessage::StatusUpdate {
+                service,
+                state: ServiceState::Stopped,
+                ..
+            }))) => {
+                pending.remove(&service);
+            }
+            Ok(Ok(Some(_))) => {}
+            _ => break,
+        }
+    }
+    restore_task_service_targets(client, &[], preexisting_targets).await;
+}
+
+async fn restore_task_service_targets(
+    client: &mut devme_client::Client,
+    closure: &[String],
+    preexisting_targets: &[String],
+) {
+    if preexisting_targets.is_empty() {
+        return;
+    }
+    let mut targets = closure.to_vec();
+    targets.extend_from_slice(preexisting_targets);
+    targets.sort();
+    targets.dedup();
+    let _ = client
+        .send(ClientMessage::StartTargets { services: targets })
+        .await;
 }
 
 fn required_service_closure(stack: &Stack, targets: &[String]) -> Vec<String> {
@@ -1249,9 +2028,7 @@ async fn logs(
     let tail_opt = if tail == 0 { None } else { Some(tail) };
 
     let cwd = std::env::current_dir()?;
-    let stack = std::fs::read_to_string(cwd.join("devme.toml"))
-        .ok()
-        .and_then(|text| Stack::parse(&text).ok());
+    let stack = devme_cli::task::load(&cwd).ok();
     if service.as_ref().is_some_and(|name| {
         stack
             .as_ref()
@@ -1277,19 +2054,17 @@ async fn logs(
         return Ok(());
     }
 
-    // Routing: a *named* repo-scoped service is owned by the shared supervisor
+    // Routing: a named repo-scoped service is owned by the shared supervisor
     // (the instance daemon only health-checks it and holds no log buffer), so
-    // route there. The instance daemon owns everything else and the
-    // all-services view. (A repo service still needs to be named explicitly to
-    // appear; the all-services view shows the instance daemon's services.)
+    // route there. An all-source query fans in both supervisors below.
     let is_repo_scoped = match &service {
-        Some(name) => std::fs::read_to_string(cwd.join("devme.toml"))
-            .ok()
-            .and_then(|t| Stack::parse(&t).ok())
-            .and_then(|s| {
-                s.service
+        Some(name) => stack
+            .as_ref()
+            .and_then(|stack| {
+                stack
+                    .service
                     .get(name)
-                    .map(|svc| svc.scope == devme_core::Scope::Repo)
+                    .map(|service| service.scope == devme_core::Scope::Repo)
             })
             .unwrap_or(false),
         None => false,
@@ -1379,6 +2154,7 @@ async fn logs(
                             ts,
                             stream,
                             text: strip_ansi(line.trim_end_matches('\r')),
+                            origin: LogOrigin::Instance,
                         });
                     }
                 }
@@ -1394,9 +2170,77 @@ async fn logs(
         }
     }
 
+    let mut shared_client = None;
+    if service.is_none()
+        && stack.as_ref().is_some_and(|stack| {
+            stack
+                .service
+                .values()
+                .any(|service| service.scope == devme_core::Scope::Repo)
+        })
+    {
+        let shared_sock = devme_config::paths::shared_socket(&cwd)?;
+        // Starting the instance daemon above also starts the shared owner, but
+        // explicitly converge it here so a transient startup race cannot make
+        // an all-source read silently omit repo-scoped history.
+        ensure_shared_daemon(&cwd).await?;
+        let mut shared = devme_client::Client::connect(&shared_sock).await?;
+        let shared_snap = shared
+            .request(ClientMessage::LogQuery {
+                services: vec![],
+                since: since_ms,
+                // Tail applies to the combined stream, not independently to
+                // each supervisor.
+                tail: None,
+                follow,
+            })
+            .await?;
+        let shared_names = match shared_snap {
+            ServerMessage::Subscribed { services, .. } => services
+                .into_iter()
+                .map(|service| service.name)
+                .collect::<std::collections::HashSet<_>>(),
+            other => {
+                return Err(anyhow::anyhow!(
+                    "shared daemon replied with unexpected message: {other:?}"
+                ));
+            }
+        };
+        loop {
+            match tokio::time::timeout(drain_max, shared.next_event()).await {
+                Ok(Ok(Some(ServerMessage::LogChunk {
+                    service: source,
+                    bytes,
+                    ts,
+                    stream,
+                }))) if shared_names.contains(&source) => {
+                    if let Some(text) = decode_log(&bytes) {
+                        for line in text.lines().filter(|line| !line.is_empty()) {
+                            replay.push(CorrelatedLine {
+                                source: source.clone(),
+                                ts,
+                                stream,
+                                text: strip_ansi(line.trim_end_matches('\r')),
+                                origin: LogOrigin::Shared,
+                            });
+                        }
+                    }
+                }
+                Ok(Ok(Some(ServerMessage::LogEnd {}))) => break,
+                Ok(Ok(Some(ServerMessage::Notice { message, .. }))) => {
+                    devme_ui::info(message);
+                }
+                Ok(Ok(Some(_))) => {}
+                Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        shared_client = Some((shared, shared_names));
+    }
+
     if service.is_none() {
         replay.extend(task_history_lines(&cwd, None, since_ms)?);
         replay.sort_by_key(|line| line.ts);
+        deduplicate_cross_supervisor_lines(&mut replay);
         if tail > 0 && replay.len() > tail {
             replay.drain(0..replay.len() - tail);
         }
@@ -1421,16 +2265,41 @@ async fn logs(
     }
     let interrupt = tokio::signal::ctrl_c();
     let mut pinned_interrupt = std::pin::pin!(interrupt);
+    let mut instance_live = true;
     loop {
         tokio::select! {
             _ = &mut pinned_interrupt => return Ok(()),
-            msg = client.next_event() => match msg? {
+            msg = client.next_event(), if instance_live => match msg? {
                 Some(ServerMessage::LogChunk { service: s, bytes, ts, stream }) if want(&s) => {
                     emit_log(&s, ts, stream, &bytes, json);
                 }
-                Some(ServerMessage::Goodbye { .. }) | None => return Ok(()),
+                Some(ServerMessage::Goodbye { .. }) | None => {
+                    instance_live = false;
+                    if shared_client.is_none() {
+                        return Ok(());
+                    }
+                }
                 _ => {}
-            }
+            },
+            msg = async {
+                let (client, _) = shared_client.as_mut().expect("guarded by select condition");
+                client.next_event().await
+            }, if shared_client.is_some() => match msg? {
+                Some(ServerMessage::LogChunk { service: source, bytes, ts, stream })
+                    if shared_client
+                        .as_ref()
+                        .is_some_and(|(_, names)| names.contains(&source)) =>
+                {
+                    emit_log(&source, ts, stream, &bytes, json);
+                }
+                Some(ServerMessage::Goodbye { .. }) | None => {
+                    shared_client = None;
+                    if !instance_live {
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            },
         }
     }
 }
@@ -1450,12 +2319,39 @@ fn emit_log(service: &str, ts: u64, stream: devme_core::LogStream, bytes: &str, 
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogOrigin {
+    Instance,
+    Shared,
+    Task,
+}
+
 #[derive(Clone)]
 struct CorrelatedLine {
     source: String,
     ts: u64,
     stream: devme_core::LogStream,
     text: String,
+    origin: LogOrigin,
+}
+
+/// Remove the same logical record when it was returned by both supervisors,
+/// while preserving legitimate repeated lines produced by one source.
+fn deduplicate_cross_supervisor_lines(lines: &mut Vec<CorrelatedLine>) {
+    use std::collections::HashMap;
+
+    let mut origins = HashMap::new();
+    lines.retain(|line| {
+        let key = (line.ts, line.source.clone(), line.stream, line.text.clone());
+        match origins.get(&key) {
+            Some(origin) if *origin != line.origin => false,
+            Some(_) => true,
+            None => {
+                origins.insert(key, line.origin);
+                true
+            }
+        }
+    });
 }
 
 fn decode_log(bytes: &str) -> Option<String> {
@@ -1496,12 +2392,29 @@ fn task_history_lines(
 ) -> anyhow::Result<Vec<CorrelatedLine>> {
     let mut lines = Vec::new();
     for result in devme_cli::task::read_history(cwd, names, since)? {
+        if !result.output_events.is_empty() {
+            for event in result.output_events {
+                for text in event.text.lines() {
+                    lines.push(CorrelatedLine {
+                        source: format!("task:{}", result.task),
+                        ts: event.ts,
+                        stream: event.stream,
+                        text: text.into(),
+                        origin: LogOrigin::Task,
+                    });
+                }
+            }
+            continue;
+        }
+        // Compatibility with task history written before per-line timestamps
+        // were added. Those records only identify the task completion time.
         for text in result.stdout.lines() {
             lines.push(CorrelatedLine {
                 source: format!("task:{}", result.task),
                 ts: result.finished_at,
                 stream: devme_core::LogStream::Stdout,
                 text: text.into(),
+                origin: LogOrigin::Task,
             });
         }
         for text in result.stderr.lines() {
@@ -1510,6 +2423,7 @@ fn task_history_lines(
                 ts: result.finished_at,
                 stream: devme_core::LogStream::Stderr,
                 text: text.into(),
+                origin: LogOrigin::Task,
             });
         }
     }
@@ -1579,7 +2493,86 @@ fn strip_ansi(s: &str) -> String {
 /// One captured log line for `doctor`: (ts, stream, text).
 type DoctorLine = (u64, devme_core::LogStream, String);
 
-async fn doctor(name: Option<String>, tail: usize) -> anyhow::Result<()> {
+struct DoctorReplay {
+    services: Vec<devme_core::ServiceSnapshot>,
+    steps: Vec<devme_core::StepSnapshot>,
+    logs: std::collections::HashMap<String, Vec<DoctorLine>>,
+}
+
+async fn doctor_replay(
+    client: &mut devme_client::Client,
+    names: Vec<String>,
+) -> anyhow::Result<DoctorReplay> {
+    let snapshot = client
+        .request(ClientMessage::LogQuery {
+            services: names,
+            since: None,
+            tail: None,
+            follow: false,
+        })
+        .await?;
+    let (services, steps) = match snapshot {
+        ServerMessage::Subscribed {
+            services, steps, ..
+        } => (services, steps),
+        other => {
+            return Err(anyhow::anyhow!(
+                "daemon replied with unexpected message: {other:?}"
+            ));
+        }
+    };
+
+    let mut logs: std::collections::HashMap<String, Vec<DoctorLine>> =
+        std::collections::HashMap::new();
+    let drain_max = std::time::Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout(drain_max, client.next_event()).await {
+            Ok(Ok(Some(ServerMessage::LogChunk {
+                service,
+                bytes,
+                ts,
+                stream,
+            }))) => {
+                if let Some(text) = decode_log(&bytes) {
+                    let buffer = logs.entry(service).or_default();
+                    for line in text.lines().filter(|line| !line.is_empty()) {
+                        buffer.push((ts, stream, strip_ansi(line.trim_end_matches('\r'))));
+                    }
+                }
+            }
+            Ok(Ok(Some(ServerMessage::LogEnd {}))) => break,
+            Ok(Ok(Some(ServerMessage::Notice { message, .. }))) => devme_ui::info(message),
+            Ok(Ok(Some(_))) => {}
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    Ok(DoctorReplay {
+        services,
+        steps,
+        logs,
+    })
+}
+
+fn merge_doctor_logs(
+    target: &mut std::collections::HashMap<String, Vec<DoctorLine>>,
+    incoming: std::collections::HashMap<String, Vec<DoctorLine>>,
+) {
+    for (source, mut lines) in incoming {
+        target.entry(source).or_default().append(&mut lines);
+    }
+    for lines in target.values_mut() {
+        lines.sort_by_key(|(ts, _, _)| *ts);
+        let mut seen = std::collections::HashSet::new();
+        lines.retain(|line| seen.insert(line.clone()));
+    }
+}
+
+async fn doctor(
+    name: Option<String>,
+    tail: usize,
+    full: bool,
+    output: devme_cli::OutputFormat,
+) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let stack = devme_cli::task::load(&cwd).ok();
     if let Some(task_name) = name.as_ref().filter(|name| {
@@ -1590,10 +2583,37 @@ async fn doctor(name: Option<String>, tail: usize) -> anyhow::Result<()> {
         let names = [task_name.clone()].into_iter().collect();
         let history = devme_cli::task::read_history(&cwd, Some(&names), None)?;
         let latest = history.last();
-        devme_ui::json(&serde_json::json!({
-            "name": task_name, "kind": "task", "runs": history.len(),
-            "latest": latest, "status": latest.map(|run| run.status.as_str()).unwrap_or("never_run")
-        }));
+        let status = latest.map(|run| run.status.as_str()).unwrap_or("never_run");
+        let latest_value = if full {
+            serde_json::to_value(latest)?
+        } else {
+            latest.map_or(serde_json::Value::Null, |run| {
+                serde_json::json!({
+                    "started_at": run.started_at,
+                    "finished_at": run.finished_at,
+                    "duration_ms": run.duration_ms,
+                    "exit_code": run.exit_code,
+                    "timed_out": run.timed_out,
+                    "cancelled": run.cancelled,
+                    "truncated": run.truncated,
+                    "recent_error": run.stderr.lines().last(),
+                })
+            })
+        };
+        let waiters = devme_cli::task::read_resource_waiters(Some(&cwd))?
+            .into_iter()
+            .filter(|waiter| waiter.task == task_name.as_str())
+            .collect::<Vec<_>>();
+        emit_doctor_report(
+            &serde_json::json!({
+                "schema_version": 1,
+                "name": task_name, "kind": "task", "runs": history.len(),
+                "latest": latest_value, "status": status,
+                "resource_waiters": waiters,
+                "help": if full { serde_json::Value::Null } else { serde_json::json!(format!("Run `devme doctor {task_name} --full` for bounded stdout and stderr")) },
+            }),
+            output,
+        )?;
         return Ok(());
     }
     if let (Some(node), Some(stack)) = (&name, &stack)
@@ -1604,103 +2624,91 @@ async fn doctor(name: Option<String>, tail: usize) -> anyhow::Result<()> {
     }
     let task_history = devme_cli::task::read_history(&cwd, None, None)?;
     let task_digest = latest_task_digest(&task_history);
-    let sock = socket_path();
-    let mut client = match devme_client::Client::connect(&sock).await {
-        Ok(c) => c,
-        Err(_) => {
-            let report = serde_json::json!({
-                "status": "no_daemon",
-                "message": "no devme daemon running — start one with `devme up -d`",
-                "services": [],
-                "steps": [],
-                "tasks": task_digest,
-            });
-            devme_ui::json(&report);
-            return Ok(());
-        }
-    };
-
-    // One LogQuery serves both modes. It replays the *disk* history tier, so
-    // the diagnosis survives ring eviction and daemon restarts — a service
-    // that crashed an hour ago still has its dying stderr here. Explicit
-    // names also reach step output (which `logs` deliberately refuses).
-    client
-        .send(ClientMessage::LogQuery {
-            services: name.clone().map(|n| vec![n]).unwrap_or_default(),
-            since: None,
-            tail: None,
-            follow: false,
+    let sessions = query_live_sessions(&cwd).await;
+    let session_digest = session_diagnostics(stack.as_ref(), &sessions);
+    let resource_waiters = devme_cli::task::read_resource_waiters(Some(&cwd))?;
+    let repo_target = name.as_ref().is_some_and(|node| {
+        stack.as_ref().is_some_and(|stack| {
+            stack
+                .service
+                .get(node)
+                .is_some_and(|service| service.scope == devme_core::Scope::Repo)
         })
-        .await?;
-    let (services, steps) = match client.next_event().await? {
-        Some(ServerMessage::Subscribed {
-            services, steps, ..
-        }) => (services, steps),
-        _ => return Err(anyhow::anyhow!("unexpected reply from daemon")),
-    };
+    });
+    let has_repo_services = stack.as_ref().is_some_and(|stack| {
+        stack
+            .service
+            .values()
+            .any(|service| service.scope == devme_core::Scope::Repo)
+    });
 
-    // Validate the zoom target before draining, so a typo fails fast.
-    if let Some(n) = &name
-        && !services.iter().any(|s| &s.name == n)
-        && !steps.iter().any(|s| &s.name == n)
+    let mut services = Vec::new();
+    let mut steps = Vec::new();
+    let mut all_logs = std::collections::HashMap::new();
+    let mut connected = false;
+
+    if let Ok(mut client) = devme_client::Client::connect(&socket_path()).await {
+        connected = true;
+        let mut replay = doctor_replay(
+            &mut client,
+            name.clone().map(|node| vec![node]).unwrap_or_default(),
+        )
+        .await?;
+        services.append(&mut replay.services);
+        steps.append(&mut replay.steps);
+        merge_doctor_logs(&mut all_logs, replay.logs);
+
+        // An empty-names query covers services only. Ask for each step so a
+        // failed check's output is included in the no-argument digest.
+        if name.is_none() && !steps.is_empty() {
+            let step_names = steps.iter().map(|step| step.name.clone()).collect();
+            let replay = doctor_replay(&mut client, step_names).await?;
+            merge_doctor_logs(&mut all_logs, replay.logs);
+        }
+    }
+
+    if (repo_target || name.is_none() && has_repo_services)
+        && let Ok(shared_sock) = devme_config::paths::shared_socket(&cwd)
+        && let Ok(mut shared) = devme_client::Client::connect(&shared_sock).await
+    {
+        connected = true;
+        let mut replay = doctor_replay(
+            &mut shared,
+            name.clone().map(|node| vec![node]).unwrap_or_default(),
+        )
+        .await?;
+        let shared_names = replay
+            .services
+            .iter()
+            .map(|service| service.name.clone())
+            .collect::<std::collections::HashSet<_>>();
+        services.retain(|service| !shared_names.contains(&service.name));
+        services.append(&mut replay.services);
+        merge_doctor_logs(&mut all_logs, replay.logs);
+    }
+
+    if !connected {
+        let report = serde_json::json!({
+            "schema_version": 1,
+            "status": "no_daemon",
+            "message": "no devme daemon running - start one with `devme up -d`",
+            "services": [],
+            "steps": [],
+            "tasks": task_digest,
+            "sessions": session_digest,
+            "resource_waiters": resource_waiters,
+        });
+        emit_doctor_report(&report, output)?;
+        return Ok(());
+    }
+
+    if let Some(node) = &name
+        && !services.iter().any(|service| &service.name == node)
+        && !steps.iter().any(|step| &step.name == node)
     {
         return Err(anyhow::anyhow!(
-            "no service or step named {n:?} in devme.toml"
+            "no service or step named {node:?} in devme.toml"
         ));
-    }
-
-    // The empty-names query covers services only; step output must be asked
-    // for by name. For the no-arg digest, issue a second query naming the
-    // steps so failed checks come back with their output.
-    if name.is_none() && !steps.is_empty() {
-        client
-            .send(ClientMessage::LogQuery {
-                services: steps.iter().map(|s| s.name.clone()).collect(),
-                since: None,
-                tail: None,
-                follow: false,
-            })
-            .await?;
-    }
-
-    let mut log_ends_expected = if name.is_none() && !steps.is_empty() {
-        2
-    } else {
-        1
-    };
-    let drain_max = std::time::Duration::from_secs(10);
-    let mut all_logs: std::collections::HashMap<String, Vec<DoctorLine>> =
-        std::collections::HashMap::new();
-    loop {
-        match tokio::time::timeout(drain_max, client.next_event()).await {
-            Ok(Ok(Some(ServerMessage::LogChunk {
-                service,
-                bytes,
-                ts,
-                stream,
-            }))) => {
-                if let Ok(decoded) =
-                    base64::engine::general_purpose::STANDARD.decode(bytes.as_bytes())
-                    && let Ok(text) = String::from_utf8(decoded)
-                {
-                    let buf = all_logs.entry(service).or_default();
-                    for line in text.split('\n') {
-                        let line = line.trim_end_matches('\r');
-                        if !line.is_empty() {
-                            buf.push((ts, stream, strip_ansi(line)));
-                        }
-                    }
-                }
-            }
-            Ok(Ok(Some(ServerMessage::LogEnd {}))) => {
-                log_ends_expected -= 1;
-                if log_ends_expected == 0 {
-                    break;
-                }
-            }
-            Ok(Ok(Some(_))) => {}
-            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
-        }
     }
 
     // The last N lines of `lines`, formatted as `[stream] text` so an agent
@@ -1720,18 +2728,33 @@ async fn doctor(name: Option<String>, tail: usize) -> anyhow::Result<()> {
             })
             .collect()
     };
+    let fmt_events = |lines: &[DoctorLine], tail: usize| -> Vec<serde_json::Value> {
+        let skip = if tail == 0 {
+            0
+        } else {
+            lines.len().saturating_sub(tail)
+        };
+        lines[skip..]
+            .iter()
+            .map(|(ts, stream, text)| serde_json::json!({"ts": ts, "stream": stream, "text": text}))
+            .collect()
+    };
 
     // Zoom mode: everything devme knows about one node, inline.
     if let Some(n) = name {
         let lines = all_logs.remove(&n).unwrap_or_default();
         let report = if let Some(s) = steps.iter().find(|s| s.name == n) {
             serde_json::json!({
+                "schema_version": 1,
                 "name": n,
                 "kind": "step",
                 "state": format!("{:?}", s.state),
                 // A step's full check/provision output — this is the only
                 // place it surfaces (it is not a runtime log stream).
                 "output": fmt_tail(&lines, tail),
+                "output_events": fmt_events(&lines, tail),
+                "sessions": session_digest,
+                "resource_waiters": resource_waiters,
             })
         } else {
             let s = services
@@ -1744,6 +2767,7 @@ async fn doctor(name: Option<String>, tail: usize) -> anyhow::Result<()> {
                 .cloned()
                 .collect();
             serde_json::json!({
+                "schema_version": 1,
                 "name": n,
                 "kind": "service",
                 "state": format!("{:?}", s.state),
@@ -1753,9 +2777,13 @@ async fn doctor(name: Option<String>, tail: usize) -> anyhow::Result<()> {
                 "readiness": s.readiness,
                 "recent_errors": fmt_tail(&errors, tail),
                 "recent_logs": fmt_tail(&lines, tail),
+                "recent_error_events": fmt_events(&errors, tail),
+                "recent_log_events": fmt_events(&lines, tail),
+                "sessions": session_digest,
+                "resource_waiters": resource_waiters,
             })
         };
-        devme_ui::json(&report);
+        emit_doctor_report(&report, output)?;
         return Ok(());
     }
 
@@ -1763,7 +2791,9 @@ async fn doctor(name: Option<String>, tail: usize) -> anyhow::Result<()> {
     // per-service stderr, plus step output only when the step actually failed.
     // Healthy chatter costs the reader tokens without aiding diagnosis; it
     // stays one `devme logs` away.
-    let has_failures = task_history.iter().any(|run| run.exit_code != 0)
+    let has_failures = latest_task_runs(&task_history)
+        .values()
+        .any(|run| run.exit_code != 0)
         || services.iter().any(|s| {
             matches!(
                 s.state,
@@ -1794,6 +2824,7 @@ async fn doctor(name: Option<String>, tail: usize) -> anyhow::Result<()> {
                 "restart_count": s.restart_count,
                 "readiness": s.readiness,
                 "recent_errors": fmt_tail(&errors, tail),
+                "recent_error_events": fmt_events(&errors, tail),
             })
         })
         .collect();
@@ -1818,23 +2849,34 @@ async fn doctor(name: Option<String>, tail: usize) -> anyhow::Result<()> {
         .collect();
 
     let report = serde_json::json!({
+        "schema_version": 1,
         "status": if has_failures { "unhealthy" } else { "healthy" },
         "services": svc_json,
         "steps": step_json,
         "tasks": task_digest,
+        "sessions": session_digest,
+        "resource_waiters": resource_waiters,
         "hint": "zoom with `devme doctor <name>`; stream services and tasks with `devme logs`",
     });
 
-    devme_ui::json(&report);
+    emit_doctor_report(&report, output)?;
+    Ok(())
+}
+
+fn emit_doctor_report(
+    report: &serde_json::Value,
+    output: devme_cli::OutputFormat,
+) -> anyhow::Result<()> {
+    match output {
+        devme_cli::OutputFormat::Json => devme_ui::json(report),
+        devme_cli::OutputFormat::Toon => devme_cli::output::print_toon(report)?,
+        devme_cli::OutputFormat::Human => println!("{}", serde_json::to_string_pretty(report)?),
+    }
     Ok(())
 }
 
 fn latest_task_digest(history: &[devme_cli::task::TaskResult]) -> Vec<serde_json::Value> {
-    let mut latest = std::collections::BTreeMap::new();
-    for run in history {
-        latest.insert(run.task.clone(), run);
-    }
-    latest
+    latest_task_runs(history)
         .into_iter()
         .map(|(name, run)| {
             serde_json::json!({
@@ -1844,6 +2886,16 @@ fn latest_task_digest(history: &[devme_cli::task::TaskResult]) -> Vec<serde_json
             })
         })
         .collect()
+}
+
+fn latest_task_runs(
+    history: &[devme_cli::task::TaskResult],
+) -> std::collections::BTreeMap<&str, &devme_cli::task::TaskResult> {
+    let mut latest = std::collections::BTreeMap::new();
+    for run in history {
+        latest.insert(run.task.as_str(), run);
+    }
+    latest
 }
 
 fn config_cmd(action: Option<ConfigAction>, json: bool) -> anyhow::Result<()> {
@@ -1893,28 +2945,29 @@ fn config_cmd(action: Option<ConfigAction>, json: bool) -> anyhow::Result<()> {
 /// `{port}`, …). Built for agents: clean JSON with `--json`, and a non-zero
 /// exit whenever there are errors so a script can gate on it.
 fn config_check(json: bool) -> anyhow::Result<()> {
-    use devme_config::{Stack, lint, validate};
+    use devme_config::{lint, validate};
 
-    let path = std::env::current_dir()?.join("devme.toml");
-    let toml_str = std::fs::read_to_string(&path)
-        .map_err(|_| anyhow::anyhow!("no devme.toml in {}", path.display()))?;
-
-    // A parse failure is terminal — nothing to validate/lint against.
-    let stack = match Stack::parse(&toml_str) {
-        Ok(s) => s,
-        Err(e) => {
+    let cwd = std::env::current_dir()?;
+    let stack = match devme_config::ResolvedWorkspace::resolve(&cwd) {
+        Ok(resolved) => resolved.into_stack(),
+        Err(error) => {
             if json {
                 let v = serde_json::json!({
+                    "schema_version": 1,
                     "ok": false,
-                    "parse_error": e.to_string(),
+                    "error": {
+                        "code": "invalid_config",
+                        "message": error.to_string(),
+                        "help": "Fix the root or explicitly listed member config, then rerun `devme config check`.",
+                    },
                     "errors": [],
                     "warnings": [],
                 });
                 devme_ui::json(&v);
             } else {
-                println!("✗ devme.toml failed to parse:\n  {e}");
+                println!("✗ Devme workspace failed to resolve:\n  {error}");
             }
-            return Err(anyhow::anyhow!("config has a parse error"));
+            return Err(anyhow::anyhow!("config is invalid"));
         }
     };
 
@@ -1926,6 +2979,7 @@ fn config_check(json: bool) -> anyhow::Result<()> {
 
     if json {
         let v = serde_json::json!({
+            "schema_version": 1,
             "ok": errors.is_empty(),
             "errors": errors,
             "warnings": warnings
@@ -1947,7 +3001,7 @@ fn config_check(json: bool) -> anyhow::Result<()> {
             println!("  fix: {}", l.hint);
         }
         if errors.is_empty() && warnings.is_empty() {
-            println!("✔ devme.toml looks good — no errors or warnings");
+            println!("✔ Devme workspace looks good - no errors or warnings");
         } else {
             println!("\n{} error(s), {} warning(s)", errors.len(), warnings.len());
         }
@@ -1968,6 +3022,7 @@ async fn worktree_cmd(action: WorktreeAction, json: bool) -> anyhow::Result<()> 
             let report = devme_tui::worktree::add_worktree(&cwd, &branch, path.as_deref())?;
             if json {
                 let value = serde_json::json!({
+                    "schema_version": 1,
                     "path": report.path.display().to_string(),
                     "branch": report.branch,
                     "created_branch": report.created_branch,
@@ -1989,6 +3044,7 @@ async fn worktree_cmd(action: WorktreeAction, json: bool) -> anyhow::Result<()> 
             let report = devme_tui::worktree::remove_worktree(&cwd, &target, force).await?;
             if json {
                 let value = serde_json::json!({
+                    "schema_version": 1,
                     "path": report.path.display().to_string(),
                     "branch": report.branch,
                     "slot": report.slot,
@@ -2063,7 +3119,24 @@ fn print_completions(shell: Shell) {
 /// the project is remote-first, so this behaves as `devme remote` — ensure
 /// the live-sync, then attach to the remote stack's TUI. Otherwise it opens
 /// the local TUI. `--local` forces the local TUI regardless.
-async fn launch_default(force_local: bool, flags: devme_cli::remote::RunFlags) -> i32 {
+async fn launch_default(
+    force_local: bool,
+    flags: devme_cli::remote::RunFlags,
+    context_format: devme_cli::OutputFormat,
+) -> i32 {
+    if context_format == devme_cli::OutputFormat::Json
+        || flags.no_input
+        || !std::io::stdin().is_terminal()
+        || !std::io::stdout().is_terminal()
+    {
+        return match std::env::current_dir() {
+            Ok(cwd) => match agent_context(&cwd, context_format).await {
+                Ok(()) => 0,
+                Err(error) => emit_command_error(context_format, &error),
+            },
+            Err(error) => emit_command_error(context_format, &error.into()),
+        };
+    }
     if !force_local {
         let cfg = devme_config::GlobalConfig::load();
         if cfg.remote.is_default() && cfg.remote.host.is_some() {
@@ -2082,30 +3155,103 @@ async fn launch_default(force_local: bool, flags: devme_cli::remote::RunFlags) -
             };
         }
     }
-    match launch_tui().await {
+    let mut focused_session = None;
+    if let Some(workspace) = PROJECT_WORKSPACE.get() {
+        let sessions = workspace.focus_sessions();
+        if sessions.len() > 1 {
+            devme_ui::error(format!(
+                "this directory declares multiple sessions ({}); run `devme sessions`, then `devme session <name>`",
+                sessions.join(", ")
+            ));
+            return 2;
+        }
+        if let Some(name) = sessions.first() {
+            let cwd = match std::env::current_dir() {
+                Ok(cwd) => cwd,
+                Err(error) => {
+                    devme_ui::error(error);
+                    return 1;
+                }
+            };
+            let socket = match devme_config::paths::supervisor_socket(&cwd) {
+                Ok(socket) => socket,
+                Err(error) => {
+                    devme_ui::error(error);
+                    return 1;
+                }
+            };
+            if let Some(run) = workspace
+                .stack()
+                .session
+                .get(name)
+                .and_then(|session| session.run.as_deref())
+                && let Err(error) = converge_task_steps(workspace.stack(), run, &cwd)
+            {
+                return match devme_cli::task::record_preflight_failure(
+                    workspace.stack(),
+                    &cwd,
+                    run,
+                    &error,
+                    devme_cli::OutputFormat::Human,
+                ) {
+                    Ok(result) => result.exit_code,
+                    Err(record_error) => {
+                        devme_ui::error(record_error);
+                        1
+                    }
+                };
+            }
+            if let Err(error) = ensure_daemon(&socket).await {
+                devme_ui::error(error);
+                return 1;
+            }
+            match devme_cli::session::open_held(
+                workspace.stack(),
+                &cwd,
+                name,
+                devme_cli::OutputFormat::Human,
+            )
+            .await
+            {
+                Ok(opened) if opened.exit_code == 0 => focused_session = Some(opened.handle),
+                Ok(opened) => return opened.exit_code,
+                Err(error) => {
+                    devme_ui::error(error);
+                    return 1;
+                }
+            }
+        }
+    }
+    let result = match launch_tui(focused_session.is_some()).await {
         Ok(code) => code,
         Err(e) => {
             devme_ui::error(e);
             1
         }
-    }
+    };
+    drop(focused_session);
+    result
 }
 
 /// Launch the TUI directly. Runs preflight checks first, then hands off
 /// to the TUI event loop which manages all daemon spawning.
-async fn launch_tui() -> anyhow::Result<i32> {
+async fn launch_tui(session_owns_home: bool) -> anyhow::Result<i32> {
     let cwd = std::env::current_dir()?;
-    let config_path = cwd.join("devme.toml");
-    if let Ok(toml_str) = std::fs::read_to_string(&config_path)
-        && let Ok(stack) = Stack::parse(&toml_str)
-    {
+    let resolved = PROJECT_WORKSPACE
+        .get()
+        .cloned()
+        .or_else(|| devme_config::ResolvedWorkspace::resolve(&cwd).ok());
+    if let Some(resolved) = &resolved {
+        let stack = resolved.stack().clone();
+        let focused = focused_runtime_stack(resolved);
         // Env resolution only prompts when vars are missing — silent otherwise.
         if !stack.env.is_empty() {
             // Honour `[stack] env_file` (ADR-0014) — compute the target
             // path before moving `stack.env` out below.
             let env_file = devme_supervisor::env_resolve::env_file_path(&stack, &cwd);
-            let env_pairs: Vec<(String, devme_config::EnvVar)> = stack.env.into_iter().collect();
-            let interactive = std::io::stdin().is_terminal();
+            let env_pairs: Vec<(String, devme_config::EnvVar)> =
+                stack.env.clone().into_iter().collect();
+            let interactive = interactive_input();
             let mut stdin = std::io::BufReader::new(std::io::stdin());
             let mut stderr = std::io::stderr();
             let _ = devme_supervisor::env_resolve::resolve_env_vars(
@@ -2119,32 +3265,76 @@ async fn launch_tui() -> anyhow::Result<i32> {
             );
         }
         // Only show preflight output when something needs provisioning.
-        if let Ok(stack) = Stack::parse(&toml_str) {
-            if !devme_supervisor::preflight::all_checks_pass(&stack, &cwd) {
-                let interactive = std::io::stdin().is_terminal();
-                let mut stdin = std::io::BufReader::new(std::io::stdin());
-                run_preflight_quiet_aware(&stack, &cwd, &mut stdin, interactive);
-            }
-            ensure_docker_if_needed(&stack)?;
-
-            // Catch ports already taken by a stray container/process and
-            // offer to free them before the daemon tries to bind.
-            let interactive = std::io::stdin().is_terminal();
+        if !devme_supervisor::preflight::all_checks_pass(&focused, &cwd) {
+            let interactive = interactive_input();
             let mut stdin = std::io::BufReader::new(std::io::stdin());
-            let mut stderr = std::io::stderr();
-            let _ = devme_supervisor::port_preflight::check_ports(
-                &stack,
-                &mut stdin,
-                &mut stderr,
-                interactive,
-                devme_ui::err_style(),
-            );
+            run_preflight_quiet_aware(&focused, &cwd, &mut stdin, interactive);
         }
+        ensure_docker_if_needed(&focused)?;
+
+        // Catch ports already taken by a stray container/process and offer
+        // to free them before the daemon tries to bind.
+        let interactive = interactive_input();
+        let mut stdin = std::io::BufReader::new(std::io::stdin());
+        let mut stderr = std::io::stderr();
+        let _ = devme_supervisor::port_preflight::check_ports(
+            &focused,
+            &mut stdin,
+            &mut stderr,
+            interactive,
+            devme_ui::err_style(),
+        );
     }
 
-    devme_tui::launch(false).await?;
+    let targets = if session_owns_home {
+        // The held session already started and owns its complete service
+        // closure. `Some([])` tells the TUI to attach without issuing the
+        // ordinary whole-stack or member-target start path.
+        Some(Vec::new())
+    } else {
+        resolved
+            .as_ref()
+            .and_then(devme_config::ResolvedWorkspace::focus_services)
+    };
+    devme_tui::launch_targets(false, targets).await?;
     maybe_show_skills_hint();
     Ok(0)
+}
+
+/// Restrict boot-time convergence to a focused member and the declared
+/// dependency closure of its services. The supervisor still receives the
+/// complete flattened stack, so later cross-member operations remain valid.
+fn focused_runtime_stack(resolved: &devme_config::ResolvedWorkspace) -> Stack {
+    let Some(targets) = resolved.focus_services() else {
+        return resolved.stack().clone();
+    };
+    let graph = devme_config::Graph::from_stack(resolved.stack());
+    let mut keep = std::collections::HashSet::new();
+    fn visit(
+        name: &str,
+        graph: &devme_config::Graph,
+        keep: &mut std::collections::HashSet<String>,
+    ) {
+        if !keep.insert(name.to_string()) {
+            return;
+        }
+        for dependency in graph
+            .dependencies(name)
+            .iter()
+            .filter(|dependency| dependency.required)
+        {
+            visit(&dependency.name, graph, keep);
+        }
+    }
+    for target in targets {
+        visit(&target, &graph, &mut keep);
+    }
+    let mut stack = resolved.stack().clone();
+    stack.step.retain(|name, _| keep.contains(name));
+    stack.service.retain(|name, _| keep.contains(name));
+    stack.task.clear();
+    stack.resource.clear();
+    stack
 }
 
 use devme_supervisor::spawn::{ensure_daemon as ensure_daemon_inner, ensure_shared_daemon};
@@ -2170,16 +3360,20 @@ async fn ensure_daemon(sock: &std::path::Path) -> anyhow::Result<bool> {
         return Ok(false);
     }
 
-    let config_path = cwd.join("devme.toml");
-    if let Ok(toml_str) = std::fs::read_to_string(&config_path)
-        && let Ok(stack) = Stack::parse(&toml_str)
-    {
+    let resolved = PROJECT_WORKSPACE
+        .get()
+        .cloned()
+        .or_else(|| devme_config::ResolvedWorkspace::resolve(&cwd).ok());
+    if let Some(resolved) = resolved {
+        let stack = resolved.stack().clone();
+        let focused = focused_runtime_stack(&resolved);
         if !stack.env.is_empty() {
             // Honour `[stack] env_file` (ADR-0014) — compute the target
             // path before moving `stack.env` out below.
             let env_file = devme_supervisor::env_resolve::env_file_path(&stack, &cwd);
-            let env_pairs: Vec<(String, devme_config::EnvVar)> = stack.env.into_iter().collect();
-            let interactive = std::io::stdin().is_terminal();
+            let env_pairs: Vec<(String, devme_config::EnvVar)> =
+                stack.env.clone().into_iter().collect();
+            let interactive = interactive_input();
             let mut stdin = std::io::BufReader::new(std::io::stdin());
             let mut stderr = std::io::stderr();
             if let Err(e) = devme_supervisor::env_resolve::resolve_env_vars(
@@ -2194,31 +3388,26 @@ async fn ensure_daemon(sock: &std::path::Path) -> anyhow::Result<bool> {
                 devme_ui::warn(format!("env resolution failed: {e}"));
             }
         }
-        // Re-parse since we moved `stack.env` above
-        if let Ok(stack) = Stack::parse(&toml_str) {
-            // Preflight: check dependencies that don't need services.
-            // Under `-q` the tree renders into a buffer that's dumped
-            // only when something failed — quiet suppresses information,
-            // not warnings.
-            let interactive = std::io::stdin().is_terminal();
-            let mut stdin = std::io::BufReader::new(std::io::stdin());
-            run_preflight_quiet_aware(&stack, &cwd, &mut stdin, interactive);
+        // Preflight: check dependencies that don't need services. Under `-q`
+        // the tree renders into a buffer dumped only when something failed.
+        let interactive = interactive_input();
+        let mut stdin = std::io::BufReader::new(std::io::stdin());
+        run_preflight_quiet_aware(&focused, &cwd, &mut stdin, interactive);
 
-            ensure_docker_if_needed(&stack)?;
+        ensure_docker_if_needed(&focused)?;
 
-            // Catch ports already taken by a stray container/process and
-            // offer to free them before the daemon tries to bind.
-            let interactive = std::io::stdin().is_terminal();
-            let mut stdin = std::io::BufReader::new(std::io::stdin());
-            let mut stderr = std::io::stderr();
-            let _ = devme_supervisor::port_preflight::check_ports(
-                &stack,
-                &mut stdin,
-                &mut stderr,
-                interactive,
-                devme_ui::err_style(),
-            );
-        }
+        // Catch ports already taken by a stray container/process and
+        // offer to free them before the daemon tries to bind.
+        let interactive = interactive_input();
+        let mut stdin = std::io::BufReader::new(std::io::stdin());
+        let mut stderr = std::io::stderr();
+        let _ = devme_supervisor::port_preflight::check_ports(
+            &focused,
+            &mut stdin,
+            &mut stderr,
+            interactive,
+            devme_ui::err_style(),
+        );
     }
 
     ensure_daemon_inner(sock, &cwd).await
@@ -2307,7 +3496,7 @@ fn ensure_docker_if_needed(stack: &Stack) -> anyhow::Result<()> {
                 let _ = cfg.save();
                 id
             } else {
-                if !std::io::stdin().is_terminal() {
+                if !interactive_input() {
                     return Err(anyhow::anyhow!(
                         "Docker is not running and no daemon is configured\n\
                          run: devme config set docker.daemon <name>"
@@ -2379,7 +3568,7 @@ fn maybe_skill_update() {
     }
 
     // Nudge only a human at a keyboard — never an agent or a pipe.
-    if !std::io::stdin().is_terminal() {
+    if !interactive_input() {
         return;
     }
     if cfg.get("hints.skills").as_deref() == Some("false") {
@@ -2511,5 +3700,26 @@ mod tests {
         assert_eq!(strip_ansi("\x1b[32mok\x1b[0m done"), "ok done");
         assert_eq!(strip_ansi("plain"), "plain");
         assert_eq!(strip_ansi("\x1b[2K\x1b[0Gprogress"), "progress");
+    }
+
+    #[test]
+    fn combined_logs_deduplicate_only_across_supervisors() {
+        let line = |origin| CorrelatedLine {
+            source: "repo".into(),
+            ts: 42,
+            stream: devme_core::LogStream::Stdout,
+            text: "same".into(),
+            origin,
+        };
+        let mut lines = vec![
+            line(LogOrigin::Instance),
+            line(LogOrigin::Instance),
+            line(LogOrigin::Shared),
+        ];
+
+        deduplicate_cross_supervisor_lines(&mut lines);
+
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|line| line.origin == LogOrigin::Instance));
     }
 }

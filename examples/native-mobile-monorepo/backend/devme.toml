@@ -1,0 +1,29 @@
+schema_version = 1
+
+[step.dependencies]
+check = "test -d node_modules"
+provision = "bun install --frozen-lockfile"
+trust = "auto"
+
+# The Convex process is not ready merely because it started. This probe asks
+# Convex for its published function specification, proving the deployment is
+# healthy and the expected schema/functions have reached it.
+[service.convex]
+cmd = "bun run convex:dev"
+depends_on = ["dependencies"]
+health = { shell = "bunx convex function-spec --url \"$CONVEX_URL\" >/dev/null" }
+readiness = { interval_ms = 1000, timeout_ms = 5000, retries = 60 }
+env = { CONVEX_STATE_DIR = "{worktree}/.devme/convex-{slot}" }
+
+[service.api]
+cmd = "vp dev --port {port}"
+depends_on = ["convex"]
+port = { base = 3210, slot_offset = 10 }
+health = { http = "http://localhost:{port}/health" }
+readiness = { interval_ms = 500, timeout_ms = 2000, retries = 60 }
+env = { DEVME_STATE_DIR = "{worktree}/.devme/backend-{slot}" }
+
+[task.test]
+cmd = "bun test"
+steps = ["dependencies"]
+timeout = 300

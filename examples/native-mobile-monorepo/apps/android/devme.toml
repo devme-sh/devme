@@ -1,0 +1,41 @@
+schema_version = 1
+
+[step.java]
+description = "A Java runtime is available to the Gradle wrapper"
+check = "command -v java >/dev/null && test -x ./gradlew"
+
+# This direct command is illustrative. A project wrapper can map the generic
+# allocated slot to pre-created AVD names and export the resulting serial.
+[service.emulator]
+cmd = "emulator -avd \"devme-${ANDROID_RUNTIME_SLOT}\" -no-snapshot-save"
+scope = "session"
+restart = "never"
+
+# adb logcat is also just a configured service, not Android-specific Devme
+# policy. Set ANDROID_SERIAL through the normal project environment.
+[service.device-logs]
+cmd = "adb -s \"$ANDROID_SERIAL\" logcat"
+scope = "session"
+depends_on = ["emulator", "backend::api"]
+restart = "on-failure"
+
+[task.test]
+cmd = "GRADLE_USER_HOME=\"{worktree}/.devme/gradle-${ANDROID_RUNTIME_SLOT}\" ./gradlew test connectedCheck"
+steps = ["java"]
+services = ["backend::api"]
+resources = ["root::android-runtime"]
+timeout = 1200
+readiness_timeout = 90
+
+[task.launch]
+cmd = "GRADLE_USER_HOME=\"{worktree}/.devme/gradle-${ANDROID_RUNTIME_SLOT}\" ./gradlew installDebug"
+steps = ["java"]
+services = ["backend::api"]
+timeout = 1200
+readiness_timeout = 90
+
+[session.dev]
+needs = ["device-logs"]
+resources = ["root::android-runtime"]
+run = "launch"
+linger = 30

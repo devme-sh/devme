@@ -30,15 +30,12 @@ pub async fn ensure_daemon(sock: &Path, cwd: &Path) -> anyhow::Result<bool> {
     if devme_client::Client::connect(sock).await.is_ok() {
         return Ok(false);
     }
-    if !cwd.join("devme.toml").exists() {
-        return Err(anyhow::anyhow!(
-            "no devme.toml in {} (run from a directory containing one)",
-            cwd.display()
-        ));
-    }
+    let workspace = devme_config::ResolvedWorkspace::resolve(cwd)
+        .map_err(|error| anyhow::anyhow!("cannot start supervisor: {error}"))?;
+    let root = workspace.root();
 
     let supervisor = find_sibling_binary("devme-supervisor")?;
-    let mut child = spawn_detached_supervisor(&supervisor, cwd)?;
+    let mut child = spawn_detached_supervisor(&supervisor, root)?;
 
     for _ in 0..50 {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
