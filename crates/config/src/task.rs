@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Task {
+    /// Semantic purpose used by interactive discovery surfaces.
+    #[serde(default)]
+    pub kind: TaskKind,
     /// Shell command. Optional for aggregate tasks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cmd: Option<String>,
@@ -35,6 +38,26 @@ pub struct Task {
     /// Overall seconds to wait for required services to become ready.
     #[serde(default = "default_readiness_timeout")]
     pub readiness_timeout: u64,
+}
+
+/// Small, stable vocabulary for grouping tasks without changing execution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskKind {
+    Launch,
+    Check,
+    #[default]
+    Utility,
+}
+
+impl TaskKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Launch => "Run",
+            Self::Check => "Check",
+            Self::Utility => "Utilities",
+        }
+    }
 }
 
 fn default_readiness_timeout() -> u64 {

@@ -20,6 +20,8 @@ depends_on = ["emulator", "backend::api"]
 restart = "on-failure"
 
 [task.test]
+kind = "check"
+description = "Verify the Android app"
 cmd = "GRADLE_USER_HOME=\"{worktree}/.devme/gradle-${ANDROID_RUNTIME_SLOT}\" ./gradlew test connectedCheck"
 steps = ["java"]
 services = ["backend::api"]
@@ -28,6 +30,8 @@ timeout = 1200
 readiness_timeout = 90
 
 [task.launch]
+kind = "launch"
+description = "Run the Android app in Emulator"
 cmd = "GRADLE_USER_HOME=\"{worktree}/.devme/gradle-${ANDROID_RUNTIME_SLOT}\" ./gradlew installDebug"
 steps = ["java"]
 services = ["backend::api"]

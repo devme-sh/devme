@@ -34,5 +34,6 @@ scope = "host"
 capacity = 1
 
 [task.check]
+kind = "check"
 description = "Run backend, iOS, and Android verification"
 depends_on = ["backend::test", "ios::test", "android::test"]

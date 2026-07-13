@@ -101,6 +101,7 @@ capacity = 2
 env = "DEVICE_SLOT"
 
 [task.test]
+kind = "check"
 cmd = "bun test"
 steps = ["deps"]
 services = ["postgres"]
@@ -113,6 +114,7 @@ scope = "session"
 depends_on = ["postgres"]
 
 [task.launch]
+kind = "launch"
 cmd = "./scripts/launch-native-app"
 
 [session.dev]
@@ -123,6 +125,7 @@ linger = 30
 ```
 
 Rules:
+- Use `kind = "launch"`, `"check"`, or `"utility"` to place tasks on the interactive Home screen. Existing tasks default to `utility`; kind is discovery metadata and never changes execution.
 - `bun` for JS/TS (not npm/node).
 - Docker services: prefix `cmd` with `docker rm -f <name> 2>/dev/null;` and run `--rm --name <project>-<service>` to survive stale containers.
 - **Web services (dev servers, frontends, APIs) need `url = "http://{host}:{port}"`** - it's the only signal that a `host:port` is openable. Without it devme treats the service as copy-only (DB/TCP), so the TUI's `o` and `devme url -o` won't open a browser. DBs/TCP services: omit `url`.

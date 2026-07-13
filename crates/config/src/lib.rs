@@ -36,6 +36,6 @@ pub use service::{Readiness, Service};
 pub use session::Session;
 pub use stack::{LogPolicy, SCHEMA_VERSION, Stack, StackMeta, Workspace};
 pub use step::Step;
-pub use task::{Resource, ResourceScope, Task};
+pub use task::{Resource, ResourceScope, Task, TaskKind};
 pub use validate::{Lint, lint, validate};
 pub use workspace::{Focus, Origin, ResolvedWorkspace, WorkspaceError};
