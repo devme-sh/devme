@@ -41,6 +41,10 @@ pub enum Event {
     Start,
     /// Begin only the required dependency closure for these services.
     StartTargets { names: Vec<String> },
+    /// Begin a named session's required service closure. Unlike an ordinary
+    /// targeted start, this is allowed to activate session-scoped services
+    /// and resets a prior stopped session sidecar for idempotent reuse.
+    StartSessionTargets { names: Vec<String> },
     /// The Step's `check` finished. `passed=true` means the prerequisite
     /// was already met; `false` means it wasn't.
     StepCheckCompleted { name: String, passed: bool },
@@ -113,7 +117,14 @@ impl Executor {
     pub fn handle(&mut self, event: Event) -> Vec<Action> {
         match event {
             Event::Start => {
-                self.active_targets = None;
+                self.active_targets = Some(
+                    self.graph
+                        .nodes()
+                        .iter()
+                        .filter(|name| !self.graph.is_session_scoped(name))
+                        .cloned()
+                        .collect(),
+                );
                 self.advance()
             }
             Event::StartTargets { names } => {
@@ -121,6 +132,26 @@ impl Executor {
                 for name in names {
                     self.collect_required(&name, &mut closure);
                 }
+                self.active_targets = Some(closure);
+                self.advance()
+            }
+            Event::StartSessionTargets { names } => {
+                let mut closure = HashSet::new();
+                for name in names {
+                    self.collect_required(&name, &mut closure);
+                }
+                self.nodes.retain(|name, status| {
+                    !(closure.contains(name)
+                        && self.graph.is_session_scoped(name)
+                        && matches!(
+                            status,
+                            NodeStatus::Service(
+                                ServiceState::Stopped
+                                    | ServiceState::Failed { .. }
+                                    | ServiceState::CrashLoop { .. }
+                            )
+                        ))
+                });
                 self.active_targets = Some(closure);
                 self.advance()
             }
@@ -416,6 +447,74 @@ cmd = "other"
             vec![Action::StartService("backend".into())]
         );
         assert!(executor.state("unrelated").is_none());
+    }
+
+    #[test]
+    fn global_start_keeps_session_scoped_services_dormant() {
+        let mut executor = Executor::new(graph(
+            r#"
+schema_version = 1
+
+[service.backend]
+cmd = "serve"
+
+[service.device_logs]
+cmd = "log stream"
+scope = "session"
+depends_on = ["backend"]
+"#,
+        ));
+
+        assert_eq!(
+            executor.handle(Event::Start),
+            vec![Action::StartService("backend".into())]
+        );
+        assert!(executor.state("device_logs").is_none());
+    }
+
+    #[test]
+    fn session_start_runs_its_existing_dependency_closure_and_can_restart() {
+        let mut executor = Executor::new(graph(
+            r#"
+schema_version = 1
+
+[service.backend]
+cmd = "serve"
+
+[service.device_logs]
+cmd = "log stream"
+scope = "session"
+depends_on = ["backend"]
+"#,
+        ));
+
+        assert_eq!(
+            executor.handle(Event::StartSessionTargets {
+                names: vec!["device_logs".into()],
+            }),
+            vec![Action::StartService("backend".into())]
+        );
+        assert_eq!(
+            executor.handle(Event::ServiceHealthy {
+                name: "backend".into(),
+            }),
+            vec![Action::StartService("device_logs".into())]
+        );
+        executor.handle(Event::ServiceHealthy {
+            name: "device_logs".into(),
+        });
+        assert_eq!(
+            executor.handle(Event::UserStop {
+                name: "device_logs".into(),
+            }),
+            vec![Action::StopService("device_logs".into())]
+        );
+        assert_eq!(
+            executor.handle(Event::StartSessionTargets {
+                names: vec!["device_logs".into()],
+            }),
+            vec![Action::StartService("device_logs".into())]
+        );
     }
 
     #[test]

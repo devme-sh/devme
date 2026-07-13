@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::env_var::EnvVar;
 use crate::service::Service;
+use crate::session::Session;
 use crate::step::Step;
 use crate::task::{Resource, Task};
 
@@ -50,6 +51,12 @@ pub struct Stack {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stack: Option<StackMeta>,
 
+    /// Optional explicit one-level workspace membership. The root config
+    /// owns every listed child config; Devme never recursively discovers or
+    /// infers a package/build graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<Workspace>,
+
     /// Declared environment variables keyed by name (e.g. `DATABASE_URL`).
     /// See ADR-0014. Resolved before step checks on every `devme` run.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
@@ -71,9 +78,21 @@ pub struct Stack {
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub resource: IndexMap<String, Resource>,
 
+    /// Resource-bound compositions over existing services and tasks.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub session: IndexMap<String, Session>,
+
     /// Shared service/task history retention and redaction policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logs: Option<LogPolicy>,
+}
+
+/// Explicit child `devme.toml` files owned by this workspace root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Workspace {
+    /// Stable member name to directory containing that member's config.
+    pub members: IndexMap<String, String>,
 }
 
 impl Stack {
@@ -141,6 +160,7 @@ mod tests {
         assert!(s.service.is_empty());
         assert!(s.task.is_empty());
         assert!(s.resource.is_empty());
+        assert!(s.session.is_empty());
     }
 
     #[test]
@@ -317,11 +337,13 @@ readiness = { interval_ms = 25, timeout_ms = 100, retries = 7 }
         let s = Stack {
             schema_version: 1,
             stack: None,
+            workspace: None,
             env: IndexMap::new(),
             step: IndexMap::new(),
             service: IndexMap::new(),
             task: IndexMap::new(),
             resource: IndexMap::new(),
+            session: IndexMap::new(),
             logs: None,
         };
         let toml_str = toml::to_string(&s).unwrap();
@@ -410,11 +432,13 @@ cmd = "npm run dev"
         let s = Stack {
             schema_version: 1,
             stack: None,
+            workspace: None,
             env: IndexMap::new(),
             step: IndexMap::new(),
             service: IndexMap::new(),
             task: IndexMap::new(),
             resource: IndexMap::new(),
+            session: IndexMap::new(),
             logs: None,
         };
         let toml_str = toml::to_string(&s).unwrap();

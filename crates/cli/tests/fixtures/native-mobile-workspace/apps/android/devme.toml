@@ -1,0 +1,25 @@
+schema_version = 1
+
+[service.emulator]
+cmd = "test -n \"$ANDROID_RUNTIME_SLOT\"; touch .started; sleep 30"
+scope = "session"
+
+[service.device-logs]
+cmd = "printf 'portable adb slot=%s\\n' \"$ANDROID_RUNTIME_SLOT\"; touch .logs-started; sleep 30"
+scope = "session"
+depends_on = ["emulator", "backend::api"]
+
+[task.verify]
+cmd = "test -f ../../backend/.schema-published; touch .verified"
+services = ["backend::api"]
+resources = ["root::android-runtime"]
+readiness_timeout = 5
+
+[task.launch]
+cmd = "test -n \"$ANDROID_RUNTIME_SLOT\"; test -f ../../backend/.schema-published; test -f .logs-started; touch .launched"
+
+[session.dev]
+needs = ["device-logs"]
+resources = ["root::android-runtime"]
+run = "launch"
+linger = 1

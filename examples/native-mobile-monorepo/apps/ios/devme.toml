@@ -1,0 +1,34 @@
+schema_version = 1
+
+[step.xcode]
+description = "Xcode command-line tools are selected"
+check = "command -v xcodebuild >/dev/null && xcode-select -p >/dev/null"
+
+# Simulator output is an ordinary service. Set SIMULATOR_UDID in the project
+# environment or map IOS_RUNTIME_SLOT to a UDID in a project-owned wrapper.
+[service.simulator-logs]
+cmd = "xcrun simctl spawn \"$SIMULATOR_UDID\" log stream --style compact"
+scope = "session"
+depends_on = ["backend::api"]
+restart = "on-failure"
+
+[task.test]
+cmd = "xcodebuild test -workspace App.xcworkspace -scheme App -derivedDataPath \"{worktree}/.devme/DerivedData-ios-${IOS_RUNTIME_SLOT}\""
+steps = ["xcode"]
+services = ["backend::api"]
+resources = ["root::ios-runtime", "root::codesigning"]
+timeout = 1200
+readiness_timeout = 90
+
+[task.launch]
+cmd = "xcodebuild -workspace App.xcworkspace -scheme App -derivedDataPath \"{worktree}/.devme/DerivedData-ios-${IOS_RUNTIME_SLOT}\" build"
+steps = ["xcode"]
+services = ["backend::api"]
+timeout = 1200
+readiness_timeout = 90
+
+[session.dev]
+needs = ["simulator-logs"]
+resources = ["root::ios-runtime", "root::codesigning"]
+run = "launch"
+linger = 30

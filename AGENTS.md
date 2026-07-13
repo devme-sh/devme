@@ -38,6 +38,8 @@ grid — `tmux new-session -d -x W -y H '…devme'`, `send-keys`, `capture-pane 
   (--tail exactness, --since, --json/NDJSON, stream tags, step redirect) and
   `doctor` (error digest, per-node zoom). Plain shell, no tmux; runs in an
   isolated fixture under /tmp.
+- `scripts/native-workspace-session-smoke.sh` - bare Devme from an iOS workspace
+  member, focused session launch, TUI-held resource lifetime, and clean quit.
 
 ## Releasing
 

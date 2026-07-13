@@ -30,6 +30,13 @@ scope. The OS releases locks after crashes, owner metadata remains inspectable,
 and a configured environment variable exposes the allocated zero-based slot.
 Names are acquired in sorted order to prevent multi-resource deadlock.
 
+`[session.<name>]` is a narrow composition over existing service closures,
+resources, and an optional launch task. It holds resource leases while
+session-scoped log or device sidecars and the launch task use the allocated
+environment. Multiple clients join idempotently. On final disconnect, a
+configurable linger permits reconnection; teardown stops sidecars before
+releasing leases. Sessions do not define steps or a second dependency graph.
+
 Task and service history share one retention and redaction policy. Redaction
 patterns are compiled as regular expressions and applied before disk writes.
 `devme logs` correlates service and `task:<name>` records by timestamp, while
@@ -51,6 +58,13 @@ guidance, guarded by a freshness test.
 Gradle Kotlin/Android, Convex, and Vite+ markers. It emits explicit delegated
 commands and does not infer or reproduce native build graphs.
 
+An explicit root `[workspace.members]` table may compose one level of child
+`devme.toml` files. Devme flattens them into the same worktree runtime with
+stable `member::node` names. An invocation inside a member can use local names,
+while cross-member dependencies remain qualified and can converge the required
+backend closure. Paths stay relative to the file that declared them. See
+ADR-0020 for ownership, focus, and boundary details.
+
 ## Consequences
 
 Devme becomes the single root orchestration contract without learning native
@@ -63,3 +77,7 @@ The orchestration remains deliberately shallow: Xcode, Gradle, Vite+, Bun, and
 Convex own compilation and runtime semantics. Devme owns ordering, isolation,
 leases, readiness, history, redaction, and diagnostics. There is no second root
 task runner, package graph, remote cache, or native build-graph model.
+
+Splitting the root file is organizational only. It does not create nested
+supervisors or independent resource and history domains. Existing single-file
+configs retain their unqualified names and behavior.

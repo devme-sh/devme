@@ -54,6 +54,16 @@ fn set_pointer_shape(w: &mut impl std::io::Write, shape: PointerShape) -> std::i
 /// Launch the TUI. Must be called from within a tokio runtime.
 /// When `no_shutdown` is true, quitting detaches without stopping daemons.
 pub async fn launch(no_shutdown: bool) -> anyhow::Result<()> {
+    launch_targets(no_shutdown, None).await
+}
+
+/// Launch the TUI and start only `home_targets` in the invoking worktree.
+/// Their dependency closure is resolved by the supervisor. `None` preserves
+/// the traditional whole-stack behavior.
+pub async fn launch_targets(
+    no_shutdown: bool,
+    home_targets: Option<Vec<String>>,
+) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let repo_dir = devme_config::paths::repo_socket_dir(&cwd)?;
     let home_id = devme_config::paths::instance_id(&cwd);
@@ -97,6 +107,7 @@ pub async fn launch(no_shutdown: bool) -> anyhow::Result<()> {
         wt_rx,
         &home_id,
         no_shutdown,
+        home_targets.as_deref(),
     )
     .await;
 
@@ -115,6 +126,7 @@ async fn run(
     mut wt_rx: mpsc::UnboundedReceiver<WorktreeEvent>,
     home_id: &str,
     no_shutdown: bool,
+    home_targets: Option<&[String]>,
 ) -> anyhow::Result<()> {
     let (key_tx, mut key_rx) = mpsc::unbounded_channel::<Event>();
     tokio::task::spawn_blocking(move || {
@@ -168,15 +180,8 @@ async fn run(
         }
         for id in state.attached_instance_ids() {
             if started.insert(id.clone()) {
-                registry
-                    .send_to(
-                        &id,
-                        ClientMessage::Start {
-                            service: String::new(),
-                            skip_deps: false,
-                        },
-                    )
-                    .await;
+                let message = initial_start_message(id == home_id, home_targets);
+                registry.send_to(&id, message).await;
             }
         }
 
@@ -938,6 +943,25 @@ async fn run(
     }
 }
 
+fn initial_start_message(is_home: bool, home_targets: Option<&[String]>) -> ClientMessage {
+    if is_home {
+        home_targets.map_or(
+            ClientMessage::Start {
+                service: String::new(),
+                skip_deps: false,
+            },
+            |services| ClientMessage::StartTargets {
+                services: services.to_vec(),
+            },
+        )
+    } else {
+        ClientMessage::Start {
+            service: String::new(),
+            skip_deps: false,
+        }
+    }
+}
+
 /// Outcome of an async worktree add/remove, sent back to the event loop.
 enum WorktreeOp {
     Removed {
@@ -1372,6 +1396,16 @@ mod tests {
         assert!(
             prompt.contains("**postgres** (shared)"),
             "shared service missing:\n{prompt}"
+        );
+    }
+
+    #[test]
+    fn empty_home_targets_attach_without_starting_any_services() {
+        assert_eq!(
+            initial_start_message(true, Some(&[])),
+            ClientMessage::StartTargets {
+                services: Vec::new()
+            }
         );
     }
 }

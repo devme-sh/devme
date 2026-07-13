@@ -35,6 +35,8 @@ pub struct Graph {
     /// instead of spawning them (e.g. a repo-scoped service owned by the
     /// shared supervisor, as seen from an instance daemon). See ADR-0007.
     external: std::collections::HashSet<String>,
+    /// Services that only an owning resource-bound session may start.
+    session_scoped: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -59,6 +61,7 @@ impl Graph {
         let mut kinds = HashMap::new();
         let mut has_provision = std::collections::HashSet::new();
         let mut external = std::collections::HashSet::new();
+        let mut session_scoped = std::collections::HashSet::new();
 
         for (name, step) in &stack.step {
             edges.insert(name.clone(), step.depends_on.clone());
@@ -74,6 +77,9 @@ impl Graph {
             if service.external {
                 external.insert(name.clone());
             }
+            if service.scope == devme_core::Scope::Session {
+                session_scoped.insert(name.clone());
+            }
             nodes.push(name.clone());
         }
 
@@ -83,6 +89,7 @@ impl Graph {
             kinds,
             has_provision,
             external,
+            session_scoped,
         }
     }
 
@@ -95,6 +102,11 @@ impl Graph {
     /// than spawned by this daemon.
     pub fn is_external(&self, node: &str) -> bool {
         self.external.contains(node)
+    }
+
+    /// True when a service is dormant outside its owning `[session]`.
+    pub fn is_session_scoped(&self, node: &str) -> bool {
+        self.session_scoped.contains(node)
     }
 
     pub fn nodes(&self) -> &[String] {

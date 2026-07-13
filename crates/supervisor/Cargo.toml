@@ -25,6 +25,8 @@ devme-slot-allocator = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures-util = { version = "0.3", features = ["sink"] }
+fs2 = { workspace = true }
+indexmap = "2"
 portable-pty = { workspace = true }
 reqwest = { workspace = true }
 process_alive = { workspace = true }

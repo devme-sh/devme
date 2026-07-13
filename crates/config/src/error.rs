@@ -41,4 +41,53 @@ pub enum ConfigError {
 
     #[error("invalid logs.redact pattern {pattern:?}: {message}")]
     InvalidRedactionPattern { pattern: String, message: String },
+
+    #[error("session '{session}' references unknown {kind} '{name}'")]
+    UnknownSessionReference {
+        session: String,
+        kind: &'static str,
+        name: String,
+    },
+
+    #[error(
+        "session-scoped service '{service}' must belong to exactly one [session] dependency closure; found {owners}"
+    )]
+    SessionServiceOwnerCount { service: String, owners: usize },
+
+    #[error(
+        "non-session service '{service}' cannot depend on session-scoped service '{dependency}'"
+    )]
+    SessionDependencyFromOrdinary { service: String, dependency: String },
+
+    #[error("session-scoped service '{service}' cannot be external")]
+    ExternalSessionService { service: String },
+
+    #[error(
+        "session '{session}' resources '{first}' and '{second}' both expose environment variable '{env}'"
+    )]
+    DuplicateSessionResourceEnv {
+        session: String,
+        first: String,
+        second: String,
+        env: String,
+    },
+
+    #[error(
+        "task '{task}' cannot require session-scoped service '{service}'; open its owning session"
+    )]
+    TaskUsesSessionService { task: String, service: String },
+
+    #[error(
+        "session '{session}' task '{task}' cannot declare resources; declare them on the session"
+    )]
+    SessionRunTaskResources { session: String, task: String },
+
+    #[error(
+        "session '{session}' must include service '{service}' required by run task '{task}' in its `needs` closure"
+    )]
+    SessionRunMissingService {
+        session: String,
+        task: String,
+        service: String,
+    },
 }

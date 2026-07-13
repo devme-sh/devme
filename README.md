@@ -14,7 +14,7 @@
 
 ---
 
-devme spawns, monitors, restarts, and tails logs from every service in your project. Backend, frontend, database, proxy, whatever you've got. Declare them in a single `devme.toml` and each git worktree gets its own coexisting stack with non-colliding ports.
+devme spawns, monitors, restarts, and tails logs from every service in your project. Backend, frontend, database, proxy, whatever you've got. Declare them in a root `devme.toml`, optionally split an explicit monorepo into child configs, and each git worktree gets its own coexisting stack with non-colliding ports.
 
 <!-- TODO: Replace with VHS-generated GIF of `devme up` starting services + TUI -->
 <!-- ![devme TUI demo](assets/demo.gif) -->
@@ -60,6 +60,40 @@ Ports automatically offset per worktree slot. Slot 0 keeps defaults, slot 1 gets
 One-shot tasks run through `devme run <name>` and delegate to the project's
 authoritative native tools. See [`examples/native-mobile-monorepo`](./examples/native-mobile-monorepo/)
 for backend, iOS, and Android orchestration with scoped runtime leases.
+
+Large monorepos can keep the same root interface while splitting configuration
+by app:
+
+```toml
+# root devme.toml
+[workspace.members]
+backend = "backend"
+ios = "apps/ios"
+android = "apps/android"
+```
+
+Preview a detected split with `devme setup split --dry-run`, then opt in with
+`devme setup split --write`. Ordinary `devme setup --write` keeps the
+conservative single-file layout, and Devme never silently moves executable
+configuration between files.
+
+Each listed directory owns one child `devme.toml`. Devme composes those files
+into one namespaced runtime graph, not a package or build graph. Child-local
+references stay concise, while cross-member references are explicit:
+
+```toml
+# apps/ios/devme.toml
+[task.test]
+cmd = "xcodebuild test -workspace App.xcworkspace -scheme App"
+services = ["backend::api"]
+```
+
+Run `devme run ios::test` from the root or `devme run test` from `apps/ios`.
+A bare `devme` in a member focuses that app while still converging its declared
+backend and setup dependencies. All members share one worktree supervisor,
+resource namespace, and timestamped log history. Composition is deliberately
+one level deep and opt-in: Devme never discovers nested configs or reproduces
+Xcode, Gradle, Convex, Vite+, or package build graphs.
 
 Coding agents can opt into compact session context with
 `devme agent setup --target <claude|codex|opencode|all>`, inspect it with `devme agent status`, and

@@ -8,7 +8,9 @@ use clap_complete::Shell;
 use devme_core::{ServiceSnapshot, StepSnapshot};
 
 pub mod agent;
+pub mod output;
 pub mod remote;
+pub mod session;
 pub mod setup;
 pub mod skill;
 pub mod task;
@@ -71,6 +73,22 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum Command {
+    /// Open a resource-bound session or stop it idempotently.
+    Session {
+        /// Session name from `[session.<name>]`.
+        session: String,
+        /// Stop the live session instead of opening it.
+        #[arg(long)]
+        stop: bool,
+        /// Structured result format. `--json` remains a compatibility alias.
+        #[arg(long, value_enum, default_value_t, global = true)]
+        output: OutputFormat,
+    },
+    /// List configured sessions and compact live state.
+    Sessions {
+        #[arg(long, value_enum, default_value_t, global = true)]
+        output: OutputFormat,
+    },
     /// Run a declarative one-shot task from devme.toml.
     Run {
         /// Task name.
@@ -127,6 +145,10 @@ pub enum Command {
         /// TUI sidebar; handy for an agent coordinating across worktrees.
         #[arg(long)]
         all: bool,
+        /// Output format. Human output remains the default; `--json` is a
+        /// compatibility alias for `--output json`.
+        #[arg(long, value_enum, default_value_t, global = true)]
+        output: OutputFormat,
     },
     /// Restart a service.
     Restart { service: String },
@@ -186,6 +208,12 @@ pub enum Command {
         /// Maximum log lines per service (default 50).
         #[arg(long, default_value_t = 50)]
         tail: usize,
+        /// Include bounded task stdout/stderr and the complete latest result.
+        #[arg(long)]
+        full: bool,
+        /// Output format. JSON remains the default for compatibility.
+        #[arg(long, value_enum, default_value = "json", global = true)]
+        output: OutputFormat,
     },
     /// View or change devme global settings, or lint this project's config.
     ///
@@ -247,8 +275,24 @@ pub enum Command {
     },
     /// Detect native/web tooling and produce an explicit devme.toml.
     Setup {
+        /// Opt in to a root workspace plus marker-local child configs.
+        #[command(subcommand)]
+        action: Option<SetupAction>,
         /// Write devme.toml. Without this flag, print a preview only.
         #[arg(long)]
+        write: bool,
+    },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum SetupAction {
+    /// Generate an explicit one-level workspace with local child configs.
+    Split {
+        /// Preview every generated file without changing the worktree.
+        #[arg(long, conflicts_with = "write", required_unless_present = "write")]
+        dry_run: bool,
+        /// Write every config after checking that none would be overwritten.
+        #[arg(long, conflicts_with = "dry_run", required_unless_present = "dry_run")]
         write: bool,
     },
 }
@@ -857,6 +901,7 @@ pub fn format_status_json(
     steps: &[StepSnapshot],
 ) -> serde_json::Value {
     serde_json::json!({
+        "schema_version": 1,
         "services": services,
         "steps": steps,
     })
@@ -869,8 +914,48 @@ mod tests {
     #[test]
     fn parses_status_subcommand() {
         let cli = Cli::parse_from(["devme", "status"]);
-        assert_eq!(cli.command, Some(Command::Status { all: false }));
+        assert_eq!(
+            cli.command,
+            Some(Command::Status {
+                all: false,
+                output: OutputFormat::Human,
+            })
+        );
         assert!(!cli.json);
+    }
+
+    #[test]
+    fn status_and_doctor_have_explicit_compatible_output_formats() {
+        let status = Cli::parse_from(["devme", "status", "--output", "toon"]);
+        assert_eq!(
+            status.command,
+            Some(Command::Status {
+                all: false,
+                output: OutputFormat::Toon,
+            })
+        );
+
+        let doctor = Cli::parse_from(["devme", "doctor", "api", "--full", "--output", "human"]);
+        assert_eq!(
+            doctor.command,
+            Some(Command::Doctor {
+                name: Some("api".into()),
+                tail: 50,
+                full: true,
+                output: OutputFormat::Human,
+            })
+        );
+
+        let doctor_default = Cli::parse_from(["devme", "doctor"]);
+        assert_eq!(
+            doctor_default.command,
+            Some(Command::Doctor {
+                name: None,
+                tail: 50,
+                full: false,
+                output: OutputFormat::Json,
+            })
+        );
     }
 
     #[test]
@@ -878,6 +963,48 @@ mod tests {
         // Bare `devme` enters the TUI mode — represented by None here.
         let cli = Cli::parse_from(["devme"]);
         assert_eq!(cli.command, None);
+    }
+
+    #[test]
+    fn setup_preserves_single_file_write_and_parses_explicit_split_modes() {
+        let single = Cli::parse_from(["devme", "setup", "--write"]);
+        assert_eq!(
+            single.command,
+            Some(Command::Setup {
+                action: None,
+                write: true,
+            })
+        );
+
+        let preview = Cli::parse_from(["devme", "setup", "split", "--dry-run"]);
+        assert_eq!(
+            preview.command,
+            Some(Command::Setup {
+                action: Some(SetupAction::Split {
+                    dry_run: true,
+                    write: false,
+                }),
+                write: false,
+            })
+        );
+
+        let write = Cli::parse_from(["devme", "setup", "split", "--write"]);
+        assert_eq!(
+            write.command,
+            Some(Command::Setup {
+                action: Some(SetupAction::Split {
+                    dry_run: false,
+                    write: true,
+                }),
+                write: false,
+            })
+        );
+    }
+
+    #[test]
+    fn setup_split_requires_an_explicit_non_interactive_mode() {
+        assert!(Cli::try_parse_from(["devme", "setup", "split"]).is_err());
+        assert!(Cli::try_parse_from(["devme", "setup", "split", "--dry-run", "--write"]).is_err());
     }
 
     #[test]
@@ -964,7 +1091,13 @@ mod tests {
     fn json_flag_is_global() {
         let cli = Cli::parse_from(["devme", "--json", "status"]);
         assert!(cli.json);
-        assert_eq!(cli.command, Some(Command::Status { all: false }));
+        assert_eq!(
+            cli.command,
+            Some(Command::Status {
+                all: false,
+                output: OutputFormat::Human,
+            })
+        );
     }
 
     #[test]
@@ -1295,7 +1428,13 @@ mod tests {
     #[test]
     fn status_all_flag_parses() {
         let cli = Cli::parse_from(["devme", "status", "--all"]);
-        assert_eq!(cli.command, Some(Command::Status { all: true }));
+        assert_eq!(
+            cli.command,
+            Some(Command::Status {
+                all: true,
+                output: OutputFormat::Human,
+            })
+        );
     }
 
     #[test]
@@ -1542,7 +1681,13 @@ mod tests {
     fn local_flag_is_global() {
         let cli = Cli::parse_from(["devme", "--local", "status"]);
         assert!(cli.local);
-        assert_eq!(cli.command, Some(Command::Status { all: false }));
+        assert_eq!(
+            cli.command,
+            Some(Command::Status {
+                all: false,
+                output: OutputFormat::Human,
+            })
+        );
     }
 
     #[test]

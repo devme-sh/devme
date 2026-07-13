@@ -12,8 +12,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  skill-freshness:
+    name: Check agent skill freshness
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check repository skill mirror
+        run: scripts/sync-devme-skill.sh --check
+
   build:
     name: Build ${{ matrix.name }}
+    needs: skill-freshness
     runs-on: ${{ matrix.runner }}
 
     strategy:

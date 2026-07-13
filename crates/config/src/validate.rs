@@ -26,11 +26,176 @@ pub fn validate(stack: &Stack) -> Result<(), Vec<ConfigError>> {
     check_readiness(stack, &mut errors);
     check_redaction_patterns(stack, &mut errors);
     check_tasks(stack, &mut errors);
+    check_sessions(stack, &mut errors);
 
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+fn check_sessions(stack: &Stack, errors: &mut Vec<ConfigError>) {
+    use devme_core::Scope;
+
+    let mut owners: HashMap<String, usize> = HashMap::new();
+    for (session_name, session) in &stack.session {
+        for service in &session.needs {
+            if !stack.service.contains_key(service) {
+                errors.push(ConfigError::UnknownSessionReference {
+                    session: session_name.clone(),
+                    kind: "service",
+                    name: service.clone(),
+                });
+            }
+        }
+        for resource in &session.resources {
+            if !stack.resource.contains_key(resource) {
+                errors.push(ConfigError::UnknownSessionReference {
+                    session: session_name.clone(),
+                    kind: "resource",
+                    name: resource.clone(),
+                });
+            }
+        }
+        if let Some(task) = &session.run
+            && !stack.task.contains_key(task)
+        {
+            errors.push(ConfigError::UnknownSessionReference {
+                session: session_name.clone(),
+                kind: "task",
+                name: task.clone(),
+            });
+        }
+        let mut closure = HashSet::new();
+        let mut pending = session.needs.clone();
+        while let Some(name) = pending.pop() {
+            if !closure.insert(name.clone()) {
+                continue;
+            }
+            if let Some(service) = stack.service.get(&name) {
+                pending.extend(
+                    service
+                        .depends_on
+                        .iter()
+                        .filter(|dependency| dependency.required)
+                        .filter(|dependency| stack.service.contains_key(&dependency.name))
+                        .map(|dependency| dependency.name.clone()),
+                );
+            }
+        }
+        if let Some(task_name) = &session.run {
+            let mut task_names = Vec::new();
+            let mut task_pending = vec![task_name.clone()];
+            let mut seen_tasks = HashSet::new();
+            while let Some(name) = task_pending.pop() {
+                if !seen_tasks.insert(name.clone()) {
+                    continue;
+                }
+                if let Some(task) = stack.task.get(&name) {
+                    task_names.push(name);
+                    task_pending.extend(task.depends_on.iter().cloned());
+                }
+            }
+            for name in &task_names {
+                if stack
+                    .task
+                    .get(name)
+                    .is_some_and(|task| !task.resources.is_empty())
+                {
+                    errors.push(ConfigError::SessionRunTaskResources {
+                        session: session_name.clone(),
+                        task: name.clone(),
+                    });
+                }
+            }
+            for required in task_names
+                .iter()
+                .filter_map(|name| stack.task.get(name))
+                .flat_map(|task| task.services.iter())
+            {
+                if !closure.contains(required) {
+                    errors.push(ConfigError::SessionRunMissingService {
+                        session: session_name.clone(),
+                        task: task_name.clone(),
+                        service: required.clone(),
+                    });
+                }
+            }
+        }
+        for service in closure {
+            if stack
+                .service
+                .get(&service)
+                .is_some_and(|service| service.scope == Scope::Session)
+            {
+                *owners.entry(service).or_default() += 1;
+            }
+        }
+
+        let mut exposed = HashMap::<&str, &str>::new();
+        for resource_name in &session.resources {
+            let Some(env) = stack
+                .resource
+                .get(resource_name)
+                .and_then(|resource| resource.env.as_deref())
+            else {
+                continue;
+            };
+            if let Some(first) = exposed.insert(env, resource_name) {
+                errors.push(ConfigError::DuplicateSessionResourceEnv {
+                    session: session_name.clone(),
+                    first: first.to_string(),
+                    second: resource_name.clone(),
+                    env: env.to_string(),
+                });
+            }
+        }
+    }
+
+    for (name, service) in &stack.service {
+        if service.scope == Scope::Session {
+            let count = owners.get(name).copied().unwrap_or_default();
+            if count != 1 {
+                errors.push(ConfigError::SessionServiceOwnerCount {
+                    service: name.clone(),
+                    owners: count,
+                });
+            }
+            if service.external {
+                errors.push(ConfigError::ExternalSessionService {
+                    service: name.clone(),
+                });
+            }
+        } else {
+            for dependency in &service.depends_on {
+                if stack
+                    .service
+                    .get(&dependency.name)
+                    .is_some_and(|dependency| dependency.scope == Scope::Session)
+                {
+                    errors.push(ConfigError::SessionDependencyFromOrdinary {
+                        service: name.clone(),
+                        dependency: dependency.name.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    for (task_name, task) in &stack.task {
+        for service_name in &task.services {
+            if stack
+                .service
+                .get(service_name)
+                .is_some_and(|service| service.scope == Scope::Session)
+            {
+                errors.push(ConfigError::TaskUsesSessionService {
+                    task: task_name.clone(),
+                    service: service_name.clone(),
+                });
+            }
+        }
     }
 }
 

@@ -1,0 +1,27 @@
+schema_version = 1
+
+[service.device-logs]
+cmd = "printf 'portable simulator slot=%s\\n' \"$IOS_RUNTIME_SLOT\"; touch .logs-started; sleep 30"
+scope = "session"
+depends_on = ["backend::api"]
+health = { shell = "test -f .logs-started" }
+readiness = { interval_ms = 20, timeout_ms = 100, retries = 50 }
+
+[task.compile]
+cmd = "touch .compiled"
+
+[task.verify]
+cmd = "test -f .compiled; test -f ../../backend/.schema-published; touch .verified"
+depends_on = ["compile"]
+services = ["backend::api"]
+resources = ["root::ios-runtime"]
+readiness_timeout = 5
+
+[task.launch]
+cmd = "test -n \"$IOS_RUNTIME_SLOT\"; test -f ../../backend/.schema-published; test -f .logs-started; touch .launched"
+
+[session.dev]
+needs = ["device-logs"]
+resources = ["root::ios-runtime"]
+run = "launch"
+linger = 1

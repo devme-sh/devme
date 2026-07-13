@@ -17,7 +17,7 @@ pub use dep::Dependency;
 pub use health::HealthCheck;
 pub use ipc::{
     ClientMessage, Envelope, ErrorCode, InstanceInfo, LogStream, NoticeLevel, ReadinessSnapshot,
-    SCHEMA_VERSION, ServerMessage, ServiceSnapshot, StepSnapshot,
+    SCHEMA_VERSION, ServerMessage, ServiceSnapshot, SessionSnapshot, SessionState, StepSnapshot,
 };
 pub use port::PortSpec;
 pub use restart::RestartPolicy;

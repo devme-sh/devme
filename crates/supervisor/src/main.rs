@@ -4,7 +4,7 @@
 //!
 //! See `docs/adr/0003-daemon-per-instance-lifecycle.md`.
 
-use devme_config::Stack;
+use devme_config::ResolvedWorkspace;
 use devme_core::InstanceInfo;
 use devme_slot_allocator::SlotAllocator;
 use devme_supervisor::daemon::DaemonServer;
@@ -17,12 +17,11 @@ fn main() {
 }
 
 fn real_main() -> anyhow::Result<()> {
-    let cwd = std::env::current_dir()?;
-    let config_path = cwd.join("devme.toml");
-
-    let toml = std::fs::read_to_string(&config_path)
-        .map_err(|e| anyhow::anyhow!("reading {}: {e}", config_path.display()))?;
-    let mut stack = Stack::parse(&toml).map_err(|e| anyhow::anyhow!("parsing config: {e}"))?;
+    let invocation = std::env::current_dir()?;
+    let resolved = ResolvedWorkspace::resolve(&invocation)
+        .map_err(|error| anyhow::anyhow!("resolving workspace: {error}"))?;
+    let cwd = resolved.root().to_path_buf();
+    let mut stack = resolved.into_stack();
 
     // Repo-scoped services are owned by the shared supervisor (ADR-0007).
     // Convert them to external services with a health check so the

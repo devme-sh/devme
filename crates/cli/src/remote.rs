@@ -1254,6 +1254,7 @@ pub fn status(cwd: &Path, json: bool, watch: bool) -> Result<()> {
             })
             .collect();
         let value = serde_json::json!({
+            "schema_version": 1,
             "session": r.session,
             "exists": exists,
             "host": r.host,
@@ -1368,6 +1369,7 @@ pub fn conflicts(cwd: &Path, json: bool) -> Result<()> {
     if !sync_exists(&r.session) {
         if json {
             let v = serde_json::json!({
+                "schema_version": 1,
                 "session": r.session, "exists": false, "conflicts": 0, "paths": [],
             });
             devme_ui::json(&v);
@@ -1382,6 +1384,7 @@ pub fn conflicts(cwd: &Path, json: bool) -> Result<()> {
 
     if json {
         let v = serde_json::json!({
+            "schema_version": 1,
             "session": r.session,
             "exists": true,
             "host": r.host,
@@ -1677,6 +1680,7 @@ pub fn doctor(cwd: &Path, json: bool) -> Result<()> {
             })
             .collect();
         let value = serde_json::json!({
+            "schema_version": 1,
             "status": if all_ok { "ok" } else { "problems" },
             "host": r.host,
             "remote_path": r.remote_path,
@@ -1868,7 +1872,10 @@ mod tests {
 
     #[test]
     fn proxyable_commands_are_daemon_facing_only() {
-        assert!(is_proxyable(&Some(C::Status { all: false })));
+        assert!(is_proxyable(&Some(C::Status {
+            all: false,
+            output: crate::OutputFormat::Human,
+        })));
         assert!(is_proxyable(&Some(C::Logs {
             service: Some("api".into()),
             follow: false,

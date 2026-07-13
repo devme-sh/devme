@@ -11,6 +11,8 @@
 //! `schema_version` is at the top level so a Client can verify compatibility
 //! before parsing the payload; breaking schema changes bump the version.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{ServiceState, StepState};
@@ -103,6 +105,14 @@ pub enum ClientMessage {
     },
     /// Start only these services and their required transitive dependencies.
     StartTargets { services: Vec<String> },
+    /// Acquire a named session's resources and start its targeted service
+    /// closure. A second client joins the same live session idempotently.
+    OpenSession { session: String },
+    /// Stop a live session, including its session-scoped services, before
+    /// releasing its resource leases. Already stopped is a successful no-op.
+    StopSession { session: String },
+    /// Return compact live session state.
+    ListSessions,
     /// Re-run health checks across the whole graph. Equivalent to
     /// `devme health --recheck`.
     RecheckHealth,
@@ -168,6 +178,28 @@ pub enum ServerMessage {
         #[serde(default)]
         last_error: Option<String>,
     },
+    /// Resource acquisition is waiting. The connection remains attached and
+    /// will receive `SessionReady` once the whole session is ready.
+    SessionPending {
+        session: String,
+        resources: Vec<String>,
+    },
+    /// Resources are held and required services are ready.
+    SessionReady {
+        session: String,
+        joined: bool,
+        services: Vec<String>,
+        env: BTreeMap<String, String>,
+        run: Option<String>,
+    },
+    /// Explicit stop acknowledgement. `already_stopped` makes the mutation
+    /// idempotent for agents and cleanup scripts.
+    SessionStopped {
+        session: String,
+        already_stopped: bool,
+    },
+    /// Compact state for all live and pending sessions.
+    Sessions { sessions: Vec<SessionSnapshot> },
     /// A step's state changed.
     StepStatusUpdate { step: String, state: StepState },
     /// End-of-replay marker for a [`ClientMessage::LogQuery`]. Everything
@@ -221,6 +253,24 @@ pub struct ReadinessSnapshot {
 pub struct StepSnapshot {
     pub name: String,
     pub state: StepState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSnapshot {
+    pub name: String,
+    pub state: SessionState,
+    pub clients: usize,
+    pub services: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionState {
+    Waiting,
+    Starting,
+    Ready,
+    Stopping,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -354,6 +404,13 @@ mod tests {
             ClientMessage::StartTargets {
                 services: vec!["backend".into()],
             },
+            ClientMessage::OpenSession {
+                session: "mobile".into(),
+            },
+            ClientMessage::StopSession {
+                session: "mobile".into(),
+            },
+            ClientMessage::ListSessions,
             ClientMessage::RecheckHealth,
             ClientMessage::Shutdown,
         ];
@@ -416,6 +473,29 @@ mod tests {
                 attempt: 3,
                 ready: false,
                 last_error: Some("schema is not published".into()),
+            },
+            ServerMessage::SessionPending {
+                session: "mobile".into(),
+                resources: vec!["device".into()],
+            },
+            ServerMessage::SessionReady {
+                session: "mobile".into(),
+                joined: false,
+                services: vec!["device_logs".into()],
+                env: BTreeMap::from([("DEVICE_ID".into(), "0".into())]),
+                run: Some("launch".into()),
+            },
+            ServerMessage::SessionStopped {
+                session: "mobile".into(),
+                already_stopped: false,
+            },
+            ServerMessage::Sessions {
+                sessions: vec![SessionSnapshot {
+                    name: "mobile".into(),
+                    state: SessionState::Ready,
+                    clients: 1,
+                    services: vec!["device_logs".into()],
+                }],
             },
             ServerMessage::StepStatusUpdate {
                 step: "gcloud".into(),
