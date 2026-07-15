@@ -1373,8 +1373,7 @@ impl TuiState {
             if self.current_instance_missing_on_host() {
                 format!(
                     "Worktree registered at {}, but that path doesn't exist on this \
-                     machine — it was likely created on another host (only the main \
-                     worktree syncs to a remote).\n\n\
+                     machine — it was likely created on another host.\n\n\
                      `git worktree prune` here drops the stale registration; \
                      `git worktree add <path> <branch>` creates it on this host.",
                     self.current_instance_cwd()

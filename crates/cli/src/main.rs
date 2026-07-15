@@ -283,7 +283,9 @@ fn initialize_project_context() {
 }
 
 async fn run(cli: Cli) -> i32 {
-    if let (_, Some(warning)) = devme_config::GlobalConfig::load_checked() {
+    let interactive_default =
+        cli.command.is_none() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if !interactive_default && let (_, Some(warning)) = devme_config::GlobalConfig::load_checked() {
         devme_ui::warn(warning);
     }
     let command_output = match &cli.command {
@@ -2785,10 +2787,7 @@ fn config_cmd(action: Option<ConfigAction>, json: bool) -> anyhow::Result<()> {
     match action {
         Some(ConfigAction::Check) => config_check(json),
         None => {
-            let (cfg, warning) = GlobalConfig::load_checked();
-            if let Some(w) = warning {
-                devme_ui::warn(w);
-            }
+            let cfg = GlobalConfig::load();
             for (key, desc) in GlobalConfig::keys() {
                 let value = cfg.get(key).unwrap_or_else(|| "(unset)".into());
                 println!("{key:<24} {value:<20} # {desc}");
@@ -2796,10 +2795,7 @@ fn config_cmd(action: Option<ConfigAction>, json: bool) -> anyhow::Result<()> {
             Ok(())
         }
         Some(ConfigAction::Get { key }) => {
-            let (cfg, warning) = GlobalConfig::load_checked();
-            if let Some(w) = warning {
-                devme_ui::warn(w);
-            }
+            let cfg = GlobalConfig::load();
             match cfg.get(&key) {
                 Some(v) => println!("{v}"),
                 None => println!("(unset)"),

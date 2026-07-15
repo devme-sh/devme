@@ -117,29 +117,14 @@ impl GlobalConfig {
             // Missing file is the normal first-run case — not a warning.
             Err(_) => return (Self::default(), None),
         };
-        match toml::from_str(&text) {
-            Ok(cfg) => {
-                let warning = toml::from_str::<toml::Value>(&text)
-                    .ok()
-                    .and_then(|value| value.get("remote").cloned())
-                    .map(|_| legacy_remote_config_warning(&path));
-                (cfg, warning)
-            }
-            Err(e) => {
-                let first = e
-                    .to_string()
-                    .lines()
-                    .next()
-                    .unwrap_or("parse error")
-                    .to_string();
-                (
-                    Self::default(),
-                    Some(format!(
-                        "{} has an error ({first}); using defaults",
-                        path.display()
-                    )),
-                )
-            }
+        parse_config_text(&path, &text)
+    }
+
+    #[cfg(test)]
+    fn load_checked_from(path: &Path) -> (Self, Option<String>) {
+        match std::fs::read_to_string(path) {
+            Ok(text) => parse_config_text(path, &text),
+            Err(_) => (Self::default(), None),
         }
     }
 
@@ -175,7 +160,7 @@ impl GlobalConfig {
             .ok_or_else(|| format!("config key must be `section.key`, got: {key}"))?;
         let path = global_config_path();
         let content = std::fs::read_to_string(&path).unwrap_or_default();
-        let updated = crate::surgical::remove_section_key(&content, section, leaf);
+        let updated = remove_key_from_text(&content, section, leaf);
         write_atomic(&path, &updated).map_err(|e| e.to_string())
     }
 
@@ -355,6 +340,20 @@ fn render_toml_value(key: &str, value: &str) -> String {
     }
 }
 
+fn remove_key_from_text(content: &str, section: &str, leaf: &str) -> String {
+    let mut updated = crate::surgical::remove_section_key(content, section, leaf);
+    if section == "remote"
+        && toml::from_str::<toml::Value>(&updated)
+            .ok()
+            .and_then(|value| value.get("remote").cloned())
+            .and_then(|value| value.as_table().cloned())
+            .is_some_and(|table| table.is_empty())
+    {
+        updated = crate::surgical::remove_section(&updated, section);
+    }
+    updated
+}
+
 /// Write `content` to `path`, creating the parent dir. Uses a temp file +
 /// rename so a crash mid-write can't truncate the user's config.
 fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
@@ -371,6 +370,33 @@ fn legacy_remote_config_warning(path: &Path) -> String {
         "{} contains a legacy [remote] section that devme now ignores; remove it, use Git for project state, and use devcloud for remote project context",
         path.display()
     )
+}
+
+fn parse_config_text(path: &Path, text: &str) -> (GlobalConfig, Option<String>) {
+    match toml::from_str(text) {
+        Ok(config) => {
+            let warning = toml::from_str::<toml::Value>(text)
+                .ok()
+                .and_then(|value| value.get("remote").cloned())
+                .map(|_| legacy_remote_config_warning(path));
+            (config, warning)
+        }
+        Err(error) => {
+            let first = error
+                .to_string()
+                .lines()
+                .next()
+                .unwrap_or("parse error")
+                .to_string();
+            (
+                GlobalConfig::default(),
+                Some(format!(
+                    "{} has an error ({first}); using defaults",
+                    path.display()
+                )),
+            )
+        }
+    }
 }
 
 /// `~/.config/devme/config.toml` or `$XDG_CONFIG_HOME/devme/config.toml`.
@@ -442,18 +468,21 @@ mod tests {
     fn legacy_remote_config_is_ignored_with_a_migration_warning() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "[docker]\ndaemon = \"orbstack\"\n[remote]\nhost = \"vps\"\ndefault = true\n",
-        )
-        .unwrap();
+        let text = "[docker]\ndaemon = \"orbstack\"\n[remote]\nhost = \"vps\"\ndefault = true\n";
+        std::fs::write(&path, text).unwrap();
 
-        let text = std::fs::read_to_string(&path).unwrap();
-        let cfg: GlobalConfig = toml::from_str(&text).unwrap();
+        let (cfg, warning) = GlobalConfig::load_checked_from(&path);
         assert_eq!(cfg.docker.daemon.as_deref(), Some("orbstack"));
-        assert!(legacy_remote_config_warning(&path).contains("devcloud"));
+        assert!(warning.unwrap().contains("devcloud"));
         assert!(GlobalConfig::default().set("remote.host", "vps").is_err());
         assert!(GlobalConfig::default().unset("remote.host").is_ok());
+
+        let without_host = remove_key_from_text(text, "remote", "host");
+        assert!(without_host.contains("[remote]"));
+        let cleaned = remove_key_from_text(&without_host, "remote", "default");
+        assert!(!cleaned.contains("[remote]"));
+        let (_, warning) = parse_config_text(&path, &cleaned);
+        assert!(warning.is_none());
     }
 
     #[test]
