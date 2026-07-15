@@ -5,13 +5,13 @@
 //! events from the terminal, and produces the snapshot the renderer
 //! consumes.
 
+pub mod actions;
 pub mod discovery;
 mod event_loop;
-pub mod home;
 pub mod keymap;
 pub mod render;
 pub mod state;
 pub mod theme;
 pub mod worktree;
 
-pub use event_loop::{launch, launch_targets, launch_with_home};
+pub use event_loop::{launch, launch_targets, launch_with_actions};

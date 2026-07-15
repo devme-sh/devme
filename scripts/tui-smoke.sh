@@ -173,6 +173,9 @@ while tmux has-session -t "$SESSION" 2>/dev/null; do
 done
 tmux new-session -d -s "$SESSION" -x 120 -y 30 \
   "cd $SMOKE_DIR && HOME=$SMOKE_HOME XDG_CONFIG_HOME=$SMOKE_HOME/.config $DEVME"
+# Queue harmless input before the first supervisor subscription. Early keys
+# must not win the race against warm-start rail selection.
+tmux send-keys -t "$SESSION" "n"
 sleep 3
 tmux capture-pane -t "$SESSION" -p > /tmp/devme-tui-cap-warm.txt
 grep -qF "stacks" /tmp/devme-tui-cap-warm.txt || {

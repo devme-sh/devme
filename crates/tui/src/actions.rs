@@ -6,7 +6,7 @@ use std::sync::Arc;
 use devme_config::{Stack, TaskKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HomeAction {
+pub struct ActionItem {
     pub task: String,
     pub label: String,
     pub description: String,
@@ -21,20 +21,49 @@ pub struct RecentResult {
     pub finished_at: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionOutcome {
+    Succeeded,
+    Cancelled,
+    Interrupted,
+    TimedOut,
+    Failed,
+}
+
+impl ActionOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+            Self::TimedOut => "timed out",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn succeeded(self) -> bool {
+        self == Self::Succeeded
+    }
+}
+
 impl RecentResult {
+    pub fn outcome(&self) -> ActionOutcome {
+        match self.status.as_str() {
+            "passed" => ActionOutcome::Succeeded,
+            "cancelled" => ActionOutcome::Cancelled,
+            "interrupted" => ActionOutcome::Interrupted,
+            "timed_out" => ActionOutcome::TimedOut,
+            _ => ActionOutcome::Failed,
+        }
+    }
+
     pub fn wording(&self) -> String {
         let noun = match self.kind {
             TaskKind::Launch => "launch",
             TaskKind::Check => "check",
             TaskKind::Utility => "run",
         };
-        let status = match self.status.as_str() {
-            "passed" => "succeeded",
-            "cancelled" => "cancelled",
-            "interrupted" => "interrupted",
-            "timed_out" => "timed out",
-            _ => "failed",
-        };
+        let status = self.outcome().label();
         format!("last {noun} {status}")
     }
 }
@@ -62,7 +91,7 @@ pub struct ActionTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionCatalog {
-    pub actions: Vec<HomeAction>,
+    pub actions: Vec<ActionItem>,
     pub recent: Vec<RecentResult>,
     member_focus: Option<String>,
 }
@@ -76,7 +105,7 @@ impl ActionCatalog {
         let mut actions = stack
             .task
             .iter()
-            .map(|(name, task)| HomeAction {
+            .map(|(name, task)| ActionItem {
                 task: name.clone(),
                 label: display_label(name, member_focus),
                 description: task.description.clone().unwrap_or_default(),
@@ -118,8 +147,8 @@ pub type LoadFuture = Pin<Box<dyn Future<Output = anyhow::Result<ActionCatalog>>
 pub type ActionLoader = Arc<dyn Fn(PathBuf) -> LoadFuture + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HomeState {
-    pub actions: Vec<HomeAction>,
+pub struct ActionPanel {
+    pub actions: Vec<ActionItem>,
     pub selected: usize,
     pub recent: Vec<RecentResult>,
     pub running: Option<String>,
@@ -134,7 +163,7 @@ pub struct HomeState {
     member_focus: Option<String>,
 }
 
-impl HomeState {
+impl ActionPanel {
     pub fn from_stack(stack: &Stack, recent: Vec<RecentResult>) -> Self {
         Self::from_stack_with_member_focus(stack, None, recent)
     }
@@ -145,6 +174,10 @@ impl HomeState {
         recent: Vec<RecentResult>,
     ) -> Self {
         let catalog = ActionCatalog::from_stack_with_member_focus(stack, member_focus, recent);
+        Self::from_catalog(catalog)
+    }
+
+    pub fn from_catalog(catalog: ActionCatalog) -> Self {
         let mut state = Self {
             actions: catalog.actions,
             selected: 0,
@@ -278,9 +311,10 @@ mod tests {
     #[test]
     fn actions_group_run_then_check_then_utility() {
         let stack = Stack::parse("schema_version = 1\n[task.z]\ncmd=\"true\"\n[task.verify]\nkind=\"check\"\ncmd=\"true\"\n[task.ios]\nkind=\"launch\"\ncmd=\"true\"\n").unwrap();
-        let home = HomeState::from_stack(&stack, vec![]);
+        let panel = ActionPanel::from_stack(&stack, vec![]);
         assert_eq!(
-            home.actions
+            panel
+                .actions
                 .iter()
                 .map(|a| a.task.as_str())
                 .collect::<Vec<_>>(),
@@ -314,9 +348,10 @@ mod tests {
         )
         .unwrap();
 
-        let home = HomeState::from_stack(&stack, vec![]);
+        let panel = ActionPanel::from_stack(&stack, vec![]);
         assert_eq!(
-            home.actions
+            panel
+                .actions
                 .iter()
                 .map(|action| action.label.as_str())
                 .collect::<Vec<_>>(),
@@ -331,15 +366,16 @@ mod tests {
         )
         .unwrap();
 
-        let home = HomeState::from_stack_with_member_focus(&stack, Some("ios"), vec![]);
+        let panel = ActionPanel::from_stack_with_member_focus(&stack, Some("ios"), vec![]);
         assert_eq!(
-            home.actions
+            panel
+                .actions
                 .iter()
                 .map(|action| action.label.as_str())
                 .collect::<Vec<_>>(),
             ["simulator", "test"]
         );
-        assert_eq!(home.task_label("ios::device-e2e"), "device e2e");
+        assert_eq!(panel.task_label("ios::device-e2e"), "device e2e");
     }
 
     #[test]
@@ -351,7 +387,7 @@ mod tests {
             status: "passed".into(),
             finished_at,
         };
-        let mut home = HomeState::from_stack(
+        let mut panel = ActionPanel::from_stack(
             &stack,
             vec![
                 result("simulator", 1),
@@ -361,16 +397,18 @@ mod tests {
         );
 
         assert_eq!(
-            home.recent
+            panel
+                .recent
                 .iter()
                 .map(|recent| (recent.task.as_str(), recent.finished_at))
                 .collect::<Vec<_>>(),
             [("test", 2), ("simulator", 3)]
         );
 
-        home.record_result(result("test", 4));
+        panel.record_result(result("test", 4));
         assert_eq!(
-            home.recent
+            panel
+                .recent
                 .iter()
                 .map(|recent| (recent.task.as_str(), recent.finished_at))
                 .collect::<Vec<_>>(),
@@ -381,7 +419,7 @@ mod tests {
     #[test]
     fn loading_another_stack_keeps_running_activity_attached_to_its_origin() {
         let stack = Stack::parse("schema_version = 1\n[task.verify]\ncmd=\"true\"\n").unwrap();
-        let mut state = HomeState::from_stack(&stack, vec![]);
+        let mut state = ActionPanel::from_stack(&stack, vec![]);
         state.set_target(ActionTarget {
             instance_id: "main".into(),
             label: "main".into(),
@@ -412,7 +450,7 @@ mod tests {
     #[test]
     fn completion_does_not_pollute_another_stacks_recent_actions() {
         let stack = Stack::parse("schema_version = 1\n[task.verify]\ncmd=\"true\"\n").unwrap();
-        let mut state = HomeState::from_stack(&stack, vec![]);
+        let mut state = ActionPanel::from_stack(&stack, vec![]);
         state.set_target(ActionTarget {
             instance_id: "main".into(),
             label: "main".into(),
