@@ -4,6 +4,8 @@ members = [
     "crates/ui",
     "crates/core",
     "crates/config",
+    "crates/resource-lease",
+    "crates/task-runner",
     "crates/slot-allocator",
     "crates/executor",
     "crates/ipc",
@@ -26,6 +28,8 @@ repository = "https://github.com/devme-sh/devme"
 devme-ui = { path = "crates/ui" }
 devme-core = { path = "crates/core" }
 devme-config = { path = "crates/config" }
+devme-resource-lease = { path = "crates/resource-lease" }
+devme-task-runner = { path = "crates/task-runner" }
 devme-slot-allocator = { path = "crates/slot-allocator" }
 devme-executor = { path = "crates/executor" }
 devme-ipc = { path = "crates/ipc" }

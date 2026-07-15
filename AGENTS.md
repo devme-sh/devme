@@ -13,6 +13,8 @@ Rust CLI tool — "the executable README". Monorepo with workspace crates.
 - `crates/client` — IPC client to supervisor
 - `crates/ipc` — IPC protocol
 - `crates/core` — shared types
+- `crates/task-runner` - presentation-free one-shot Task lifecycle
+- `crates/resource-lease` - shared Task and Session scarce-resource leasing
 - `crates/slot-allocator` — port slot management
 
 ## Building

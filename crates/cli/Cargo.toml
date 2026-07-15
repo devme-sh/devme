@@ -17,9 +17,10 @@ path = "src/main.rs"
 [dependencies]
 devme-core = { workspace = true }
 devme-config = { workspace = true }
+devme-resource-lease = { workspace = true }
+devme-task-runner = { workspace = true }
 devme-ui = { workspace = true }
 devme-client = { workspace = true }
-devme-slot-allocator = { workspace = true }
 devme-supervisor = { path = "../supervisor" }
 devme-shared-supervisor = { path = "../shared-supervisor" }
 clap = { workspace = true }
@@ -33,7 +34,6 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
 toon-format = { workspace = true }
-fs2 = { workspace = true }
 libc = "0.2"
 devme-tui = { path = "../tui" }
 

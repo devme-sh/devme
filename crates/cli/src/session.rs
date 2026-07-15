@@ -37,8 +37,16 @@ impl std::error::Error for SessionCommandError {}
 
 /// Open a session and keep the IPC connection alive while its optional task
 /// runs. Dropping the connection starts the configured linger interval.
-pub async fn open(stack: &Stack, root: &Path, name: &str, format: OutputFormat) -> Result<i32> {
-    Ok(open_held(stack, root, name, format).await?.exit_code)
+pub async fn open(
+    stack: &Stack,
+    root: &Path,
+    name: &str,
+    format: OutputFormat,
+    approval: crate::task::ApprovalHandler,
+) -> Result<i32> {
+    Ok(open_held(stack, root, name, format, approval)
+        .await?
+        .exit_code)
 }
 
 /// Open through readiness, run the optional task with allocated identifiers,
@@ -49,6 +57,7 @@ pub async fn open_held(
     root: &Path,
     name: &str,
     format: OutputFormat,
+    approval: crate::task::ApprovalHandler,
 ) -> Result<OpenedSession> {
     if !stack.session.contains_key(name) {
         return Err(SessionCommandError {
@@ -91,9 +100,20 @@ pub async fn open_held(
                 ..
             } => {
                 if let Some(task) = run.filter(|_| !joined) {
-                    let result =
-                        crate::task::execute_with_env(stack, root, &task, &[], format, &env)
-                            .await?;
+                    let runner = crate::task::TaskRunner::new(stack, root);
+                    let result = runner
+                        .run_borrowed(crate::task::BorrowedRunRequest {
+                            session: name.to_string(),
+                            task,
+                            args: Vec::new(),
+                            env,
+                            services,
+                            approval,
+                            events: None,
+                            cancellation: None,
+                        })
+                        .await?;
+                    crate::task::emit_result(&result, format)?;
                     return Ok(OpenedSession {
                         exit_code: result.exit_code,
                         handle: SessionHandle { _client: client },

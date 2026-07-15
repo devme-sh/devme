@@ -1,0 +1,17 @@
+[package]
+name = "devme-resource-lease"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+devme-config = { workspace = true }
+anyhow = { workspace = true }
+fs2 = { workspace = true }
+indexmap = "2"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }

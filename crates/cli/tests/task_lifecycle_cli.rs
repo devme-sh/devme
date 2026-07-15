@@ -271,7 +271,10 @@ readiness_timeout=30
     assert_eq!(result["task"], "check");
     assert_eq!(result["status"], "failed");
     let diagnostic = result["stderr"].as_str().unwrap();
-    assert!(diagnostic.contains("required service \"backend\" failed"));
+    assert!(
+        diagnostic.contains("required service \"backend\" failed"),
+        "{diagnostic}"
+    );
     assert!(diagnostic.contains("exited with code 17"));
     assert!(diagnostic.contains("devme doctor backend"));
     assert!(diagnostic.contains("devme logs backend"));

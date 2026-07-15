@@ -327,6 +327,59 @@ fn render_home(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
         )),
         chunks[3],
     );
+    if let Some(prompt) = &home.approval {
+        render_task_approval(frame, area, prompt, &p);
+    }
+}
+
+fn render_task_approval(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    prompt: &crate::home::ApprovalPrompt,
+    palette: &Palette,
+) {
+    let width = area.width.saturating_sub(4).clamp(30, 76);
+    let height = area.height.saturating_sub(2).clamp(6, 10);
+    let modal = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .title(Span::styled(
+            " Step approval ",
+            Style::default()
+                .fg(palette.yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(palette.yellow));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    let mut lines = vec![
+        Line::styled(
+            format!("Step {} needs to run:", prompt.step),
+            Style::default().fg(palette.text),
+        ),
+        Line::from(""),
+        Line::styled(&prompt.command, Style::default().fg(palette.mauve)),
+    ];
+    if let Some(description) = &prompt.description {
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            description,
+            Style::default().fg(palette.subtext0),
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        "Enter/y approve   n/s skip   Esc cancel",
+        Style::default().fg(palette.overlay0),
+    ));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 /// Stack-info modal (`i`): the focused stack's identity (branch, worktree
@@ -2639,6 +2692,25 @@ mod tests {
         assert!(text.contains("typescript check  Format-check TypeScript"));
         assert!(text.contains("last launch succeeded"));
         assert!(!text.contains("currently running"));
+    }
+
+    #[test]
+    fn home_renders_typed_step_approval_as_a_modal() {
+        let stack =
+            devme_config::Stack::parse("schema_version=1\n[task.check]\ncmd=\"true\"\n").unwrap();
+        let mut state = TuiState::default();
+        let mut home = crate::home::HomeState::from_stack(&stack, vec![]);
+        home.approval = Some(crate::home::ApprovalPrompt {
+            step: "toolchain".into(),
+            command: "mise install".into(),
+            description: Some("Install the pinned toolchain".into()),
+        });
+        state.set_home(home);
+
+        let text = render_to_text(&mut state, 90, 24);
+        assert!(text.contains("Step approval"), "{text}");
+        assert!(text.contains("mise install"), "{text}");
+        assert!(text.contains("Enter/y approve"), "{text}");
     }
 
     #[test]

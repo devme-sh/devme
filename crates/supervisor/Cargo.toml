@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 devme-core = { workspace = true }
 devme-config = { workspace = true }
+devme-resource-lease = { workspace = true }
 devme-ui = { workspace = true }
 devme-executor = { workspace = true }
 devme-ipc = { workspace = true }
@@ -25,7 +26,6 @@ devme-slot-allocator = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures-util = { version = "0.3", features = ["sink"] }
-fs2 = { workspace = true }
 indexmap = "2"
 portable-pty = { workspace = true }
 reqwest = { workspace = true }

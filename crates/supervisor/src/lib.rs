@@ -13,5 +13,6 @@ pub mod preflight;
 pub mod process;
 pub mod prompt;
 pub mod runtime;
+pub mod service_hold;
 pub mod session;
 pub mod spawn;

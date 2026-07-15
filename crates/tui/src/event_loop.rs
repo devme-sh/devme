@@ -12,7 +12,7 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
 use crate::discovery::Registry;
-use crate::home::{HomeState, TaskRunner, TaskUpdate};
+use crate::home::{HomeState, TaskApproval, TaskRunner, TaskUpdate};
 use crate::keymap;
 use crate::render::render;
 use crate::state::{PointerShape, TuiState};
@@ -208,6 +208,7 @@ async fn run(
     let (wt_op_tx, mut wt_op_rx) = mpsc::unbounded_channel::<WorktreeOp>();
     let (task_update_tx, mut task_update_rx) = mpsc::unbounded_channel::<TaskUpdate>();
     let mut task_cancel: Option<tokio::sync::watch::Sender<bool>> = None;
+    let mut task_approval: Option<tokio::sync::oneshot::Sender<TaskApproval>> = None;
 
     loop {
         terminal.draw(|f| render(f, state))?;
@@ -230,6 +231,23 @@ async fn run(
                         continue;
                     }
                     if state.home_visible() {
+                        if state.home().is_some_and(|home| home.approval.is_some()) {
+                            let response = match k.code {
+                                KeyCode::Enter | KeyCode::Char('y') => Some(TaskApproval::Approve),
+                                KeyCode::Char('n') | KeyCode::Char('s') => Some(TaskApproval::Skip),
+                                KeyCode::Esc => Some(TaskApproval::Cancel),
+                                _ => None,
+                            };
+                            if let Some(response) = response {
+                                if let Some(sender) = task_approval.take() {
+                                    let _ = sender.send(response);
+                                }
+                                if let Some(home) = state.home_mut() {
+                                    home.approval = None;
+                                }
+                            }
+                            continue;
+                        }
                         match k.code {
                             KeyCode::Up | KeyCode::Char('k') => state.home_mut().unwrap().move_previous(),
                             KeyCode::Down | KeyCode::Char('j') => state.home_mut().unwrap().move_next(),
@@ -897,7 +915,15 @@ async fn run(
                             home.logs.push(line);
                             if home.logs.len() > 1_000 { home.logs.remove(0); }
                         }
+                        TaskUpdate::ApprovalRequired { prompt, response } => {
+                            if let Some(previous) = task_approval.replace(response) {
+                                let _ = previous.send(TaskApproval::Cancel);
+                            }
+                            home.approval = Some(prompt);
+                        }
                         TaskUpdate::Finished(result) => {
+                            task_approval = None;
+                            home.approval = None;
                             task_cancel = None;
                             home.running = None;
                             home.record_result(result);

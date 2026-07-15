@@ -38,9 +38,10 @@ Route on `$action`. Default to diagnostics when none is given.
 - `devme tasks show <name> --output toon` shows dependencies, services, resources, and timeout.
 - `devme run <name> --output toon` runs a task. Use `--output json` for existing JSON consumers. Arguments after `--` are passed to the native command.
 - A task with no required services runs without a supervisor. A task with services starts this worktree's supervisor and waits for readiness first.
-- Exit codes are authoritative: wrapped failures retain their code, timeout is 124, and cancellation is 130. Do not infer success by scraping output.
-- Host/repo/worktree resource leases wait atomically and release automatically after exit or crash. Task results are bounded and secret-shaped task environment values are redacted before persistence.
-- `devme sessions --output toon` lists resource-bound native/runtime sessions without starting a daemon. `devme session <name> --output toon` acquires its resources, starts only its required service closure, waits for readiness, and runs its optional launch task. `devme session <name> --stop` is idempotent for a declared session.
+- Exit codes are authoritative: wrapped failures retain their code, timeout is 124, and cancellation is 130. A guardian records `interrupted = true` and exit code 130 if the owning foreground CLI disappears. Do not infer success by scraping output.
+- Host/repo/worktree Resource leases wait atomically. The Task guardian releases them only after the Task process group has exited. Task results are bounded and secret-shaped task environment values are redacted before persistence.
+- Required Services use overlapping reference-counted holds. Finishing one Task or Session never stops a Service that another active owner still requires, and a Task does not claim a pre-existing explicitly managed Service for teardown.
+- `devme sessions --output toon` lists resource-bound native/runtime sessions without starting a daemon. `devme session <name> --output toon` acquires its Resources, holds only its required Service closure, waits for readiness, and runs its optional launch Task inside that existing context. The launch Task cannot widen the Session's Services or Resources. `devme session <name> --stop` is idempotent for a declared Session.
 - From a workspace member, unqualified task/session/service names are local aliases. Use `member::name` for another member and `root::name` for a root task or resource.
 
 ### action "setup" - generate devme.toml
@@ -152,7 +153,7 @@ Rules:
 | `devme config [set <k> <v>] [check]` | Show / set global config; `check` lints `devme.toml` (`--json`, non-zero on errors) |
 | `devme skill install [-g]` | (Re)install this skill into `.claude/skills/devme/` (`-g` = `~/.claude/`); embedded, always matches the binary |
 | `devme tasks [show <name>] [--output toon\|json]` | List concise task contracts or show one task's full execution requirements |
-| `devme run <name> [--output toon\|json] [-- <args>...]` | Run a task DAG with readiness, scoped leases, process-tree timeout/cancellation, persisted results, and raw exit semantics |
+| `devme run <name> [--output toon\|json] [-- <args>...]` | Run a Task DAG with typed Step approval, reference-counted Service holds, guarded Resource leases, process-tree timeout/cancellation/interruption, persisted results, and raw exit semantics |
 | `devme sessions [--output human\|toon\|json]` | List declared sessions and compact live/waiting state without starting a daemon |
 | `devme session <name> [--stop] [--output human\|toon\|json]` | Open/join or idempotently stop a resource-bound service/task composition |
 | `devme setup [--write]` | Detect supported project markers and preview or write one root config |

@@ -1,11 +1,10 @@
 //! `devme` — user-facing CLI binary. Argument parsing and shared
 //! formatters live in [`devme_cli`]; this binary dispatches.
 
-use std::io::IsTerminal;
+use std::io::{BufRead, IsTerminal};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::Context;
 use base64::Engine;
 use clap::{CommandFactory, Parser, error::ErrorKind};
 use clap_complete::{Shell, generate};
@@ -21,7 +20,6 @@ use devme_core::{ClientMessage, ServerMessage, ServiceState};
 static ASSUME_YES: AtomicBool = AtomicBool::new(false);
 static NO_INPUT: AtomicBool = AtomicBool::new(false);
 static PROJECT_WORKSPACE: OnceLock<devme_config::ResolvedWorkspace> = OnceLock::new();
-const READINESS_ATTEMPT_TAIL: usize = 32;
 
 /// Should the *stdout* surface (tables, data) use color? Quiet/color
 /// resolution lives in [`devme_ui`]; this is the bool the table formatters
@@ -39,6 +37,9 @@ fn interactive_input() -> bool {
 }
 
 fn main() {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__task-guardian")) {
+        std::process::exit(task_guardian_main());
+    }
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__supervisor")) {
         if let Err(error) = devme_supervisor::runtime::run() {
             eprintln!("devme-supervisor: {error}");
@@ -113,6 +114,157 @@ fn main() {
         }
     };
     std::process::exit(runtime.block_on(run(cli)));
+}
+
+fn task_guardian_main() -> i32 {
+    let args = std::env::args().skip(2).collect::<Vec<_>>();
+    if args.len() != 12 {
+        return 2;
+    }
+    let Ok(owner_pid) = args[0].parse::<u32>() else {
+        return 2;
+    };
+    let owner_identity = &args[1];
+    let Ok(task_pid) = args[2].parse::<u32>() else {
+        return 2;
+    };
+    let task_identity = &args[3];
+    let gate = std::path::PathBuf::from(&args[4]);
+    let completion = std::path::PathBuf::from(&args[5]);
+    let root = std::path::PathBuf::from(&args[6]);
+    let task = &args[7];
+    let Ok(started_at) = args[8].parse::<u64>() else {
+        return 2;
+    };
+    let owner_matches = || {
+        devme_resource_lease::process_identity(owner_pid).as_deref()
+            == Some(owner_identity.as_str())
+    };
+    let task_matches = || {
+        devme_resource_lease::process_identity(task_pid).as_deref() == Some(task_identity.as_str())
+    };
+    if !task_matches() || !task_is_group_leader(task_pid) {
+        let _ = devme_cli::task::record_interrupted(&root, task, started_at);
+        return 1;
+    }
+    if !owner_matches() {
+        terminate_task_group_and_wait(task_pid);
+        let _ = devme_cli::task::record_interrupted(&root, task, started_at);
+        return 1;
+    }
+    let Ok(_hold) = acquire_guardian_hold(&args[9], &args[10], &args[11]) else {
+        terminate_task_group_and_wait(task_pid);
+        let _ = devme_cli::task::record_interrupted(&root, task, started_at);
+        return 1;
+    };
+    if !task_matches() || !task_is_group_leader(task_pid) {
+        let _ = devme_cli::task::record_interrupted(&root, task, started_at);
+        return 1;
+    }
+    if !owner_matches() {
+        terminate_task_group_and_wait(task_pid);
+        let _ = devme_cli::task::record_interrupted(&root, task, started_at);
+        return 1;
+    }
+    if std::fs::write(&gate, b"ready").is_err() {
+        terminate_task_group_and_wait(task_pid);
+        let _ = devme_cli::task::record_interrupted(&root, task, started_at);
+        return 1;
+    }
+    loop {
+        if !process_group_exists(task_pid) && completion.exists() {
+            let _ = std::fs::remove_file(&completion);
+            let _ = std::fs::remove_file(&gate);
+            return 0;
+        }
+        if !owner_matches() {
+            terminate_task_group_and_wait(task_pid);
+            let _ = devme_cli::task::record_interrupted(&root, task, started_at);
+            let _ = std::fs::remove_file(&gate);
+            return 0;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn task_is_group_leader(pid: u32) -> bool {
+    unsafe { libc::getpgid(pid as libc::pid_t) == pid as libc::pid_t }
+}
+
+fn process_group_exists(pid: u32) -> bool {
+    let result = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn terminate_task_group_and_wait(pid: u32) {
+    unsafe {
+        libc::kill(-(pid as libc::pid_t), libc::SIGTERM);
+    }
+    for _ in 0..20 {
+        if !process_group_exists(pid) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let mut attempts = 0_u32;
+    while process_group_exists(pid) {
+        if attempts.is_multiple_of(10) {
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+        }
+        attempts = attempts.saturating_add(1);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn acquire_guardian_hold(
+    kind: &str,
+    target: &str,
+    socket: &str,
+) -> anyhow::Result<Option<devme_client::Client>> {
+    if kind == "none" {
+        return Ok(None);
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let mut client = devme_client::Client::connect(std::path::Path::new(socket)).await?;
+        match kind {
+            "services" => {
+                let services = serde_json::from_str::<Vec<String>>(target)?;
+                match client
+                    .request(ClientMessage::AcquireServiceHold { services })
+                    .await?
+                {
+                    ServerMessage::ServiceHoldAcquired { .. } => Ok(Some(client)),
+                    ServerMessage::Error { message, .. } => Err(anyhow::anyhow!(message)),
+                    other => Err(anyhow::anyhow!(
+                        "unexpected guardian Service hold reply: {other:?}"
+                    )),
+                }
+            }
+            "session" => {
+                client
+                    .send(ClientMessage::OpenSession {
+                        session: target.to_string(),
+                    })
+                    .await?;
+                loop {
+                    match client.next_event().await? {
+                        Some(ServerMessage::SessionReady { .. }) => return Ok(Some(client)),
+                        Some(ServerMessage::Error { message, .. }) => {
+                            return Err(anyhow::anyhow!(message));
+                        }
+                        Some(_) => {}
+                        None => return Err(anyhow::anyhow!("guardian Session hold disconnected")),
+                    }
+                }
+            }
+            _ => Err(anyhow::anyhow!("unknown guardian hold kind {kind:?}")),
+        }
+    })
 }
 
 /// Resolve an owning workspace once and run project commands from its root.
@@ -196,19 +348,6 @@ async fn run(cli: Cli) -> i32 {
             let result = if stop {
                 devme_cli::session::stop(&stack, &cwd, &session, output).await
             } else {
-                if let Some(run) = stack
-                    .session
-                    .get(&session)
-                    .and_then(|session| session.run.as_deref())
-                    && let Err(error) = converge_task_steps(&stack, run, &cwd, true)
-                {
-                    return match devme_cli::task::record_preflight_failure(
-                        &stack, &cwd, run, &error, output,
-                    ) {
-                        Ok(result) => result.exit_code,
-                        Err(record_error) => emit_command_error(output, &record_error),
-                    };
-                }
                 let socket = match devme_config::paths::supervisor_socket(&cwd) {
                     Ok(socket) => socket,
                     Err(error) => return emit_command_error(output, &error.into()),
@@ -216,7 +355,14 @@ async fn run(cli: Cli) -> i32 {
                 if let Err(error) = ensure_daemon(&socket).await {
                     return emit_command_error(output, &error);
                 }
-                devme_cli::session::open(&stack, &cwd, &session, output).await
+                devme_cli::session::open(
+                    &stack,
+                    &cwd,
+                    &session,
+                    output,
+                    task_approval_handler(true, None),
+                )
+                .await
             };
             return match result {
                 Ok(exit_code) => exit_code,
@@ -360,6 +506,63 @@ async fn run(cli: Cli) -> i32 {
     }
 }
 
+fn task_approval_handler(
+    emit: bool,
+    updates: Option<tokio::sync::mpsc::UnboundedSender<devme_tui::home::TaskUpdate>>,
+) -> devme_cli::task::ApprovalHandler {
+    std::sync::Arc::new(move |request| {
+        let updates = updates.clone();
+        Box::pin(async move {
+            if assume_yes() {
+                return devme_cli::task::Approval::Approve;
+            }
+            if let Some(updates) = updates {
+                let (response, answer) = tokio::sync::oneshot::channel();
+                if updates
+                    .send(devme_tui::home::TaskUpdate::ApprovalRequired {
+                        prompt: devme_tui::home::ApprovalPrompt {
+                            step: request.step,
+                            command: request.command,
+                            description: request.description,
+                        },
+                        response,
+                    })
+                    .is_err()
+                {
+                    return devme_cli::task::Approval::Cancel;
+                }
+                return match answer.await {
+                    Ok(devme_tui::home::TaskApproval::Approve) => {
+                        devme_cli::task::Approval::Approve
+                    }
+                    Ok(devme_tui::home::TaskApproval::Skip) => devme_cli::task::Approval::Skip,
+                    Ok(devme_tui::home::TaskApproval::Cancel) | Err(_) => {
+                        devme_cli::task::Approval::Cancel
+                    }
+                };
+            }
+            if !emit || !interactive_input() {
+                return devme_cli::task::Approval::Skip;
+            }
+            tokio::task::spawn_blocking(move || {
+                eprintln!(
+                    "devme: Step {} requires this command:\n  {}\nRun it? [Y/n]",
+                    request.step, request.command
+                );
+                let mut line = String::new();
+                let _ = std::io::BufReader::new(std::io::stdin()).read_line(&mut line);
+                if matches!(line.trim(), "n" | "N" | "no" | "No") {
+                    devme_cli::task::Approval::Skip
+                } else {
+                    devme_cli::task::Approval::Approve
+                }
+            })
+            .await
+            .unwrap_or(devme_cli::task::Approval::Cancel)
+        })
+    })
+}
+
 async fn run_task(
     task: &str,
     args: &[String],
@@ -370,123 +573,66 @@ async fn run_task(
 ) -> anyhow::Result<devme_cli::task::TaskResult> {
     let cwd = std::env::current_dir()?;
     let stack = devme_cli::task::load(&cwd)?;
-    if let Err(error) = converge_task_steps(&stack, task, &cwd, emit) {
-        return if emit {
-            devme_cli::task::record_preflight_failure(&stack, &cwd, task, &error, output)
-        } else {
-            devme_cli::task::record_preflight_failure_silent(&stack, &cwd, task, &error)
-        };
-    }
-    let services = devme_cli::task::services_for(&stack, task)?;
-    let readiness_timeout = devme_cli::task::readiness_timeout_for(&stack, task).unwrap_or(60);
-    if !services.is_empty()
-        && let Err(error) =
-            ensure_task_services(&stack, &services, readiness_timeout, cancellation.clone()).await
-    {
-        return if let Some(cancellation) = error.downcast_ref::<TaskReadinessCancelled>() {
-            if emit {
-                devme_cli::task::record_preflight_cancellation(
-                    &stack,
-                    &cwd,
-                    task,
-                    &error,
-                    output,
-                    cancellation.started_at,
-                    cancellation.duration_ms,
-                )
-            } else {
-                devme_cli::task::record_preflight_cancellation_silent(
-                    &stack,
-                    &cwd,
-                    task,
-                    &error,
-                    cancellation.started_at,
-                    cancellation.duration_ms,
-                )
+    let daemon_stack = stack.clone();
+    let daemon_root = cwd.clone();
+    let daemon_starter: devme_cli::task::DaemonStarter = std::sync::Arc::new(move |targets| {
+        let stack = daemon_stack.clone();
+        let root = daemon_root.clone();
+        Box::pin(async move {
+            if targets.iter().any(|name| {
+                stack
+                    .service
+                    .get(name)
+                    .is_some_and(|service| service.scope == devme_core::Scope::Repo)
+            }) {
+                ensure_shared_daemon(&root).await?;
             }
-        } else {
-            if emit {
-                devme_cli::task::record_preflight_failure(&stack, &cwd, task, &error, output)
-            } else {
-                devme_cli::task::record_preflight_failure_silent(&stack, &cwd, task, &error)
-            }
-        };
-    }
-    if emit {
-        devme_cli::task::execute(&stack, &cwd, task, args, output).await
-    } else if let Some(tui_updates) = tui_updates {
-        let (tx, mut rx) =
-            tokio::sync::mpsc::unbounded_channel::<devme_cli::task::TaskOutputEvent>();
-        tokio::spawn(async move {
+            let socket = devme_config::paths::supervisor_socket(&root)?;
+            ensure_daemon_for_targets(&socket, &targets).await?;
+            Ok(())
+        })
+    });
+    let approval = task_approval_handler(emit, tui_updates.clone());
+    let (events, event_bridge) = if let Some(tui_updates) = tui_updates {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let bridge = tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
-                for line in event.text.lines() {
-                    let _ = tui_updates.send(devme_tui::home::TaskUpdate::Output(line.to_string()));
+                match event {
+                    devme_cli::task::TaskEvent::Progress(message) => {
+                        let _ = tui_updates.send(devme_tui::home::TaskUpdate::Progress(message));
+                    }
+                    devme_cli::task::TaskEvent::Output(event) => {
+                        for line in event.text.lines() {
+                            let _ = tui_updates
+                                .send(devme_tui::home::TaskUpdate::Output(line.to_string()));
+                        }
+                    }
+                    devme_cli::task::TaskEvent::ApprovalRequired(_) => {}
                 }
             }
         });
-        devme_cli::task::execute_streaming(&stack, &cwd, task, args, tx, cancellation).await
+        (Some(tx), Some(bridge))
     } else {
-        devme_cli::task::execute_silent(&stack, &cwd, task, args).await
-    }
-}
-
-async fn wait_for_task_cancel(mut cancellation: Option<tokio::sync::watch::Receiver<bool>>) {
-    let Some(receiver) = cancellation.as_mut() else {
-        std::future::pending::<()>().await;
-        return;
+        (None, None)
     };
-    while !*receiver.borrow() {
-        if receiver.changed().await.is_err() {
-            return;
-        }
+    let runner = devme_cli::task::TaskRunner::new(&stack, &cwd);
+    let result = runner
+        .run(devme_cli::task::RunRequest {
+            task: task.to_string(),
+            args: args.to_vec(),
+            approval,
+            daemon_starter,
+            events,
+            cancellation,
+        })
+        .await?;
+    if let Some(bridge) = event_bridge {
+        let _ = bridge.await;
     }
-}
-
-fn converge_task_steps(
-    stack: &Stack,
-    task: &str,
-    cwd: &std::path::Path,
-    render: bool,
-) -> anyhow::Result<()> {
-    let steps = devme_cli::task::steps_for(stack, task)?;
-    if steps.is_empty() {
-        return Ok(());
+    if emit {
+        devme_cli::task::emit_result(&result, output)?;
     }
-    let keep = steps.into_iter().collect::<std::collections::HashSet<_>>();
-    let mut focused = stack.clone();
-    focused.step.retain(|name, _| keep.contains(name));
-    focused.task.clear();
-    focused.resource.clear();
-    focused.session.clear();
-    let mut stdin = std::io::BufReader::new(std::io::stdin());
-    if render {
-        run_preflight_quiet_aware(&focused, cwd, &mut stdin, interactive_input());
-    } else {
-        let mut output = Vec::new();
-        let _ = devme_supervisor::preflight::run_preflight(
-            &focused,
-            cwd,
-            &mut stdin,
-            &mut output,
-            false,
-            assume_yes(),
-            devme_ui::err_style(),
-        );
-    }
-    for name in keep {
-        let step = &stack.step[&name];
-        let status = std::process::Command::new("sh")
-            .args(["-c", &step.check])
-            .current_dir(cwd)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .with_context(|| format!("checking required step {name:?}"))?;
-        if !status.success() {
-            anyhow::bail!("required step {name:?} is not satisfied after convergence");
-        }
-    }
-    Ok(())
+    Ok(result)
 }
 
 fn focus_name(name: &str) -> String {
@@ -1611,321 +1757,6 @@ async fn up(services: Vec<String>, detach: bool, wait: bool, timeout: u64) -> an
         devme_ui::success("shared services stopped");
     }
     Ok(())
-}
-
-async fn ensure_task_services(
-    stack: &Stack,
-    services: &[String],
-    timeout_secs: u64,
-    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
-) -> anyhow::Result<()> {
-    let wait_started_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let wait_started = std::time::Instant::now();
-    let cwd = std::env::current_dir()?;
-    let closure = required_service_closure(stack, services);
-    if closure.iter().any(|name| {
-        stack
-            .service
-            .get(name)
-            .is_some_and(|service| service.scope == devme_core::Scope::Repo)
-    }) {
-        ensure_shared_daemon(&cwd).await?;
-    }
-    let sock = socket_path();
-    ensure_daemon_for_targets(&sock, services).await?;
-    let mut client = devme_client::Client::connect(&sock).await?;
-    let initial = client
-        .request(ClientMessage::Subscribe {
-            services: closure.clone(),
-        })
-        .await?;
-    let mut states: std::collections::HashMap<String, ServiceState> = match initial {
-        ServerMessage::Subscribed {
-            services: snapshot, ..
-        } => snapshot
-            .into_iter()
-            .filter(|item| closure.contains(&item.name))
-            .map(|item| (item.name, item.state))
-            .collect(),
-        other => anyhow::bail!("unexpected supervisor reply: {other:?}"),
-    };
-    let started_here = states
-        .iter()
-        .filter_map(|(name, state)| matches!(state, ServiceState::Stopped).then_some(name.clone()))
-        .collect::<std::collections::HashSet<_>>();
-    let preexisting_targets = states
-        .iter()
-        .filter_map(|(name, state)| {
-            (!matches!(
-                state,
-                ServiceState::Stopped
-                    | ServiceState::Failed { .. }
-                    | ServiceState::CrashLoop { .. }
-            ))
-            .then_some(name.clone())
-        })
-        .collect::<Vec<_>>();
-    client
-        .send(ClientMessage::StartTargets {
-            services: services.to_vec(),
-        })
-        .await?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    let mut attempts: std::collections::HashMap<String, Vec<(u32, String)>> =
-        std::collections::HashMap::new();
-    let mut omitted_attempts: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    if let Some(error) = terminal_task_service_error(stack, &closure, &states, &attempts) {
-        stop_task_started_services(&mut client, &closure, &started_here, &preexisting_targets)
-            .await;
-        return Err(error);
-    }
-    loop {
-        if services
-            .iter()
-            .all(|name| states.get(name).is_some_and(ServiceState::is_up))
-        {
-            restore_task_service_targets(&mut client, &closure, &preexisting_targets).await;
-            return Ok(());
-        }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let timeout_error = || {
-            let detail = closure
-                .iter()
-                .filter_map(|name| {
-                    let service = stack.service.get(name)?;
-                    let readiness = service.readiness.clone().unwrap_or_default();
-                    let evidence = attempts
-                        .get(name)
-                        .map(|items| {
-                            let tail = items
-                                .iter()
-                                .map(|(attempt, error)| format!("attempt {attempt}: {error}"))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            match omitted_attempts.get(name).copied().unwrap_or_default() {
-                                0 => tail,
-                                omitted => format!("{omitted} earlier attempts omitted, {tail}"),
-                            }
-                        })
-                        .unwrap_or_else(|| "no probe attempt reported".to_string());
-                    Some(format!(
-                        "{name}: {evidence} (interval_ms={}, timeout_ms={}, retries={}, deadline_seconds={timeout_secs})",
-                        readiness.interval_ms, readiness.timeout_ms, readiness.retries
-                    ))
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            anyhow::anyhow!(
-                "required services were not ready after {timeout_secs}s{}",
-                if detail.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {detail}")
-                }
-            )
-        };
-        if remaining.is_zero() {
-            let error = timeout_error();
-            stop_task_started_services(&mut client, &closure, &started_here, &preexisting_targets)
-                .await;
-            return Err(error);
-        }
-        let event = tokio::select! {
-            event = tokio::time::timeout(remaining, client.next_event()) => match event {
-                Ok(event) => event?,
-                Err(_) => {
-                    let error = timeout_error();
-                    stop_task_started_services(
-                        &mut client,
-                        &closure,
-                        &started_here,
-                        &preexisting_targets,
-                    ).await;
-                    return Err(error);
-                }
-            },
-            _ = tokio::signal::ctrl_c() => {
-                stop_task_started_services(
-                    &mut client,
-                    &closure,
-                    &started_here,
-                    &preexisting_targets,
-                ).await;
-                return Err(TaskReadinessCancelled {
-                    started_at: wait_started_at,
-                    duration_ms: wait_started.elapsed().as_millis() as u64,
-                }.into());
-            }
-            _ = wait_for_task_cancel(cancellation.clone()) => {
-                stop_task_started_services(&mut client, &closure, &started_here, &preexisting_targets).await;
-                return Err(TaskReadinessCancelled { started_at: wait_started_at, duration_ms: wait_started.elapsed().as_millis() as u64 }.into());
-            }
-        };
-        match event {
-            Some(ServerMessage::StatusUpdate { service, state, .. }) => {
-                states.insert(service, state);
-                if let Some(error) =
-                    terminal_task_service_error(stack, &closure, &states, &attempts)
-                {
-                    stop_task_started_services(
-                        &mut client,
-                        &closure,
-                        &started_here,
-                        &preexisting_targets,
-                    )
-                    .await;
-                    return Err(error);
-                }
-            }
-            Some(ServerMessage::Readiness {
-                service,
-                attempt,
-                last_error: Some(error),
-                ..
-            }) => {
-                let service_attempts = attempts.entry(service.clone()).or_default();
-                if service_attempts.len() == READINESS_ATTEMPT_TAIL {
-                    service_attempts.remove(0);
-                    *omitted_attempts.entry(service).or_default() += 1;
-                }
-                service_attempts.push((attempt, error));
-            }
-            Some(ServerMessage::Error { message, .. }) => {
-                stop_task_started_services(
-                    &mut client,
-                    &closure,
-                    &started_here,
-                    &preexisting_targets,
-                )
-                .await;
-                anyhow::bail!("{message}");
-            }
-            Some(_) => {}
-            None => anyhow::bail!("supervisor stopped while waiting for readiness"),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct TaskReadinessCancelled {
-    started_at: u64,
-    duration_ms: u64,
-}
-
-impl std::fmt::Display for TaskReadinessCancelled {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("task cancelled while waiting for required service readiness")
-    }
-}
-
-impl std::error::Error for TaskReadinessCancelled {}
-
-fn terminal_task_service_error(
-    stack: &Stack,
-    closure: &[String],
-    states: &std::collections::HashMap<String, ServiceState>,
-    attempts: &std::collections::HashMap<String, Vec<(u32, String)>>,
-) -> Option<anyhow::Error> {
-    closure.iter().find_map(|name| {
-        let state = states.get(name)?;
-        let failure = match state {
-            ServiceState::Failed { exit_code } => match exit_code {
-                Some(code) => format!("process exited with code {code}"),
-                None => "process was terminated by a signal".to_string(),
-            },
-            ServiceState::CrashLoop {
-                restart_count,
-                reason,
-            } => format!(
-                "entered a crash loop after {restart_count} restarts{}",
-                reason
-                    .as_deref()
-                    .map(|reason| format!(": {reason}"))
-                    .unwrap_or_default()
-            ),
-            _ => return None,
-        };
-        let readiness = stack
-            .service
-            .get(name)
-            .and_then(|service| service.readiness.clone())
-            .unwrap_or_default();
-        let probe = attempts
-            .get(name)
-            .and_then(|items| items.last())
-            .map(|(attempt, error)| format!("; probe attempt {attempt}: {error}"))
-            .unwrap_or_default();
-        Some(anyhow::anyhow!(
-            "required service {name:?} failed before it became ready: {failure}{probe} (interval_ms={}, timeout_ms={}, retries={}); run `devme doctor {name}` and `devme logs {name}`",
-            readiness.interval_ms,
-            readiness.timeout_ms,
-            readiness.retries
-        ))
-    })
-}
-
-async fn stop_task_started_services(
-    client: &mut devme_client::Client,
-    closure: &[String],
-    started_here: &std::collections::HashSet<String>,
-    preexisting_targets: &[String],
-) {
-    let mut pending = closure
-        .iter()
-        .filter(|name| started_here.contains(*name))
-        .cloned()
-        .collect::<std::collections::HashSet<_>>();
-    for service in closure.iter().rev().filter(|name| pending.contains(*name)) {
-        if client
-            .send(ClientMessage::Stop {
-                service: service.clone(),
-            })
-            .await
-            .is_err()
-        {
-            break;
-        }
-    }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    while !pending.is_empty() {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match tokio::time::timeout(remaining, client.next_event()).await {
-            Ok(Ok(Some(ServerMessage::StatusUpdate {
-                service,
-                state: ServiceState::Stopped,
-                ..
-            }))) => {
-                pending.remove(&service);
-            }
-            Ok(Ok(Some(_))) => {}
-            _ => break,
-        }
-    }
-    restore_task_service_targets(client, &[], preexisting_targets).await;
-}
-
-async fn restore_task_service_targets(
-    client: &mut devme_client::Client,
-    closure: &[String],
-    preexisting_targets: &[String],
-) {
-    if preexisting_targets.is_empty() {
-        return;
-    }
-    let mut targets = closure.to_vec();
-    targets.extend_from_slice(preexisting_targets);
-    targets.sort();
-    targets.dedup();
-    let _ = client
-        .send(ClientMessage::StartTargets { services: targets })
-        .await;
 }
 
 fn required_service_closure(stack: &Stack, targets: &[String]) -> Vec<String> {
@@ -3255,27 +3086,6 @@ async fn launch_default(
                     return 1;
                 }
             };
-            if let Some(run) = workspace
-                .stack()
-                .session
-                .get(name)
-                .and_then(|session| session.run.as_deref())
-                && let Err(error) = converge_task_steps(workspace.stack(), run, &cwd, true)
-            {
-                return match devme_cli::task::record_preflight_failure(
-                    workspace.stack(),
-                    &cwd,
-                    run,
-                    &error,
-                    devme_cli::OutputFormat::Human,
-                ) {
-                    Ok(result) => result.exit_code,
-                    Err(record_error) => {
-                        devme_ui::error(record_error);
-                        1
-                    }
-                };
-            }
             if let Err(error) = ensure_daemon(&socket).await {
                 devme_ui::error(error);
                 return 1;
@@ -3285,6 +3095,7 @@ async fn launch_default(
                 &cwd,
                 name,
                 devme_cli::OutputFormat::Human,
+                task_approval_handler(true, None),
             )
             .await
             {

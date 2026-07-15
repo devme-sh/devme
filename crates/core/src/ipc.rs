@@ -105,6 +105,11 @@ pub enum ClientMessage {
     },
     /// Start only these services and their required transitive dependencies.
     StartTargets { services: Vec<String> },
+    /// Keep these Service targets and their required dependency closures
+    /// active until this client releases the hold or disconnects.
+    AcquireServiceHold { services: Vec<String> },
+    /// Release this client's Service hold.
+    ReleaseServiceHold,
     /// Acquire a named session's resources and start its targeted service
     /// closure. A second client joins the same live session idempotently.
     OpenSession { session: String },
@@ -178,6 +183,10 @@ pub enum ServerMessage {
         #[serde(default)]
         last_error: Option<String>,
     },
+    /// Acknowledges that this client owns the requested Service hold.
+    ServiceHoldAcquired { services: Vec<String> },
+    /// Acknowledges release of this client's Service hold.
+    ServiceHoldReleased {},
     /// Resource acquisition is waiting. The connection remains attached and
     /// will receive `SessionReady` once the whole session is ready.
     SessionPending {
@@ -474,6 +483,10 @@ mod tests {
                 ready: false,
                 last_error: Some("schema is not published".into()),
             },
+            ServerMessage::ServiceHoldAcquired {
+                services: vec!["backend".into()],
+            },
+            ServerMessage::ServiceHoldReleased {},
             ServerMessage::SessionPending {
                 session: "mobile".into(),
                 resources: vec!["device".into()],

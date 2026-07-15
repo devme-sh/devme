@@ -29,8 +29,18 @@ Resource leases are file-locked slots with host, repository, or worktree
 scope. The OS releases locks after crashes, owner metadata remains inspectable,
 and a configured environment variable exposes the allocated zero-based slot.
 Names are acquired in sorted order to prevent multi-resource deadlock.
-Task process groups inherit their lease descriptors, so an abrupt CLI death
-cannot make a still-running task's resource available for double allocation.
+Task and Session acquisition use one shared Resource lease module and metadata
+format. A foreground Task hands its lease descriptors to an exact-binary Task
+guardian before it starts running. The Task remains behind a gate until the
+guardian has recorded both the Task process-group identity and the owning CLI
+identity and acquired an independent copy of the Task plan's Service hold. A
+Session launch guardian independently joins the existing Session instead. If
+the CLI disappears, the guardian terminates and waits for the full Task group,
+persists an `interrupted` result, and only then releases the Service or Session
+hold and Resource leases. On clean completion, the runner persists the result
+and waits for the guardian to acknowledge it before either owner releases its
+hold. This prevents leaked Tasks, premature Service shutdown, and premature
+Resource reallocation.
 Session sidecars start behind a supervisor-owned gate: Devme records each
 process-group PID and OS start-time identity before releasing the gate. After a
 supervisor crash, the replacement verifies those identities, kills and waits
@@ -47,6 +57,15 @@ session-scoped log or device sidecars and the launch task use the allocated
 environment. Multiple clients join idempotently. On final disconnect, a
 configurable linger permits reconnection; teardown stops sidecars before
 releasing leases. Sessions do not define steps or a second dependency graph.
+The optional launch Task borrows the Session's Service and Resource context. It
+cannot widen that context by requesting another Service or Resource.
+
+Every active Task, Session, or explicit runtime owner contributes a reference-
+counted Service hold for its required Service closure. A Task DAG contributes
+one hold for the aggregate plan, while each executable Task acquires its own
+Resource leases. Releasing one hold stops only hold-managed Services that no
+remaining owner requires. Pre-existing or explicitly managed Services are not
+claimed for teardown merely because a Task used them.
 
 Task and service history share one retention and redaction policy. Redaction
 patterns are compiled as regular expressions and applied before disk writes.

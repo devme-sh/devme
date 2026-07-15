@@ -22,6 +22,10 @@ A oneshot node in the [[Stack]] graph. Considered satisfied when its `check` com
 
 A long-running node in the [[Stack]] graph. Spawned and kept alive by a [[Daemon]]; the supervisor manages its lifecycle (start, stop, restart, crash recovery). Examples: backend HTTP server, frontend dev server, local database.
 
+### Task
+
+A one-shot command in a [[Stack]] that delegates work to an authoritative project tool. A Task may depend on other Tasks, require [[Step]]s and [[Service]]s, and acquire [[Resource]]s. Dependency Tasks execute in declaration order, and aggregate Tasks group dependencies without declaring their own command.
+
 ### Task kind
 
 Semantic discovery metadata for a one-shot task: `launch`, `check`, or `utility`. It controls grouping on the interactive [[Home screen]] but never changes execution. Existing tasks default to `utility`.
@@ -87,6 +91,22 @@ Any connection to a [[Daemon]] — the TUI, a CLI subcommand, or an agent proces
 ### Slot
 
 A small integer (0..9 by default) assigned to a [[Stack instance]] at startup. Used to offset port allocations so multiple worktrees can run their stacks on the same machine without colliding. Frontend port = `5173 + slot * 10`, backend port = `8080 + slot * 10`, etc. Slot 0 keeps the natural defaults. Slots are stable per instance ID across daemon restarts.
+
+### Resource
+
+A bounded pool of scarce runtime capacity allocated to a [[Task]] or [[Session]]. A Resource has host, repo, or worktree scope and exposes its allocated zero-based identifier through an optional environment variable. Examples include simulator identities, emulator identities, and signing access.
+
+### Session
+
+A runtime composition that holds one or more [[Resource]] allocations while its declared [[Service]] closure, sidecars, and optional launch [[Task]] use them. Multiple clients join the same Session idempotently. After the final client disconnects, an optional linger period permits reconnection before sidecars stop and Resources are released.
+
+### Service hold
+
+A runtime ownership claim that keeps a requested [[Service]] target and its required dependency closure active. Concurrent [[Task]]s, [[Session]]s, and explicit runtime commands may hold overlapping closures. Releasing one Service hold never stops a Service that another active hold still requires.
+
+### Task guardian
+
+An exact-binary helper process that owns a foreground [[Task]]'s [[Resource]] lease descriptors and an independent [[Service hold]] or [[Session]] attachment after launch. It verifies the Task process-group and CLI process identities before releasing the start gate. If the CLI disappears, the guardian terminates the full Task group, persists an interrupted result, and releases ownership only after the group exits. On clean completion, it acknowledges the runner's persisted result before either owner releases its hold.
 
 ### Instance ID
 

@@ -30,6 +30,7 @@ impl RecentResult {
         let status = match self.status.as_str() {
             "passed" => "succeeded",
             "cancelled" => "cancelled",
+            "interrupted" => "interrupted",
             "timed_out" => "timed out",
             _ => "failed",
         };
@@ -37,10 +38,27 @@ impl RecentResult {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskApproval {
+    Approve,
+    Skip,
+    Cancel,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalPrompt {
+    pub step: String,
+    pub command: String,
+    pub description: Option<String>,
+}
+
 pub enum TaskUpdate {
     Progress(String),
     Output(String),
+    ApprovalRequired {
+        prompt: ApprovalPrompt,
+        response: tokio::sync::oneshot::Sender<TaskApproval>,
+    },
     Finished(RecentResult),
 }
 
@@ -62,6 +80,7 @@ pub struct HomeState {
     pub recent: Vec<RecentResult>,
     pub running: Option<String>,
     pub logs: Vec<String>,
+    pub approval: Option<ApprovalPrompt>,
     pub visible: bool,
     member_focus: Option<String>,
 }
@@ -93,6 +112,7 @@ impl HomeState {
             recent: Vec::new(),
             running: None,
             logs: Vec::new(),
+            approval: None,
             visible: true,
             member_focus: member_focus.map(str::to_owned),
         };
@@ -172,6 +192,14 @@ mod tests {
             finished_at: 1,
         };
         assert_eq!(result.wording(), "last launch succeeded");
+        assert_eq!(
+            RecentResult {
+                status: "interrupted".into(),
+                ..result
+            }
+            .wording(),
+            "last launch interrupted"
+        );
     }
 
     #[test]

@@ -353,12 +353,12 @@ dependencies = [
  "devme-client",
  "devme-config",
  "devme-core",
+ "devme-resource-lease",
  "devme-shared-supervisor",
- "devme-slot-allocator",
  "devme-supervisor",
+ "devme-task-runner",
  "devme-tui",
  "devme-ui",
- "fs2",
  "libc",
  "serde",
  "serde_json",
@@ -434,6 +434,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "devme-resource-lease"
+version = "0.4.1"
+dependencies = [
+ "anyhow",
+ "devme-config",
+ "fs2",
+ "indexmap",
+ "libc",
+ "tempfile",
+]
+
+[[package]]
 name = "devme-shared-supervisor"
 version = "0.4.1"
 dependencies = [
@@ -479,9 +491,9 @@ dependencies = [
  "devme-core",
  "devme-executor",
  "devme-ipc",
+ "devme-resource-lease",
  "devme-slot-allocator",
  "devme-ui",
- "fs2",
  "futures-util",
  "indexmap",
  "libc",
@@ -497,6 +509,23 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "devme-task-runner"
+version = "0.4.1"
+dependencies = [
+ "anyhow",
+ "devme-client",
+ "devme-config",
+ "devme-core",
+ "devme-resource-lease",
+ "devme-slot-allocator",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

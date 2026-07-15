@@ -11,7 +11,9 @@ Returning developers remember `devme`, but not necessarily project-specific task
 
 Bare interactive `devme` opens a Home screen before the service dashboard. Home groups declarative tasks by exactly three semantic kinds: `launch`, `check`, and `utility`. Existing tasks default to `utility`, so metadata does not change execution or invalidate old configuration. Declaration order remains meaningful within each group after workspace composition.
 
-The CLI owns one deep task-runner interface covering setup convergence, targeted service readiness, resources, dependency execution, cancellation, persistence, and results. Both `devme run <task>` and Home invoke that interface. The TUI owns selection, progress presentation, and recent-result wording only. It does not shell out to Devme or duplicate orchestration.
+The presentation-free `devme-task-runner` crate owns one deep interface covering setup convergence, typed approval requests, targeted service readiness, Service holds, Resource leases, dependency execution, guardian handoff, cancellation, persistence, and results. Both `devme run <task>`, Session launch Tasks, and Home invoke that interface. A Session launch uses a borrowed context that cannot widen the Session's Services or Resources. The CLI and TUI adapt typed events into their own presentation. They do not shell out to Devme or duplicate orchestration.
+
+When a prompt-trust Step needs provisioning, Home renders the runner's typed approval request as a modal. Enter or `y` approves, `n` or `s` skips, and Escape cancels. The response returns through the runner interface rather than a terminal prompt hidden behind the TUI frame.
 
 Cancellation is an explicit runner input. CLI Ctrl-C and TUI Esc feed the same cancellation path, which stops targeted readiness work, releases resource waits, terminates the spawned process group, persists `cancelled`, and returns the conventional exit code 130. The TUI does not signal its own process.
 

@@ -32,6 +32,7 @@ use tokio_util::codec::Framed;
 use crate::health::probe;
 use crate::logstore::LogStore;
 use crate::process::{ChildProcess, process_is_alive, send_sigkill, send_sigterm};
+use crate::service_hold::{ServiceHoldOwner, ServiceHolds};
 use crate::session::SessionLeases;
 
 /// Per-service log ring capacity. ~2000 lines is enough to scroll back a
@@ -255,6 +256,8 @@ struct DaemonState {
     readiness: HashMap<String, ReadinessSnapshot>,
     pending_sessions: HashMap<String, PendingSession>,
     sessions: HashMap<String, LiveSession>,
+    service_holds: ServiceHolds,
+    hold_managed: HashSet<String>,
     next_generation: u64,
     next_client_id: u64,
     shutting_down: bool,
@@ -272,6 +275,7 @@ impl DaemonState {
                 .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/devme/orphan-logs")),
         )
         .with_policy(policy.retention_bytes, redactions);
+        let service_holds = ServiceHolds::new(&stack);
         Self {
             stack,
             executor: Executor::new(graph),
@@ -292,6 +296,8 @@ impl DaemonState {
             readiness: HashMap::new(),
             pending_sessions: HashMap::new(),
             sessions: HashMap::new(),
+            service_holds,
+            hold_managed: HashSet::new(),
             next_generation: 0,
             next_client_id: 0,
             shutting_down: false,
@@ -675,6 +681,7 @@ fn process_event(
         InternalEvent::ClientDisconnected { id } => {
             state.clients.remove(&id);
             state.subscriptions.remove(&id);
+            release_service_hold(state, ServiceHoldOwner::task(id.to_string()), tx);
             detach_session_client(state, id, tx);
         }
         InternalEvent::ClientMessage { id, msg } => handle_client_message(state, id, msg, tx),
@@ -895,6 +902,61 @@ fn send_to(state: &DaemonState, id: ClientId, message: ServerMessage) {
     }
 }
 
+fn acquire_service_hold(state: &mut DaemonState, owner: ServiceHoldOwner, targets: &[String]) {
+    let newly_required = state.service_holds.acquire(owner, targets);
+    for service in newly_required {
+        let external = state
+            .stack
+            .service
+            .get(&service)
+            .is_some_and(|config| config.external);
+        if !external && !state.current_service_state(&service).is_up() {
+            state.hold_managed.insert(service);
+        }
+    }
+}
+
+fn acquire_explicit_service_holds(state: &mut DaemonState, targets: &[String]) {
+    for target in targets {
+        state.service_holds.acquire(
+            ServiceHoldOwner::explicit(target.clone()),
+            std::slice::from_ref(target),
+        );
+    }
+}
+
+fn release_service_hold(
+    state: &mut DaemonState,
+    owner: ServiceHoldOwner,
+    tx: &mpsc::UnboundedSender<InternalEvent>,
+) {
+    let no_longer_required = state.service_holds.release(&owner);
+    for service in no_longer_required {
+        if !state.hold_managed.remove(&service) {
+            continue;
+        }
+        if state.children.contains_key(&service) {
+            state.intentional_stops.insert(service.clone());
+        }
+        let actions = state.executor.handle(ExecEvent::UserStop {
+            name: service.clone(),
+        });
+        enact_actions(state, actions, tx);
+        if !state.children.contains_key(&service) {
+            state.broadcast(
+                Some(&service),
+                ServerMessage::StatusUpdate {
+                    service: service.clone(),
+                    state: ServiceState::Stopped,
+                    pid: None,
+                    port: None,
+                    restart_count: 0,
+                },
+            );
+        }
+    }
+}
+
 fn open_session(
     state: &mut DaemonState,
     id: ClientId,
@@ -1027,6 +1089,11 @@ fn handle_session_acquired(
         return;
     }
     let services = session_scoped_services(&state.stack, &pending.config.needs);
+    acquire_service_hold(
+        state,
+        ServiceHoldOwner::session(name.clone()),
+        &pending.config.needs,
+    );
     state.sessions.insert(
         name.clone(),
         LiveSession {
@@ -1147,14 +1214,8 @@ fn begin_session_stop(
     live.state = SessionState::Stopping;
     live.generation = live.generation.saturating_add(1);
     live.clients.clear();
-    let services = live.services.clone();
-    for service in services {
-        if state.children.contains_key(&service) {
-            state.intentional_stops.insert(service.clone());
-        }
-        let actions = state.executor.handle(ExecEvent::UserStop { name: service });
-        enact_actions(state, actions, tx);
-    }
+    let _ = live;
+    release_service_hold(state, ServiceHoldOwner::session(name.to_string()), tx);
 }
 
 fn advance_sessions(state: &mut DaemonState, tx: &mpsc::UnboundedSender<InternalEvent>) {
@@ -1381,6 +1442,14 @@ fn handle_client_message(
             // For v1, any Start triggers a global Event::Start. The service
             // argument is informational; the executor advances the whole
             // graph in topo order.
+            let explicit = state
+                .stack
+                .service
+                .iter()
+                .filter(|(_, config)| config.scope != devme_core::Scope::Session)
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            acquire_explicit_service_holds(state, &explicit);
             // If the user is explicitly starting a service, clear its restart
             // counter so the backoff resets after intentional interaction.
             if !service.is_empty() {
@@ -1440,10 +1509,45 @@ fn handle_client_message(
                 }
                 return;
             }
+            acquire_explicit_service_holds(state, &services);
             let actions = state
                 .executor
                 .handle(ExecEvent::StartTargets { names: services });
             enact_actions(state, actions, tx);
+        }
+        ClientMessage::AcquireServiceHold { services } => {
+            let unknown = services
+                .iter()
+                .filter(|name| !state.stack.service.contains_key(*name))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !unknown.is_empty() {
+                send_to(
+                    state,
+                    id,
+                    ServerMessage::Error {
+                        code: ErrorCode::NotFound,
+                        message: format!("unknown services: {}", unknown.join(", ")),
+                    },
+                );
+                return;
+            }
+            acquire_service_hold(state, ServiceHoldOwner::task(id.to_string()), &services);
+            send_to(
+                state,
+                id,
+                ServerMessage::ServiceHoldAcquired {
+                    services: services.clone(),
+                },
+            );
+            let actions = state
+                .executor
+                .handle(ExecEvent::StartTargets { names: services });
+            enact_actions(state, actions, tx);
+        }
+        ClientMessage::ReleaseServiceHold => {
+            release_service_hold(state, ServiceHoldOwner::task(id.to_string()), tx);
+            send_to(state, id, ServerMessage::ServiceHoldReleased {});
         }
         ClientMessage::OpenSession { session } => open_session(state, id, session, tx),
         ClientMessage::StopSession { session } => {
@@ -1469,6 +1573,17 @@ fn handle_client_message(
             },
         ),
         ClientMessage::Stop { service } => {
+            let explicit_owner = ServiceHoldOwner::explicit(service.clone());
+            let was_hold_managed = state.hold_managed.contains(&service);
+            if state.service_holds.contains_owner(&explicit_owner) {
+                release_service_hold(state, explicit_owner, tx);
+            }
+            if state.service_holds.required(&service) {
+                return;
+            }
+            if was_hold_managed {
+                return;
+            }
             state.restart_counts.remove(&service);
             state.rapid_exits.remove(&service);
             state.failure_reasons.remove(&service);
@@ -3707,6 +3822,204 @@ health = {{ shell = "{probe_cmd}" }}
 
         send_msg(&mut conn, ClientMessage::Shutdown).await;
         let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    #[tokio::test]
+    async fn overlapping_service_holds_stop_only_after_the_final_owner_releases() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("d.sock");
+        let server = DaemonServer::bind_with_stack(
+            &sock,
+            make_stack(
+                r#"
+schema_version = 1
+[service.db]
+cmd = "sleep 30"
+"#,
+            ),
+        )
+        .unwrap();
+        let server_task = tokio::spawn(server.serve());
+        let mut first = connect(&sock).await;
+        let mut second = connect(&sock).await;
+
+        send_msg(
+            &mut first,
+            ClientMessage::AcquireServiceHold {
+                services: vec!["db".into()],
+            },
+        )
+        .await;
+        let _ = recv_until(&mut first, Duration::from_secs(3), |message| {
+            matches!(message, ServerMessage::ServiceHoldAcquired { .. })
+        })
+        .await;
+        let _ = recv_until(&mut first, Duration::from_secs(3), |message| {
+            matches!(
+                message,
+                ServerMessage::StatusUpdate {
+                    service,
+                    state: ServiceState::Running { .. },
+                    ..
+                } if service == "db"
+            )
+        })
+        .await;
+
+        send_msg(
+            &mut second,
+            ClientMessage::AcquireServiceHold {
+                services: vec!["db".into()],
+            },
+        )
+        .await;
+        let _ = recv_until(&mut second, Duration::from_secs(3), |message| {
+            matches!(message, ServerMessage::ServiceHoldAcquired { .. })
+        })
+        .await;
+
+        send_msg(&mut first, ClientMessage::ReleaseServiceHold).await;
+        let _ = recv_until(&mut first, Duration::from_secs(3), |message| {
+            matches!(message, ServerMessage::ServiceHoldReleased {})
+        })
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), async {
+                loop {
+                    if matches!(
+                        recv_msg(&mut second).await,
+                        ServerMessage::StatusUpdate {
+                            service,
+                            state: ServiceState::Stopped,
+                            ..
+                        } if service == "db"
+                    ) {
+                        return;
+                    }
+                }
+            })
+            .await
+            .is_err(),
+            "first owner stopped a Service still held by the second owner"
+        );
+
+        send_msg(&mut second, ClientMessage::ReleaseServiceHold).await;
+        let _ = recv_until(&mut second, Duration::from_secs(5), |message| {
+            matches!(
+                message,
+                ServerMessage::StatusUpdate {
+                    service,
+                    state: ServiceState::Stopped,
+                    ..
+                } if service == "db"
+            )
+        })
+        .await;
+        send_msg(&mut second, ClientMessage::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), server_task).await;
+    }
+
+    #[tokio::test]
+    async fn releasing_task_hold_preserves_explicitly_started_service() {
+        let dir = TempDir::new().unwrap();
+        let sock = dir.path().join("d.sock");
+        let server = DaemonServer::bind_with_stack(
+            &sock,
+            make_stack(
+                r#"
+schema_version = 1
+[service.db]
+cmd = "sleep 30"
+"#,
+            ),
+        )
+        .unwrap();
+        let server_task = tokio::spawn(server.serve());
+        let mut observer = connect(&sock).await;
+        send_msg(
+            &mut observer,
+            ClientMessage::Subscribe {
+                services: vec!["db".into()],
+            },
+        )
+        .await;
+        let _ = recv_msg(&mut observer).await;
+        send_msg(
+            &mut observer,
+            ClientMessage::StartTargets {
+                services: vec!["db".into()],
+            },
+        )
+        .await;
+        let _ = recv_until(&mut observer, Duration::from_secs(3), |message| {
+            matches!(
+                message,
+                ServerMessage::StatusUpdate {
+                    service,
+                    state: ServiceState::Running { .. },
+                    ..
+                } if service == "db"
+            )
+        })
+        .await;
+
+        let mut task = connect(&sock).await;
+        send_msg(
+            &mut task,
+            ClientMessage::AcquireServiceHold {
+                services: vec!["db".into()],
+            },
+        )
+        .await;
+        let _ = recv_until(&mut task, Duration::from_secs(3), |message| {
+            matches!(message, ServerMessage::ServiceHoldAcquired { .. })
+        })
+        .await;
+        send_msg(&mut task, ClientMessage::ReleaseServiceHold).await;
+        let _ = recv_until(&mut task, Duration::from_secs(3), |message| {
+            matches!(message, ServerMessage::ServiceHoldReleased {})
+        })
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), async {
+                loop {
+                    if matches!(
+                        recv_msg(&mut observer).await,
+                        ServerMessage::StatusUpdate {
+                            service,
+                            state: ServiceState::Stopped,
+                            ..
+                        } if service == "db"
+                    ) {
+                        return;
+                    }
+                }
+            })
+            .await
+            .is_err(),
+            "Task release stopped an explicitly started Service"
+        );
+
+        send_msg(
+            &mut observer,
+            ClientMessage::Stop {
+                service: "db".into(),
+            },
+        )
+        .await;
+        let _ = recv_until(&mut observer, Duration::from_secs(3), |message| {
+            matches!(
+                message,
+                ServerMessage::StatusUpdate {
+                    service,
+                    state: ServiceState::Stopped,
+                    ..
+                } if service == "db"
+            )
+        })
+        .await;
+        send_msg(&mut observer, ClientMessage::Shutdown).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), server_task).await;
     }
 
     #[tokio::test]

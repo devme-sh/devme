@@ -1,0 +1,22 @@
+[package]
+name = "devme-task-runner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+devme-core = { workspace = true }
+devme-config = { workspace = true }
+devme-resource-lease = { workspace = true }
+devme-slot-allocator = { workspace = true }
+devme-client = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
