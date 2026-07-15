@@ -78,7 +78,7 @@ launch
 assert_has "AI skill" "install-title-2"
 "$TMUX_BIN" send-keys -t "$SESSION" "n"; sleep 1
 assert_absent "Install it" "dismissed-by-n"
-assert_has "d dashboard" "footer-back" # Home keybindings visible again
+assert_has "jk action" "footer-back" # Actions keybindings visible again
 quit_tui
 if [ -f "$PROJ/.claude/skills/devme/SKILL.md" ]; then
   echo "  FAIL [n-no-install] file was written on dismiss"; fails=$((fails + 1))

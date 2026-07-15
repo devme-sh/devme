@@ -24,7 +24,7 @@ pub enum Action {
     NextStack,
     PrevStack,
     ToggleSidebar,
-    Home,
+    ToggleActions,
     // log viewport
     PageUp,
     PageDown,
@@ -153,13 +153,13 @@ pub const MOUSE_NOTES: &[MouseNote] = &[
 pub const BINDINGS: &[Binding] = &[
     // navigation
     Binding {
-        keys: "d",
-        desc: "return to Home actions",
+        keys: "a",
+        desc: "show actions for the selected stack",
         section: Section::Navigation,
-        actions: &[Action::Home],
+        actions: &[Action::ToggleActions],
         footer: Some(FooterHint {
-            keys: "d",
-            label: "home",
+            keys: "a",
+            label: "actions",
         }),
     },
     Binding {
@@ -352,7 +352,7 @@ pub const ALL_ACTIONS: &[Action] = &[
     Action::NextStack,
     Action::PrevStack,
     Action::ToggleSidebar,
-    Action::Home,
+    Action::ToggleActions,
     Action::PageUp,
     Action::PageDown,
     Action::HalfPageUp,
@@ -393,7 +393,7 @@ fn exhaustive_marker(a: Action) {
         | Action::NextStack
         | Action::PrevStack
         | Action::ToggleSidebar
-        | Action::Home
+        | Action::ToggleActions
         | Action::PageUp
         | Action::PageDown
         | Action::HalfPageUp
@@ -436,7 +436,7 @@ pub fn resolve(k: &KeyEvent) -> Option<Action> {
         (KeyCode::Down | KeyCode::Char('j'), false) => NextStack,
         (KeyCode::Up | KeyCode::Char('k'), false) => PrevStack,
         (KeyCode::Char('`'), false) => ToggleSidebar,
-        (KeyCode::Char('d'), false) => Home,
+        (KeyCode::Char('a'), false) => ToggleActions,
         // log viewport
         (KeyCode::PageUp | KeyCode::Char('b'), false) => PageUp,
         (KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('f'), false) => PageDown,
@@ -508,7 +508,7 @@ mod tests {
         let code = |kc: KeyCode| KeyEvent::new(kc, KeyModifiers::NONE);
 
         let mut events: Vec<KeyEvent> = Vec::new();
-        for c in "dlhjkbfgGJKyYpvzSsrociqDwx,nR?` ".chars() {
+        for c in "alhjkbfgGJKyYpvzSsrociqDwx,nR?` ".chars() {
             events.push(plain(c));
         }
         for c in ['u', 'd', 'c'] {

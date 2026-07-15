@@ -48,14 +48,6 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     // the sidebar/tabs (copy, zoom) simply leave it empty, so clicks no-op.
     state.begin_frame_hits();
 
-    if state.home_visible() {
-        render_home(frame, area, state);
-        if let Some(dlg) = state.skill_dialog() {
-            render_skill_dialog(frame, area, dlg);
-        }
-        return;
-    }
-
     if state.copy_mode() {
         render_copy_mode(frame, area, state);
         return;
@@ -73,9 +65,22 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
         return;
     }
 
+    let activity_height = u16::from(state.actions().is_some_and(|panel| {
+        panel.running.is_some()
+            || panel.last_activity.is_some()
+            || (panel.visible
+                && panel
+                    .actions
+                    .get(panel.selected)
+                    .is_some_and(|action| !action.description.is_empty()))
+    }));
     let vertical = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(activity_height),
+            Constraint::Length(1),
+        ])
         .split(area);
 
     // The sidebar can be collapsed (`\``) to give the log pane full width.
@@ -96,17 +101,23 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
         outer[1]
     };
     render_main(frame, main_area, state);
-    render_footer(frame, vertical[1], state);
+    if activity_height > 0 {
+        render_activity_bar(frame, vertical[1], state);
+    }
+    render_footer(frame, vertical[2], state);
 
     // Transient corner notifications, above the main pane.
     render_toasts(frame, main_area, state);
 
-    // Modal priority: port conflict > skill prompt > quit confirm > settings
-    // > help. A crash-on-bind needs the user's attention before anything else.
+    // Modal priority: port conflict > skill prompt > action approval > quit
+    // confirm > settings > help. A crash-on-bind needs the user's attention
+    // before anything else.
     if let Some(dlg) = state.port_conflict() {
         render_port_conflict_dialog(frame, area, dlg);
     } else if let Some(dlg) = state.skill_dialog() {
         render_skill_dialog(frame, area, dlg);
+    } else if let Some(prompt) = state.actions().and_then(|panel| panel.approval.as_ref()) {
+        render_task_approval(frame, area, prompt, state.palette());
     } else if state.worktree_remove_visible() {
         render_worktree_remove_dialog(frame, area, state);
     } else if state.worktree_add_visible() {
@@ -124,221 +135,10 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
     }
 }
 
-fn render_home(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
-    let p = *state.palette();
-    let block = Block::default()
-        .title(Span::styled(
-            " devme home ",
-            Style::default().fg(p.mauve).add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(p.surface1));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.width < 38 || inner.height < 10 {
-        frame.render_widget(
-            Paragraph::new("Terminal too small - resize to at least 40×10"),
-            inner,
-        );
-        return;
-    }
-    let health = state
-        .services()
-        .iter()
-        .filter(|service| matches!(service.state, ServiceState::Running { .. }))
-        .count();
-    let total = state.services().len();
-    let Some(home) = state.home().cloned() else {
-        return;
-    };
-    let group_count = home
-        .actions
-        .iter()
-        .map(|action| action.kind)
-        .fold((None, 0_u16), |(previous, count), kind| {
-            (Some(kind), count + u16::from(previous != Some(kind)))
-        })
-        .1;
-    let action_line_count = home.actions.len() as u16 + group_count;
-    let flexible_height = inner.height.saturating_sub(4);
-    let recent_height = if flexible_height <= 6 {
-        1
-    } else {
-        flexible_height
-            .saturating_sub(action_line_count)
-            .clamp(2, 5)
-    };
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(recent_height),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::styled(
-                "What do you want to do?",
-                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
-            ),
-            Line::styled(
-                format!("Service health: {health}/{total} healthy"),
-                Style::default().fg(if health == total { p.green } else { p.yellow }),
-            ),
-        ]),
-        chunks[0],
-    );
-    let mut lines = Vec::new();
-    let mut last_kind = None;
-    let label_width = home
-        .actions
-        .iter()
-        .map(|action| action.label.chars().count())
-        .max()
-        .unwrap_or_default();
-    for (index, action) in home.actions.iter().enumerate() {
-        if last_kind != Some(action.kind) {
-            lines.push((
-                Line::styled(
-                    action.kind.label(),
-                    Style::default().fg(p.subtext0).add_modifier(Modifier::BOLD),
-                ),
-                None,
-            ));
-            last_kind = Some(action.kind);
-        }
-        let selected = index == home.selected;
-        let marker = if selected { "  ▸ " } else { "    " };
-        let description_width =
-            (chunks[1].width as usize).saturating_sub(marker.chars().count() + label_width + 2);
-        lines.push((
-            Line::from(vec![
-                Span::styled(
-                    format!("{marker}{:<label_width$}  ", action.label),
-                    Style::default()
-                        .fg(if selected { p.text } else { p.subtext0 })
-                        .add_modifier(if selected {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ),
-                Span::styled(
-                    theme::truncate(&action.description, description_width),
-                    Style::default().fg(p.overlay0),
-                ),
-            ]),
-            Some(index),
-        ));
-    }
-    if lines.is_empty() {
-        lines.push((
-            Line::styled(
-                "No tasks declared - add [task.<name>] to devme.toml",
-                Style::default().fg(p.overlay0),
-            ),
-            None,
-        ));
-    }
-    let selected_line = lines
-        .iter()
-        .position(|(_, action)| *action == Some(home.selected))
-        .unwrap_or_default();
-    let viewport_height = chunks[1].height as usize;
-    let max_scroll = lines.len().saturating_sub(viewport_height);
-    let scroll = selected_line
-        .saturating_sub(viewport_height.saturating_sub(1))
-        .min(max_scroll);
-    for (line_index, (_, action)) in lines.iter().enumerate().skip(scroll) {
-        let visible_row = line_index - scroll;
-        if visible_row >= viewport_height {
-            break;
-        }
-        if let Some(index) = action {
-            state.push_click_region(
-                chunks[1].x,
-                chunks[1].y + visible_row as u16,
-                chunks[1].width,
-                1,
-                crate::state::ClickTarget::HomeAction(*index),
-            );
-        }
-    }
-    frame.render_widget(
-        Paragraph::new(lines.into_iter().map(|(line, _)| line).collect::<Vec<_>>())
-            .scroll((scroll as u16, 0)),
-        chunks[1],
-    );
-    let (activity, title) = if let Some(task) = &home.running {
-        let lines = home
-            .logs
-            .iter()
-            .rev()
-            .take(3)
-            .rev()
-            .cloned()
-            .map(Line::from)
-            .collect::<Vec<_>>();
-        let lines = if lines.is_empty() {
-            vec![Line::styled(
-                "Preparing dependencies and services…",
-                Style::default().fg(p.overlay0),
-            )]
-        } else {
-            lines
-        };
-        (lines, format!("Running {}", home.task_label(task)))
-    } else {
-        let lines = home
-            .recent
-            .iter()
-            .rev()
-            .take(3)
-            .map(|result| {
-                Line::from(format!(
-                    "{}  {}",
-                    home.task_label(&result.task),
-                    result.wording()
-                ))
-            })
-            .collect::<Vec<_>>();
-        let lines = if lines.is_empty() {
-            vec![Line::styled(
-                "No task results yet",
-                Style::default().fg(p.overlay0),
-            )]
-        } else {
-            lines
-        };
-        (
-            lines,
-            "Recent activity - Enter reruns the selected action".into(),
-        )
-    };
-    frame.render_widget(
-        Paragraph::new(activity).block(Block::default().title(title).borders(Borders::TOP)),
-        chunks[2],
-    );
-    frame.render_widget(
-        Paragraph::new(format!(
-            "↑↓ navigate   Enter run   Esc cancel   d dashboard   q quit   {}/{}",
-            home.selected.saturating_add(1).min(home.actions.len()),
-            home.actions.len()
-        )),
-        chunks[3],
-    );
-    if let Some(prompt) = &home.approval {
-        render_task_approval(frame, area, prompt, &p);
-    }
-}
-
 fn render_task_approval(
     frame: &mut Frame<'_>,
     area: Rect,
-    prompt: &crate::home::ApprovalPrompt,
+    prompt: &crate::actions::ApprovalPrompt,
     palette: &Palette,
 ) {
     let width = area.width.saturating_sub(4).clamp(30, 76);
@@ -1138,12 +938,19 @@ fn render_stopped(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
 }
 
 /// Small centred quit modal offering a choice: stop every service and quit,
-/// or detach and leave services running. Shown on `q` when
-/// `tui.confirm_quit` is on (the default).
+/// or detach and leave services running. An active foreground action is
+/// client-owned, so both exit paths state plainly that it will be cancelled.
 fn render_quit_confirm(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let p = *state.palette();
     let w = 52u16.min(area.width.saturating_sub(4));
-    let h = 7u16.min(area.height.saturating_sub(2));
+    let running = state.actions().and_then(|panel| {
+        panel
+            .activity_target
+            .as_ref()
+            .zip(panel.running.as_ref())
+            .map(|(target, task)| format!("{} / {task} is still running", target.label))
+    });
+    let h = (7 + u16::from(running.is_some())).min(area.height.saturating_sub(2));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let modal = Rect {
@@ -1170,20 +977,37 @@ fn render_quit_confirm(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(block, modal);
 
     let bold = |c| Style::default().fg(c).add_modifier(Modifier::BOLD);
-    let lines = vec![
-        Line::from(Span::styled(
-            "Quit the TUI — and the services?",
-            Style::default().fg(p.text),
-        )),
+    let mut lines = vec![Line::from(Span::styled(
+        "Quit the TUI - and the services?",
+        Style::default().fg(p.text),
+    ))];
+    if let Some(running) = running {
+        lines.push(Line::from(Span::styled(
+            running,
+            Style::default().fg(p.yellow),
+        )));
+    }
+    lines.extend([
         Line::default(),
         Line::from(vec![
             Span::styled(" q ", bold(p.red)),
-            Span::styled("stop all & quit", Style::default().fg(p.overlay0)),
+            Span::styled(
+                if state.actions().is_some_and(|panel| panel.running.is_some()) {
+                    "cancel action, stop all & quit"
+                } else {
+                    "stop all & quit"
+                },
+                Style::default().fg(p.overlay0),
+            ),
         ]),
         Line::from(vec![
             Span::styled(" d ", bold(p.accent)),
             Span::styled(
-                "detach — leave services running",
+                if state.actions().is_some_and(|panel| panel.running.is_some()) {
+                    "cancel action, leave services running"
+                } else {
+                    "detach - leave services running"
+                },
                 Style::default().fg(p.overlay0),
             ),
         ]),
@@ -1191,7 +1015,7 @@ fn render_quit_confirm(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             Span::styled(" Esc ", bold(p.accent)),
             Span::styled("cancel", Style::default().fg(p.overlay0)),
         ]),
-    ];
+    ]);
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -1368,7 +1192,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let dim = Style::default().fg(p.overlay0);
     let key = Style::default().fg(p.accent).add_modifier(Modifier::BOLD);
 
-    let stack = if state.shared_selected() {
+    let stack = if state.actions_visible() {
+        state
+            .actions()
+            .and_then(|panel| panel.target.as_ref())
+            .map(|target| target.label.as_str())
+            .unwrap_or("actions")
+    } else if state.shared_selected() {
         "shared"
     } else {
         state.instance_label()
@@ -1377,13 +1207,37 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .selected_service()
         .map(|s| s.name.as_str())
         .unwrap_or("—");
-    let breadcrumb = format!(" {stack} › {svc} ");
+    let breadcrumb = if state.actions_visible() {
+        format!(" actions: {stack} ")
+    } else {
+        format!(" {stack} › {svc} ")
+    };
     let left = Paragraph::new(Line::from(vec![Span::styled(
         breadcrumb,
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     )]));
 
-    let centre_line = if state.show_skill_hint() {
+    let centre_line = if state.actions_visible() {
+        let mut spans = vec![
+            Span::styled("jk ", key),
+            Span::styled("action  ", dim),
+            Span::styled("Enter ", key),
+            Span::styled("run  ", dim),
+        ];
+        if state.actions().is_some_and(|panel| panel.running.is_some()) {
+            spans.push(Span::styled("c ", key));
+            spans.push(Span::styled("cancel  ", dim));
+        }
+        spans.extend([
+            Span::styled("hl ", key),
+            Span::styled("service  ", dim),
+            Span::styled("a/Esc ", key),
+            Span::styled("stacks  ", dim),
+            Span::styled("q ", key),
+            Span::styled("quit", dim),
+        ]);
+        Line::from(spans)
+    } else if state.show_skill_hint() {
         Line::from(vec![
             Span::styled("hint: ", Style::default().fg(Color::DarkGray)),
             Span::styled("devme skill install", Style::default().fg(Color::Yellow)),
@@ -1658,6 +1512,10 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
     if area.width == 0 || area.height == 0 {
         return;
     }
+    if state.actions_visible() {
+        render_actions_sidebar(frame, area, state);
+        return;
+    }
     let content = Rect {
         width: area.width - 1,
         ..area
@@ -1680,6 +1538,242 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
     if tools_height > 0 {
         render_tools_pane(&p, frame, chunks[1], state);
     }
+}
+
+fn render_actions_sidebar(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let p = *state.palette();
+    let content = Rect {
+        width: area.width.saturating_sub(1),
+        ..area
+    };
+    let Some(panel) = state.actions().cloned() else {
+        return;
+    };
+    let target = panel
+        .target
+        .as_ref()
+        .map(|target| target.label.as_str())
+        .unwrap_or("stack");
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!(
+                " actions: {}",
+                theme::truncate(target, content.width.saturating_sub(10) as usize)
+            ),
+            Style::default().fg(p.mauve).add_modifier(Modifier::BOLD),
+        )),
+        Rect {
+            height: 1,
+            ..content
+        },
+    );
+    let list = Rect {
+        y: content.y.saturating_add(1),
+        height: content.height.saturating_sub(1),
+        ..content
+    };
+    if list.height == 0 {
+        return;
+    }
+    if panel.loading {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "  Loading actions...",
+                Style::default().fg(p.overlay0),
+            )),
+            list,
+        );
+        return;
+    }
+    if let Some(error) = &panel.load_error {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled("  Actions unavailable", Style::default().fg(p.red)),
+                Line::styled(
+                    format!(
+                        "  {}",
+                        theme::truncate(error, list.width.saturating_sub(2) as usize)
+                    ),
+                    Style::default().fg(p.overlay0),
+                ),
+            ])
+            .wrap(Wrap { trim: true }),
+            list,
+        );
+        return;
+    }
+    if panel.actions.is_empty() {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled("  No actions declared", Style::default().fg(p.subtext0)),
+                Line::styled("  Add [task.<name>]", Style::default().fg(p.overlay0)),
+                Line::styled("  to devme.toml", Style::default().fg(p.overlay0)),
+            ]),
+            list,
+        );
+        return;
+    }
+
+    let mut rows: Vec<(Line<'static>, Option<usize>)> = Vec::new();
+    let mut last_kind = None;
+    for (index, action) in panel.actions.iter().enumerate() {
+        if last_kind != Some(action.kind) {
+            rows.push((
+                Line::styled(
+                    format!(
+                        " {}",
+                        match action.kind {
+                            devme_config::TaskKind::Launch => "launch",
+                            devme_config::TaskKind::Check => "check",
+                            devme_config::TaskKind::Utility => "utility",
+                        }
+                    ),
+                    Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
+                ),
+                None,
+            ));
+            last_kind = Some(action.kind);
+        }
+        let running_here = panel.running.as_deref() == Some(action.task.as_str())
+            && panel
+                .target
+                .as_ref()
+                .zip(panel.activity_target.as_ref())
+                .is_some_and(|(catalog, activity)| catalog.instance_id == activity.instance_id);
+        let recent = panel
+            .recent
+            .iter()
+            .rev()
+            .find(|result| result.task == action.task);
+        let (glyph, color) = if running_here {
+            ("◌", p.yellow)
+        } else {
+            match recent.map(|result| result.outcome) {
+                Some(crate::actions::ActionOutcome::Succeeded) => ("✓", p.green),
+                Some(
+                    crate::actions::ActionOutcome::Cancelled
+                    | crate::actions::ActionOutcome::Interrupted,
+                ) => ("-", p.overlay0),
+                Some(_) => ("✗", p.red),
+                None => (" ", p.overlay0),
+            }
+        };
+        let selected = index == panel.selected;
+        let max_label = list.width.saturating_sub(5) as usize;
+        rows.push((
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(glyph, Style::default().fg(color)),
+                Span::raw(" "),
+                Span::styled(
+                    theme::truncate(&action.label, max_label),
+                    Style::default()
+                        .fg(if selected { p.text } else { p.subtext0 })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+            ]),
+            Some(index),
+        ));
+    }
+    let selected_line = rows
+        .iter()
+        .position(|(_, action)| *action == Some(panel.selected))
+        .unwrap_or_default();
+    let viewport = list.height as usize;
+    let scroll = selected_line
+        .saturating_sub(viewport.saturating_sub(1))
+        .min(rows.len().saturating_sub(viewport));
+    let mut regions = Vec::new();
+    for (row, (line, action)) in rows.iter().skip(scroll).take(viewport).enumerate() {
+        let y = list.y + row as u16;
+        let selected = action.is_some_and(|index| index == panel.selected);
+        render_filled(
+            frame,
+            Rect {
+                y,
+                height: 1,
+                ..list
+            },
+            line.clone(),
+            selected.then(|| Style::default().bg(p.surface0)),
+        );
+        if let Some(index) = action {
+            regions.push((y, *index));
+        }
+    }
+    for (y, index) in regions {
+        state.push_click_region(list.x, y, list.width, 1, ClickTarget::ActionItem(index));
+    }
+}
+
+fn render_activity_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let Some(panel) = state.actions() else {
+        return;
+    };
+    let p = *state.palette();
+    let target = if panel.running.is_some() || panel.last_activity.is_some() {
+        panel.activity_target.as_ref()
+    } else {
+        panel.target.as_ref()
+    }
+    .map(|target| target.label.as_str())
+    .unwrap_or("stack");
+    let (glyph, color, task, detail) = if let Some(task) = panel.running.as_deref() {
+        (
+            "◌",
+            p.yellow,
+            task,
+            panel
+                .logs
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "Preparing".into()),
+        )
+    } else if let Some(result) = &panel.last_activity {
+        let outcome = result.outcome;
+        let passed = outcome.succeeded();
+        (
+            if passed { "✓" } else { "✗" },
+            if passed { p.green } else { p.red },
+            result.task.as_str(),
+            outcome.label().into(),
+        )
+    } else if panel.visible {
+        let Some(action) = panel.actions.get(panel.selected) else {
+            return;
+        };
+        (
+            "›",
+            p.accent,
+            action.task.as_str(),
+            action.description.clone(),
+        )
+    } else {
+        return;
+    };
+    let prefix = format!(" {glyph} {target} / {task}  ");
+    let detail_width = area.width.saturating_sub(prefix.chars().count() as u16 + 1) as usize;
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                prefix,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                theme::truncate(&detail, detail_width),
+                Style::default().fg(p.subtext0),
+            ),
+        ]))
+        .style(Style::default().bg(p.panel_bg)),
+        area,
+    );
 }
 
 /// A single status dot (glyph + colour) summarising a stack's health.
@@ -2627,38 +2721,47 @@ mod tests {
     }
 
     #[test]
-    fn home_renders_grouped_actions_health_and_truthful_history() {
+    fn actions_replace_the_sidebar_without_hiding_the_dashboard() {
         let stack = devme_config::Stack::parse("schema_version=1\n[task.ios]\nkind=\"launch\"\ndescription=\"Run on Simulator\"\ncmd=\"true\"\n[task.verify]\nkind=\"check\"\ncmd=\"true\"\n[task.typescript-check]\nkind=\"check\"\ndescription=\"Format-check TypeScript\"\ncmd=\"true\"\n").unwrap();
         let mut state = TuiState::default();
-        state.set_home(crate::home::HomeState::from_stack(
+        let mut panel = crate::actions::ActionPanel::from_stack(
             &stack,
-            vec![crate::home::RecentResult {
+            vec![crate::actions::RecentResult {
                 task: "ios".into(),
                 kind: devme_config::TaskKind::Launch,
-                status: "passed".into(),
+                outcome: crate::actions::ActionOutcome::Succeeded,
                 finished_at: 1,
             }],
-        ));
+        );
+        panel.set_target(crate::actions::ActionTarget {
+            instance_id: "main".into(),
+            label: "main".into(),
+            cwd: "/tmp/main".into(),
+        });
+        state.set_actions(panel);
         let text = render_to_text(&mut state, 90, 24);
-        assert!(text.contains("What do you want to do?"));
-        assert!(text.contains("Run on Simulator"));
-        assert!(text.contains("typescript check  Format-check TypeScript"));
-        assert!(text.contains("last launch succeeded"));
-        assert!(!text.contains("currently running"));
+        assert!(text.contains("actions: main"), "{text}");
+        assert!(text.contains("ios"), "{text}");
+        assert!(text.contains("typescript check"), "{text}");
+        assert!(text.contains("✓"), "recent success is missing:\n{text}");
+        assert!(
+            text.contains("no services declared in devme.toml"),
+            "dashboard disappeared behind actions:\n{text}"
+        );
     }
 
     #[test]
-    fn home_renders_typed_step_approval_as_a_modal() {
+    fn actions_render_typed_step_approval_as_a_modal() {
         let stack =
             devme_config::Stack::parse("schema_version=1\n[task.check]\ncmd=\"true\"\n").unwrap();
         let mut state = TuiState::default();
-        let mut home = crate::home::HomeState::from_stack(&stack, vec![]);
-        home.approval = Some(crate::home::ApprovalPrompt {
+        let mut panel = crate::actions::ActionPanel::from_stack(&stack, vec![]);
+        panel.approval = Some(crate::actions::ApprovalPrompt {
             step: "toolchain".into(),
             command: "mise install".into(),
             description: Some("Install the pinned toolchain".into()),
         });
-        state.set_home(home);
+        state.set_actions(panel);
 
         let text = render_to_text(&mut state, 90, 24);
         assert!(text.contains("Step approval"), "{text}");
@@ -2667,7 +2770,34 @@ mod tests {
     }
 
     #[test]
-    fn home_prioritizes_actions_and_keeps_the_selection_visible() {
+    fn activity_bar_keeps_the_origin_visible_after_actions_close() {
+        let stack = devme_config::Stack::parse(
+            "schema_version=1\n[task.verify]\nkind=\"check\"\ncmd=\"true\"\n",
+        )
+        .unwrap();
+        let mut state = TuiState::default();
+        let mut panel = crate::actions::ActionPanel::from_stack(&stack, vec![]);
+        panel.set_target(crate::actions::ActionTarget {
+            instance_id: "feature".into(),
+            label: "feature-x".into(),
+            cwd: "/tmp/feature-x".into(),
+        });
+        panel.start_activity("verify".into());
+        panel.logs.push("Waiting for API readiness".into());
+        panel.visible = false;
+        state.set_actions(panel);
+
+        let text = render_to_text(&mut state, 90, 24);
+        assert!(text.contains("feature-x / verify"), "{text}");
+        assert!(text.contains("Waiting for API readiness"), "{text}");
+        assert!(
+            text.contains("stacks"),
+            "stack sidebar did not return:\n{text}"
+        );
+    }
+
+    #[test]
+    fn action_panel_keeps_the_selection_visible() {
         let mut config = String::from("schema_version=1\n");
         for index in 0..3 {
             config.push_str(&format!(
@@ -2684,24 +2814,26 @@ mod tests {
         }
         let stack = devme_config::Stack::parse(&config).unwrap();
         let mut state = TuiState::default();
-        state.set_home(crate::home::HomeState::from_stack(&stack, vec![]));
+        state.set_actions(crate::actions::ActionPanel::from_stack(&stack, vec![]));
 
         let text = render_to_text(&mut state, 100, 30);
         assert!(
             text.contains("utility 5"),
             "last action was clipped:\n{text}"
         );
-        assert!(text.contains("1/19"), "action position is missing:\n{text}");
 
         for _ in 1..19 {
-            state.home_mut().unwrap().move_next();
+            state.actions_mut().unwrap().move_next();
         }
         let text = render_to_text(&mut state, 80, 16);
         assert!(
-            text.contains("▸ utility 5"),
+            text.contains("utility 5"),
             "selected action did not scroll into view:\n{text}"
         );
-        assert!(text.contains("19/19"), "action position is stale:\n{text}");
+        assert!(
+            !text.contains("launch 0"),
+            "action list did not scroll away from the first group:\n{text}"
+        );
     }
 
     #[test]
