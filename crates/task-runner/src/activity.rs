@@ -17,9 +17,47 @@ static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum TaskActivityOutcome {
+    Succeeded,
+    Cancelled,
+    Interrupted,
+    TimedOut,
+    Failed,
+}
+
+impl TaskActivityOutcome {
+    fn from_status(status: &str) -> Self {
+        match status {
+            "passed" => Self::Succeeded,
+            "cancelled" => Self::Cancelled,
+            "interrupted" => Self::Interrupted,
+            "timed_out" => Self::TimedOut,
+            _ => Self::Failed,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+            Self::TimedOut => "timed out",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum TaskActivityState {
-    Running,
-    Finished,
+    Running {
+        message: String,
+    },
+    Finished {
+        outcome: TaskActivityOutcome,
+        finished_at: u64,
+        duration_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,15 +74,32 @@ pub struct TaskActivity {
     pub updated_at: u64,
     pub revision: u64,
     pub state: TaskActivityState,
-    pub message: String,
-    pub status: Option<String>,
-    pub finished_at: Option<u64>,
-    pub duration_ms: Option<u64>,
 }
 
 impl TaskActivity {
     pub fn is_running(&self) -> bool {
-        self.state == TaskActivityState::Running
+        matches!(self.state, TaskActivityState::Running { .. })
+    }
+
+    pub fn message(&self) -> &str {
+        match &self.state {
+            TaskActivityState::Running { message } => message,
+            TaskActivityState::Finished { outcome, .. } => outcome.label(),
+        }
+    }
+
+    pub fn outcome(&self) -> Option<TaskActivityOutcome> {
+        match self.state {
+            TaskActivityState::Running { .. } => None,
+            TaskActivityState::Finished { outcome, .. } => Some(outcome),
+        }
+    }
+
+    pub fn finished_at(&self) -> Option<u64> {
+        match self.state {
+            TaskActivityState::Running { .. } => None,
+            TaskActivityState::Finished { finished_at, .. } => Some(finished_at),
+        }
     }
 
     pub fn owner_is_live(&self) -> bool {
@@ -84,11 +139,9 @@ impl TaskActivityWriter {
             started_at: now,
             updated_at: now,
             revision: 0,
-            state: TaskActivityState::Running,
-            message: format!("Preparing {task}"),
-            status: None,
-            finished_at: None,
-            duration_ms: None,
+            state: TaskActivityState::Running {
+                message: format!("Preparing {task}"),
+            },
         };
         let path = task_activity_dir(root)
             .and_then(|dir| {
@@ -108,7 +161,12 @@ impl TaskActivityWriter {
 
     pub(crate) fn progress(&self, message: &str) {
         self.update(|activity| {
-            activity.message = compact_message(message);
+            if let TaskActivityState::Running {
+                message: activity_message,
+            } = &mut activity.state
+            {
+                *activity_message = compact_message(message);
+            }
         });
     }
 
@@ -130,21 +188,27 @@ impl TaskActivityWriter {
     pub(crate) fn finish(&self, result: &Result<TaskResult>) {
         self.update(|activity| {
             let now = now_ms();
-            activity.state = TaskActivityState::Finished;
-            activity.finished_at = Some(now);
-            match result {
-                Ok(result) => {
-                    activity.status = Some(result.status.clone());
-                    activity.finished_at = Some(result.finished_at);
-                    activity.duration_ms = Some(result.duration_ms);
-                    activity.message = result.status.clone();
-                }
-                Err(_) => {
-                    activity.status = Some("failed".into());
-                    activity.duration_ms = Some(now.saturating_sub(activity.started_at));
-                    activity.message = "failed".into();
-                }
-            }
+            let (outcome, finished_at, duration_ms) = result.as_ref().map_or_else(
+                |_| {
+                    (
+                        TaskActivityOutcome::Failed,
+                        now,
+                        now.saturating_sub(activity.started_at),
+                    )
+                },
+                |result| {
+                    (
+                        TaskActivityOutcome::from_status(&result.status),
+                        result.finished_at,
+                        result.duration_ms,
+                    )
+                },
+            );
+            activity.state = TaskActivityState::Finished {
+                outcome,
+                finished_at,
+                duration_ms,
+            };
         });
     }
 

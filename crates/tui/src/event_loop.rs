@@ -280,7 +280,7 @@ async fn run(
 
         tokio::select! {
             observed = activity_feed.recv() => if let Some(observed) = observed {
-                state.apply_task_activity(observed.activity, observed.initial);
+                state.apply_task_activity(observed.activity, observed.origin);
             },
             _ = task_liveness.tick() => state.reap_dead_task_activities(),
             evt = key_rx.recv() => match evt {

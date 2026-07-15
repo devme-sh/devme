@@ -142,17 +142,8 @@ impl<'a> TaskRunner<'a> {
             }
         };
 
-        let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();
-        let events = request.events.clone();
-        let output_activity = activity.clone();
-        let bridge = tokio::spawn(async move {
-            while let Some(event) = output_rx.recv().await {
-                output_activity.output(&event);
-                if let Some(events) = &events {
-                    let _ = events.send(TaskEvent::Output(event));
-                }
-            }
-        });
+        let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
+        let bridge = spawn_output_bridge(output_rx, request.events.clone(), activity.clone());
         self.progress(
             &request.events,
             activity,
@@ -229,17 +220,8 @@ impl<'a> TaskRunner<'a> {
                 crate::record_preflight_failure_silent(self.stack, self.root, &request.task, &error)
             };
         }
-        let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();
-        let events = request.events.clone();
-        let output_activity = activity.clone();
-        let bridge = tokio::spawn(async move {
-            while let Some(event) = output_rx.recv().await {
-                output_activity.output(&event);
-                if let Some(events) = &events {
-                    let _ = events.send(TaskEvent::Output(event));
-                }
-            }
-        });
+        let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
+        let bridge = spawn_output_bridge(output_rx, request.events.clone(), activity.clone());
         self.progress(
             &request.events,
             activity,
@@ -435,6 +417,21 @@ impl<'a> TaskRunner<'a> {
             let _ = events.send(TaskEvent::Progress(message));
         }
     }
+}
+
+fn spawn_output_bridge(
+    mut output: tokio::sync::mpsc::UnboundedReceiver<TaskOutputEvent>,
+    events: Option<tokio::sync::mpsc::UnboundedSender<TaskEvent>>,
+    activity: crate::activity::TaskActivityWriter,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(event) = output.recv().await {
+            activity.output(&event);
+            if let Some(events) = &events {
+                let _ = events.send(TaskEvent::Output(event));
+            }
+        }
+    })
 }
 
 fn readiness_timeout_error(
@@ -662,7 +659,10 @@ mod tests {
         assert_eq!(result.status, "passed");
         let finished = crate::read_task_activities(root.path()).unwrap();
         assert_eq!(finished.len(), 1);
-        assert_eq!(finished[0].status.as_deref(), Some("passed"));
+        assert_eq!(
+            finished[0].outcome(),
+            Some(crate::TaskActivityOutcome::Succeeded)
+        );
         assert!(!finished[0].is_running());
     }
 

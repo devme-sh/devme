@@ -5,6 +5,9 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEVME="${1:-$REPO_ROOT/target/release/devme}"
+if [[ "$DEVME" != /* ]]; then
+  DEVME="$(cd "$(dirname "$DEVME")" && pwd)/$(basename "$DEVME")"
+fi
 SESSION="devme-agent-tui-$$"
 FIXTURE="$(mktemp -d /tmp/devme-agent-tui-smoke.XXXXXX)"
 HOME_DIR="$FIXTURE/home"

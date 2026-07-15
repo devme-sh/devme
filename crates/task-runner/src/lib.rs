@@ -3,8 +3,8 @@
 mod activity;
 mod runner;
 pub use activity::{
-    TaskActivity, TaskActivityState, read_task_activities, read_task_activities_from_dir,
-    task_activity_dir,
+    TaskActivity, TaskActivityOutcome, TaskActivityState, read_task_activities,
+    read_task_activities_from_dir, task_activity_dir,
 };
 pub use runner::{
     Approval, ApprovalHandler, ApprovalRequest, BorrowedRunRequest, DaemonStarter, RunRequest,

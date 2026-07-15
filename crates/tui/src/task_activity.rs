@@ -4,9 +4,15 @@ use devme_task_runner::TaskActivity;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationOrigin {
+    InitialScan,
+    LiveEvent,
+}
+
 pub struct ObservedActivity {
     pub activity: TaskActivity,
-    pub initial: bool,
+    pub origin: ObservationOrigin,
 }
 
 pub struct ActivityFeed {
@@ -17,13 +23,6 @@ pub struct ActivityFeed {
 impl ActivityFeed {
     pub fn bind(repo_dir: &Path) -> std::io::Result<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
-        for activity in scan(repo_dir)? {
-            let _ = tx.send(ObservedActivity {
-                activity,
-                initial: true,
-            });
-        }
-
         let (path_tx, mut path_rx) = mpsc::unbounded_channel::<PathBuf>();
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             if let Ok(event) = event {
@@ -40,6 +39,7 @@ impl ActivityFeed {
             .watch(repo_dir, RecursiveMode::Recursive)
             .map_err(|error| std::io::Error::other(format!("task activity watch: {error}")))?;
 
+        let live_tx = tx.clone();
         tokio::spawn(async move {
             while let Some(path) = path_rx.recv().await {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -49,10 +49,10 @@ impl ActivityFeed {
                 let Ok(activity) = serde_json::from_slice::<TaskActivity>(&bytes) else {
                     continue;
                 };
-                if tx
+                if live_tx
                     .send(ObservedActivity {
                         activity,
-                        initial: false,
+                        origin: ObservationOrigin::LiveEvent,
                     })
                     .is_err()
                 {
@@ -60,6 +60,16 @@ impl ActivityFeed {
                 }
             }
         });
+
+        // Install the watcher before scanning so a task created during the
+        // initial read is observed by at least one path. Revision deduplication
+        // makes overlap between the scan and watcher harmless.
+        for activity in scan(repo_dir)? {
+            let _ = tx.send(ObservedActivity {
+                activity,
+                origin: ObservationOrigin::InitialScan,
+            });
+        }
 
         Ok(Self {
             rx,
@@ -125,11 +135,9 @@ mod tests {
             started_at: 1,
             updated_at: 1,
             revision: 0,
-            state: devme_task_runner::TaskActivityState::Running,
-            message: "Preparing verify".into(),
-            status: None,
-            finished_at: None,
-            duration_ms: None,
+            state: devme_task_runner::TaskActivityState::Running {
+                message: "Preparing verify".into(),
+            },
         };
         std::fs::write(
             activity_dir.join("run-1.json"),
@@ -139,5 +147,55 @@ mod tests {
         std::fs::write(root.path().join("ignored.json"), b"{}").unwrap();
 
         assert_eq!(scan(root.path()).unwrap(), vec![activity]);
+    }
+
+    #[tokio::test]
+    async fn feed_scans_existing_activity_then_streams_updates() {
+        let root = tempfile::tempdir().unwrap();
+        let activity_dir = root.path().join("abc-task-activity");
+        std::fs::create_dir_all(&activity_dir).unwrap();
+        let path = activity_dir.join("run-1.json");
+        let mut activity = TaskActivity {
+            schema_version: 1,
+            run_id: "run-1".into(),
+            instance_id: "abc".into(),
+            cwd: "/repo".into(),
+            task: "verify".into(),
+            owner_pid: std::process::id(),
+            owner_identity: None,
+            started_at: 1,
+            updated_at: 1,
+            revision: 0,
+            state: devme_task_runner::TaskActivityState::Running {
+                message: "Preparing verify".into(),
+            },
+        };
+        std::fs::write(&path, serde_json::to_vec(&activity).unwrap()).unwrap();
+
+        let mut feed = ActivityFeed::bind(root.path()).unwrap();
+        let initial = feed.recv().await.unwrap();
+        assert_eq!(initial.origin, ObservationOrigin::InitialScan);
+        assert_eq!(initial.activity, activity);
+
+        activity.revision = 1;
+        activity.updated_at = 2;
+        activity.state = devme_task_runner::TaskActivityState::Running {
+            message: "Running verify".into(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&activity).unwrap()).unwrap();
+
+        let live = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let observed = feed.recv().await.unwrap();
+                if observed.origin == ObservationOrigin::LiveEvent
+                    && observed.activity.revision == 1
+                {
+                    break observed;
+                }
+            }
+        })
+        .await
+        .expect("activity update was not observed");
+        assert_eq!(live.activity.message(), "Running verify");
     }
 }
