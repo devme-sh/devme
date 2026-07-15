@@ -47,10 +47,8 @@ pub fn repo_id(cwd: &Path) -> String {
 /// that holds the real `.git` directory, as opposed to a linked `git
 /// worktree` (which holds only a `.git` *pointer file*).
 ///
-/// `devme remote` syncs this single root (shared-`.git` model 1a): every
-/// worktree of a repo resolves to the same main root, so running `devme
-/// remote` from any worktree drives one sync session. Outside a git repo it
-/// falls back to the canonicalized `cwd`.
+/// Every worktree of a repo resolves to the same main root. Outside a git
+/// repo it falls back to the canonicalized `cwd`.
 pub fn main_worktree_root(cwd: &Path) -> PathBuf {
     match git_common_dir(cwd) {
         // `<main>/.git` → the main worktree is its parent.

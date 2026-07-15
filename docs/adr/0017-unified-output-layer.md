@@ -15,7 +15,7 @@ parallel styling systems:
 | clack tree | `supervisor/{preflight,port_preflight,env_resolve,prompt}.rs` | `◆ │ ◇ └` headers/bars, 4 private copies of the same ANSI + glyph constants |
 | compose mimicry | `down`, foreground `up` | `[+] Stopping 5/5`, ` ✔ Service web  Stopped  0.0s` |
 | status table | `cli/lib.rs` (`format_status_*`) | `STEPS`/`SERVICES` grid, glyphs `● ◐ ◌ ↻ ✗ ○ ◆`, its own `ansi` module + `paint()` |
-| prefix one-liners | `main.rs` (`info!`), `remote.rs` | `devme: …`, `devme remote: …`, bare prose, ad-hoc `⚠ ✔ ✗ ✓ ▲ • ↳`, `hint:` / `warning:` / `fix:` labels |
+| prefix one-liners | `main.rs` (`info!`) | `devme: …`, bare prose, ad-hoc `⚠ ✔ ✗ ✓ ▲ • ↳`, `hint:` / `warning:` / `fix:` labels |
 | JSON | scattered | mostly `to_string_pretty`, sometimes compact; `logs --json` is NDJSON |
 
 Concrete drift this caused:
@@ -29,8 +29,8 @@ Concrete drift this caused:
 - **Glyphs disagree**: success is `✔` in four places and `✓` in one;
   "missing" is `▲` in preflight and `✗` elsewhere; hints are `↳`, `fix:`, or
   `hint:` depending on the file.
-- **Quiet is inconsistent**: `main.rs` has an `info!` macro, `remote.rs`
-  threads a `quiet` bool by hand, the supervisor renderers ignore it.
+- **Quiet is inconsistent**: `main.rs` has an `info!` macro while the
+  supervisor renderers ignore it.
 
 Every new command re-decides all of this from scratch.
 
@@ -42,12 +42,12 @@ visual vocabulary. Everything user-facing renders through it.
 ### The vocabulary
 
 - **One-liners** (stderr): `devme: <msg>`, optionally scoped
-  (`devme remote: <msg>`). Levels: `info` / `success` (quiet-gated),
+  (`devme config: <msg>`). Levels: `info` / `success` (quiet-gated),
   `warn` / `error` (never gated). Hints are dim `  ↳ <msg>` continuation
   lines, quiet-gated.
 - **Sections** (any multi-item flow): the clack tree is devme's signature
   look and becomes the *only* multi-line style — preflight, port checks, the
-  env wizard, `down` progress, `remote doctor`, `validate`:
+  env wizard, `down` progress, and `validate`:
 
   ```
     ◆  Stopping stack
@@ -73,7 +73,7 @@ visual vocabulary. Everything user-facing renders through it.
 ```rust
 devme_ui::init(quiet, no_color);          // once, in main()
 devme_ui::info("started 5 services");     // → stderr "devme: started 5 services"
-devme_ui::scoped("remote").warn("…");     // → stderr "devme remote: ⚠ …"
+devme_ui::scoped("config").warn("…");     // → stderr "devme config: ⚠ …"
 devme_ui::hint("devme logs api");         // → stderr "  ↳ devme logs api" (dim)
 devme_ui::json(&value);                   // → stdout, pretty
 

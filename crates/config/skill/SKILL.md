@@ -169,6 +169,7 @@ Rules:
 - **Worktrees converge - no lifecycle hooks.** There is no per-worktree setup or teardown hook (`[stack] on_create`/`on_destroy` parse for back-compat but never run - `config check` flags them). Per-worktree setup is a `[step]` check/provision: idempotent, so *any* worktree - created by `devme worktree add`, the TUI's `w`, or a bare `git worktree add` - converges on its first `devme up`. Removal is mechanical (stop, `git worktree remove`, release slot); a bare `git worktree remove` is reaped to the same end state. Make slot-scoped provisions idempotent (e.g. `dropdb --if-exists app_slot{slot} && createdb app_slot{slot}`) so a reused slot starts clean.
 - **Restart cascades.** Services have dependency ordering; restarting a DB can cascade to dependents.
 - **Remote context is external.** devme owns stack/runtime supervision: steps, services, logs, status, URLs, and the TUI. Remote project context is owned by the separate `devme-sh/devcloud` tool/repository. v1 remote work uses Git as the sync boundary; there is no live Mutagen sync, transparent remote proxy, Herdr attach preset, Codex/Claude session transfer, or remote URL rewriting in the active devme contract.
+- **Legacy remote config is ignored.** Remove old `[remote]` settings when devme warns about them. `devme config unset remote.<key>` remains available for cleanup, but remote keys cannot be set and never affect runtime behavior.
 
 ## Live agent guidance
 

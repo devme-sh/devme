@@ -35,9 +35,7 @@ SMOKE_DIR="$(mktemp -d /tmp/devme-tui-smoke.XXXXXX)"
 cp "$SMOKE_SRC/devme.toml" "$SMOKE_DIR/"
 git -C "$SMOKE_DIR" init -q
 
-# Isolate HOME too: the user's real global config can redirect the whole run
-# (`remote.default = true` would live-sync the fixture to their VPS and run
-# the stack there). A throwaway HOME keeps the smoke local and hermetic.
+# Isolate HOME too so user preferences cannot affect the fixture.
 # Suppress the skill-install prompt a fresh HOME would otherwise raise — it's
 # modal and would swallow the keys this script sends (the skill modals have
 # their own smoke: skill-modal-smoke.sh).

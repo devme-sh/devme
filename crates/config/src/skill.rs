@@ -305,6 +305,8 @@ mod tests {
         assert!(SKILL_MD.starts_with("---\nname: devme\n"));
         assert!(SKILL_MD.contains("description: Manage dev environments with devme. Use when"));
         assert!(SKILL_MD.contains("### CLI reference"));
+        assert!(!SKILL_MD.contains("`devme remote"));
+        assert!(SKILL_MD.contains("Legacy remote config is ignored"));
     }
 
     #[test]

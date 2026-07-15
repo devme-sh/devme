@@ -9,7 +9,6 @@ use devme_core::{ServiceSnapshot, StepSnapshot};
 
 pub mod agent;
 pub mod output;
-pub mod remote;
 pub mod session;
 pub mod setup;
 pub mod skill;
@@ -62,13 +61,6 @@ pub struct Cli {
     /// "I know what I want" mode (ADR-0002).
     #[arg(long, short = 'y', global = true)]
     pub yes: bool,
-
-    /// Force a command to run against the *local* daemon even when this
-    /// project has a live remote sync. By default, daemon-facing commands
-    /// (`status`, `logs`, `up`, …) transparently proxy to the remote host
-    /// while a sync is active; `--local` is the escape hatch.
-    #[arg(long, global = true)]
-    pub local: bool,
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
@@ -234,26 +226,6 @@ pub enum Command {
         #[command(subcommand)]
         action: WorktreeAction,
     },
-    /// Live-sync this project to a remote dev host and attach to its
-    /// (remote-primary) dev environment.
-    ///
-    /// The remote runs the stack, supervisor, and `devme tui`; your laptop
-    /// edits files (synced via Mutagen) and views the TUI. Work survives
-    /// closing the lid — reopen and it reconciles. Configure the host once:
-    /// `devme config set remote.host <ssh-target>`.
-    ///
-    /// `devme remote` — ensure the live-sync, then attach.
-    /// `devme remote doctor` — preflight the local + remote setup.
-    /// `devme remote status` — conflict-aware sync state.
-    /// `devme remote conflicts` — list halted-sync conflicts + how to resolve.
-    /// `devme remote sync` — reconcile without attaching.
-    /// `devme remote flush` — force an immediate reconcile (e.g. on wake).
-    /// `devme remote stop` — terminate the live-sync.
-    /// `devme remote toggle` — flip whether bare `devme` defaults to remote.
-    Remote {
-        #[command(subcommand)]
-        action: Option<RemoteAction>,
-    },
     /// Install or update the devme AI agent skill — a `SKILL.md` that teaches
     /// coding agents (Claude Code et al.) how to drive devme.
     ///
@@ -356,42 +328,6 @@ pub enum WorktreeAction {
         /// uncommitted changes / untracked files).
         #[arg(long, short = 'f')]
         force: bool,
-    },
-}
-
-#[derive(Debug, Subcommand, PartialEq, Eq)]
-pub enum RemoteAction {
-    /// Preflight the local tooling, host reachability, and remote
-    /// `git`/`devme` — with a fixable hint per failure.
-    Doctor,
-    /// Show the live-sync's conflict-aware state for this project.
-    Status {
-        /// Refresh a single compact status line until Ctrl-C — for a laptop-
-        /// side split pane next to an attached session.
-        #[arg(long, short = 'w')]
-        watch: bool,
-    },
-    /// List unresolved sync conflicts (two-way-safe halts on conflict): the
-    /// paths involved, the full alpha/beta detail, and how to resolve them.
-    Conflicts,
-    /// Reconcile the live-sync now without attaching.
-    Sync,
-    /// Force an immediate reconcile (e.g. right after the laptop wakes).
-    Flush,
-    /// Terminate the live-sync. The remote files stay; the live link stops.
-    Stop,
-    /// Reconcile every devme-managed sync now. Run by the wake-hook so changes
-    /// the remote made while the laptop slept come down immediately.
-    Wake,
-    /// Toggle whether bare `devme` defaults to remote. Shortcut for
-    /// `devme config set remote.default true|false`.
-    Toggle,
-    /// Install (or `--uninstall`) the OS wake hook that runs `devme remote
-    /// wake` on resume — macOS sleepwatcher's `~/.wakeup`.
-    WakeHook {
-        /// Remove the hook instead of installing it.
-        #[arg(long)]
-        uninstall: bool,
     },
 }
 
@@ -616,7 +552,7 @@ pub fn format_status_text(
         return "  No services or steps declared in devme.toml.\n".to_string();
     }
 
-    let host = crate::remote::advertise_host();
+    let host = "localhost";
 
     // One name column wide enough for steps and services together, so the two
     // groups stay vertically aligned.
@@ -677,7 +613,7 @@ pub fn format_status_text(
             // resolution); fall back to a plain http URL from the port.
             let url = match &s.url {
                 Some(t) if !(t.contains("{port}") && s.port.is_none()) => {
-                    let mut u = t.replace("{host}", &host);
+                    let mut u = t.replace("{host}", host);
                     if let Some(p) = s.port {
                         u = u.replace("{port}", &p.to_string());
                     }
@@ -1613,81 +1549,9 @@ mod tests {
     }
 
     #[test]
-    fn remote_bare_parses_to_no_action() {
-        let cli = Cli::parse_from(["devme", "remote"]);
-        assert_eq!(cli.command, Some(Command::Remote { action: None }));
-    }
-
-    #[test]
-    fn remote_subcommands_parse() {
-        for (arg, expected) in [
-            ("doctor", RemoteAction::Doctor),
-            ("status", RemoteAction::Status { watch: false }),
-            ("conflicts", RemoteAction::Conflicts),
-            ("sync", RemoteAction::Sync),
-            ("flush", RemoteAction::Flush),
-            ("stop", RemoteAction::Stop),
-            ("wake", RemoteAction::Wake),
-            ("toggle", RemoteAction::Toggle),
-        ] {
-            let cli = Cli::parse_from(["devme", "remote", arg]);
-            assert_eq!(
-                cli.command,
-                Some(Command::Remote {
-                    action: Some(expected)
-                })
-            );
-        }
-    }
-
-    #[test]
-    fn remote_status_watch_flag_parses() {
-        let cli = Cli::parse_from(["devme", "remote", "status", "--watch"]);
-        assert_eq!(
-            cli.command,
-            Some(Command::Remote {
-                action: Some(RemoteAction::Status { watch: true })
-            })
-        );
-        // Short form too.
-        let cli = Cli::parse_from(["devme", "remote", "status", "-w"]);
-        assert_eq!(
-            cli.command,
-            Some(Command::Remote {
-                action: Some(RemoteAction::Status { watch: true })
-            })
-        );
-    }
-
-    #[test]
-    fn remote_wake_hook_parses_install_and_uninstall() {
-        let cli = Cli::parse_from(["devme", "remote", "wake-hook"]);
-        assert_eq!(
-            cli.command,
-            Some(Command::Remote {
-                action: Some(RemoteAction::WakeHook { uninstall: false })
-            })
-        );
-        let cli = Cli::parse_from(["devme", "remote", "wake-hook", "--uninstall"]);
-        assert_eq!(
-            cli.command,
-            Some(Command::Remote {
-                action: Some(RemoteAction::WakeHook { uninstall: true })
-            })
-        );
-    }
-
-    #[test]
-    fn local_flag_is_global() {
-        let cli = Cli::parse_from(["devme", "--local", "status"]);
-        assert!(cli.local);
-        assert_eq!(
-            cli.command,
-            Some(Command::Status {
-                all: false,
-                output: OutputFormat::Human,
-            })
-        );
+    fn removed_remote_command_and_local_flag_are_rejected() {
+        assert!(Cli::try_parse_from(["devme", "remote"]).is_err());
+        assert!(Cli::try_parse_from(["devme", "--local", "status"]).is_err());
     }
 
     #[test]
