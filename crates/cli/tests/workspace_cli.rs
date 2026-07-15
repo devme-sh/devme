@@ -1,9 +1,81 @@
 use std::process::Command;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use tempfile::TempDir;
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_devme")
+}
+
+#[test]
+#[cfg(unix)]
+fn legacy_remote_config_never_changes_default_or_daemon_commands() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("devme.toml"), "schema_version = 1\n").unwrap();
+    let config_dir = dir.path().join(".config/devme");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[remote]\nhost = \"legacy-vps\"\ndefault = true\n",
+    )
+    .unwrap();
+
+    let fake_bin = dir.path().join("bin");
+    std::fs::create_dir(&fake_bin).unwrap();
+    let ssh_marker = dir.path().join("ssh-invoked");
+    let fake_ssh = fake_bin.join("ssh");
+    std::fs::write(
+        &fake_ssh,
+        format!("#!/bin/sh\ntouch '{}'\nexit 99\n", ssh_marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let run = |args: &[&str]| {
+        Command::new(bin())
+            .args(args)
+            .current_dir(dir.path())
+            .env("HOME", dir.path())
+            .env("PATH", &path)
+            .output()
+            .unwrap()
+    };
+
+    let bare = run(&[]);
+    assert!(
+        bare.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bare.stderr)
+    );
+    assert!(
+        !bare.stdout.is_empty(),
+        "bare devme produced no local context"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&bare.stderr)
+            .matches("legacy [remote]")
+            .count(),
+        1
+    );
+
+    let status = run(&["status", "--output", "json"]);
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        !ssh_marker.exists(),
+        "devme attempted transparent SSH proxying"
+    );
+    let _ = run(&["down"]);
 }
 
 #[test]
