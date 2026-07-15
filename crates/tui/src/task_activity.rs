@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 pub enum ObservationOrigin {
     InitialScan,
     LiveEvent,
+    OwnerReaped,
 }
 
 pub struct ObservedActivity {

@@ -119,6 +119,37 @@ pub(crate) struct TaskActivityWriter {
     last_output_persisted: Arc<Mutex<Option<Instant>>>,
 }
 
+pub(crate) struct TaskActivityLifecycle {
+    writer: TaskActivityWriter,
+    completed: bool,
+}
+
+impl TaskActivityLifecycle {
+    pub(crate) fn start(root: &Path, task: &str) -> Self {
+        Self {
+            writer: TaskActivityWriter::start(root, task),
+            completed: false,
+        }
+    }
+
+    pub(crate) fn writer(&self) -> &TaskActivityWriter {
+        &self.writer
+    }
+
+    pub(crate) fn complete(&mut self, result: &Result<TaskResult>) {
+        self.writer.finish(result);
+        self.completed = true;
+    }
+}
+
+impl Drop for TaskActivityLifecycle {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.writer.interrupt();
+        }
+    }
+}
+
 impl TaskActivityWriter {
     pub(crate) fn start(root: &Path, task: &str) -> Self {
         let now = now_ms();
@@ -208,6 +239,17 @@ impl TaskActivityWriter {
                 outcome,
                 finished_at,
                 duration_ms,
+            };
+        });
+    }
+
+    fn interrupt(&self) {
+        self.update(|activity| {
+            let finished_at = now_ms();
+            activity.state = TaskActivityState::Finished {
+                outcome: TaskActivityOutcome::Interrupted,
+                finished_at,
+                duration_ms: finished_at.saturating_sub(activity.started_at),
             };
         });
     }

@@ -70,9 +70,9 @@ impl<'a> TaskRunner<'a> {
     }
 
     pub async fn run(&self, request: RunRequest) -> Result<TaskResult> {
-        let activity = crate::activity::TaskActivityWriter::start(self.root, &request.task);
-        let result = self.run_observed(request, &activity).await;
-        activity.finish(&result);
+        let mut activity = crate::activity::TaskActivityLifecycle::start(self.root, &request.task);
+        let result = self.run_observed(request, activity.writer()).await;
+        activity.complete(&result);
         result
     }
 
@@ -175,9 +175,9 @@ impl<'a> TaskRunner<'a> {
     /// receives the Session's allocated Resource environment without taking a
     /// second Service hold or Resource lease.
     pub async fn run_borrowed(&self, request: BorrowedRunRequest) -> Result<TaskResult> {
-        let activity = crate::activity::TaskActivityWriter::start(self.root, &request.task);
-        let result = self.run_borrowed_observed(request, &activity).await;
-        activity.finish(&result);
+        let mut activity = crate::activity::TaskActivityLifecycle::start(self.root, &request.task);
+        let result = self.run_borrowed_observed(request, activity.writer()).await;
+        activity.complete(&result);
         result
     }
 
@@ -664,6 +664,53 @@ mod tests {
             Some(crate::TaskActivityOutcome::Succeeded)
         );
         assert!(!finished[0].is_running());
+    }
+
+    #[tokio::test]
+    async fn aborting_run_future_persists_interrupted_activity() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+        let stack =
+            Stack::parse("schema_version=1\n[task.verify]\ncmd=\"echo started; sleep 2\"\n")
+                .unwrap();
+        let run_root = root_path.clone();
+        let run = tokio::spawn(async move {
+            TaskRunner::new(&stack, &run_root)
+                .run(RunRequest {
+                    task: "verify".into(),
+                    args: Vec::new(),
+                    approval: approval(Approval::Approve),
+                    daemon_starter: Arc::new(|_| Box::pin(async { Ok(()) })),
+                    events: None,
+                    cancellation: None,
+                })
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if crate::read_task_activities(&root_path)
+                    .unwrap()
+                    .iter()
+                    .any(crate::TaskActivity::is_running)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("running activity was not persisted");
+
+        run.abort();
+        let _ = run.await;
+
+        let activity = crate::read_task_activities(&root_path).unwrap();
+        assert_eq!(activity.len(), 1);
+        assert_eq!(
+            activity[0].outcome(),
+            Some(crate::TaskActivityOutcome::Interrupted)
+        );
     }
 
     #[tokio::test]

@@ -1737,13 +1737,17 @@ fn render_activity_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let p = *state.palette();
     let shared_activity = state.active_task_for_current();
     let target = if shared_activity.is_some() {
-        panel.target.as_ref()
+        state
+            .current_instance()
+            .map(|instance| instance.info.label.as_str())
     } else if panel.running.is_some() || panel.last_activity.is_some() {
-        panel.activity_target.as_ref()
+        panel
+            .activity_target
+            .as_ref()
+            .map(|target| target.label.as_str())
     } else {
-        panel.target.as_ref()
+        panel.target.as_ref().map(|target| target.label.as_str())
     }
-    .map(|target| target.label.as_str())
     .unwrap_or("stack");
     let (glyph, color, task, mut detail) = if let Some(activity) = shared_activity {
         (
@@ -2888,6 +2892,62 @@ mod tests {
             text.lines().any(|line| line.contains("2 verify")),
             "concurrent count is missing from the Actions row:\n{text}"
         );
+    }
+
+    #[test]
+    fn agent_activity_bar_uses_the_selected_stack_label() {
+        let stack = devme_config::Stack::parse(
+            "schema_version=1\n[task.verify]\nkind=\"check\"\ncmd=\"true\"\n",
+        )
+        .unwrap();
+        let mut panel = crate::actions::ActionPanel::from_stack(&stack, Vec::new());
+        panel.set_target(crate::actions::ActionTarget {
+            instance_id: "old".into(),
+            label: "old-stack".into(),
+            cwd: "/repo/old".into(),
+        });
+        let mut state = TuiState::default();
+        state.set_actions(panel);
+        for (id, label, cwd) in [
+            ("old", "old-stack", "/repo/old"),
+            ("current", "current-stack", "/repo/current"),
+        ] {
+            state.apply(ServerMessage::Subscribed {
+                instance: InstanceInfo {
+                    id: id.into(),
+                    label: label.into(),
+                    cwd: cwd.into(),
+                },
+                services: Vec::new(),
+                steps: Vec::new(),
+            });
+        }
+        state.select_instance_by_id("current");
+        state.apply_task_activity(
+            devme_task_runner::TaskActivity {
+                schema_version: 1,
+                run_id: "current-run".into(),
+                instance_id: "current".into(),
+                cwd: "/repo/current".into(),
+                task: "verify".into(),
+                owner_pid: std::process::id(),
+                owner_identity: None,
+                started_at: 1,
+                updated_at: 1,
+                revision: 0,
+                state: devme_task_runner::TaskActivityState::Running {
+                    message: "Running verify".into(),
+                },
+            },
+            crate::task_activity::ObservationOrigin::LiveEvent,
+        );
+
+        let text = render_to_text(&mut state, 120, 24);
+        assert!(
+            text.contains("◌ current-stack / verify  Running verify"),
+            "{text}"
+        );
+        assert!(!text.contains("◌ old-stack / verify"), "{text}");
     }
 
     #[test]

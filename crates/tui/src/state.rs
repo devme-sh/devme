@@ -140,6 +140,10 @@ const TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_TOASTS: usize = 4;
 /// Cap on the retained notification scrollback (oldest evicted first).
 const MAX_NOTIF_HISTORY: usize = 200;
+/// Completed task revisions retained for watcher-event deduplication. This is
+/// larger than the on-disk activity-file cap so delayed filesystem events can
+/// still be suppressed without growing a long-lived dashboard indefinitely.
+const MAX_COMPLETED_TASK_OBSERVATIONS: usize = 512;
 
 /// Repo-scoped shared daemon state. Shows as a separate sidebar entry.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -624,6 +628,7 @@ struct SidebarDivider {
 struct TaskActivityObservation {
     revision: u64,
     saw_live_event: bool,
+    start_notified: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -631,6 +636,7 @@ pub struct TuiState {
     actions: Option<ActionPanel>,
     task_activities: HashMap<String, devme_task_runner::TaskActivity>,
     task_activity_observations: HashMap<String, TaskActivityObservation>,
+    task_activity_observation_order: VecDeque<String>,
     instances: Vec<InstanceData>,
     selected_instance: Option<usize>,
     /// Shared (repo-scoped) daemon state with its own sidebar row.
@@ -752,6 +758,7 @@ impl Default for TuiState {
             actions: None,
             task_activities: HashMap::new(),
             task_activity_observations: HashMap::new(),
+            task_activity_observation_order: VecDeque::new(),
             instances: Vec::new(),
             selected_instance: None,
             shared: SharedData::default(),
@@ -822,6 +829,7 @@ impl TuiState {
         let first_observation = previous.is_none();
         let first_live_observation = origin == ObservationOrigin::LiveEvent
             && previous.is_none_or(|observation| !observation.saw_live_event);
+        let start_already_notified = previous.is_some_and(|observation| observation.start_notified);
         let stale_or_already_observed = previous.is_some_and(|observation| {
             observation.revision > activity.revision
                 || ((activity.is_running() || !first_live_observation)
@@ -835,9 +843,14 @@ impl TuiState {
             TaskActivityObservation {
                 revision: activity.revision,
                 saw_live_event: previous.is_some_and(|observation| observation.saw_live_event)
-                    || origin == ObservationOrigin::LiveEvent,
+                    || origin != ObservationOrigin::InitialScan,
+                start_notified: start_already_notified,
             },
         );
+        if first_observation {
+            self.task_activity_observation_order
+                .push_back(activity.run_id.clone());
+        }
 
         let label = self
             .instances
@@ -860,13 +873,23 @@ impl TuiState {
                 && (origin == ObservationOrigin::LiveEvent || activity.owner_is_live())
             {
                 self.notify(activity.task, format!("running in {label}"));
+                if let Some(observation) = self.task_activity_observations.get_mut(&activity.run_id)
+                {
+                    observation.start_notified = true;
+                }
             }
             return;
         }
 
         self.task_activities.remove(&activity.run_id);
-        if (first_observation || first_live_observation) && origin == ObservationOrigin::LiveEvent {
+        if !start_already_notified
+            && (first_observation || first_live_observation)
+            && origin == ObservationOrigin::LiveEvent
+        {
             self.notify(activity.task.clone(), format!("running in {label}"));
+            if let Some(observation) = self.task_activity_observations.get_mut(&activity.run_id) {
+                observation.start_notified = true;
+            }
         }
         let activity_outcome = activity
             .outcome()
@@ -912,7 +935,7 @@ impl TuiState {
                 result,
             );
         }
-        if origin == ObservationOrigin::LiveEvent {
+        if origin != ObservationOrigin::InitialScan {
             let verb = if outcome.succeeded() {
                 "succeeded"
             } else {
@@ -920,6 +943,7 @@ impl TuiState {
             };
             self.notify(activity.task, format!("{verb} in {label}"));
         }
+        self.prune_task_activity_observations();
     }
 
     pub fn active_task_for_current(&self) -> Option<&devme_task_runner::TaskActivity> {
@@ -970,7 +994,33 @@ impl TuiState {
                 finished_at: activity.updated_at,
                 duration_ms: activity.updated_at.saturating_sub(activity.started_at),
             };
-            self.apply_task_activity(activity, ObservationOrigin::LiveEvent);
+            self.apply_task_activity(activity, ObservationOrigin::OwnerReaped);
+        }
+    }
+
+    fn prune_task_activity_observations(&mut self) {
+        while self
+            .task_activity_observations
+            .len()
+            .saturating_sub(self.task_activities.len())
+            > MAX_COMPLETED_TASK_OBSERVATIONS
+        {
+            let mut removed = false;
+            for _ in 0..self.task_activity_observation_order.len() {
+                let Some(run_id) = self.task_activity_observation_order.pop_front() else {
+                    break;
+                };
+                if self.task_activities.contains_key(&run_id) {
+                    self.task_activity_observation_order.push_back(run_id);
+                } else {
+                    self.task_activity_observations.remove(&run_id);
+                    removed = true;
+                    break;
+                }
+            }
+            if !removed {
+                break;
+            }
         }
     }
 
@@ -4003,6 +4053,31 @@ mod tests {
     }
 
     #[test]
+    fn finishing_task_seen_running_at_startup_does_not_duplicate_start() {
+        let mut state = TuiState::default();
+        state.add_placeholder_instance("main", "main", "/repo/main");
+        let mut activity = running_task("attached-run", "verify", 10);
+
+        state.apply_task_activity(activity.clone(), ObservationOrigin::InitialScan);
+        activity.revision = 1;
+        activity.updated_at = 20;
+        activity.state = devme_task_runner::TaskActivityState::Finished {
+            outcome: devme_task_runner::TaskActivityOutcome::Succeeded,
+            finished_at: 20,
+            duration_ms: 10,
+        };
+        state.apply_task_activity(activity, ObservationOrigin::LiveEvent);
+
+        let task_notifications = state
+            .notifications()
+            .iter()
+            .filter(|notification| notification.title == "verify")
+            .map(|notification| notification.body.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(task_notifications, ["running in main", "succeeded in main"]);
+    }
+
+    #[test]
     fn concurrent_task_activities_are_counted_and_newest_is_selected() {
         let mut state = TuiState::default();
         state.add_placeholder_instance("main", "main", "/repo/main");
@@ -4023,6 +4098,36 @@ mod tests {
                 .map(|activity| activity.task.as_str()),
             Some("deploy")
         );
+    }
+
+    #[test]
+    fn task_activity_observation_cache_is_bounded_without_evicting_active_runs() {
+        let mut state = TuiState::default();
+        state.add_placeholder_instance("main", "main", "/repo/main");
+        state.apply_task_activity(
+            running_task("active-run", "verify", 1),
+            ObservationOrigin::InitialScan,
+        );
+
+        for index in 0..(MAX_COMPLETED_TASK_OBSERVATIONS + 20) {
+            let mut activity = running_task(&format!("finished-{index}"), "verify", index as u64);
+            activity.state = devme_task_runner::TaskActivityState::Finished {
+                outcome: devme_task_runner::TaskActivityOutcome::Succeeded,
+                finished_at: index as u64,
+                duration_ms: 1,
+            };
+            state.apply_task_activity(activity, ObservationOrigin::InitialScan);
+        }
+
+        assert_eq!(
+            state
+                .task_activity_observations
+                .len()
+                .saturating_sub(state.task_activities.len()),
+            MAX_COMPLETED_TASK_OBSERVATIONS
+        );
+        assert!(state.task_activity_observations.contains_key("active-run"));
+        assert!(state.task_activities.contains_key("active-run"));
     }
 
     #[test]
@@ -4054,6 +4159,12 @@ mod tests {
         assert!(state.notifications().iter().any(|toast| {
             toast.title == "verify" && toast.body.contains("interrupted in main")
         }));
+        assert!(
+            !state
+                .notifications()
+                .iter()
+                .any(|toast| { toast.title == "verify" && toast.body.contains("running in main") })
+        );
     }
 
     #[test]
