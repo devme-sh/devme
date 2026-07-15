@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -52,44 +53,21 @@ pub struct ApprovalPrompt {
     pub description: Option<String>,
 }
 
-pub enum TaskUpdate {
-    Progress(String),
-    Output(String),
-    ApprovalRequired {
-        prompt: ApprovalPrompt,
-        response: tokio::sync::oneshot::Sender<TaskApproval>,
-    },
-    Finished(RecentResult),
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionTarget {
+    pub instance_id: String,
+    pub label: String,
+    pub cwd: PathBuf,
 }
 
-pub type RunFuture = Pin<Box<dyn Future<Output = anyhow::Result<RecentResult>> + Send>>;
-pub type TaskRunner = Arc<
-    dyn Fn(
-            String,
-            tokio::sync::mpsc::UnboundedSender<TaskUpdate>,
-            tokio::sync::watch::Receiver<bool>,
-        ) -> RunFuture
-        + Send
-        + Sync,
->;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HomeState {
+pub struct ActionCatalog {
     pub actions: Vec<HomeAction>,
-    pub selected: usize,
     pub recent: Vec<RecentResult>,
-    pub running: Option<String>,
-    pub logs: Vec<String>,
-    pub approval: Option<ApprovalPrompt>,
-    pub visible: bool,
     member_focus: Option<String>,
 }
 
-impl HomeState {
-    pub fn from_stack(stack: &Stack, recent: Vec<RecentResult>) -> Self {
-        Self::from_stack_with_member_focus(stack, None, recent)
-    }
-
+impl ActionCatalog {
     pub fn from_stack_with_member_focus(
         stack: &Stack,
         member_focus: Option<&str>,
@@ -106,20 +84,147 @@ impl HomeState {
             })
             .collect::<Vec<_>>();
         actions.sort_by_key(|action| kind_order(action.kind));
-        let mut state = Self {
+        Self {
             actions,
+            recent,
+            member_focus: member_focus.map(str::to_owned),
+        }
+    }
+}
+
+pub enum TaskUpdate {
+    Progress(String),
+    Output(String),
+    ApprovalRequired {
+        prompt: ApprovalPrompt,
+        response: tokio::sync::oneshot::Sender<TaskApproval>,
+    },
+    Finished(RecentResult),
+}
+
+pub type RunFuture = Pin<Box<dyn Future<Output = anyhow::Result<RecentResult>> + Send>>;
+pub type TaskRunner = Arc<
+    dyn Fn(
+            PathBuf,
+            String,
+            tokio::sync::mpsc::UnboundedSender<TaskUpdate>,
+            tokio::sync::watch::Receiver<bool>,
+        ) -> RunFuture
+        + Send
+        + Sync,
+>;
+
+pub type LoadFuture = Pin<Box<dyn Future<Output = anyhow::Result<ActionCatalog>> + Send>>;
+pub type ActionLoader = Arc<dyn Fn(PathBuf) -> LoadFuture + Send + Sync>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HomeState {
+    pub actions: Vec<HomeAction>,
+    pub selected: usize,
+    pub recent: Vec<RecentResult>,
+    pub running: Option<String>,
+    pub logs: Vec<String>,
+    pub approval: Option<ApprovalPrompt>,
+    pub visible: bool,
+    pub loading: bool,
+    pub load_error: Option<String>,
+    pub target: Option<ActionTarget>,
+    pub activity_target: Option<ActionTarget>,
+    pub last_activity: Option<RecentResult>,
+    member_focus: Option<String>,
+}
+
+impl HomeState {
+    pub fn from_stack(stack: &Stack, recent: Vec<RecentResult>) -> Self {
+        Self::from_stack_with_member_focus(stack, None, recent)
+    }
+
+    pub fn from_stack_with_member_focus(
+        stack: &Stack,
+        member_focus: Option<&str>,
+        recent: Vec<RecentResult>,
+    ) -> Self {
+        let catalog = ActionCatalog::from_stack_with_member_focus(stack, member_focus, recent);
+        let mut state = Self {
+            actions: catalog.actions,
             selected: 0,
             recent: Vec::new(),
             running: None,
             logs: Vec::new(),
             approval: None,
             visible: true,
-            member_focus: member_focus.map(str::to_owned),
+            loading: false,
+            load_error: None,
+            target: None,
+            activity_target: None,
+            last_activity: None,
+            member_focus: catalog.member_focus,
         };
-        for result in recent {
+        for result in catalog.recent {
             state.record_result(result);
         }
         state
+    }
+
+    pub fn set_target(&mut self, target: ActionTarget) {
+        self.target = Some(target);
+    }
+
+    pub fn begin_loading(&mut self, target: ActionTarget) {
+        self.target = Some(target);
+        self.actions.clear();
+        self.recent.clear();
+        self.selected = 0;
+        self.loading = true;
+        self.load_error = None;
+    }
+
+    pub fn apply_catalog(&mut self, catalog: ActionCatalog) {
+        self.actions = catalog.actions;
+        self.recent.clear();
+        self.selected = 0;
+        self.loading = false;
+        self.load_error = None;
+        self.member_focus = catalog.member_focus;
+        for result in catalog.recent {
+            self.record_result(result);
+        }
+    }
+
+    pub fn fail_loading(&mut self, error: impl Into<String>) {
+        self.actions.clear();
+        self.recent.clear();
+        self.selected = 0;
+        self.loading = false;
+        self.load_error = Some(error.into());
+    }
+
+    pub fn target_matches(&self, instance_id: &str) -> bool {
+        self.target
+            .as_ref()
+            .is_some_and(|target| target.instance_id == instance_id)
+    }
+
+    pub fn start_activity(&mut self, task: String) -> Option<PathBuf> {
+        let target = self.target.clone()?;
+        self.running = Some(task);
+        self.activity_target = Some(target.clone());
+        self.last_activity = None;
+        self.logs.clear();
+        Some(target.cwd)
+    }
+
+    pub fn finish_activity(&mut self, result: RecentResult) {
+        let same_target = self
+            .target
+            .as_ref()
+            .zip(self.activity_target.as_ref())
+            .is_some_and(|(catalog, activity)| catalog.instance_id == activity.instance_id);
+        self.running = None;
+        self.last_activity = Some(result.clone());
+        if same_target {
+            self.record_result(result);
+        }
     }
 
     pub fn task_label(&self, task: &str) -> String {
@@ -270,6 +375,70 @@ mod tests {
                 .map(|recent| (recent.task.as_str(), recent.finished_at))
                 .collect::<Vec<_>>(),
             [("simulator", 3), ("test", 4)]
+        );
+    }
+
+    #[test]
+    fn loading_another_stack_keeps_running_activity_attached_to_its_origin() {
+        let stack = Stack::parse("schema_version = 1\n[task.verify]\ncmd=\"true\"\n").unwrap();
+        let mut state = HomeState::from_stack(&stack, vec![]);
+        state.set_target(ActionTarget {
+            instance_id: "main".into(),
+            label: "main".into(),
+            cwd: "/repo/main".into(),
+        });
+        assert_eq!(
+            state.start_activity("verify".into()),
+            Some(PathBuf::from("/repo/main"))
+        );
+
+        state.begin_loading(ActionTarget {
+            instance_id: "feature".into(),
+            label: "feature".into(),
+            cwd: "/repo/feature".into(),
+        });
+
+        assert_eq!(state.running.as_deref(), Some("verify"));
+        assert_eq!(
+            state
+                .activity_target
+                .as_ref()
+                .map(|target| target.label.as_str()),
+            Some("main")
+        );
+        assert!(state.recent.is_empty());
+    }
+
+    #[test]
+    fn completion_does_not_pollute_another_stacks_recent_actions() {
+        let stack = Stack::parse("schema_version = 1\n[task.verify]\ncmd=\"true\"\n").unwrap();
+        let mut state = HomeState::from_stack(&stack, vec![]);
+        state.set_target(ActionTarget {
+            instance_id: "main".into(),
+            label: "main".into(),
+            cwd: "/repo/main".into(),
+        });
+        state.start_activity("verify".into());
+        state.set_target(ActionTarget {
+            instance_id: "feature".into(),
+            label: "feature".into(),
+            cwd: "/repo/feature".into(),
+        });
+
+        state.finish_activity(RecentResult {
+            task: "verify".into(),
+            kind: TaskKind::Check,
+            status: "passed".into(),
+            finished_at: 1,
+        });
+
+        assert!(state.recent.is_empty());
+        assert_eq!(
+            state
+                .last_activity
+                .as_ref()
+                .map(|result| result.task.as_str()),
+            Some("verify")
         );
     }
 }

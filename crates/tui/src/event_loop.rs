@@ -12,7 +12,7 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
 use crate::discovery::Registry;
-use crate::home::{HomeState, TaskApproval, TaskRunner, TaskUpdate};
+use crate::home::{ActionCatalog, ActionLoader, HomeState, TaskApproval, TaskRunner, TaskUpdate};
 use crate::keymap;
 use crate::render::render;
 use crate::state::{PointerShape, TuiState};
@@ -65,22 +65,31 @@ pub async fn launch_targets(
     no_shutdown: bool,
     home_targets: Option<Vec<String>>,
 ) -> anyhow::Result<()> {
-    launch_impl(no_shutdown, home_targets, None, None).await
+    launch_impl(no_shutdown, home_targets, None, None, None).await
 }
 
 pub async fn launch_with_home(
     no_shutdown: bool,
     home_targets: Option<Vec<String>>,
     home: HomeState,
+    loader: ActionLoader,
     runner: TaskRunner,
 ) -> anyhow::Result<()> {
-    launch_impl(no_shutdown, home_targets, Some(home), Some(runner)).await
+    launch_impl(
+        no_shutdown,
+        home_targets,
+        Some(home),
+        Some(loader),
+        Some(runner),
+    )
+    .await
 }
 
 async fn launch_impl(
     no_shutdown: bool,
     home_targets: Option<Vec<String>>,
     home: Option<HomeState>,
+    loader: Option<ActionLoader>,
     runner: Option<TaskRunner>,
 ) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
@@ -126,6 +135,7 @@ async fn launch_impl(
             home_id: &home_id,
             no_shutdown,
             home_targets: home_targets.as_deref(),
+            loader,
             runner,
         },
     )
@@ -143,6 +153,7 @@ struct RunOptions<'a> {
     home_id: &'a str,
     no_shutdown: bool,
     home_targets: Option<&'a [String]>,
+    loader: Option<ActionLoader>,
     runner: Option<TaskRunner>,
 }
 
@@ -157,6 +168,7 @@ async fn run(
         home_id,
         no_shutdown,
         home_targets,
+        loader,
         runner,
     } = options;
     let (key_tx, mut key_rx) = mpsc::unbounded_channel::<Event>();
@@ -170,6 +182,7 @@ async fn run(
 
     let mut started: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut home_selected = false;
+    let mut startup_actions_pending = state.home_visible();
     // Last mouse-pointer shape we asked the terminal for, so we only emit an
     // OSC 22 update when the cell under the cursor changes category.
     let mut pointer_shape = PointerShape::Default;
@@ -202,6 +215,8 @@ async fn run(
     // 10s grace); their outcomes come back here.
     let (wt_op_tx, mut wt_op_rx) = mpsc::unbounded_channel::<WorktreeOp>();
     let (task_update_tx, mut task_update_rx) = mpsc::unbounded_channel::<TaskUpdate>();
+    let (action_load_tx, mut action_load_rx) =
+        mpsc::unbounded_channel::<(String, anyhow::Result<ActionCatalog>)>();
     let mut task_cancel: Option<tokio::sync::watch::Sender<bool>> = None;
     let mut task_approval: Option<tokio::sync::oneshot::Sender<TaskApproval>> = None;
 
@@ -210,6 +225,14 @@ async fn run(
 
         if !home_selected && state.has_instance(home_id) {
             state.select_instance_by_id(home_id);
+            if let Some(target) = state.current_action_target()
+                && state
+                    .home()
+                    .is_some_and(|home| home.target_matches(home_id))
+                && let Some(home) = state.home_mut()
+            {
+                home.set_target(target);
+            }
             home_selected = true;
         }
         for id in state.attached_instance_ids() {
@@ -225,56 +248,107 @@ async fn run(
                     if matches!(k.kind, KeyEventKind::Release) {
                         continue;
                     }
+                    startup_actions_pending = false;
                     if state.skill_dialog_visible() {
                         handle_skill_dialog_key(state, k.code);
                         continue;
                     }
-                    if state.home_visible() {
-                        if state.home().is_some_and(|home| home.approval.is_some()) {
-                            let response = match k.code {
-                                KeyCode::Enter | KeyCode::Char('y') => Some(TaskApproval::Approve),
-                                KeyCode::Char('n') | KeyCode::Char('s') => Some(TaskApproval::Skip),
-                                KeyCode::Esc => Some(TaskApproval::Cancel),
-                                _ => None,
-                            };
-                            if let Some(response) = response {
-                                if let Some(sender) = task_approval.take() {
-                                    let _ = sender.send(response);
-                                }
-                                if let Some(home) = state.home_mut() {
-                                    home.approval = None;
-                                }
+                    if state.home().is_some_and(|home| home.approval.is_some()) {
+                        let response = match k.code {
+                            KeyCode::Enter | KeyCode::Char('y') => Some(TaskApproval::Approve),
+                            KeyCode::Char('n') | KeyCode::Char('s') => Some(TaskApproval::Skip),
+                            KeyCode::Esc => Some(TaskApproval::Cancel),
+                            _ => None,
+                        };
+                        if let Some(response) = response {
+                            if let Some(sender) = task_approval.take() {
+                                let _ = sender.send(response);
                             }
-                            continue;
+                            if let Some(home) = state.home_mut() {
+                                home.approval = None;
+                            }
                         }
+                        continue;
+                    }
+                    if state.home_visible() {
                         match k.code {
-                            KeyCode::Up | KeyCode::Char('k') => state.home_mut().unwrap().move_previous(),
-                            KeyCode::Down | KeyCode::Char('j') => state.home_mut().unwrap().move_next(),
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                state.home_mut().unwrap().move_previous();
+                                continue;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                state.home_mut().unwrap().move_next();
+                                continue;
+                            }
                             KeyCode::Enter => {
+                                if let Some((target, task)) = state.home().and_then(|home| {
+                                    home.activity_target
+                                        .as_ref()
+                                        .zip(home.running.as_ref())
+                                        .map(|(target, task)| (target.label.clone(), task.clone()))
+                                }) {
+                                    state.notify(
+                                        "actions",
+                                        format!("{target} / {task} is already running"),
+                                    );
+                                    continue;
+                                }
+                                let selected = state.home().and_then(|home| {
+                                    home.actions
+                                        .get(home.selected)
+                                        .map(|action| (action.task.clone(), action.kind))
+                                });
                                 if state.home().and_then(|home| home.running.as_ref()).is_none()
-                                    && let (Some(task), Some(runner)) = (state.home().and_then(HomeState::selected_task), runner.clone())
+                                    && let (Some((task, kind)), Some(runner)) = (selected, runner.clone())
+                                    && let Some(cwd) = state.home_mut().and_then(|home| home.start_activity(task.clone()))
                                 {
                                     let tx = task_update_tx.clone();
                                     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
                                     task_cancel = Some(cancel_tx);
-                                    let task_for_state = task.clone();
-                                    state.home_mut().unwrap().running = Some(task_for_state);
-                                    state.home_mut().unwrap().logs.clear();
                                     tokio::spawn(async move {
-                                        if let Err(error) = runner(task.clone(), tx.clone(), cancel_rx).await {
-                                            let _ = tx.send(TaskUpdate::Progress(format!("failed to run {task}: {error}")));
+                                        match runner(cwd, task.clone(), tx.clone(), cancel_rx).await {
+                                            Ok(result) => {
+                                                let _ = tx.send(TaskUpdate::Finished(result));
+                                            }
+                                            Err(error) => {
+                                                let _ = tx.send(TaskUpdate::Progress(format!("failed to run {task}: {error}")));
+                                                let finished_at = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .map_or(0, |duration| duration.as_secs());
+                                                let _ = tx.send(TaskUpdate::Finished(crate::home::RecentResult {
+                                                    task,
+                                                    kind,
+                                                    status: "failed".into(),
+                                                    finished_at,
+                                                }));
+                                            }
                                         }
                                     });
                                 }
+                                continue;
                             }
-                            KeyCode::Char('d') => state.home_mut().unwrap().visible = false,
-                            KeyCode::Esc if state.home().and_then(|home| home.running.as_ref()).is_some() => {
-                                if let Some(cancel) = &task_cancel { let _ = cancel.send(true); }
+                            KeyCode::Char('a') | KeyCode::Esc => {
+                                state.close_actions();
+                                continue;
                             }
-                            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                            KeyCode::Char('c')
+                                if state.home().is_some_and(|home| home.running.is_some()) =>
+                            {
+                                if let Some(cancel) = &task_cancel {
+                                    let _ = cancel.send(true);
+                                }
+                                continue;
+                            }
+                            KeyCode::Char('h') | KeyCode::Left => {
+                                state.select_prev_service();
+                                continue;
+                            }
+                            KeyCode::Char('l') | KeyCode::Right => {
+                                state.select_next_service();
+                                continue;
+                            }
                             _ => {}
                         }
-                        continue;
                     }
                     match k.code {
                         KeyCode::Esc if state.copy_mode() => {
@@ -420,6 +494,9 @@ async fn run(
                             | KeyCode::Char('s')
                             | KeyCode::Char('y')
                             | KeyCode::Enter => {
+                                if let Some(cancel) = &task_cancel {
+                                    let _ = cancel.send(true);
+                                }
                                 if !no_shutdown
                                     && let Ok(cwd) = std::env::current_dir()
                                 {
@@ -428,7 +505,12 @@ async fn run(
                                 return Ok(());
                             }
                             // Detach: quit the TUI but leave services running.
-                            KeyCode::Char('d') | KeyCode::Char('D') => return Ok(()),
+                            KeyCode::Char('d') | KeyCode::Char('D') => {
+                                if let Some(cancel) = &task_cancel {
+                                    let _ = cancel.send(true);
+                                }
+                                return Ok(());
+                            }
                             KeyCode::Char('n') | KeyCode::Esc => state.cancel_quit_confirm(),
                             _ => {}
                         }
@@ -561,9 +643,31 @@ async fn run(
                             let Some(action) = keymap::resolve(&k) else { continue };
                             use keymap::Action;
                             match action {
-                                Action::Home => {
-                                    if let Some(home) = state.home_mut() {
-                                        home.visible = true;
+                                Action::ToggleActions => {
+                                    let Some(target) = state.current_action_target() else {
+                                        state.notify("actions", "select a stack to run actions");
+                                        continue;
+                                    };
+                                    state.open_actions();
+                                    if state.sidebar_collapsed() {
+                                        state.toggle_sidebar();
+                                    }
+                                    let needs_load = state
+                                        .home()
+                                        .is_some_and(|home| !home.target_matches(&target.instance_id));
+                                    if needs_load {
+                                        let id = target.instance_id.clone();
+                                        let cwd = target.cwd.clone();
+                                        if let Some(home) = state.home_mut() {
+                                            home.begin_loading(target);
+                                        }
+                                        if let Some(loader) = loader.clone() {
+                                            let tx = action_load_tx.clone();
+                                            tokio::spawn(async move {
+                                                let result = loader(cwd).await;
+                                                let _ = tx.send((id, result));
+                                            });
+                                        }
                                     }
                                 }
                                 Action::NextService => state.select_next_service(),
@@ -737,7 +841,12 @@ async fn run(
                                 // Detach: leave every daemon running in the
                                 // background (use `devme up -d` to start that way
                                 // deliberately).
-                                Action::Detach => return Ok(()),
+                                Action::Detach => {
+                                    if let Some(cancel) = &task_cancel {
+                                        let _ = cancel.send(true);
+                                    }
+                                    return Ok(());
+                                }
                                 Action::Quit => {
                                     // With `tui.confirm_quit`, ask first — but
                                     // only when quitting would actually stop
@@ -745,6 +854,9 @@ async fn run(
                                     if state.confirm_quit_enabled() && !no_shutdown {
                                         state.open_quit_confirm();
                                     } else {
+                                        if let Some(cancel) = &task_cancel {
+                                            let _ = cancel.send(true);
+                                        }
                                         if !no_shutdown
                                             && let Ok(cwd) = std::env::current_dir()
                                         {
@@ -847,6 +959,15 @@ async fn run(
                 Some(_) => {}
                 None => return Ok(()),
             },
+            loaded = action_load_rx.recv() => if let Some((instance_id, result)) = loaded
+                && let Some(home) = state.home_mut()
+                && home.target_matches(&instance_id)
+            {
+                match result {
+                    Ok(catalog) => home.apply_catalog(catalog),
+                    Err(error) => home.fail_loading(error.to_string()),
+                }
+            },
             update = task_update_rx.recv() => if let Some(update) = update
                 && let Some(home) = state.home_mut() {
                     match update {
@@ -864,14 +985,24 @@ async fn run(
                             task_approval = None;
                             home.approval = None;
                             task_cancel = None;
-                            home.running = None;
-                            home.record_result(result);
+                            home.finish_activity(result);
                         }
                     }
             },
             tagged = registry.recv() => match tagged {
                 Some(t) => {
+                    let home_subscribed = startup_actions_pending
+                        && t.instance_id == home_id
+                        && matches!(&t.message, devme_core::ServerMessage::Subscribed { .. });
                     state.apply_from(&t.instance_id, t.message);
+                    if home_subscribed {
+                        if state.services().iter().any(|service| {
+                            matches!(service.state, devme_core::ServiceState::Running { .. })
+                        }) {
+                            state.close_actions();
+                        }
+                        startup_actions_pending = false;
+                    }
                     // A deliberate `devme down`/quit elsewhere drains every
                     // daemon (each sends Goodbye). Rather than exit, park in a
                     // stopped state and keep watching the socket dir: the TUI
