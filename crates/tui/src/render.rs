@@ -1219,6 +1219,8 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
     let centre_line = if state.actions_visible() {
         let mut spans = vec![
+            Span::styled("Esc ", key),
+            Span::styled("back  ", dim),
             Span::styled("jk ", key),
             Span::styled("action  ", dim),
             Span::styled("Enter ", key),
@@ -1231,7 +1233,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         spans.extend([
             Span::styled("hl ", key),
             Span::styled("service  ", dim),
-            Span::styled("a/Esc ", key),
+            Span::styled("a ", key),
             Span::styled("stacks  ", dim),
             Span::styled("q ", key),
             Span::styled("quit", dim),
@@ -2739,7 +2741,7 @@ mod tests {
             cwd: "/tmp/main".into(),
         });
         state.set_actions(panel);
-        let text = render_to_text(&mut state, 90, 24);
+        let text = render_to_text(&mut state, 120, 24);
         assert!(text.contains("actions: main"), "{text}");
         assert!(text.contains("ios"), "{text}");
         assert!(text.contains("typescript check"), "{text}");
@@ -2748,6 +2750,14 @@ mod tests {
             text.contains("no services declared in devme.toml"),
             "dashboard disappeared behind actions:\n{text}"
         );
+        let footer = text.lines().last().unwrap_or_default();
+        let esc = footer
+            .find("Esc back")
+            .expect("Actions footer is missing Esc back");
+        let navigation = footer
+            .find("jk action")
+            .expect("Actions footer is missing action navigation");
+        assert!(esc < navigation, "Esc back is not the first tip: {footer}");
     }
 
     #[test]
