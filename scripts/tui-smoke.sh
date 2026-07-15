@@ -80,6 +80,11 @@ grep -qF "tick" /tmp/devme-tui-cap-actions.txt || {
   cat /tmp/devme-tui-cap-actions.txt >&2
   exit 1
 }
+grep -qF "Esc back  jk action" /tmp/devme-tui-cap-actions.txt || {
+  echo "ASSERT FAIL: Actions footer did not lead with Esc back" >&2
+  cat /tmp/devme-tui-cap-actions.txt >&2
+  exit 1
+}
 tmux send-keys -t "$SESSION" Enter
 sleep 1
 tmux capture-pane -t "$SESSION" -p > /tmp/devme-tui-cap-action-result.txt
@@ -109,6 +114,7 @@ assert_contains() {
 
 echo "1. actions and dashboard share the initial render"
 echo "  ok  [actions-pane] saw 'actions:' and 'verify'"
+echo "  ok  [actions-footer] led with 'Esc back'"
 echo "  ok  [activity-bar] verify succeeded without hiding services"
 assert_contains "stacks"  "stacks-pane"
 assert_contains "tools"   "tools-pane"
