@@ -70,10 +70,25 @@ impl<'a> TaskRunner<'a> {
     }
 
     pub async fn run(&self, request: RunRequest) -> Result<TaskResult> {
+        let mut activity = crate::activity::TaskActivityLifecycle::start(self.root, &request.task);
+        let result = self.run_observed(request, activity.writer()).await;
+        activity.complete(&result);
+        result
+    }
+
+    async fn run_observed(
+        &self,
+        request: RunRequest,
+        activity: &crate::activity::TaskActivityWriter,
+    ) -> Result<TaskResult> {
         let started_at = now_ms();
-        self.progress(&request.events, format!("Preparing {}", request.task));
+        self.progress(
+            &request.events,
+            activity,
+            format!("Preparing {}", request.task),
+        );
         if let Err(error) = self
-            .converge_steps(&request.task, &request.approval, &request.events)
+            .converge_steps(&request.task, &request.approval, &request.events, activity)
             .await
         {
             return if error.downcast_ref::<ApprovalCancelled>().is_some() {
@@ -127,15 +142,13 @@ impl<'a> TaskRunner<'a> {
             }
         };
 
-        let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();
-        let events = request.events.clone();
-        let bridge = tokio::spawn(async move {
-            while let Some(event) = output_rx.recv().await {
-                if let Some(events) = &events {
-                    let _ = events.send(TaskEvent::Output(event));
-                }
-            }
-        });
+        let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
+        let bridge = spawn_output_bridge(output_rx, request.events.clone(), activity.clone());
+        self.progress(
+            &request.events,
+            activity,
+            format!("Running {}", request.task),
+        );
         let result = crate::execute_streaming(
             self.stack,
             self.root,
@@ -162,7 +175,23 @@ impl<'a> TaskRunner<'a> {
     /// receives the Session's allocated Resource environment without taking a
     /// second Service hold or Resource lease.
     pub async fn run_borrowed(&self, request: BorrowedRunRequest) -> Result<TaskResult> {
+        let mut activity = crate::activity::TaskActivityLifecycle::start(self.root, &request.task);
+        let result = self.run_borrowed_observed(request, activity.writer()).await;
+        activity.complete(&result);
+        result
+    }
+
+    async fn run_borrowed_observed(
+        &self,
+        request: BorrowedRunRequest,
+        activity: &crate::activity::TaskActivityWriter,
+    ) -> Result<TaskResult> {
         let started_at = now_ms();
+        self.progress(
+            &request.events,
+            activity,
+            format!("Preparing {}", request.task),
+        );
         let required = crate::services_for(self.stack, &request.task)?;
         let borrowed_closure = required_service_closure(self.stack, &request.services);
         if let Some(service) = required
@@ -175,7 +204,7 @@ impl<'a> TaskRunner<'a> {
             );
         }
         if let Err(error) = self
-            .converge_steps(&request.task, &request.approval, &request.events)
+            .converge_steps(&request.task, &request.approval, &request.events, activity)
             .await
         {
             return if error.downcast_ref::<ApprovalCancelled>().is_some() {
@@ -191,15 +220,13 @@ impl<'a> TaskRunner<'a> {
                 crate::record_preflight_failure_silent(self.stack, self.root, &request.task, &error)
             };
         }
-        let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();
-        let events = request.events.clone();
-        let bridge = tokio::spawn(async move {
-            while let Some(event) = output_rx.recv().await {
-                if let Some(events) = &events {
-                    let _ = events.send(TaskEvent::Output(event));
-                }
-            }
-        });
+        let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
+        let bridge = spawn_output_bridge(output_rx, request.events.clone(), activity.clone());
+        self.progress(
+            &request.events,
+            activity,
+            format!("Running {}", request.task),
+        );
         let result = crate::execute_streaming_with_env(
             self.stack,
             self.root,
@@ -223,11 +250,12 @@ impl<'a> TaskRunner<'a> {
         task: &str,
         approval: &ApprovalHandler,
         events: &Option<tokio::sync::mpsc::UnboundedSender<TaskEvent>>,
+        activity: &crate::activity::TaskActivityWriter,
     ) -> Result<()> {
         for name in crate::steps_for(self.stack, task)? {
             let step = &self.stack.step[&name];
             if check(&step.check, self.root) {
-                self.progress(events, format!("Step {name} satisfied"));
+                self.progress(events, activity, format!("Step {name} satisfied"));
                 continue;
             }
             let Some(provision) = &step.provision else {
@@ -253,7 +281,7 @@ impl<'a> TaskRunner<'a> {
             };
             match approval {
                 Approval::Approve => {
-                    self.progress(events, format!("Provisioning Step {name}"));
+                    self.progress(events, activity, format!("Provisioning Step {name}"));
                     let status = std::process::Command::new("sh")
                         .args(["-c", command])
                         .current_dir(self.root)
@@ -381,12 +409,29 @@ impl<'a> TaskRunner<'a> {
     fn progress(
         &self,
         events: &Option<tokio::sync::mpsc::UnboundedSender<TaskEvent>>,
+        activity: &crate::activity::TaskActivityWriter,
         message: String,
     ) {
+        activity.progress(&message);
         if let Some(events) = events {
             let _ = events.send(TaskEvent::Progress(message));
         }
     }
+}
+
+fn spawn_output_bridge(
+    mut output: tokio::sync::mpsc::UnboundedReceiver<TaskOutputEvent>,
+    events: Option<tokio::sync::mpsc::UnboundedSender<TaskEvent>>,
+    activity: crate::activity::TaskActivityWriter,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(event) = output.recv().await {
+            activity.output(&event);
+            if let Some(events) = &events {
+                let _ = events.send(TaskEvent::Output(event));
+            }
+        }
+    })
 }
 
 fn readiness_timeout_error(
@@ -580,6 +625,92 @@ mod tests {
 
     fn approval(value: Approval) -> ApprovalHandler {
         Arc::new(move |_| Box::pin(async move { value }))
+    }
+
+    #[tokio::test]
+    async fn run_publishes_process_shared_activity_until_completion() {
+        let root = tempfile::tempdir().unwrap();
+        let stack = Stack::parse(
+            "schema_version=1\n[task.verify]\ncmd=\"echo compiling; sleep 0.3; echo done\"\n",
+        )
+        .unwrap();
+        let runner = TaskRunner::new(&stack, root.path());
+        let run = runner.run(RunRequest {
+            task: "verify".into(),
+            args: Vec::new(),
+            approval: approval(Approval::Approve),
+            daemon_starter: Arc::new(|_| Box::pin(async { Ok(()) })),
+            events: None,
+            cancellation: None,
+        });
+        tokio::pin!(run);
+
+        tokio::select! {
+            result = &mut run => panic!("task finished before activity could be observed: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(80)) => {}
+        }
+        let live = crate::read_task_activities(root.path()).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].task, "verify");
+        assert!(live[0].is_running());
+        assert!(live[0].owner_is_live());
+
+        let result = run.await.unwrap();
+        assert_eq!(result.status, "passed");
+        let finished = crate::read_task_activities(root.path()).unwrap();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(
+            finished[0].outcome(),
+            Some(crate::TaskActivityOutcome::Succeeded)
+        );
+        assert!(!finished[0].is_running());
+    }
+
+    #[tokio::test]
+    async fn aborting_run_future_persists_interrupted_activity() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().to_path_buf();
+        let stack =
+            Stack::parse("schema_version=1\n[task.verify]\ncmd=\"echo started; sleep 2\"\n")
+                .unwrap();
+        let run_root = root_path.clone();
+        let run = tokio::spawn(async move {
+            TaskRunner::new(&stack, &run_root)
+                .run(RunRequest {
+                    task: "verify".into(),
+                    args: Vec::new(),
+                    approval: approval(Approval::Approve),
+                    daemon_starter: Arc::new(|_| Box::pin(async { Ok(()) })),
+                    events: None,
+                    cancellation: None,
+                })
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if crate::read_task_activities(&root_path)
+                    .unwrap()
+                    .iter()
+                    .any(crate::TaskActivity::is_running)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("running activity was not persisted");
+
+        run.abort();
+        let _ = run.await;
+
+        let activity = crate::read_task_activities(&root_path).unwrap();
+        assert_eq!(activity.len(), 1);
+        assert_eq!(
+            activity[0].outcome(),
+            Some(crate::TaskActivityOutcome::Interrupted)
+        );
     }
 
     #[tokio::test]

@@ -67,6 +67,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
 
     let activity_height = u16::from(state.actions().is_some_and(|panel| {
         panel.running.is_some()
+            || state.active_task_for_current().is_some()
             || panel.last_activity.is_some()
             || (panel.visible
                 && panel
@@ -1639,28 +1640,42 @@ fn render_actions_sidebar(frame: &mut Frame<'_>, area: Rect, state: &mut TuiStat
             ));
             last_kind = Some(action.kind);
         }
-        let running_here = panel.running.as_deref() == Some(action.task.as_str())
+        let local_running = panel.running.as_deref() == Some(action.task.as_str())
             && panel
                 .target
                 .as_ref()
                 .zip(panel.activity_target.as_ref())
                 .is_some_and(|(catalog, activity)| catalog.instance_id == activity.instance_id);
+        let shared_count = panel
+            .target
+            .as_ref()
+            .map(|target| state.task_active_count(&target.instance_id, action.task.as_str()))
+            .unwrap_or_default();
+        let active_count = shared_count.max(usize::from(local_running));
+        let running_here = active_count > 0;
         let recent = panel
             .recent
             .iter()
             .rev()
             .find(|result| result.task == action.task);
         let (glyph, color) = if running_here {
-            ("◌", p.yellow)
+            (
+                if active_count > 1 {
+                    active_count.min(9).to_string()
+                } else {
+                    "◌".into()
+                },
+                p.yellow,
+            )
         } else {
             match recent.map(|result| result.outcome) {
-                Some(crate::actions::ActionOutcome::Succeeded) => ("✓", p.green),
+                Some(crate::actions::ActionOutcome::Succeeded) => ("✓".into(), p.green),
                 Some(
                     crate::actions::ActionOutcome::Cancelled
                     | crate::actions::ActionOutcome::Interrupted,
-                ) => ("-", p.overlay0),
-                Some(_) => ("✗", p.red),
-                None => (" ", p.overlay0),
+                ) => ("-".into(), p.overlay0),
+                Some(_) => ("✗".into(), p.red),
+                None => (" ".into(), p.overlay0),
             }
         };
         let selected = index == panel.selected;
@@ -1720,14 +1735,28 @@ fn render_activity_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         return;
     };
     let p = *state.palette();
-    let target = if panel.running.is_some() || panel.last_activity.is_some() {
-        panel.activity_target.as_ref()
+    let shared_activity = state.active_task_for_current();
+    let target = if shared_activity.is_some() {
+        state
+            .current_instance()
+            .map(|instance| instance.info.label.as_str())
+    } else if panel.running.is_some() || panel.last_activity.is_some() {
+        panel
+            .activity_target
+            .as_ref()
+            .map(|target| target.label.as_str())
     } else {
-        panel.target.as_ref()
+        panel.target.as_ref().map(|target| target.label.as_str())
     }
-    .map(|target| target.label.as_str())
     .unwrap_or("stack");
-    let (glyph, color, task, detail) = if let Some(task) = panel.running.as_deref() {
+    let (glyph, color, task, mut detail) = if let Some(activity) = shared_activity {
+        (
+            "◌",
+            p.yellow,
+            activity.task.as_str(),
+            activity.message().to_string(),
+        )
+    } else if let Some(task) = panel.running.as_deref() {
         (
             "◌",
             p.yellow,
@@ -1760,6 +1789,10 @@ fn render_activity_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     } else {
         return;
     };
+    let active_count = state.active_task_count_for_current();
+    if shared_activity.is_some() && active_count > 1 {
+        detail.push_str(&format!("  +{} more", active_count - 1));
+    }
     let prefix = format!(" {glyph} {target} / {task}  ");
     let detail_width = area.width.saturating_sub(prefix.chars().count() as u16 + 1) as usize;
     frame.render_widget(
@@ -2758,6 +2791,163 @@ mod tests {
             .find("jk action")
             .expect("Actions footer is missing action navigation");
         assert!(esc < navigation, "Esc back is not the first tip: {footer}");
+    }
+
+    #[test]
+    fn agent_task_activity_is_visible_without_owning_the_tui_event_loop() {
+        let stack = devme_config::Stack::parse(
+            "schema_version=1\n[task.verify]\nkind=\"check\"\ncmd=\"true\"\n",
+        )
+        .unwrap();
+        let mut panel = crate::actions::ActionPanel::from_stack(&stack, Vec::new());
+        panel.set_target(crate::actions::ActionTarget {
+            instance_id: "main".into(),
+            label: "main".into(),
+            cwd: "/repo/main".into(),
+        });
+        let mut state = TuiState::default();
+        state.set_actions(panel);
+        state.apply(ServerMessage::Subscribed {
+            instance: InstanceInfo {
+                id: "main".into(),
+                label: "main".into(),
+                cwd: "/repo/main".into(),
+            },
+            services: Vec::new(),
+            steps: Vec::new(),
+        });
+        state.apply_task_activity(
+            devme_task_runner::TaskActivity {
+                schema_version: 1,
+                run_id: "agent-run".into(),
+                instance_id: "main".into(),
+                cwd: "/repo/main".into(),
+                task: "verify".into(),
+                owner_pid: std::process::id(),
+                owner_identity: None,
+                started_at: 1,
+                updated_at: 2,
+                revision: 1,
+                state: devme_task_runner::TaskActivityState::Running {
+                    message: "Running verify".into(),
+                },
+            },
+            crate::task_activity::ObservationOrigin::LiveEvent,
+        );
+
+        let text = render_to_text(&mut state, 120, 24);
+        assert!(text.contains("◌ main / verify  Running verify"), "{text}");
+    }
+
+    #[test]
+    fn concurrent_agent_tasks_show_count_and_newest_progress() {
+        let stack = devme_config::Stack::parse(
+            "schema_version=1\n[task.verify]\nkind=\"check\"\ncmd=\"true\"\n[task.deploy]\nkind=\"utility\"\ncmd=\"true\"\n",
+        )
+        .unwrap();
+        let mut panel = crate::actions::ActionPanel::from_stack(&stack, Vec::new());
+        panel.set_target(crate::actions::ActionTarget {
+            instance_id: "main".into(),
+            label: "main".into(),
+            cwd: "/repo/main".into(),
+        });
+        let mut state = TuiState::default();
+        state.set_actions(panel);
+        state.apply(ServerMessage::Subscribed {
+            instance: InstanceInfo {
+                id: "main".into(),
+                label: "main".into(),
+                cwd: "/repo/main".into(),
+            },
+            services: Vec::new(),
+            steps: Vec::new(),
+        });
+        for (run_id, task, updated_at) in [("run-1", "verify", 1), ("run-2", "verify", 2)] {
+            state.apply_task_activity(
+                devme_task_runner::TaskActivity {
+                    schema_version: 1,
+                    run_id: run_id.into(),
+                    instance_id: "main".into(),
+                    cwd: "/repo/main".into(),
+                    task: task.into(),
+                    owner_pid: std::process::id(),
+                    owner_identity: None,
+                    started_at: updated_at,
+                    updated_at,
+                    revision: 0,
+                    state: devme_task_runner::TaskActivityState::Running {
+                        message: format!("Running {task}"),
+                    },
+                },
+                crate::task_activity::ObservationOrigin::LiveEvent,
+            );
+        }
+
+        let text = render_to_text(&mut state, 120, 24);
+        assert!(
+            text.contains("◌ main / verify  Running verify  +1 more"),
+            "{text}"
+        );
+        assert!(
+            text.lines().any(|line| line.contains("2 verify")),
+            "concurrent count is missing from the Actions row:\n{text}"
+        );
+    }
+
+    #[test]
+    fn agent_activity_bar_uses_the_selected_stack_label() {
+        let stack = devme_config::Stack::parse(
+            "schema_version=1\n[task.verify]\nkind=\"check\"\ncmd=\"true\"\n",
+        )
+        .unwrap();
+        let mut panel = crate::actions::ActionPanel::from_stack(&stack, Vec::new());
+        panel.set_target(crate::actions::ActionTarget {
+            instance_id: "old".into(),
+            label: "old-stack".into(),
+            cwd: "/repo/old".into(),
+        });
+        let mut state = TuiState::default();
+        state.set_actions(panel);
+        for (id, label, cwd) in [
+            ("old", "old-stack", "/repo/old"),
+            ("current", "current-stack", "/repo/current"),
+        ] {
+            state.apply(ServerMessage::Subscribed {
+                instance: InstanceInfo {
+                    id: id.into(),
+                    label: label.into(),
+                    cwd: cwd.into(),
+                },
+                services: Vec::new(),
+                steps: Vec::new(),
+            });
+        }
+        state.select_instance_by_id("current");
+        state.apply_task_activity(
+            devme_task_runner::TaskActivity {
+                schema_version: 1,
+                run_id: "current-run".into(),
+                instance_id: "current".into(),
+                cwd: "/repo/current".into(),
+                task: "verify".into(),
+                owner_pid: std::process::id(),
+                owner_identity: None,
+                started_at: 1,
+                updated_at: 1,
+                revision: 0,
+                state: devme_task_runner::TaskActivityState::Running {
+                    message: "Running verify".into(),
+                },
+            },
+            crate::task_activity::ObservationOrigin::LiveEvent,
+        );
+
+        let text = render_to_text(&mut state, 120, 24);
+        assert!(
+            text.contains("◌ current-stack / verify  Running verify"),
+            "{text}"
+        );
+        assert!(!text.contains("◌ old-stack / verify"), "{text}");
     }
 
     #[test]

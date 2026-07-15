@@ -17,6 +17,7 @@ devme-core = { workspace = true }
 devme-config = { workspace = true }
 devme-client = { workspace = true }
 devme-supervisor = { path = "../supervisor" }
+devme-task-runner = { path = "../task-runner" }
 devme-slot-allocator = { path = "../slot-allocator" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }

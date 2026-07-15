@@ -260,6 +260,17 @@ impl ActionPanel {
         }
     }
 
+    pub fn observe_activity_result(&mut self, target: ActionTarget, result: RecentResult) {
+        let same_target = self.target_matches(&target.instance_id);
+        if self.running.is_none() {
+            self.activity_target = Some(target);
+            self.last_activity = Some(result.clone());
+        }
+        if same_target {
+            self.record_result(result);
+        }
+    }
+
     pub fn task_label(&self, task: &str) -> String {
         display_label(task, self.member_focus.as_deref())
     }

@@ -18,6 +18,7 @@ use crate::discovery::Registry;
 use crate::keymap;
 use crate::render::render;
 use crate::state::{PointerShape, TuiState};
+use crate::task_activity::ActivityFeed;
 use crate::worktree::{AutoSpawner, WorktreeEvent};
 
 const LOG_PAGE: usize = 20;
@@ -124,6 +125,7 @@ async fn launch_impl(
     let home_id = devme_config::paths::instance_id(&cwd);
 
     let mut registry = Registry::bind(&repo_dir).await?;
+    let mut activity_feed = ActivityFeed::bind(&repo_dir)?;
     let (wt_tx, wt_rx) = mpsc::unbounded_channel::<WorktreeEvent>();
     let _spawner = AutoSpawner::bind(&cwd, wt_tx).await?;
     let mut state = TuiState::default();
@@ -157,6 +159,7 @@ async fn launch_impl(
         &mut terminal,
         &mut state,
         &mut registry,
+        &mut activity_feed,
         wt_rx,
         RunOptions {
             home_id: &home_id,
@@ -188,6 +191,7 @@ async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     state: &mut TuiState,
     registry: &mut Registry,
+    activity_feed: &mut ActivityFeed,
     mut wt_rx: mpsc::UnboundedReceiver<WorktreeEvent>,
     options: RunOptions<'_>,
 ) -> anyhow::Result<()> {
@@ -220,6 +224,8 @@ async fn run(
     // Animation/expiry tick — drives the service spinner and toast timeout.
     let mut anim = tokio::time::interval(std::time::Duration::from_millis(120));
     anim.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut task_liveness = tokio::time::interval(std::time::Duration::from_secs(1));
+    task_liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Background git refresh, fanned out to a detached task so a slow `git`
     // never stalls the UI; results flow back over this channel as
     // `(instance id, current branch, ahead/behind, merged, dirty)`. The
@@ -273,6 +279,10 @@ async fn run(
         }
 
         tokio::select! {
+            observed = activity_feed.recv() => if let Some(observed) = observed {
+                state.apply_task_activity(observed.activity, observed.origin);
+            },
+            _ = task_liveness.tick() => state.reap_dead_task_activities(),
             evt = key_rx.recv() => match evt {
                 Some(Event::Key(k)) => {
                     if matches!(k.kind, KeyEventKind::Release) {

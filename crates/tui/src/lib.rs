@@ -11,6 +11,7 @@ mod event_loop;
 pub mod keymap;
 pub mod render;
 pub mod state;
+mod task_activity;
 pub mod theme;
 pub mod worktree;
 

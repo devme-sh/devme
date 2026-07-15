@@ -15,6 +15,7 @@ use devme_config::GlobalConfig;
 use devme_core::{InstanceInfo, ServerMessage, ServiceSnapshot, ServiceState, StepSnapshot};
 
 use crate::actions::ActionPanel;
+use crate::task_activity::ObservationOrigin;
 use crate::theme::Palette;
 
 /// Per-service log cap inside the TUI. The daemon's ring is the source of
@@ -139,6 +140,10 @@ const TOAST_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_TOASTS: usize = 4;
 /// Cap on the retained notification scrollback (oldest evicted first).
 const MAX_NOTIF_HISTORY: usize = 200;
+/// Completed task revisions retained for watcher-event deduplication. This is
+/// larger than the on-disk activity-file cap so delayed filesystem events can
+/// still be suppressed without growing a long-lived dashboard indefinitely.
+const MAX_COMPLETED_TASK_OBSERVATIONS: usize = 512;
 
 /// Repo-scoped shared daemon state. Shows as a separate sidebar entry.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -619,9 +624,19 @@ struct SidebarDivider {
     total_width: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TaskActivityObservation {
+    revision: u64,
+    saw_live_event: bool,
+    start_notified: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiState {
     actions: Option<ActionPanel>,
+    task_activities: HashMap<String, devme_task_runner::TaskActivity>,
+    task_activity_observations: HashMap<String, TaskActivityObservation>,
+    task_activity_observation_order: VecDeque<String>,
     instances: Vec<InstanceData>,
     selected_instance: Option<usize>,
     /// Shared (repo-scoped) daemon state with its own sidebar row.
@@ -741,6 +756,9 @@ impl Default for TuiState {
     fn default() -> Self {
         Self {
             actions: None,
+            task_activities: HashMap::new(),
+            task_activity_observations: HashMap::new(),
+            task_activity_observation_order: VecDeque::new(),
             instances: Vec::new(),
             selected_instance: None,
             shared: SharedData::default(),
@@ -797,6 +815,213 @@ impl TuiState {
     }
     pub fn actions_visible(&self) -> bool {
         self.actions.as_ref().is_some_and(|actions| actions.visible)
+    }
+
+    pub fn apply_task_activity(
+        &mut self,
+        activity: devme_task_runner::TaskActivity,
+        origin: ObservationOrigin,
+    ) {
+        let previous = self
+            .task_activity_observations
+            .get(&activity.run_id)
+            .copied();
+        let first_observation = previous.is_none();
+        let first_live_observation = origin == ObservationOrigin::LiveEvent
+            && previous.is_none_or(|observation| !observation.saw_live_event);
+        let start_already_notified = previous.is_some_and(|observation| observation.start_notified);
+        let stale_or_already_observed = previous.is_some_and(|observation| {
+            observation.revision > activity.revision
+                || ((activity.is_running() || !first_live_observation)
+                    && observation.revision == activity.revision)
+        });
+        if stale_or_already_observed {
+            return;
+        }
+        self.task_activity_observations.insert(
+            activity.run_id.clone(),
+            TaskActivityObservation {
+                revision: activity.revision,
+                saw_live_event: previous.is_some_and(|observation| observation.saw_live_event)
+                    || origin != ObservationOrigin::InitialScan,
+                start_notified: start_already_notified,
+            },
+        );
+        if first_observation {
+            self.task_activity_observation_order
+                .push_back(activity.run_id.clone());
+        }
+
+        let label = self
+            .instances
+            .iter()
+            .find(|instance| instance.info.id == activity.instance_id)
+            .map(|instance| instance.info.label.clone())
+            .or_else(|| {
+                std::path::Path::new(&activity.cwd)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "stack".into());
+
+        if activity.is_running() {
+            let first_active_observation = self
+                .task_activities
+                .insert(activity.run_id.clone(), activity.clone())
+                .is_none();
+            if first_active_observation
+                && (origin == ObservationOrigin::LiveEvent || activity.owner_is_live())
+            {
+                self.notify(activity.task, format!("running in {label}"));
+                if let Some(observation) = self.task_activity_observations.get_mut(&activity.run_id)
+                {
+                    observation.start_notified = true;
+                }
+            }
+            return;
+        }
+
+        self.task_activities.remove(&activity.run_id);
+        if !start_already_notified
+            && (first_observation || first_live_observation)
+            && origin == ObservationOrigin::LiveEvent
+        {
+            self.notify(activity.task.clone(), format!("running in {label}"));
+            if let Some(observation) = self.task_activity_observations.get_mut(&activity.run_id) {
+                observation.start_notified = true;
+            }
+        }
+        let activity_outcome = activity
+            .outcome()
+            .unwrap_or(devme_task_runner::TaskActivityOutcome::Failed);
+        let outcome = match activity_outcome {
+            devme_task_runner::TaskActivityOutcome::Succeeded => {
+                crate::actions::ActionOutcome::Succeeded
+            }
+            devme_task_runner::TaskActivityOutcome::Cancelled => {
+                crate::actions::ActionOutcome::Cancelled
+            }
+            devme_task_runner::TaskActivityOutcome::Interrupted => {
+                crate::actions::ActionOutcome::Interrupted
+            }
+            devme_task_runner::TaskActivityOutcome::TimedOut => {
+                crate::actions::ActionOutcome::TimedOut
+            }
+            devme_task_runner::TaskActivityOutcome::Failed => crate::actions::ActionOutcome::Failed,
+        };
+        let result = crate::actions::RecentResult {
+            task: activity.task.clone(),
+            kind: self
+                .actions
+                .as_ref()
+                .and_then(|panel| {
+                    panel
+                        .actions
+                        .iter()
+                        .find(|action| action.task == activity.task)
+                })
+                .map(|action| action.kind)
+                .unwrap_or_default(),
+            outcome,
+            finished_at: activity.finished_at().unwrap_or(activity.updated_at),
+        };
+        if let Some(panel) = self.actions.as_mut() {
+            panel.observe_activity_result(
+                crate::actions::ActionTarget {
+                    instance_id: activity.instance_id,
+                    label: label.clone(),
+                    cwd: activity.cwd.into(),
+                },
+                result,
+            );
+        }
+        if origin != ObservationOrigin::InitialScan {
+            let verb = if outcome.succeeded() {
+                "succeeded"
+            } else {
+                outcome.label()
+            };
+            self.notify(activity.task, format!("{verb} in {label}"));
+        }
+        self.prune_task_activity_observations();
+    }
+
+    pub fn active_task_for_current(&self) -> Option<&devme_task_runner::TaskActivity> {
+        let instance_id = &self.current_instance()?.info.id;
+        self.task_activities
+            .values()
+            .filter(|activity| &activity.instance_id == instance_id && activity.is_running())
+            .max_by_key(|activity| (activity.updated_at, activity.revision))
+    }
+
+    pub fn task_is_active(&self, instance_id: &str, task: &str) -> bool {
+        self.task_active_count(instance_id, task) > 0
+    }
+
+    pub fn task_active_count(&self, instance_id: &str, task: &str) -> usize {
+        self.task_activities
+            .values()
+            .filter(|activity| {
+                activity.instance_id == instance_id
+                    && activity.task == task
+                    && activity.is_running()
+            })
+            .count()
+    }
+
+    pub fn active_task_count_for_current(&self) -> usize {
+        let Some(instance_id) = self.current_instance().map(|instance| &instance.info.id) else {
+            return 0;
+        };
+        self.task_activities
+            .values()
+            .filter(|activity| &activity.instance_id == instance_id && activity.is_running())
+            .count()
+    }
+
+    pub fn reap_dead_task_activities(&mut self) {
+        let dead = self
+            .task_activities
+            .values()
+            .filter(|activity| !activity.owner_is_live())
+            .cloned()
+            .collect::<Vec<_>>();
+        for mut activity in dead {
+            activity.revision = activity.revision.saturating_add(1);
+            activity.updated_at = current_epoch_ms();
+            activity.state = devme_task_runner::TaskActivityState::Finished {
+                outcome: devme_task_runner::TaskActivityOutcome::Interrupted,
+                finished_at: activity.updated_at,
+                duration_ms: activity.updated_at.saturating_sub(activity.started_at),
+            };
+            self.apply_task_activity(activity, ObservationOrigin::OwnerReaped);
+        }
+    }
+
+    fn prune_task_activity_observations(&mut self) {
+        while self
+            .task_activity_observations
+            .len()
+            .saturating_sub(self.task_activities.len())
+            > MAX_COMPLETED_TASK_OBSERVATIONS
+        {
+            let mut removed = false;
+            for _ in 0..self.task_activity_observation_order.len() {
+                let Some(run_id) = self.task_activity_observation_order.pop_front() else {
+                    break;
+                };
+                if self.task_activities.contains_key(&run_id) {
+                    self.task_activity_observation_order.push_back(run_id);
+                } else {
+                    self.task_activity_observations.remove(&run_id);
+                    removed = true;
+                    break;
+                }
+            }
+            if !removed {
+                break;
+            }
+        }
     }
 
     pub fn open_actions(&mut self) {
@@ -868,6 +1093,13 @@ fn record_skill_hint_shown() {
         .unwrap_or(0);
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(&state_file, format!("{}\n{now}", count + 1));
+}
+
+fn current_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// True if a skill is already installed at either default Claude Code
@@ -3317,6 +3549,24 @@ mod tests {
         }
     }
 
+    fn running_task(run_id: &str, task: &str, updated_at: u64) -> devme_task_runner::TaskActivity {
+        devme_task_runner::TaskActivity {
+            schema_version: 1,
+            run_id: run_id.into(),
+            instance_id: "main".into(),
+            cwd: "/repo/main".into(),
+            task: task.into(),
+            owner_pid: std::process::id(),
+            owner_identity: None,
+            started_at: 10,
+            updated_at,
+            revision: 0,
+            state: devme_task_runner::TaskActivityState::Running {
+                message: format!("Running {task}"),
+            },
+        }
+    }
+
     #[test]
     fn default_state_has_no_selection() {
         let s = TuiState::default();
@@ -3661,6 +3911,259 @@ mod tests {
         assert_eq!(
             s.notifications().last().unwrap().body,
             format!("note {}", MAX_TOASTS + 2)
+        );
+    }
+
+    #[test]
+    fn process_shared_task_activity_updates_actions_and_notifications() {
+        let stack = devme_config::Stack::parse(
+            "schema_version=1\n[task.verify]\nkind=\"check\"\ncmd=\"true\"\n",
+        )
+        .unwrap();
+        let mut actions = crate::actions::ActionPanel::from_stack(&stack, Vec::new());
+        actions.set_target(crate::actions::ActionTarget {
+            instance_id: "main".into(),
+            label: "main".into(),
+            cwd: "/repo/main".into(),
+        });
+        let mut state = TuiState::default();
+        state.set_actions(actions);
+        state.add_placeholder_instance("main", "main", "/repo/main");
+
+        let mut activity = devme_task_runner::TaskActivity {
+            schema_version: 1,
+            run_id: "run-1".into(),
+            instance_id: "main".into(),
+            cwd: "/repo/main".into(),
+            task: "verify".into(),
+            owner_pid: std::process::id(),
+            owner_identity: None,
+            started_at: 10,
+            updated_at: 10,
+            revision: 0,
+            state: devme_task_runner::TaskActivityState::Running {
+                message: "Running verify".into(),
+            },
+        };
+        state.apply_task_activity(activity.clone(), ObservationOrigin::LiveEvent);
+
+        assert!(state.task_is_active("main", "verify"));
+        assert_eq!(
+            state.active_task_for_current().map(|run| run.message()),
+            Some("Running verify")
+        );
+        assert!(
+            state
+                .notifications()
+                .iter()
+                .any(|toast| { toast.title == "verify" && toast.body.contains("running in main") })
+        );
+
+        activity.revision = 1;
+        activity.updated_at = 20;
+        activity.state = devme_task_runner::TaskActivityState::Finished {
+            outcome: devme_task_runner::TaskActivityOutcome::Succeeded,
+            finished_at: 20,
+            duration_ms: 10,
+        };
+        state.apply_task_activity(activity, ObservationOrigin::LiveEvent);
+
+        assert!(!state.task_is_active("main", "verify"));
+        assert!(
+            state.notifications().iter().any(|toast| {
+                toast.title == "verify" && toast.body.contains("succeeded in main")
+            })
+        );
+        assert_eq!(
+            state
+                .actions()
+                .unwrap()
+                .recent
+                .last()
+                .map(|result| result.task.as_str()),
+            Some("verify")
+        );
+    }
+
+    #[test]
+    fn fast_live_task_reports_start_and_finish_from_one_snapshot() {
+        let mut state = TuiState::default();
+        state.add_placeholder_instance("main", "main", "/repo/main");
+        let mut activity = running_task("fast-run", "verify", 10);
+        activity.state = devme_task_runner::TaskActivityState::Finished {
+            outcome: devme_task_runner::TaskActivityOutcome::Succeeded,
+            finished_at: 11,
+            duration_ms: 1,
+        };
+        activity.updated_at = 11;
+        activity.revision = 1;
+
+        state.apply_task_activity(activity, ObservationOrigin::LiveEvent);
+
+        let task_notifications = state
+            .notifications()
+            .iter()
+            .filter(|notification| notification.title == "verify")
+            .map(|notification| notification.body.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(task_notifications, ["running in main", "succeeded in main"]);
+    }
+
+    #[test]
+    fn completed_initial_activity_does_not_replay_notifications() {
+        let mut state = TuiState::default();
+        state.add_placeholder_instance("main", "main", "/repo/main");
+        let mut activity = running_task("old-run", "verify", 10);
+        activity.state = devme_task_runner::TaskActivityState::Finished {
+            outcome: devme_task_runner::TaskActivityOutcome::Succeeded,
+            finished_at: 11,
+            duration_ms: 1,
+        };
+        activity.updated_at = 11;
+        activity.revision = 1;
+
+        state.apply_task_activity(activity, ObservationOrigin::InitialScan);
+
+        assert!(state.notifications().is_empty());
+    }
+
+    #[test]
+    fn live_event_overlapping_initial_scan_still_reports_fast_task() {
+        let mut state = TuiState::default();
+        state.add_placeholder_instance("main", "main", "/repo/main");
+        let mut activity = running_task("overlap-run", "verify", 10);
+        activity.state = devme_task_runner::TaskActivityState::Finished {
+            outcome: devme_task_runner::TaskActivityOutcome::Succeeded,
+            finished_at: 11,
+            duration_ms: 1,
+        };
+        activity.updated_at = 11;
+        activity.revision = 1;
+
+        state.apply_task_activity(activity.clone(), ObservationOrigin::InitialScan);
+        state.apply_task_activity(activity, ObservationOrigin::LiveEvent);
+
+        let task_notifications = state
+            .notifications()
+            .iter()
+            .filter(|notification| notification.title == "verify")
+            .map(|notification| notification.body.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(task_notifications, ["running in main", "succeeded in main"]);
+    }
+
+    #[test]
+    fn finishing_task_seen_running_at_startup_does_not_duplicate_start() {
+        let mut state = TuiState::default();
+        state.add_placeholder_instance("main", "main", "/repo/main");
+        let mut activity = running_task("attached-run", "verify", 10);
+
+        state.apply_task_activity(activity.clone(), ObservationOrigin::InitialScan);
+        activity.revision = 1;
+        activity.updated_at = 20;
+        activity.state = devme_task_runner::TaskActivityState::Finished {
+            outcome: devme_task_runner::TaskActivityOutcome::Succeeded,
+            finished_at: 20,
+            duration_ms: 10,
+        };
+        state.apply_task_activity(activity, ObservationOrigin::LiveEvent);
+
+        let task_notifications = state
+            .notifications()
+            .iter()
+            .filter(|notification| notification.title == "verify")
+            .map(|notification| notification.body.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(task_notifications, ["running in main", "succeeded in main"]);
+    }
+
+    #[test]
+    fn concurrent_task_activities_are_counted_and_newest_is_selected() {
+        let mut state = TuiState::default();
+        state.add_placeholder_instance("main", "main", "/repo/main");
+        state.apply_task_activity(
+            running_task("run-1", "verify", 10),
+            ObservationOrigin::LiveEvent,
+        );
+        state.apply_task_activity(
+            running_task("run-2", "deploy", 20),
+            ObservationOrigin::LiveEvent,
+        );
+
+        assert_eq!(state.active_task_count_for_current(), 2);
+        assert_eq!(state.task_active_count("main", "verify"), 1);
+        assert_eq!(
+            state
+                .active_task_for_current()
+                .map(|activity| activity.task.as_str()),
+            Some("deploy")
+        );
+    }
+
+    #[test]
+    fn task_activity_observation_cache_is_bounded_without_evicting_active_runs() {
+        let mut state = TuiState::default();
+        state.add_placeholder_instance("main", "main", "/repo/main");
+        state.apply_task_activity(
+            running_task("active-run", "verify", 1),
+            ObservationOrigin::InitialScan,
+        );
+
+        for index in 0..(MAX_COMPLETED_TASK_OBSERVATIONS + 20) {
+            let mut activity = running_task(&format!("finished-{index}"), "verify", index as u64);
+            activity.state = devme_task_runner::TaskActivityState::Finished {
+                outcome: devme_task_runner::TaskActivityOutcome::Succeeded,
+                finished_at: index as u64,
+                duration_ms: 1,
+            };
+            state.apply_task_activity(activity, ObservationOrigin::InitialScan);
+        }
+
+        assert_eq!(
+            state
+                .task_activity_observations
+                .len()
+                .saturating_sub(state.task_activities.len()),
+            MAX_COMPLETED_TASK_OBSERVATIONS
+        );
+        assert!(state.task_activity_observations.contains_key("active-run"));
+        assert!(state.task_activities.contains_key("active-run"));
+    }
+
+    #[test]
+    fn dead_task_owner_is_reaped_as_interrupted() {
+        let mut state = TuiState::default();
+        state.add_placeholder_instance("main", "main", "/repo/main");
+        state.apply_task_activity(
+            devme_task_runner::TaskActivity {
+                schema_version: 1,
+                run_id: "dead-run".into(),
+                instance_id: "main".into(),
+                cwd: "/repo/main".into(),
+                task: "verify".into(),
+                owner_pid: std::process::id(),
+                owner_identity: Some("not-the-current-process".into()),
+                started_at: 1,
+                updated_at: 1,
+                revision: 0,
+                state: devme_task_runner::TaskActivityState::Running {
+                    message: "Running verify".into(),
+                },
+            },
+            ObservationOrigin::InitialScan,
+        );
+
+        state.reap_dead_task_activities();
+
+        assert!(!state.task_is_active("main", "verify"));
+        assert!(state.notifications().iter().any(|toast| {
+            toast.title == "verify" && toast.body.contains("interrupted in main")
+        }));
+        assert!(
+            !state
+                .notifications()
+                .iter()
+                .any(|toast| { toast.title == "verify" && toast.body.contains("running in main") })
         );
     }
 
