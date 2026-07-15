@@ -798,6 +798,18 @@ impl TuiState {
     pub fn home_visible(&self) -> bool {
         self.home.as_ref().is_some_and(|home| home.visible)
     }
+
+    pub fn open_actions(&mut self) {
+        if let Some(home) = &mut self.home {
+            home.visible = true;
+        }
+    }
+
+    pub fn close_actions(&mut self) {
+        if let Some(home) = &mut self.home {
+            home.visible = false;
+        }
+    }
 }
 
 fn check_skill_hint_eligible() -> bool {
@@ -1265,6 +1277,18 @@ impl TuiState {
         self.current_instance()
             .map(|i| i.info.cwd.as_str())
             .unwrap_or("")
+    }
+
+    pub fn current_action_target(&self) -> Option<crate::home::ActionTarget> {
+        if self.shared_selected {
+            return None;
+        }
+        self.current_instance()
+            .map(|instance| crate::home::ActionTarget {
+                instance_id: instance.info.id.clone(),
+                label: instance.info.label.clone(),
+                cwd: std::path::PathBuf::from(&instance.info.cwd),
+            })
     }
 
     // ── proxies to the selected instance ────────────────────────────────

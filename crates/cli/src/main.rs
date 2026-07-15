@@ -556,6 +556,19 @@ async fn run_task(
     cancellation: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> anyhow::Result<devme_cli::task::TaskResult> {
     let cwd = std::env::current_dir()?;
+    run_task_at(&cwd, task, args, output, emit, tui_updates, cancellation).await
+}
+
+async fn run_task_at(
+    cwd: &std::path::Path,
+    task: &str,
+    args: &[String],
+    output: devme_cli::OutputFormat,
+    emit: bool,
+    tui_updates: Option<tokio::sync::mpsc::UnboundedSender<devme_tui::home::TaskUpdate>>,
+    cancellation: Option<tokio::sync::watch::Receiver<bool>>,
+) -> anyhow::Result<devme_cli::task::TaskResult> {
+    let cwd = cwd.to_path_buf();
     let stack = devme_cli::task::load(&cwd)?;
     let daemon_stack = stack.clone();
     let daemon_root = cwd.clone();
@@ -3140,24 +3153,40 @@ async fn launch_tui(session_owns_home: bool) -> anyhow::Result<i32> {
             devme_config::Focus::Root => None,
             devme_config::Focus::Member(member) => Some(member.as_str()),
         };
-        let home = devme_tui::home::HomeState::from_stack_with_member_focus(
+        let mut home = devme_tui::home::HomeState::from_stack_with_member_focus(
             &home_stack,
             member_focus,
             recent,
         );
-        let kinds = home_stack
-            .task
-            .iter()
-            .map(|(name, task)| (name.clone(), task.kind))
-            .collect::<std::collections::HashMap<_, _>>();
+        home.set_target(devme_tui::home::ActionTarget {
+            instance_id: devme_config::paths::instance_id(&cwd),
+            label: cwd
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "stack".into()),
+            cwd: cwd.clone(),
+        });
+        let loader: devme_tui::home::ActionLoader = std::sync::Arc::new(move |cwd| {
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || load_action_catalog(&cwd))
+                    .await
+                    .map_err(|error| anyhow::anyhow!("action discovery failed: {error}"))?
+            })
+        });
         let runner: devme_tui::home::TaskRunner =
-            std::sync::Arc::new(move |task, updates, cancellation| {
-                let kind = kinds.get(&task).copied().unwrap_or_default();
+            std::sync::Arc::new(move |cwd, task, updates, cancellation| {
                 Box::pin(async move {
+                    let stack = devme_cli::task::load(&cwd)?;
+                    let kind = stack
+                        .task
+                        .get(&task)
+                        .map(|task| task.kind)
+                        .unwrap_or_default();
                     let _ = updates.send(devme_tui::home::TaskUpdate::Progress(format!(
                         "Preparing {task}"
                     )));
-                    let result = run_task(
+                    let result = run_task_at(
+                        &cwd,
                         &task,
                         &[],
                         devme_cli::OutputFormat::Human,
@@ -3172,18 +3201,54 @@ async fn launch_tui(session_owns_home: bool) -> anyhow::Result<i32> {
                         status: result.status,
                         finished_at: result.finished_at,
                     };
-                    let _ = updates.send(devme_tui::home::TaskUpdate::Finished(recent.clone()));
                     Ok(recent)
                 })
             });
         // Home is passive: selecting an action converges only that task's
         // required service closure through the shared runner.
-        devme_tui::launch_with_home(false, Some(Vec::new()), home, runner).await?;
+        devme_tui::launch_with_home(false, Some(Vec::new()), home, loader, runner).await?;
     } else {
         devme_tui::launch_targets(false, targets).await?;
     }
     maybe_show_skills_hint();
     Ok(0)
+}
+
+fn load_action_catalog(cwd: &std::path::Path) -> anyhow::Result<devme_tui::home::ActionCatalog> {
+    let resolved = devme_config::ResolvedWorkspace::resolve(cwd)?;
+    let stack = task_view_for_focus(resolved.stack(), resolved.focus(), true);
+    let task_names = stack
+        .task
+        .keys()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let history =
+        devme_cli::task::read_history(resolved.root(), Some(&task_names), None).unwrap_or_default();
+    let recent = history
+        .into_iter()
+        .rev()
+        .take(5)
+        .rev()
+        .map(|result| {
+            let kind = resolved
+                .stack()
+                .task
+                .get(&result.task)
+                .map(|task| task.kind)
+                .unwrap_or_default();
+            devme_tui::home::RecentResult {
+                task: result.task,
+                kind,
+                status: result.status,
+                finished_at: result.finished_at,
+            }
+        })
+        .collect();
+    let member_focus = match resolved.focus() {
+        devme_config::Focus::Root => None,
+        devme_config::Focus::Member(member) => Some(member.as_str()),
+    };
+    Ok(devme_tui::home::ActionCatalog::from_stack_with_member_focus(&stack, member_focus, recent))
 }
 
 /// Restrict boot-time convergence to a focused member and the declared

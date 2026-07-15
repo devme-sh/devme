@@ -6,6 +6,11 @@ schema_version = 1
 [step.tools]
 check = "command -v sh"
 
+[task.verify]
+kind = "check"
+description = "Run the smoke verification"
+cmd = "printf 'smoke verified\n'"
+
 # Fast cadence on purpose: the smoke test scrolls back (PAUSED pill), which
 # needs more buffered lines than the viewport holds within a few seconds.
 [service.tick]

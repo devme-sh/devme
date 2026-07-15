@@ -60,9 +60,35 @@ tmux new-session -d -s "$SESSION" -x 120 -y 30 \
 # Long enough for the daemon to spawn and for tick (10 lines/s) to overflow
 # the ~24-row viewport, so page-up in step 2 has somewhere to scroll to.
 sleep 5
-# Home is the default entry surface. Switch to the service dashboard before
-# exercising dashboard navigation and log scrolling.
-tmux send-keys -t "$SESSION" "d"
+# Actions replace the stack sidebar on cold start without hiding the service
+# dashboard. Return the sidebar to stack navigation before exercising the
+# dashboard-specific vertical navigation below.
+sleep 1
+tmux capture-pane -t "$SESSION" -p > /tmp/devme-tui-cap-actions.txt
+grep -qF "actions:" /tmp/devme-tui-cap-actions.txt || {
+  echo "ASSERT FAIL: cold start did not open Actions" >&2
+  cat /tmp/devme-tui-cap-actions.txt >&2
+  exit 1
+}
+grep -qF "verify" /tmp/devme-tui-cap-actions.txt || {
+  echo "ASSERT FAIL: Actions did not list verify" >&2
+  cat /tmp/devme-tui-cap-actions.txt >&2
+  exit 1
+}
+grep -qF "tick" /tmp/devme-tui-cap-actions.txt || {
+  echo "ASSERT FAIL: service dashboard disappeared behind Actions" >&2
+  cat /tmp/devme-tui-cap-actions.txt >&2
+  exit 1
+}
+tmux send-keys -t "$SESSION" Enter
+sleep 1
+tmux capture-pane -t "$SESSION" -p > /tmp/devme-tui-cap-action-result.txt
+grep -qF "/ verify  succeeded" /tmp/devme-tui-cap-action-result.txt || {
+  echo "ASSERT FAIL: verify result did not reach the shared activity bar" >&2
+  cat /tmp/devme-tui-cap-action-result.txt >&2
+  exit 1
+}
+tmux send-keys -t "$SESSION" "a"
 sleep 1
 tmux send-keys -t "$SESSION" "S"
 sleep 5
@@ -81,7 +107,9 @@ assert_contains() {
   echo "  ok  [$label] saw '$needle'"
 }
 
-echo "1. initial render"
+echo "1. actions and dashboard share the initial render"
+echo "  ok  [actions-pane] saw 'actions:' and 'verify'"
+echo "  ok  [activity-bar] verify succeeded without hiding services"
 assert_contains "stacks"  "stacks-pane"
 assert_contains "tools"   "tools-pane"
 assert_contains "tick"    "tabs"
@@ -133,7 +161,35 @@ tmux send-keys -t "$SESSION" "l"
 sleep 1
 assert_contains "flaky" "tab-switch-flaky"
 
-echo "6. q quits and shuts down the daemon"
+echo "6. warm reattach opens Stacks, then q shuts down"
+tmux send-keys -t "$SESSION" "D"
+deadline=$((SECONDS + 10))
+while tmux has-session -t "$SESSION" 2>/dev/null; do
+  if (( SECONDS >= deadline )); then
+    echo "ASSERT FAIL: D did not detach the first TUI" >&2
+    exit 1
+  fi
+  sleep 1
+done
+tmux new-session -d -s "$SESSION" -x 120 -y 30 \
+  "cd $SMOKE_DIR && HOME=$SMOKE_HOME XDG_CONFIG_HOME=$SMOKE_HOME/.config $DEVME"
+sleep 3
+tmux capture-pane -t "$SESSION" -p > /tmp/devme-tui-cap-warm.txt
+grep -qF "stacks" /tmp/devme-tui-cap-warm.txt || {
+  echo "ASSERT FAIL: warm reattach did not open Stacks" >&2
+  cat /tmp/devme-tui-cap-warm.txt >&2
+  exit 1
+}
+if grep -qF "actions:" /tmp/devme-tui-cap-warm.txt; then
+  echo "ASSERT FAIL: warm reattach reopened Actions over running services" >&2
+  cat /tmp/devme-tui-cap-warm.txt >&2
+  exit 1
+fi
+echo "  ok  [warm-start] running services opened Stacks"
+tmux send-keys -t "$SESSION" "q"
+sleep 1
+# Confirm the default quit modal. A single q only opens the choice; the
+# second q commits "stop all & quit".
 tmux send-keys -t "$SESSION" "q"
 # Quit tears down every worktree's daemon plus the shared supervisor; give it
 # up to 15s rather than a fixed beat. Done when `down` finds nothing to stop.
