@@ -541,6 +541,7 @@ dependencies = [
  "devme-core",
  "devme-slot-allocator",
  "devme-supervisor",
+ "devme-task-runner",
  "notify",
  "ratatui",
  "serde",

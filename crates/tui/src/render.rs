@@ -67,6 +67,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
 
     let activity_height = u16::from(state.actions().is_some_and(|panel| {
         panel.running.is_some()
+            || state.active_task_for_current().is_some()
             || panel.last_activity.is_some()
             || (panel.visible
                 && panel
@@ -1639,12 +1640,17 @@ fn render_actions_sidebar(frame: &mut Frame<'_>, area: Rect, state: &mut TuiStat
             ));
             last_kind = Some(action.kind);
         }
-        let running_here = panel.running.as_deref() == Some(action.task.as_str())
+        let local_running = panel.running.as_deref() == Some(action.task.as_str())
             && panel
                 .target
                 .as_ref()
                 .zip(panel.activity_target.as_ref())
                 .is_some_and(|(catalog, activity)| catalog.instance_id == activity.instance_id);
+        let shared_running = panel
+            .target
+            .as_ref()
+            .is_some_and(|target| state.task_is_active(&target.instance_id, action.task.as_str()));
+        let running_here = local_running || shared_running;
         let recent = panel
             .recent
             .iter()
@@ -1720,7 +1726,12 @@ fn render_activity_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         return;
     };
     let p = *state.palette();
-    let target = if panel.running.is_some() || panel.last_activity.is_some() {
+    let shared_activity = state.active_task_for_current();
+    let target = if panel.running.is_some() {
+        panel.activity_target.as_ref()
+    } else if shared_activity.is_some() {
+        panel.target.as_ref()
+    } else if panel.last_activity.is_some() {
         panel.activity_target.as_ref()
     } else {
         panel.target.as_ref()
@@ -1737,6 +1748,13 @@ fn render_activity_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 .last()
                 .cloned()
                 .unwrap_or_else(|| "Preparing".into()),
+        )
+    } else if let Some(activity) = shared_activity {
+        (
+            "◌",
+            p.yellow,
+            activity.task.as_str(),
+            activity.message.clone(),
         )
     } else if let Some(result) = &panel.last_activity {
         let outcome = result.outcome;
@@ -2758,6 +2776,54 @@ mod tests {
             .find("jk action")
             .expect("Actions footer is missing action navigation");
         assert!(esc < navigation, "Esc back is not the first tip: {footer}");
+    }
+
+    #[test]
+    fn agent_task_activity_is_visible_without_owning_the_tui_event_loop() {
+        let stack = devme_config::Stack::parse(
+            "schema_version=1\n[task.verify]\nkind=\"check\"\ncmd=\"true\"\n",
+        )
+        .unwrap();
+        let mut panel = crate::actions::ActionPanel::from_stack(&stack, Vec::new());
+        panel.set_target(crate::actions::ActionTarget {
+            instance_id: "main".into(),
+            label: "main".into(),
+            cwd: "/repo/main".into(),
+        });
+        let mut state = TuiState::default();
+        state.set_actions(panel);
+        state.apply(ServerMessage::Subscribed {
+            instance: InstanceInfo {
+                id: "main".into(),
+                label: "main".into(),
+                cwd: "/repo/main".into(),
+            },
+            services: Vec::new(),
+            steps: Vec::new(),
+        });
+        state.apply_task_activity(
+            devme_task_runner::TaskActivity {
+                schema_version: 1,
+                run_id: "agent-run".into(),
+                instance_id: "main".into(),
+                cwd: "/repo/main".into(),
+                task: "verify".into(),
+                owner_pid: std::process::id(),
+                owner_identity: None,
+                started_at: 1,
+                updated_at: 2,
+                revision: 1,
+                state: devme_task_runner::TaskActivityState::Running,
+                message: "Running verify".into(),
+                status: None,
+                finished_at: None,
+                duration_ms: None,
+            },
+            false,
+        );
+
+        let text = render_to_text(&mut state, 120, 24);
+        assert!(text.contains("◌ main / verify  Running verify"), "{text}");
     }
 
     #[test]

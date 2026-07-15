@@ -1,6 +1,11 @@
 //! One-shot task execution, result history, and generic scarce-resource leases.
 
+mod activity;
 mod runner;
+pub use activity::{
+    TaskActivity, TaskActivityState, read_task_activities, read_task_activities_from_dir,
+    task_activity_dir,
+};
 pub use runner::{
     Approval, ApprovalHandler, ApprovalRequest, BorrowedRunRequest, DaemonStarter, RunRequest,
     TaskEvent, TaskRunner,
@@ -558,6 +563,11 @@ async fn execute_one_attempt(
             Ok(())
         });
     }
+    // Register SIGINT before spawning the command. The child can become
+    // externally observable immediately, so installing the handler only when
+    // the later select begins leaves a race where Ctrl-C terminates devme
+    // itself instead of producing the documented cancellation result.
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to start task {name:?}"))?;
@@ -605,7 +615,7 @@ async fn execute_one_attempt(
     let (status, timed_out, cancelled) = tokio::select! {
         value = child.wait() => (value?, false, false),
         _ = tokio::time::sleep(deadline) => { terminate_group(pid, &mut child).await?; (child.wait().await?, true, false) },
-        _ = tokio::signal::ctrl_c() => { terminate_group(pid, &mut child).await?; (child.wait().await?, false, true) },
+        _ = interrupt.recv() => { terminate_group(pid, &mut child).await?; (child.wait().await?, false, true) },
         _ = wait_for_cancel(cancellation) => { terminate_group(pid, &mut child).await?; (child.wait().await?, false, true) },
     };
     let _ = std::fs::remove_file(gate);
