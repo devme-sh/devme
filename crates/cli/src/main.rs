@@ -3162,7 +3162,7 @@ async fn launch_tui(session_owns_home: bool) -> anyhow::Result<i32> {
                     let recent = devme_tui::actions::RecentResult {
                         task: result.task,
                         kind,
-                        status: result.status,
+                        outcome: devme_tui::actions::ActionOutcome::from_status(&result.status),
                         finished_at: result.finished_at,
                     };
                     Ok(recent)
@@ -3207,7 +3207,7 @@ fn action_catalog(resolved: &devme_config::ResolvedWorkspace) -> devme_tui::acti
             devme_tui::actions::RecentResult {
                 task: result.task,
                 kind,
-                status: result.status,
+                outcome: devme_tui::actions::ActionOutcome::from_status(&result.status),
                 finished_at: result.finished_at,
             }
         })
