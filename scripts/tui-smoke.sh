@@ -175,7 +175,7 @@ tmux new-session -d -s "$SESSION" -x 120 -y 30 \
   "cd $SMOKE_DIR && HOME=$SMOKE_HOME XDG_CONFIG_HOME=$SMOKE_HOME/.config $DEVME"
 # Queue harmless input before the first supervisor subscription. Early keys
 # must not win the race against warm-start rail selection.
-tmux send-keys -t "$SESSION" "n"
+tmux send-keys -t "$SESSION" "j"
 sleep 3
 tmux capture-pane -t "$SESSION" -p > /tmp/devme-tui-cap-warm.txt
 grep -qF "stacks" /tmp/devme-tui-cap-warm.txt || {
@@ -188,7 +188,37 @@ if grep -qF "actions:" /tmp/devme-tui-cap-warm.txt; then
   cat /tmp/devme-tui-cap-warm.txt >&2
   exit 1
 fi
-echo "  ok  [warm-start] running services opened Stacks"
+echo "  ok  [warm-start] unrelated early input still opened Stacks"
+tmux send-keys -t "$SESSION" "D"
+deadline=$((SECONDS + 10))
+while tmux has-session -t "$SESSION" 2>/dev/null; do
+  if (( SECONDS >= deadline )); then
+    echo "ASSERT FAIL: D did not detach the warm TUI" >&2
+    exit 1
+  fi
+  sleep 1
+done
+tmux new-session -d -s "$SESSION" -x 120 -y 30 \
+  "cd $SMOKE_DIR && HOME=$SMOKE_HOME XDG_CONFIG_HOME=$SMOKE_HOME/.config $DEVME"
+sleep 3
+# On a settled warm stack, choosing Actions and starting a task keeps the
+# panel open. The event-loop unit covers the same intent before subscription.
+tmux send-keys -t "$SESSION" "a"
+sleep 1
+tmux send-keys -t "$SESSION" Enter
+sleep 1
+tmux capture-pane -t "$SESSION" -p > /tmp/devme-tui-cap-warm-action.txt
+grep -qF "actions:" /tmp/devme-tui-cap-warm-action.txt || {
+  echo "ASSERT FAIL: starting a warm action did not preserve Actions" >&2
+  cat /tmp/devme-tui-cap-warm-action.txt >&2
+  exit 1
+}
+grep -qF "/ verify  succeeded" /tmp/devme-tui-cap-warm-action.txt || {
+  echo "ASSERT FAIL: warm Actions did not run the selected action" >&2
+  cat /tmp/devme-tui-cap-warm-action.txt >&2
+  exit 1
+}
+echo "  ok  [warm-action] starting verify kept Actions open"
 tmux send-keys -t "$SESSION" "q"
 sleep 1
 # Confirm the default quit modal. A single q only opens the choice; the

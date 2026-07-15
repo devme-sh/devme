@@ -25,6 +25,31 @@ const MOUSE_SCROLL_LINES: usize = 3;
 /// Columns the tab row scrolls per wheel notch when the pointer is over it.
 const MOUSE_TAB_SCROLL_COLS: isize = 4;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StartupRailChoice {
+    pending: bool,
+}
+
+impl StartupRailChoice {
+    fn new(actions_visible: bool) -> Self {
+        Self {
+            pending: actions_visible,
+        }
+    }
+
+    fn user_chose_rail(&mut self) {
+        self.pending = false;
+    }
+
+    fn take_for_subscription(&mut self, is_home_subscription: bool) -> bool {
+        if !is_home_subscription || !self.pending {
+            return false;
+        }
+        self.pending = false;
+        true
+    }
+}
+
 // 1003 = any-event tracking: reports press, release, motion while a button is
 // held (drag), AND motion with no button (hover). We need hover to swap the
 // mouse-pointer shape over clickable/resizable cells; plain 1002 (drag only)
@@ -187,7 +212,7 @@ async fn run(
     // The first subscription chooses the cold/warm default. Only an explicit
     // rail choice below may cancel it - startup modals and early navigation
     // keys must not turn a warm reattach into Actions by winning the race.
-    let mut startup_actions_pending = state.actions_visible();
+    let mut startup_rail = StartupRailChoice::new(state.actions_visible());
     // Last mouse-pointer shape we asked the terminal for, so we only emit an
     // OSC 22 update when the cell under the cursor changes category.
     let mut pointer_shape = PointerShape::Default;
@@ -233,10 +258,10 @@ async fn run(
             if let Some(target) = state.current_action_target()
                 && state
                     .actions()
-                    .is_some_and(|home| home.target_matches(home_id))
-                && let Some(home) = state.actions_mut()
+                    .is_some_and(|panel| panel.target_matches(home_id))
+                && let Some(panel) = state.actions_mut()
             {
-                home.set_target(target);
+                panel.set_target(target);
             }
             home_selected = true;
         }
@@ -257,7 +282,7 @@ async fn run(
                         handle_skill_dialog_key(state, k.code);
                         continue;
                     }
-                    if state.actions().is_some_and(|home| home.approval.is_some()) {
+                    if state.actions().is_some_and(|panel| panel.approval.is_some()) {
                         let response = match k.code {
                             KeyCode::Enter | KeyCode::Char('y') => Some(TaskApproval::Approve),
                             KeyCode::Char('n') | KeyCode::Char('s') => Some(TaskApproval::Skip),
@@ -268,8 +293,8 @@ async fn run(
                             if let Some(sender) = task_approval.take() {
                                 let _ = sender.send(response);
                             }
-                            if let Some(home) = state.actions_mut() {
-                                home.approval = None;
+                            if let Some(panel) = state.actions_mut() {
+                                panel.approval = None;
                             }
                         }
                         continue;
@@ -285,10 +310,10 @@ async fn run(
                                 continue;
                             }
                             KeyCode::Enter => {
-                                if let Some((target, task)) = state.actions().and_then(|home| {
-                                    home.activity_target
+                                if let Some((target, task)) = state.actions().and_then(|panel| {
+                                    panel.activity_target
                                         .as_ref()
-                                        .zip(home.running.as_ref())
+                                        .zip(panel.running.as_ref())
                                         .map(|(target, task)| (target.label.clone(), task.clone()))
                                 }) {
                                     state.notify(
@@ -297,15 +322,16 @@ async fn run(
                                     );
                                     continue;
                                 }
-                                let selected = state.actions().and_then(|home| {
-                                    home.actions
-                                        .get(home.selected)
+                                let selected = state.actions().and_then(|panel| {
+                                    panel.actions
+                                        .get(panel.selected)
                                         .map(|action| (action.task.clone(), action.kind))
                                 });
-                                if state.actions().and_then(|home| home.running.as_ref()).is_none()
+                                if state.actions().and_then(|panel| panel.running.as_ref()).is_none()
                                     && let (Some((task, kind)), Some(runner)) = (selected, runner.clone())
-                                    && let Some(cwd) = state.actions_mut().and_then(|home| home.start_activity(task.clone()))
+                                    && let Some(cwd) = state.actions_mut().and_then(|panel| panel.start_activity(task.clone()))
                                 {
+                                    startup_rail.user_chose_rail();
                                     let tx = task_update_tx.clone();
                                     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
                                     task_cancel = Some(cancel_tx);
@@ -322,7 +348,7 @@ async fn run(
                                                 let _ = tx.send(TaskUpdate::Finished(crate::actions::RecentResult {
                                                     task,
                                                     kind,
-                                                    status: "failed".into(),
+                                                    outcome: crate::actions::ActionOutcome::Failed,
                                                     finished_at,
                                                 }));
                                             }
@@ -332,12 +358,12 @@ async fn run(
                                 continue;
                             }
                             KeyCode::Char('a') | KeyCode::Esc => {
-                                startup_actions_pending = false;
+                                startup_rail.user_chose_rail();
                                 state.close_actions();
                                 continue;
                             }
                             KeyCode::Char('c')
-                                if state.actions().is_some_and(|home| home.running.is_some()) =>
+                                if state.actions().is_some_and(|panel| panel.running.is_some()) =>
                             {
                                 if let Some(cancel) = &task_cancel {
                                     let _ = cancel.send(true);
@@ -649,7 +675,7 @@ async fn run(
                             use keymap::Action;
                             match action {
                                 Action::ToggleActions => {
-                                    startup_actions_pending = false;
+                                    startup_rail.user_chose_rail();
                                     let Some(target) = state.current_action_target() else {
                                         state.notify("actions", "select a stack to run actions");
                                         continue;
@@ -660,12 +686,12 @@ async fn run(
                                     }
                                     let needs_load = state
                                         .actions()
-                                        .is_some_and(|home| !home.target_matches(&target.instance_id));
+                                        .is_some_and(|panel| !panel.target_matches(&target.instance_id));
                                     if needs_load {
                                         let id = target.instance_id.clone();
                                         let cwd = target.cwd.clone();
-                                        if let Some(home) = state.actions_mut() {
-                                            home.begin_loading(target);
+                                        if let Some(panel) = state.actions_mut() {
+                                            panel.begin_loading(target);
                                         }
                                         if let Some(loader) = loader.clone() {
                                             let tx = action_load_tx.clone();
@@ -966,48 +992,48 @@ async fn run(
                 None => return Ok(()),
             },
             loaded = action_load_rx.recv() => if let Some((instance_id, result)) = loaded
-                && let Some(home) = state.actions_mut()
-                && home.target_matches(&instance_id)
+                && let Some(panel) = state.actions_mut()
+                && panel.target_matches(&instance_id)
             {
                 match result {
-                    Ok(catalog) => home.apply_catalog(catalog),
-                    Err(error) => home.fail_loading(error.to_string()),
+                    Ok(catalog) => panel.apply_catalog(catalog),
+                    Err(error) => panel.fail_loading(error.to_string()),
                 }
             },
             update = task_update_rx.recv() => if let Some(update) = update
-                && let Some(home) = state.actions_mut() {
+                && let Some(panel) = state.actions_mut() {
                     match update {
                         TaskUpdate::Progress(line) | TaskUpdate::Output(line) => {
-                            home.logs.push(line);
-                            if home.logs.len() > 1_000 { home.logs.remove(0); }
+                            panel.logs.push(line);
+                            if panel.logs.len() > 1_000 { panel.logs.remove(0); }
                         }
                         TaskUpdate::ApprovalRequired { prompt, response } => {
                             if let Some(previous) = task_approval.replace(response) {
                                 let _ = previous.send(TaskApproval::Cancel);
                             }
-                            home.approval = Some(prompt);
+                            panel.approval = Some(prompt);
                         }
                         TaskUpdate::Finished(result) => {
                             task_approval = None;
-                            home.approval = None;
+                            panel.approval = None;
                             task_cancel = None;
-                            home.finish_activity(result);
+                            panel.finish_activity(result);
                         }
                     }
             },
             tagged = registry.recv() => match tagged {
                 Some(t) => {
-                    let home_subscribed = startup_actions_pending
-                        && t.instance_id == home_id
-                        && matches!(&t.message, devme_core::ServerMessage::Subscribed { .. });
+                    let home_subscribed = startup_rail.take_for_subscription(
+                        t.instance_id == home_id
+                            && matches!(&t.message, devme_core::ServerMessage::Subscribed { .. }),
+                    );
                     state.apply_from(&t.instance_id, t.message);
-                    if home_subscribed {
-                        if state.services().iter().any(|service| {
+                    if home_subscribed
+                        && state.services().iter().any(|service| {
                             matches!(service.state, devme_core::ServiceState::Running { .. })
-                        }) {
-                            state.close_actions();
-                        }
-                        startup_actions_pending = false;
+                        })
+                    {
+                        state.close_actions();
                     }
                     // A deliberate `devme down`/quit elsewhere drains every
                     // daemon (each sends Goodbye). Rather than exit, park in a
@@ -1566,5 +1592,21 @@ mod tests {
                 services: Vec::new()
             }
         );
+    }
+
+    #[test]
+    fn explicit_action_intent_overrides_the_warm_start_default() {
+        let mut startup = StartupRailChoice::new(true);
+        startup.user_chose_rail();
+
+        assert!(!startup.take_for_subscription(true));
+    }
+
+    #[test]
+    fn unrelated_input_leaves_the_warm_start_default_pending() {
+        let mut startup = StartupRailChoice::new(true);
+
+        assert!(startup.take_for_subscription(true));
+        assert!(!startup.take_for_subscription(true));
     }
 }

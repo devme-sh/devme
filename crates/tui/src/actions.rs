@@ -13,14 +13,6 @@ pub struct ActionItem {
     pub kind: TaskKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecentResult {
-    pub task: String,
-    pub kind: TaskKind,
-    pub status: String,
-    pub finished_at: u64,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionOutcome {
     Succeeded,
@@ -31,6 +23,16 @@ pub enum ActionOutcome {
 }
 
 impl ActionOutcome {
+    pub fn from_status(status: &str) -> Self {
+        match status {
+            "passed" => Self::Succeeded,
+            "cancelled" => Self::Cancelled,
+            "interrupted" => Self::Interrupted,
+            "timed_out" => Self::TimedOut,
+            _ => Self::Failed,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Succeeded => "succeeded",
@@ -46,24 +48,22 @@ impl ActionOutcome {
     }
 }
 
-impl RecentResult {
-    pub fn outcome(&self) -> ActionOutcome {
-        match self.status.as_str() {
-            "passed" => ActionOutcome::Succeeded,
-            "cancelled" => ActionOutcome::Cancelled,
-            "interrupted" => ActionOutcome::Interrupted,
-            "timed_out" => ActionOutcome::TimedOut,
-            _ => ActionOutcome::Failed,
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentResult {
+    pub task: String,
+    pub kind: TaskKind,
+    pub outcome: ActionOutcome,
+    pub finished_at: u64,
+}
 
+impl RecentResult {
     pub fn wording(&self) -> String {
         let noun = match self.kind {
             TaskKind::Launch => "launch",
             TaskKind::Check => "check",
             TaskKind::Utility => "run",
         };
-        let status = self.outcome().label();
+        let status = self.outcome.label();
         format!("last {noun} {status}")
     }
 }
@@ -327,13 +327,13 @@ mod tests {
         let result = RecentResult {
             task: "ios".into(),
             kind: TaskKind::Launch,
-            status: "passed".into(),
+            outcome: ActionOutcome::Succeeded,
             finished_at: 1,
         };
         assert_eq!(result.wording(), "last launch succeeded");
         assert_eq!(
             RecentResult {
-                status: "interrupted".into(),
+                outcome: ActionOutcome::Interrupted,
                 ..result
             }
             .wording(),
@@ -384,7 +384,7 @@ mod tests {
         let result = |task: &str, finished_at| RecentResult {
             task: task.to_string(),
             kind: TaskKind::Launch,
-            status: "passed".into(),
+            outcome: ActionOutcome::Succeeded,
             finished_at,
         };
         let mut panel = ActionPanel::from_stack(
@@ -466,7 +466,7 @@ mod tests {
         state.finish_activity(RecentResult {
             task: "verify".into(),
             kind: TaskKind::Check,
-            status: "passed".into(),
+            outcome: ActionOutcome::Succeeded,
             finished_at: 1,
         });
 
