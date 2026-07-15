@@ -299,14 +299,6 @@ pub const SETTINGS: &[SettingDef] = &[
         unset_value: None,
     },
     SettingDef {
-        key: "remote.default",
-        label: "Remote by default",
-        desc: "Bare `devme` syncs + attaches to the remote host (needs remote.host)",
-        control: SettingControl::Toggle,
-        default: "false",
-        unset_value: None,
-    },
-    SettingDef {
         key: "docker.daemon",
         label: "Docker daemon",
         desc: "Which daemon to start when Docker isn't running",
@@ -728,11 +720,6 @@ pub struct TuiState {
     worktree_remove: Option<WorktreeRemoveDialog>,
     /// The new-worktree branch prompt (`w`), when open.
     worktree_add: Option<WorktreeAddDialog>,
-    /// The reachable hostname when this whole TUI is attached to a remote stack
-    /// (over `devme remote`, which exports `DEVME_URL_HOST`). `None` for a local
-    /// session. Drives the sidebar remote badge and the info modal's Host row —
-    /// the entire session is remote or local, never a per-stack mix.
-    remote_host: Option<String>,
     /// Horizontal scroll offset (columns) of the service-tab row, for when the
     /// tabs overflow the pane. Driven manually by the mouse wheel over the row;
     /// the renderer also nudges it to keep the *selected* tab in view when the
@@ -791,7 +778,6 @@ impl Default for TuiState {
             stack_info: None,
             worktree_remove: None,
             worktree_add: None,
-            remote_host: None,
             tab_scroll: 0,
             tab_ctx: None,
             tab_row: None,
@@ -1387,8 +1373,7 @@ impl TuiState {
             if self.current_instance_missing_on_host() {
                 format!(
                     "Worktree registered at {}, but that path doesn't exist on this \
-                     machine — it was likely created on another host (only the main \
-                     worktree syncs to a remote).\n\n\
+                     machine — it was likely created on another host.\n\n\
                      `git worktree prune` here drops the stale registration; \
                      `git worktree add <path> <branch>` creates it on this host.",
                     self.current_instance_cwd()
@@ -2101,7 +2086,7 @@ impl TuiState {
             && info.instance_id.as_deref() == Some(id)
         {
             let slot = info.slot;
-            self.open_stack_info(slot, self.remote_host.clone());
+            self.open_stack_info(slot);
         }
     }
 
@@ -2128,32 +2113,14 @@ impl TuiState {
             .collect()
     }
 
-    // ── remote session ──────────────────────────────────────────────────
-
-    /// Record the reachable hostname for a remote-attached TUI (set once at
-    /// startup from `DEVME_URL_HOST`). `None` leaves it local.
-    pub fn set_remote_host(&mut self, host: Option<String>) {
-        self.remote_host = host;
-    }
-
-    /// The remote host this TUI is attached to, or `None` when local. Drives
-    /// the sidebar remote badge and the info modal's Host row.
-    pub fn remote_host(&self) -> Option<&str> {
-        self.remote_host.as_deref()
-    }
-
     // ── stack-info modal ────────────────────────────────────────────────
 
     /// Open the stack-info modal for the focused stack. `slot` is the port
     /// slot it holds (looked up by the caller off the render path, since that
     /// reads the allocator registry); `None` when unknown or for the shared
-    /// row. `remote_host` is the reachable hostname when this TUI is attached
-    /// to a remote stack (over `devme remote`) — it surfaces as a leading
-    /// `Host` row so the remote path/slot below read as remote, and is itself
-    /// copyable to `ssh` in. `None` for a local TUI (no Host row). A no-op if
-    /// there's nothing to describe.
-    pub fn open_stack_info(&mut self, slot: Option<u8>, remote_host: Option<String>) {
-        let (title, fields) = self.build_stack_info(slot, remote_host);
+    /// row. A no-op if there's nothing to describe.
+    pub fn open_stack_info(&mut self, slot: Option<u8>) {
+        let (title, fields) = self.build_stack_info(slot);
         if fields.is_empty() {
             return;
         }
@@ -2181,25 +2148,14 @@ impl TuiState {
 
     /// Assemble the modal's heading and rows for whatever is focused — a
     /// worktree stack (branch / path / slot / status / id) or the shared row
-    /// (id / status), with a leading `Host` row when `remote_host` is set.
-    /// Pure: reads only in-memory state plus the passed slot/host.
-    fn build_stack_info(
-        &self,
-        slot: Option<u8>,
-        remote_host: Option<String>,
-    ) -> (String, Vec<StackInfoField>) {
+    /// (id / status). Pure: reads only in-memory state plus the passed slot.
+    fn build_stack_info(&self, slot: Option<u8>) -> (String, Vec<StackInfoField>) {
         let mut fields = Vec::new();
         let copyable = |label: &'static str, value: String| StackInfoField {
             label,
             value,
             copyable: true,
         };
-        // On a remote TUI, lead with the host so the path/slot below read as
-        // remote (and the host itself is copyable to ssh in).
-        if let Some(host) = remote_host {
-            fields.push(copyable("Host", host));
-        }
-
         if self.shared_selected {
             if let Some(id) = &self.shared.id {
                 fields.push(copyable("Instance id", id.clone()));
@@ -4054,7 +4010,7 @@ mod tests {
         s.apply(snapshot_msg(&["api"]));
         s.apply_git_refresh("test-id", Some("feature/x".into()), Some((1, 2)));
 
-        s.open_stack_info(Some(3), None);
+        s.open_stack_info(Some(3));
         let info = s.stack_info().expect("modal open");
         assert_eq!(info.title, "feature/x");
         // Status / PR / Merged / Remove are info-only; the rest copy.
@@ -4093,38 +4049,10 @@ mod tests {
     }
 
     #[test]
-    fn stack_info_leads_with_host_on_remote() {
-        let mut s = TuiState::default();
-        s.apply(snapshot_msg(&["api"]));
-        s.open_stack_info(Some(3), Some("vps.tail123.ts.net".into()));
-        let info = s.stack_info().expect("modal open");
-        // Host leads the rows and the cursor starts on it.
-        assert_eq!(info.fields[0].label, "Host");
-        assert_eq!(
-            s.stack_info_field("Host").as_deref(),
-            Some("vps.tail123.ts.net")
-        );
-        assert_eq!(
-            s.stack_info_selected_value().as_deref(),
-            Some("vps.tail123.ts.net")
-        );
-        // A local TUI (no host) has no Host row.
-        s.close_stack_info();
-        s.open_stack_info(Some(3), None);
-        assert!(
-            s.stack_info()
-                .unwrap()
-                .fields
-                .iter()
-                .all(|f| f.label != "Host")
-        );
-    }
-
-    #[test]
     fn stack_info_cursor_skips_info_only_rows() {
         let mut s = TuiState::default();
         s.apply(snapshot_msg(&["api"]));
-        s.open_stack_info(None, None); // no slot → Branch, Path, Status, Instance id
+        s.open_stack_info(None); // no slot → Branch, Path, Status, Instance id
 
         // Down past Path lands on Instance id, hopping over the Status row.
         s.stack_info_move(1); // Path
@@ -4174,7 +4102,7 @@ mod tests {
     fn pr_result_refreshes_open_stack_info_in_place() {
         let mut s = TuiState::default();
         s.apply(snapshot_msg(&["api"]));
-        s.open_stack_info(Some(1), None);
+        s.open_stack_info(Some(1));
         // The async gh lookup lands while the modal is open → rows update.
         s.apply_pr_info("test-id", Some(pr("OPEN")));
         let info = s.stack_info().expect("modal still open");

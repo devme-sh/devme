@@ -4,7 +4,8 @@
 # ~/.config. Patterned after scripts/tui-smoke.sh.
 set -uo pipefail
 
-DEVME="$HOME/.cargo/bin/devme"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DEVME="${1:-$REPO_ROOT/target/release/devme}"
 TMUX_BIN="$(command -v tmux)"
 ROOT="$(mktemp -d /tmp/skill-modal.XXXXXX)"
 SESSION="skill-modal-$$"
@@ -77,7 +78,7 @@ launch
 assert_has "AI skill" "install-title-2"
 "$TMUX_BIN" send-keys -t "$SESSION" "n"; sleep 1
 assert_absent "Install it" "dismissed-by-n"
-assert_has "help" "footer-back"        # footer keybindings visible again
+assert_has "d dashboard" "footer-back" # Home keybindings visible again
 quit_tui
 if [ -f "$PROJ/.claude/skills/devme/SKILL.md" ]; then
   echo "  FAIL [n-no-install] file was written on dismiss"; fails=$((fails + 1))

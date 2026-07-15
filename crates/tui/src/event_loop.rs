@@ -110,11 +110,6 @@ async fn launch_impl(
     if let Some(warning) = cfg_warning {
         state.push_config_warning(warning);
     }
-    // When attached over `devme remote`, the whole session lives on the remote
-    // host — record it so the sidebar can badge it and the info modal can lead
-    // with the host (so its remote path/slot read as remote).
-    state.set_remote_host(is_remote_tui().then(service_url_host));
-
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -228,6 +223,10 @@ async fn run(
             evt = key_rx.recv() => match evt {
                 Some(Event::Key(k)) => {
                     if matches!(k.kind, KeyEventKind::Release) {
+                        continue;
+                    }
+                    if state.skill_dialog_visible() {
+                        handle_skill_dialog_key(state, k.code);
                         continue;
                     }
                     if state.home_visible() {
@@ -428,8 +427,7 @@ async fn run(
                                 }
                                 return Ok(());
                             }
-                            // Detach: quit the TUI but leave services running —
-                            // for `devme remote` this keeps the remote stack up.
+                            // Detach: quit the TUI but leave services running.
                             KeyCode::Char('d') | KeyCode::Char('D') => return Ok(()),
                             KeyCode::Char('n') | KeyCode::Esc => state.cancel_quit_confirm(),
                             _ => {}
@@ -438,26 +436,7 @@ async fn run(
                         // rest so the choice is deliberate. Install offers
                         // i/g/n; update offers u/a/n.
                         _ if state.skill_dialog_visible() => {
-                            use crate::state::SkillPrompt;
-                            let kind = state.skill_dialog().map(|d| d.kind);
-                            match (kind, k.code) {
-                                (Some(SkillPrompt::Install), KeyCode::Char('i')) => {
-                                    state.apply_skill_install(false)
-                                }
-                                (Some(SkillPrompt::Install), KeyCode::Char('g')) => {
-                                    state.apply_skill_install(true)
-                                }
-                                (Some(SkillPrompt::Update), KeyCode::Char('u')) => {
-                                    state.apply_skill_update(false)
-                                }
-                                (Some(SkillPrompt::Update), KeyCode::Char('a')) => {
-                                    state.apply_skill_update(true)
-                                }
-                                (_, KeyCode::Char('n') | KeyCode::Esc) => {
-                                    state.dismiss_skill_dialog()
-                                }
-                                _ => {}
-                            }
+                            handle_skill_dialog_key(state, k.code);
                         }
                         // Settings overlay is modal: route its keys here and
                         // swallow the rest. Changes persist + apply live.
@@ -651,14 +630,7 @@ async fn run(
                                     // browser, with a toast so it's never a
                                     // silent no-op. Only web (`http(s)://`)
                                     // services are openable; a database's bare
-                                    // `host:port` is copied instead. On a
-                                    // remote TUI the browser must open on the
-                                    // *laptop*, not this headless host — the
-                                    // open request rides the live-sync down
-                                    // (see `remote::OPEN_URL_FILE`) and the
-                                    // laptop-side `devme remote` watcher opens
-                                    // it locally.
-                                    let remote = is_remote_tui();
+                                    // `host:port` is copied instead.
                                     let sel = state
                                         .selected_service()
                                         .map(|s| (s.name.clone(), s.url.clone(), s.port));
@@ -668,14 +640,7 @@ async fn run(
                                             state.notify("open", format!("{name} has no URL"));
                                         }
                                         Some((name, Some(tmpl), port)) => {
-                                            // Remote: build the URL with the
-                                            // laptop-reachable host, same as `c`.
-                                            let host = if remote {
-                                                service_url_host()
-                                            } else {
-                                                "localhost".to_string()
-                                            };
-                                            match resolve_service_url(&tmpl, port, &host) {
+                                            match resolve_service_url(&tmpl, port, "localhost") {
                                                 None => state.notify(
                                                     "open",
                                                     format!("{name} has no port yet"),
@@ -684,31 +649,12 @@ async fn run(
                                                     if url.starts_with("http://")
                                                         || url.starts_with("https://") =>
                                                 {
-                                                    if remote {
-                                                        match write_open_request(
-                                                            state.current_instance_cwd(),
-                                                            &url,
-                                                        ) {
-                                                            Ok(()) => state.notify(
-                                                                "open",
-                                                                format!("→ laptop: {url}"),
-                                                            ),
-                                                            Err(e) => state.notify(
-                                                                "open",
-                                                                format!(
-                                                                    "couldn't reach laptop ({e}) — press c to copy"
-                                                                ),
-                                                            ),
-                                                        }
-                                                    } else {
-                                                        match devme_config::browser::open_url(&url)
-                                                        {
-                                                            Ok(()) => state.notify("open", url),
-                                                            Err(e) => state.notify(
-                                                                "open",
-                                                                format!("couldn't open: {e}"),
-                                                            ),
-                                                        }
+                                                    match devme_config::browser::open_url(&url) {
+                                                        Ok(()) => state.notify("open", url),
+                                                        Err(e) => state.notify(
+                                                            "open",
+                                                            format!("couldn't open: {e}"),
+                                                        ),
                                                     }
                                                 }
                                                 // No scheme → not browser-openable
@@ -731,11 +677,8 @@ async fn run(
                                 }
                                 Action::CopyUrl => {
                                     // Copy the focused service's URL to the
-                                    // clipboard. Uses the service-URL host (the
-                                    // remote-injected DEVME_URL_HOST, e.g. a
-                                    // Tailscale name, else localhost) so a copy
-                                    // from a remote TUI is reachable from the
-                                    // laptop. OSC 52 carries it back over SSH.
+                                    // clipboard. OSC 52 carries it through an
+                                    // SSH terminal when supported.
                                     let sel = state
                                         .selected_service()
                                         .map(|s| (s.name.clone(), s.url.clone(), s.port));
@@ -745,7 +688,7 @@ async fn run(
                                             state.notify_transient("copy", format!("{name} has no URL"));
                                         }
                                         Some((name, Some(tmpl), port)) => {
-                                            match resolve_service_url(&tmpl, port, &service_url_host()) {
+                                            match resolve_service_url(&tmpl, port, "localhost") {
                                                 None => state.notify(
                                                     "copy",
                                                     format!("{name} has no port yet"),
@@ -767,11 +710,7 @@ async fn run(
                                     } else {
                                         crate::worktree::slot_for_cwd(state.current_instance_cwd())
                                     };
-                                    // On a remote TUI the path/slot are the
-                                    // remote host's — surface the host so they
-                                    // read as remote (and it's copyable to ssh).
-                                    let remote_host = state.remote_host().map(str::to_string);
-                                    state.open_stack_info(slot, remote_host);
+                                    state.open_stack_info(slot);
                                     // Kick a fresh PR lookup so the modal's
                                     // "checking…" resolves in seconds (the
                                     // periodic cadence is a minute).
@@ -1056,6 +995,19 @@ async fn run(
     }
 }
 
+fn handle_skill_dialog_key(state: &mut TuiState, code: KeyCode) {
+    use crate::state::SkillPrompt;
+    let kind = state.skill_dialog().map(|dialog| dialog.kind);
+    match (kind, code) {
+        (Some(SkillPrompt::Install), KeyCode::Char('i')) => state.apply_skill_install(false),
+        (Some(SkillPrompt::Install), KeyCode::Char('g')) => state.apply_skill_install(true),
+        (Some(SkillPrompt::Update), KeyCode::Char('u')) => state.apply_skill_update(false),
+        (Some(SkillPrompt::Update), KeyCode::Char('a')) => state.apply_skill_update(true),
+        (_, KeyCode::Char('n') | KeyCode::Esc) => state.dismiss_skill_dialog(),
+        _ => {}
+    }
+}
+
 fn initial_start_message(is_home: bool, home_targets: Option<&[String]>) -> ClientMessage {
     if is_home {
         home_targets.map_or(
@@ -1204,15 +1156,6 @@ fn run_port_remediation(action: &crate::state::PortConflictAction) -> Result<Str
     }
 }
 
-/// Host to build service URLs from. When the TUI runs on a remote host,
-/// this is the browser-reachable name (e.g. a Tailscale MagicDNS name) so a
-/// copied/opened URL works from the laptop. Resolution is shared with
-/// `devme url`: `$DEVME_URL_HOST` (injected by the attach templates and the
-/// herdr session server env) → `remote.advertise_host` config → localhost.
-fn service_url_host() -> String {
-    devme_config::remote::advertise_host()
-}
-
 /// Fill a service URL template's `{host}`/`{port}` placeholders. Returns
 /// `None` when the template needs a port the service hasn't resolved yet.
 /// A verbatim URL (no placeholders) passes through unchanged.
@@ -1225,40 +1168,6 @@ fn resolve_service_url(template: &str, port: Option<u16>, host: &str) -> Option<
         url = url.replace("{port}", &p.to_string());
     }
     Some(url)
-}
-
-/// True when this TUI is the remote stack's TUI, attached from a laptop.
-/// Opening a browser here would land on the headless host, so `o` forwards
-/// the open to the laptop instead. Two signals, either suffices:
-///
-/// - `DEVME_URL_HOST` env — injected by the ssh/tmux attach templates and
-///   the herdr session server's environment.
-/// - `remote.advertise_host` config — set only on machines that *host*
-///   remote stacks (a laptop never sets it), so it catches panes whose
-///   environment devme didn't shape (a herdr server the user started
-///   themselves, brew services, …).
-fn is_remote_tui() -> bool {
-    std::env::var_os("DEVME_URL_HOST").is_some_and(|v| !v.is_empty())
-        || devme_config::GlobalConfig::load()
-            .remote
-            .advertise_host
-            .is_some_and(|h| !h.trim().is_empty())
-}
-
-/// Ask the laptop to open `url`: write the one-shot request file into the
-/// project root, where the live-sync carries it to the laptop and the
-/// `devme remote` watcher opens + deletes it. The wall-clock-millis seq lets
-/// the watcher distinguish a fresh request from one it already served.
-fn write_open_request(instance_cwd: &str, url: &str) -> std::io::Result<()> {
-    let seq = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(1);
-    let path = std::path::Path::new(instance_cwd).join(devme_config::remote::OPEN_URL_FILE);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(&path, devme_config::remote::open_request_json(seq, url))
 }
 
 /// Toast body for a log-copy action, pluralised. `scope` is "visible"/"all".

@@ -134,10 +134,8 @@ pub struct Service {
 impl Service {
     /// A copy/open URL *template* for this service, or `None` when there's
     /// nothing to point at (no port). `{host}` and `{port}` are placeholders
-    /// the client fills with the reachable host (localhost, or a remote name)
-    /// and the service's resolved port — kept as placeholders because the host
-    /// is a client-side concern (remote TUIs rewrite it) and the port isn't
-    /// known until spawn.
+    /// the client fills with `localhost` and the service's resolved port. The
+    /// port remains a placeholder because it isn't known until spawn.
     ///
     /// An `http` health check means the service speaks HTTP, so it gets a
     /// browser-openable `http(s)://{host}:{port}`. Everything else (databases,

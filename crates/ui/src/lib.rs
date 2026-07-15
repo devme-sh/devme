@@ -6,7 +6,7 @@
 //!   Tables, URLs, JSON, and log lines go to stdout; progress, narration,
 //!   warnings, and errors go to stderr via the one-liner helpers here.
 //! - **One-liners** are `devme: <msg>` (optionally scoped:
-//!   `devme remote: <msg>`). `info`/`success`/`hint` are quiet-gated;
+//!   `devme config: <msg>`). `info`/`success`/`hint` are quiet-gated;
 //!   `warn`/`error` always print.
 //! - **Sections** are the clack-style tree (`◆ │ ◇ └`) — the only
 //!   multi-line progress style. Items are `◇` done / `⚠` attention /
@@ -201,7 +201,7 @@ pub const fn root() -> Scope {
     Scope("")
 }
 
-/// A subcommand scope: `scoped("remote")` → `devme remote: …`.
+/// A subcommand scope: `scoped("config")` → `devme config: …`.
 pub const fn scoped(name: &'static str) -> Scope {
     Scope(name)
 }
@@ -571,10 +571,10 @@ mod tests {
     #[test]
     fn scope_prefixes() {
         assert_eq!(root().prefix(), "devme:");
-        assert_eq!(scoped("remote").prefix(), "devme remote:");
+        assert_eq!(scoped("config").prefix(), "devme config:");
         assert_eq!(
-            scoped("remote").format(glyph::WARN, ansi::YELLOW, "sync down", Style::PLAIN),
-            "devme remote: ⚠ sync down"
+            scoped("config").format(glyph::WARN, ansi::YELLOW, "invalid setting", Style::PLAIN),
+            "devme config: ⚠ invalid setting"
         );
         assert_eq!(
             root().format("", "", "started", Style::PLAIN),

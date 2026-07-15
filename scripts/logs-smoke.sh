@@ -15,6 +15,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEVME="${1:-$REPO_ROOT/target/release/devme}"
 FIXTURE="$(mktemp -d /tmp/devme-logs-smoke.XXXXXX)"
+export XDG_CONFIG_HOME="$FIXTURE/config"
+mkdir -p "$XDG_CONFIG_HOME"
 
 if [[ ! -x "$DEVME" ]]; then
   echo "devme binary not found at $DEVME — run 'cargo build --release' first" >&2

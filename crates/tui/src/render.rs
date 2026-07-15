@@ -50,6 +50,9 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
 
     if state.home_visible() {
         render_home(frame, area, state);
+        if let Some(dlg) = state.skill_dialog() {
+            render_skill_dialog(frame, area, dlg);
+        }
         return;
     }
 
@@ -1135,8 +1138,8 @@ fn render_stopped(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
 }
 
 /// Small centred quit modal offering a choice: stop every service and quit,
-/// or detach (leave services running — the remote stack stays up under
-/// `devme remote`). Shown on `q` when `tui.confirm_quit` is on (the default).
+/// or detach and leave services running. Shown on `q` when
+/// `tui.confirm_quit` is on (the default).
 fn render_quit_confirm(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let p = *state.palette();
     let w = 52u16.min(area.width.saturating_sub(4));
@@ -1691,42 +1694,6 @@ fn health_dot(p: &Palette, health: crate::state::StackHealth) -> (&'static str, 
     }
 }
 
-/// Shorten a remote host for the sidebar badge: drop any `user@`, keep the
-/// first DNS label (`vps.tail069899.ts.net` → `vps`), capped so a long name
-/// can't crowd the sidebar.
-fn short_host(host: &str) -> String {
-    let after_at = host.rsplit('@').next().unwrap_or(host);
-    let first = after_at.split('.').next().unwrap_or(after_at);
-    theme::truncate(first, 14)
-}
-
-/// The stacks-section header with a right-aligned remote badge (`⇅ host`),
-/// shown when the TUI is attached to a remote stack so the whole sidebar
-/// clearly reads as living on another host. The `⇅` echoes the sync that
-/// `devme remote` runs; the host names which box. Falls back to the plain
-/// `section_header` locally.
-fn render_stacks_header_remote(p: &Palette, frame: &mut Frame<'_>, area: Rect, host: &str) {
-    if area.height == 0 {
-        return;
-    }
-    let width = area.width as usize;
-    let badge = format!("⇅ {} ", short_host(host));
-    let left = " stacks";
-    let pad = width.saturating_sub(left.chars().count() + badge.chars().count());
-    let line = Line::from(vec![
-        Span::styled(
-            left,
-            Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(
-            badge,
-            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(line), Rect { height: 1, ..area });
-}
-
 /// Header label for a sidebar section — a quiet lowercase tag, herdr-style.
 fn section_header(p: &Palette, frame: &mut Frame<'_>, area: Rect, label: &str) {
     if area.height == 0 {
@@ -1868,12 +1835,7 @@ fn render_stacks_pane(p: &Palette, frame: &mut Frame<'_>, area: Rect, state: &mu
     if area.height == 0 {
         return;
     }
-    // When attached to a remote stack, badge the header so it's unmistakable
-    // the whole sidebar lives on another host; otherwise a plain header.
-    match state.remote_host() {
-        Some(host) => render_stacks_header_remote(p, frame, area, host),
-        None => section_header(p, frame, area, "stacks"),
-    }
+    section_header(p, frame, area, "stacks");
 
     let selected = state.selected_instance_index();
     let shared_active = state.shared_selected();
@@ -2143,15 +2105,6 @@ fn format_main_title(state: &TuiState) -> Line<'_> {
         spans.push(Span::styled(
             format!("• {failed} failed"),
             Style::default().fg(p.red),
-        ));
-    }
-    // Remote marker in the always-visible title bar so remoteness survives a
-    // collapsed sidebar (where the `⇅ host` header badge is hidden).
-    if let Some(host) = state.remote_host() {
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            format!("⇅ {}", short_host(host)),
-            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
         ));
     }
     spans.push(Span::raw(" "));
@@ -3273,38 +3226,6 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_badges_remote_host() {
-        let mut state = TuiState::default();
-        state.apply(ServerMessage::Subscribed {
-            instance: InstanceInfo {
-                id: "id".into(),
-                label: "main".into(),
-                cwd: "/srv/app".into(),
-            },
-            services: vec![],
-            steps: vec![],
-        });
-
-        // Local: a plain header, no badge.
-        let text = render_to_text(&mut state, 100, 20);
-        assert!(!text.contains("⇅"), "remote badge leaked locally:\n{text}");
-
-        // Remote: the stacks header gains a `⇅ <short host>` badge.
-        state.set_remote_host(Some("vps.tail069899.ts.net".into()));
-        let text = render_to_text(&mut state, 100, 20);
-        assert!(text.contains("⇅"), "remote badge missing:\n{text}");
-        assert!(
-            text.contains("vps"),
-            "short host missing from badge:\n{text}"
-        );
-        // The long DNS suffix is dropped — only the first label shows.
-        assert!(
-            !text.contains("tail069899"),
-            "badge should shorten the host:\n{text}"
-        );
-    }
-
-    #[test]
     fn stack_info_overlay_renders_fields_when_open() {
         let mut state = TuiState::default();
         state.apply(ServerMessage::Subscribed {
@@ -3331,7 +3252,7 @@ mod tests {
             "modal leaked when hidden:\n{text}"
         );
 
-        state.open_stack_info(Some(2), None);
+        state.open_stack_info(Some(2));
         let text = render_to_text(&mut state, 100, 30);
         assert!(text.contains("feature/x"), "branch/title missing:\n{text}");
         assert!(text.contains("/tmp/wt-x"), "worktree path missing:\n{text}");
@@ -3475,29 +3396,6 @@ mod tests {
         assert!(
             text.contains(name),
             "tool label clipped despite fitting the sidebar:\n{text}"
-        );
-    }
-
-    #[test]
-    fn title_bar_marks_remote() {
-        let mut state = TuiState::default();
-        state.apply(ServerMessage::Subscribed {
-            instance: InstanceInfo {
-                id: "id".into(),
-                label: "main".into(),
-                cwd: "/srv/app".into(),
-            },
-            services: vec![],
-            steps: vec![],
-        });
-        // Collapse the sidebar so the header badge is gone — the title must
-        // still carry the remote marker.
-        state.toggle_sidebar();
-        state.set_remote_host(Some("vps.tail069899.ts.net".into()));
-        let text = render_to_text(&mut state, 100, 20);
-        assert!(
-            text.contains("⇅ vps"),
-            "title-bar remote marker missing:\n{text}"
         );
     }
 

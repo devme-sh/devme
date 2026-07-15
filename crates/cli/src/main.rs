@@ -9,8 +9,8 @@ use base64::Engine;
 use clap::{CommandFactory, Parser, error::ErrorKind};
 use clap_complete::{Shell, generate};
 use devme_cli::{
-    Cli, Command, ConfigAction, RemoteAction, SkillAction, WorktreeAction, format_status_all,
-    format_status_json, format_status_text,
+    Cli, Command, ConfigAction, SkillAction, WorktreeAction, format_status_all, format_status_json,
+    format_status_text,
 };
 use devme_config::Stack;
 use devme_core::{ClientMessage, ServerMessage, ServiceState};
@@ -283,22 +283,11 @@ fn initialize_project_context() {
 }
 
 async fn run(cli: Cli) -> i32 {
-    // Transparent remote proxy: while this project has a live remote sync,
-    // daemon-facing commands (status, logs, up, …) run on the remote host so
-    // they behave exactly as local but read the VPS. `--local` opts out. See
-    // DEV-5.
-    if !cli.local
-        && let Some(code) = devme_cli::remote::maybe_proxy(&cli.command)
-    {
-        return code;
+    let interactive_default =
+        cli.command.is_none() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if !interactive_default && let (_, Some(warning)) = devme_config::GlobalConfig::load_checked() {
+        devme_ui::warn(warning);
     }
-
-    // The global interactivity flags, packaged once for the remote paths.
-    let remote_flags = devme_cli::remote::RunFlags {
-        no_input: cli.no_input,
-        yes: cli.yes,
-        quiet: cli.quiet,
-    };
     let command_output = match &cli.command {
         Some(Command::Status { output, .. }) | Some(Command::Doctor { output, .. }) => *output,
         _ => devme_cli::OutputFormat::Human,
@@ -315,15 +304,11 @@ async fn run(cli: Cli) -> i32 {
 
     let result = match cli.command {
         None => {
-            return launch_default(
-                cli.local,
-                remote_flags,
-                if cli.json {
-                    devme_cli::OutputFormat::Json
-                } else {
-                    devme_cli::OutputFormat::Toon
-                },
-            )
+            return launch_default(if cli.json {
+                devme_cli::OutputFormat::Json
+            } else {
+                devme_cli::OutputFormat::Toon
+            })
             .await;
         }
         Some(Command::Session {
@@ -485,7 +470,6 @@ async fn run(cli: Cli) -> i32 {
         }
         Some(Command::Config { action }) => config_cmd(action, cli.json),
         Some(Command::Worktree { action }) => worktree_cmd(action, cli.json).await,
-        Some(Command::Remote { action }) => remote_cmd(action, cli.json, remote_flags),
         Some(Command::Skill { action }) => skill_cmd(action, cli.json),
         Some(Command::Agent { action }) => {
             let output = if cli.json {
@@ -1295,7 +1279,7 @@ async fn status_all(output: devme_cli::OutputFormat) -> anyhow::Result<()> {
     }
     for r in reports.iter_mut() {
         if let Some(services) = &mut r.services {
-            devme_cli::resolve_service_urls(services, &devme_cli::remote::advertise_host());
+            devme_cli::resolve_service_urls(services, "localhost");
         }
     }
     if output == devme_cli::OutputFormat::Human {
@@ -1351,12 +1335,7 @@ async fn url(service: String, open: bool) -> anyhow::Result<()> {
     let port = svc
         .port
         .ok_or_else(|| anyhow::anyhow!("service {service:?} has no port to build a URL from"))?;
-    // Advertise a reachable host: on the VPS (with `remote.advertise_host` or
-    // `$DEVME_URL_HOST` set) this hands back a laptop-reachable link instead of
-    // `localhost`, so an agent in a herdr pane can print a clickable URL. On a
-    // plain laptop it stays `localhost`. See remote::advertise_host.
-    let host = devme_cli::remote::advertise_host();
-    let url = format!("http://{host}:{port}");
+    let url = format!("http://localhost:{port}");
     println!("{url}");
     if !open {
         return Ok(());
@@ -1394,7 +1373,7 @@ async fn status(output: devme_cli::OutputFormat) -> anyhow::Result<()> {
             }
             // Hand out ready-to-use URLs — agents reading `--json` shouldn't
             // have to resolve `{host}`/`{port}` templates themselves.
-            devme_cli::resolve_service_urls(&mut services, &devme_cli::remote::advertise_host());
+            devme_cli::resolve_service_urls(&mut services, "localhost");
             let sessions = query_live_sessions(&cwd).await;
             let resource_waiters =
                 devme_cli::task::read_resource_waiters(Some(&cwd)).unwrap_or_default();
@@ -1656,9 +1635,7 @@ async fn up(services: Vec<String>, detach: bool, wait: bool, timeout: u64) -> an
             devme_ui::hint("devme status — snapshot");
             devme_ui::hint("devme down — stop everything");
         } else {
-            // Re-entry — the stack was already up; one line, no hint block
-            // (it printed when the daemon booted, and `devme remote` re-runs
-            // `up -d` on every attach).
+            // Re-entry — the stack was already up; one line, no hint block.
             devme_ui::success(format!("{n} service{plural} up; daemon already running"));
         }
         maybe_skill_update();
@@ -2810,10 +2787,7 @@ fn config_cmd(action: Option<ConfigAction>, json: bool) -> anyhow::Result<()> {
     match action {
         Some(ConfigAction::Check) => config_check(json),
         None => {
-            let (cfg, warning) = GlobalConfig::load_checked();
-            if let Some(w) = warning {
-                devme_ui::warn(w);
-            }
+            let cfg = GlobalConfig::load();
             for (key, desc) in GlobalConfig::keys() {
                 let value = cfg.get(key).unwrap_or_else(|| "(unset)".into());
                 println!("{key:<24} {value:<20} # {desc}");
@@ -2821,10 +2795,7 @@ fn config_cmd(action: Option<ConfigAction>, json: bool) -> anyhow::Result<()> {
             Ok(())
         }
         Some(ConfigAction::Get { key }) => {
-            let (cfg, warning) = GlobalConfig::load_checked();
-            if let Some(w) = warning {
-                devme_ui::warn(w);
-            }
+            let cfg = GlobalConfig::load();
             match cfg.get(&key) {
                 Some(v) => println!("{v}"),
                 None => println!("(unset)"),
@@ -2984,28 +2955,6 @@ async fn worktree_cmd(action: WorktreeAction, json: bool) -> anyhow::Result<()> 
     }
 }
 
-/// `devme remote …` — live-sync + attach to a remote dev host. Shells out
-/// to `mutagen`/`ssh`, so it's synchronous (no devme daemon involved).
-fn remote_cmd(
-    action: Option<RemoteAction>,
-    json: bool,
-    flags: devme_cli::remote::RunFlags,
-) -> anyhow::Result<()> {
-    let cwd = std::env::current_dir()?;
-    match action {
-        None => devme_cli::remote::run(&cwd, flags),
-        Some(RemoteAction::Doctor) => devme_cli::remote::doctor(&cwd, json),
-        Some(RemoteAction::Status { watch }) => devme_cli::remote::status(&cwd, json, watch),
-        Some(RemoteAction::Conflicts) => devme_cli::remote::conflicts(&cwd, json),
-        Some(RemoteAction::Sync) => devme_cli::remote::sync(&cwd),
-        Some(RemoteAction::Flush) => devme_cli::remote::flush(&cwd),
-        Some(RemoteAction::Stop) => devme_cli::remote::stop(&cwd),
-        Some(RemoteAction::Wake) => devme_cli::remote::wake(),
-        Some(RemoteAction::Toggle) => devme_cli::remote::toggle(),
-        Some(RemoteAction::WakeHook { uninstall }) => devme_cli::remote::wake_hook(uninstall),
-    }
-}
-
 /// `devme skill …` — manage the embedded AI agent skill. Pure filesystem
 /// work, so it's synchronous (no daemon involved).
 fn skill_cmd(action: SkillAction, json: bool) -> anyhow::Result<()> {
@@ -3021,17 +2970,11 @@ fn print_completions(shell: Shell) {
     generate(shell, &mut cmd, "devme", &mut std::io::stdout());
 }
 
-/// Bare `devme` entry point. With `remote.default = true` (and a host set),
-/// the project is remote-first, so this behaves as `devme remote` — ensure
-/// the live-sync, then attach to the remote stack's TUI. Otherwise it opens
-/// the local TUI. `--local` forces the local TUI regardless.
-async fn launch_default(
-    force_local: bool,
-    flags: devme_cli::remote::RunFlags,
-    context_format: devme_cli::OutputFormat,
-) -> i32 {
+/// Bare `devme` entry point. Non-interactive use prints agent context;
+/// interactive use opens the runtime TUI on the current host.
+async fn launch_default(context_format: devme_cli::OutputFormat) -> i32 {
     if context_format == devme_cli::OutputFormat::Json
-        || flags.no_input
+        || NO_INPUT.load(Ordering::Relaxed)
         || !std::io::stdin().is_terminal()
         || !std::io::stdout().is_terminal()
     {
@@ -3042,24 +2985,6 @@ async fn launch_default(
             },
             Err(error) => emit_command_error(context_format, &error.into()),
         };
-    }
-    if !force_local {
-        let cfg = devme_config::GlobalConfig::load();
-        if cfg.remote.is_default() && cfg.remote.host.is_some() {
-            return match std::env::current_dir() {
-                Ok(cwd) => match devme_cli::remote::run(&cwd, flags) {
-                    Ok(()) => 0,
-                    Err(e) => {
-                        devme_ui::error(e);
-                        1
-                    }
-                },
-                Err(e) => {
-                    devme_ui::error(e);
-                    1
-                }
-            };
-        }
     }
     let mut focused_session = None;
     if let Some(workspace) = PROJECT_WORKSPACE.get() {
@@ -3330,8 +3255,8 @@ async fn ensure_daemon_with_preflight_targets(
     // Re-entrant `up` (daemon already listening): skip the boot preflight —
     // env resolution, dependency checks, Docker, port probes all gated the
     // *boot* that already happened, and re-running them adds seconds and a
-    // full "Check dependencies" tree to every re-attach (`devme remote` runs
-    // `up -d` on each attach). A daemon that's alive resolved its env and
+    // full "Check dependencies" tree to every re-attach. A daemon that's
+    // alive resolved its env and
     // passed its checks when it booted; if dependencies broke since, `devme
     // doctor` (or `down` + `up`) is the re-check path.
     if devme_client::Client::connect(sock).await.is_ok() {

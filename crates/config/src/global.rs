@@ -18,8 +18,6 @@ pub struct GlobalConfig {
     pub skill: SkillConfig,
     #[serde(default, skip_serializing_if = "TuiConfig::is_empty")]
     pub tui: TuiConfig,
-    #[serde(default, skip_serializing_if = "crate::RemoteConfig::is_empty")]
-    pub remote: crate::RemoteConfig,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,23 +117,14 @@ impl GlobalConfig {
             // Missing file is the normal first-run case — not a warning.
             Err(_) => return (Self::default(), None),
         };
-        match toml::from_str(&text) {
-            Ok(cfg) => (cfg, None),
-            Err(e) => {
-                let first = e
-                    .to_string()
-                    .lines()
-                    .next()
-                    .unwrap_or("parse error")
-                    .to_string();
-                (
-                    Self::default(),
-                    Some(format!(
-                        "{} has an error ({first}); using defaults",
-                        path.display()
-                    )),
-                )
-            }
+        parse_config_text(&path, &text)
+    }
+
+    #[cfg(test)]
+    fn load_checked_from(path: &Path) -> (Self, Option<String>) {
+        match std::fs::read_to_string(path) {
+            Ok(text) => parse_config_text(path, &text),
+            Err(_) => (Self::default(), None),
         }
     }
 
@@ -171,7 +160,7 @@ impl GlobalConfig {
             .ok_or_else(|| format!("config key must be `section.key`, got: {key}"))?;
         let path = global_config_path();
         let content = std::fs::read_to_string(&path).unwrap_or_default();
-        let updated = crate::surgical::remove_section_key(&content, section, leaf);
+        let updated = remove_key_from_text(&content, section, leaf);
         write_atomic(&path, &updated).map_err(|e| e.to_string())
     }
 
@@ -197,14 +186,6 @@ impl GlobalConfig {
             "tui.theme" => self.tui.theme.clone(),
             "tui.confirm_quit" => self.tui.confirm_quit.map(|b| b.to_string()),
             "tui.toasts" => self.tui.toasts.map(|b| b.to_string()),
-            "remote.host" => self.remote.host.clone(),
-            "remote.root" => self.remote.root.clone(),
-            "remote.sync_mode" => self.remote.sync_mode.clone(),
-            "remote.attach" => self.remote.attach.clone(),
-            "remote.url_host" => self.remote.url_host.clone(),
-            "remote.advertise_host" => self.remote.advertise_host.clone(),
-            "remote.up_on_attach" => self.remote.up_on_attach.map(|b| b.to_string()),
-            "remote.default" => self.remote.default.map(|b| b.to_string()),
             _ => None,
         }
     }
@@ -244,44 +225,9 @@ impl GlobalConfig {
                 self.tui.toasts = Some(b);
                 Ok(())
             }
-            "remote.host" => {
-                self.remote.host = Some(value.to_string());
-                Ok(())
-            }
-            "remote.root" => {
-                self.remote.root = Some(value.to_string());
-                Ok(())
-            }
-            "remote.sync_mode" => {
-                crate::remote::validate_sync_mode(value)?;
-                self.remote.sync_mode = Some(value.to_string());
-                Ok(())
-            }
-            "remote.attach" => {
-                self.remote.attach = Some(value.to_string());
-                Ok(())
-            }
-            "remote.url_host" => {
-                self.remote.url_host = Some(value.to_string());
-                Ok(())
-            }
-            "remote.advertise_host" => {
-                self.remote.advertise_host = Some(value.to_string());
-                Ok(())
-            }
-            "remote.up_on_attach" => {
-                let b = parse_bool(value).ok_or_else(|| {
-                    format!("remote.up_on_attach expects true/false, got: {value}")
-                })?;
-                self.remote.up_on_attach = Some(b);
-                Ok(())
-            }
-            "remote.default" => {
-                let b = parse_bool(value)
-                    .ok_or_else(|| format!("remote.default expects true/false, got: {value}"))?;
-                self.remote.default = Some(b);
-                Ok(())
-            }
+            key if key.starts_with("remote.") => Err(format!(
+                "{key} was removed; use Git for project state and devcloud for remote project context"
+            )),
             _ => Err(format!("unknown config key: {key}")),
         }
     }
@@ -312,38 +258,7 @@ impl GlobalConfig {
                 self.tui.toasts = None;
                 Ok(())
             }
-            "remote.host" => {
-                self.remote.host = None;
-                Ok(())
-            }
-            "remote.root" => {
-                self.remote.root = None;
-                Ok(())
-            }
-            "remote.sync_mode" => {
-                self.remote.sync_mode = None;
-                Ok(())
-            }
-            "remote.attach" => {
-                self.remote.attach = None;
-                Ok(())
-            }
-            "remote.url_host" => {
-                self.remote.url_host = None;
-                Ok(())
-            }
-            "remote.advertise_host" => {
-                self.remote.advertise_host = None;
-                Ok(())
-            }
-            "remote.up_on_attach" => {
-                self.remote.up_on_attach = None;
-                Ok(())
-            }
-            "remote.default" => {
-                self.remote.default = None;
-                Ok(())
-            }
+            key if key.starts_with("remote.") => Ok(()),
             _ => Err(format!("unknown config key: {key}")),
         }
     }
@@ -367,38 +282,6 @@ impl GlobalConfig {
             (
                 "tui.toasts",
                 "Show service crash/recovery notifications (true/false)",
-            ),
-            (
-                "remote.host",
-                "Remote dev host: an SSH target (Tailscale MagicDNS name, ~/.ssh/config alias, or user@host)",
-            ),
-            (
-                "remote.root",
-                "Remote parent dir for synced projects (default ~/development)",
-            ),
-            (
-                "remote.sync_mode",
-                "Mutagen sync mode (two-way-safe/two-way-resolved)",
-            ),
-            (
-                "remote.attach",
-                "Attach command after sync: preset (tui/ssh/tmux/herdr) or a raw template",
-            ),
-            (
-                "remote.url_host",
-                "Host for service URLs over a live remote (default: remote.host, e.g. a Tailscale name)",
-            ),
-            (
-                "remote.advertise_host",
-                "Host THIS machine puts in `devme url` output when it runs the stack (a hostname or \"auto\" for its Tailscale name). Set on the remote/VPS.",
-            ),
-            (
-                "remote.up_on_attach",
-                "Ensure the remote stack is up (devme up -d) before attaching (true/false, default true)",
-            ),
-            (
-                "remote.default",
-                "Make bare `devme` behave as `devme remote` (true/false)",
             ),
         ]
     }
@@ -452,13 +335,23 @@ fn parse_bool(value: &str) -> Option<bool> {
 /// string-typed `hints.skills`) is quoted.
 fn render_toml_value(key: &str, value: &str) -> String {
     match key {
-        "skill.auto_update"
-        | "tui.confirm_quit"
-        | "tui.toasts"
-        | "remote.up_on_attach"
-        | "remote.default" => value.to_string(),
+        "skill.auto_update" | "tui.confirm_quit" | "tui.toasts" => value.to_string(),
         _ => format!("\"{value}\""),
     }
+}
+
+fn remove_key_from_text(content: &str, section: &str, leaf: &str) -> String {
+    let mut updated = crate::surgical::remove_section_key(content, section, leaf);
+    if section == "remote"
+        && toml::from_str::<toml::Value>(&updated)
+            .ok()
+            .and_then(|value| value.get("remote").cloned())
+            .and_then(|value| value.as_table().cloned())
+            .is_some_and(|table| table.is_empty())
+    {
+        updated = crate::surgical::remove_section(&updated, section);
+    }
+    updated
 }
 
 /// Write `content` to `path`, creating the parent dir. Uses a temp file +
@@ -470,6 +363,40 @@ fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, content)?;
     std::fs::rename(&tmp, path)
+}
+
+fn legacy_remote_config_warning(path: &Path) -> String {
+    format!(
+        "{} contains a legacy [remote] section that devme now ignores; remove it, use Git for project state, and use devcloud for remote project context",
+        path.display()
+    )
+}
+
+fn parse_config_text(path: &Path, text: &str) -> (GlobalConfig, Option<String>) {
+    match toml::from_str(text) {
+        Ok(config) => {
+            let warning = toml::from_str::<toml::Value>(text)
+                .ok()
+                .and_then(|value| value.get("remote").cloned())
+                .map(|_| legacy_remote_config_warning(path));
+            (config, warning)
+        }
+        Err(error) => {
+            let first = error
+                .to_string()
+                .lines()
+                .next()
+                .unwrap_or("parse error")
+                .to_string();
+            (
+                GlobalConfig::default(),
+                Some(format!(
+                    "{} has an error ({first}); using defaults",
+                    path.display()
+                )),
+            )
+        }
+    }
 }
 
 /// `~/.config/devme/config.toml` or `$XDG_CONFIG_HOME/devme/config.toml`.
@@ -538,26 +465,24 @@ mod tests {
     }
 
     #[test]
-    fn remote_keys_round_trip_and_validate() {
-        let mut cfg = GlobalConfig::default();
-        assert_eq!(cfg.get("remote.host"), None);
-        cfg.set("remote.host", "vps").unwrap();
-        cfg.set("remote.root", "~/dev").unwrap();
-        cfg.set("remote.sync_mode", "two-way-safe").unwrap();
-        cfg.set("remote.attach", "tui").unwrap();
-        assert_eq!(cfg.get("remote.host"), Some("vps".into()));
-        assert_eq!(cfg.get("remote.sync_mode"), Some("two-way-safe".into()));
-        // Bad sync mode is rejected at set time.
-        assert!(cfg.set("remote.sync_mode", "one-way-replica").is_err());
-        // Round-trips through the file.
+    fn legacy_remote_config_is_ignored_with_a_migration_warning() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
-        cfg.save_to(&path).unwrap();
-        let loaded = GlobalConfig::load_from(&path).unwrap();
-        assert_eq!(loaded.remote.host.as_deref(), Some("vps"));
-        assert_eq!(loaded.remote.attach.as_deref(), Some("tui"));
-        cfg.unset("remote.host").unwrap();
-        assert_eq!(cfg.get("remote.host"), None);
+        let text = "[docker]\ndaemon = \"orbstack\"\n[remote]\nhost = \"vps\"\ndefault = true\n";
+        std::fs::write(&path, text).unwrap();
+
+        let (cfg, warning) = GlobalConfig::load_checked_from(&path);
+        assert_eq!(cfg.docker.daemon.as_deref(), Some("orbstack"));
+        assert!(warning.unwrap().contains("devcloud"));
+        assert!(GlobalConfig::default().set("remote.host", "vps").is_err());
+        assert!(GlobalConfig::default().unset("remote.host").is_ok());
+
+        let without_host = remove_key_from_text(text, "remote", "host");
+        assert!(without_host.contains("[remote]"));
+        let cleaned = remove_key_from_text(&without_host, "remote", "default");
+        assert!(!cleaned.contains("[remote]"));
+        let (_, warning) = parse_config_text(&path, &cleaned);
+        assert!(warning.is_none());
     }
 
     #[test]

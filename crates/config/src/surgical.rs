@@ -89,6 +89,29 @@ pub fn remove_section_key(content: &str, section: &str, key: &str) -> String {
     result.join("\n") + "\n"
 }
 
+/// Remove an entire top-level section, including comments and blank lines in
+/// its body. Used when migration cleanup removes the final legacy key.
+pub fn remove_section(content: &str, section: &str) -> String {
+    let header = format!("[{section}]");
+    let mut result = Vec::new();
+    let mut in_section = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_section = trimmed == header;
+            if in_section {
+                continue;
+            }
+        }
+        if !in_section {
+            result.push(line.to_string());
+        }
+    }
+
+    result.join("\n").trim_end().to_string() + "\n"
+}
+
 /// Does `trimmed` assign to `key` (i.e. `key =` or `key=`)?
 fn is_assignment_for(trimmed: &str, key: &str) -> bool {
     trimmed.starts_with(&format!("{key} ")) || trimmed.starts_with(&format!("{key}="))
@@ -130,5 +153,14 @@ mod tests {
         let updated = remove_section_key(content, "tui", "theme");
         assert!(!updated.contains("theme = \"latte\""));
         assert!(updated.contains("other = 1"));
+    }
+
+    #[test]
+    fn remove_section_drops_its_header_and_body_only() {
+        let content = "[remote]\n# legacy\nhost = \"vps\"\n\n[tui]\ntheme = \"latte\"\n";
+        let updated = remove_section(content, "remote");
+        assert!(!updated.contains("[remote]"));
+        assert!(!updated.contains("host ="));
+        assert!(updated.contains("[tui]"));
     }
 }
