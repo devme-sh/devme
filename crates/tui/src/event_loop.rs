@@ -11,8 +11,10 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 
+use crate::actions::{
+    ActionCatalog, ActionLoader, ActionPanel, TaskApproval, TaskRunner, TaskUpdate,
+};
 use crate::discovery::Registry;
-use crate::home::{ActionCatalog, ActionLoader, HomeState, TaskApproval, TaskRunner, TaskUpdate};
 use crate::keymap;
 use crate::render::render;
 use crate::state::{PointerShape, TuiState};
@@ -68,17 +70,17 @@ pub async fn launch_targets(
     launch_impl(no_shutdown, home_targets, None, None, None).await
 }
 
-pub async fn launch_with_home(
+pub async fn launch_with_actions(
     no_shutdown: bool,
     home_targets: Option<Vec<String>>,
-    home: HomeState,
+    actions: ActionPanel,
     loader: ActionLoader,
     runner: TaskRunner,
 ) -> anyhow::Result<()> {
     launch_impl(
         no_shutdown,
         home_targets,
-        Some(home),
+        Some(actions),
         Some(loader),
         Some(runner),
     )
@@ -88,7 +90,7 @@ pub async fn launch_with_home(
 async fn launch_impl(
     no_shutdown: bool,
     home_targets: Option<Vec<String>>,
-    home: Option<HomeState>,
+    actions: Option<ActionPanel>,
     loader: Option<ActionLoader>,
     runner: Option<TaskRunner>,
 ) -> anyhow::Result<()> {
@@ -100,8 +102,8 @@ async fn launch_impl(
     let (wt_tx, wt_rx) = mpsc::unbounded_channel::<WorktreeEvent>();
     let _spawner = AutoSpawner::bind(&cwd, wt_tx).await?;
     let mut state = TuiState::default();
-    if let Some(home) = home {
-        state.set_home(home);
+    if let Some(actions) = actions {
+        state.set_actions(actions);
     }
     // Queue a skill prompt before entering the alt-screen loop: offer to
     // install when nothing's there, or to refresh a stale devme-managed copy
@@ -182,7 +184,10 @@ async fn run(
 
     let mut started: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut home_selected = false;
-    let mut startup_actions_pending = state.home_visible();
+    // The first subscription chooses the cold/warm default. Only an explicit
+    // rail choice below may cancel it - startup modals and early navigation
+    // keys must not turn a warm reattach into Actions by winning the race.
+    let mut startup_actions_pending = state.actions_visible();
     // Last mouse-pointer shape we asked the terminal for, so we only emit an
     // OSC 22 update when the cell under the cursor changes category.
     let mut pointer_shape = PointerShape::Default;
@@ -227,9 +232,9 @@ async fn run(
             state.select_instance_by_id(home_id);
             if let Some(target) = state.current_action_target()
                 && state
-                    .home()
+                    .actions()
                     .is_some_and(|home| home.target_matches(home_id))
-                && let Some(home) = state.home_mut()
+                && let Some(home) = state.actions_mut()
             {
                 home.set_target(target);
             }
@@ -248,12 +253,11 @@ async fn run(
                     if matches!(k.kind, KeyEventKind::Release) {
                         continue;
                     }
-                    startup_actions_pending = false;
                     if state.skill_dialog_visible() {
                         handle_skill_dialog_key(state, k.code);
                         continue;
                     }
-                    if state.home().is_some_and(|home| home.approval.is_some()) {
+                    if state.actions().is_some_and(|home| home.approval.is_some()) {
                         let response = match k.code {
                             KeyCode::Enter | KeyCode::Char('y') => Some(TaskApproval::Approve),
                             KeyCode::Char('n') | KeyCode::Char('s') => Some(TaskApproval::Skip),
@@ -264,24 +268,24 @@ async fn run(
                             if let Some(sender) = task_approval.take() {
                                 let _ = sender.send(response);
                             }
-                            if let Some(home) = state.home_mut() {
+                            if let Some(home) = state.actions_mut() {
                                 home.approval = None;
                             }
                         }
                         continue;
                     }
-                    if state.home_visible() {
+                    if state.actions_visible() {
                         match k.code {
                             KeyCode::Up | KeyCode::Char('k') => {
-                                state.home_mut().unwrap().move_previous();
+                                state.actions_mut().unwrap().move_previous();
                                 continue;
                             }
                             KeyCode::Down | KeyCode::Char('j') => {
-                                state.home_mut().unwrap().move_next();
+                                state.actions_mut().unwrap().move_next();
                                 continue;
                             }
                             KeyCode::Enter => {
-                                if let Some((target, task)) = state.home().and_then(|home| {
+                                if let Some((target, task)) = state.actions().and_then(|home| {
                                     home.activity_target
                                         .as_ref()
                                         .zip(home.running.as_ref())
@@ -293,14 +297,14 @@ async fn run(
                                     );
                                     continue;
                                 }
-                                let selected = state.home().and_then(|home| {
+                                let selected = state.actions().and_then(|home| {
                                     home.actions
                                         .get(home.selected)
                                         .map(|action| (action.task.clone(), action.kind))
                                 });
-                                if state.home().and_then(|home| home.running.as_ref()).is_none()
+                                if state.actions().and_then(|home| home.running.as_ref()).is_none()
                                     && let (Some((task, kind)), Some(runner)) = (selected, runner.clone())
-                                    && let Some(cwd) = state.home_mut().and_then(|home| home.start_activity(task.clone()))
+                                    && let Some(cwd) = state.actions_mut().and_then(|home| home.start_activity(task.clone()))
                                 {
                                     let tx = task_update_tx.clone();
                                     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
@@ -315,7 +319,7 @@ async fn run(
                                                 let finished_at = std::time::SystemTime::now()
                                                     .duration_since(std::time::UNIX_EPOCH)
                                                     .map_or(0, |duration| duration.as_secs());
-                                                let _ = tx.send(TaskUpdate::Finished(crate::home::RecentResult {
+                                                let _ = tx.send(TaskUpdate::Finished(crate::actions::RecentResult {
                                                     task,
                                                     kind,
                                                     status: "failed".into(),
@@ -328,11 +332,12 @@ async fn run(
                                 continue;
                             }
                             KeyCode::Char('a') | KeyCode::Esc => {
+                                startup_actions_pending = false;
                                 state.close_actions();
                                 continue;
                             }
                             KeyCode::Char('c')
-                                if state.home().is_some_and(|home| home.running.is_some()) =>
+                                if state.actions().is_some_and(|home| home.running.is_some()) =>
                             {
                                 if let Some(cancel) = &task_cancel {
                                     let _ = cancel.send(true);
@@ -644,6 +649,7 @@ async fn run(
                             use keymap::Action;
                             match action {
                                 Action::ToggleActions => {
+                                    startup_actions_pending = false;
                                     let Some(target) = state.current_action_target() else {
                                         state.notify("actions", "select a stack to run actions");
                                         continue;
@@ -653,12 +659,12 @@ async fn run(
                                         state.toggle_sidebar();
                                     }
                                     let needs_load = state
-                                        .home()
+                                        .actions()
                                         .is_some_and(|home| !home.target_matches(&target.instance_id));
                                     if needs_load {
                                         let id = target.instance_id.clone();
                                         let cwd = target.cwd.clone();
-                                        if let Some(home) = state.home_mut() {
+                                        if let Some(home) = state.actions_mut() {
                                             home.begin_loading(target);
                                         }
                                         if let Some(loader) = loader.clone() {
@@ -960,7 +966,7 @@ async fn run(
                 None => return Ok(()),
             },
             loaded = action_load_rx.recv() => if let Some((instance_id, result)) = loaded
-                && let Some(home) = state.home_mut()
+                && let Some(home) = state.actions_mut()
                 && home.target_matches(&instance_id)
             {
                 match result {
@@ -969,7 +975,7 @@ async fn run(
                 }
             },
             update = task_update_rx.recv() => if let Some(update) = update
-                && let Some(home) = state.home_mut() {
+                && let Some(home) = state.actions_mut() {
                     match update {
                         TaskUpdate::Progress(line) | TaskUpdate::Output(line) => {
                             home.logs.push(line);

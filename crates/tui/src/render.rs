@@ -65,7 +65,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
         return;
     }
 
-    let activity_height = u16::from(state.home().is_some_and(|home| {
+    let activity_height = u16::from(state.actions().is_some_and(|home| {
         home.running.is_some()
             || home.last_activity.is_some()
             || (home.visible
@@ -116,7 +116,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
         render_port_conflict_dialog(frame, area, dlg);
     } else if let Some(dlg) = state.skill_dialog() {
         render_skill_dialog(frame, area, dlg);
-    } else if let Some(prompt) = state.home().and_then(|home| home.approval.as_ref()) {
+    } else if let Some(prompt) = state.actions().and_then(|home| home.approval.as_ref()) {
         render_task_approval(frame, area, prompt, state.palette());
     } else if state.worktree_remove_visible() {
         render_worktree_remove_dialog(frame, area, state);
@@ -138,7 +138,7 @@ pub fn render(frame: &mut Frame<'_>, state: &mut TuiState) {
 fn render_task_approval(
     frame: &mut Frame<'_>,
     area: Rect,
-    prompt: &crate::home::ApprovalPrompt,
+    prompt: &crate::actions::ApprovalPrompt,
     palette: &Palette,
 ) {
     let width = area.width.saturating_sub(4).clamp(30, 76);
@@ -943,7 +943,7 @@ fn render_stopped(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
 fn render_quit_confirm(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let p = *state.palette();
     let w = 52u16.min(area.width.saturating_sub(4));
-    let running = state.home().and_then(|home| {
+    let running = state.actions().and_then(|home| {
         home.activity_target
             .as_ref()
             .zip(home.running.as_ref())
@@ -991,7 +991,7 @@ fn render_quit_confirm(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Line::from(vec![
             Span::styled(" q ", bold(p.red)),
             Span::styled(
-                if state.home().is_some_and(|home| home.running.is_some()) {
+                if state.actions().is_some_and(|home| home.running.is_some()) {
                     "cancel action, stop all & quit"
                 } else {
                     "stop all & quit"
@@ -1002,7 +1002,7 @@ fn render_quit_confirm(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Line::from(vec![
             Span::styled(" d ", bold(p.accent)),
             Span::styled(
-                if state.home().is_some_and(|home| home.running.is_some()) {
+                if state.actions().is_some_and(|home| home.running.is_some()) {
                     "cancel action, leave services running"
                 } else {
                     "detach - leave services running"
@@ -1191,9 +1191,9 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let dim = Style::default().fg(p.overlay0);
     let key = Style::default().fg(p.accent).add_modifier(Modifier::BOLD);
 
-    let stack = if state.home_visible() {
+    let stack = if state.actions_visible() {
         state
-            .home()
+            .actions()
             .and_then(|home| home.target.as_ref())
             .map(|target| target.label.as_str())
             .unwrap_or("actions")
@@ -1206,7 +1206,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .selected_service()
         .map(|s| s.name.as_str())
         .unwrap_or("—");
-    let breadcrumb = if state.home_visible() {
+    let breadcrumb = if state.actions_visible() {
         format!(" actions: {stack} ")
     } else {
         format!(" {stack} › {svc} ")
@@ -1216,14 +1216,14 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Style::default().fg(p.text).add_modifier(Modifier::BOLD),
     )]));
 
-    let centre_line = if state.home_visible() {
+    let centre_line = if state.actions_visible() {
         let mut spans = vec![
             Span::styled("jk ", key),
             Span::styled("action  ", dim),
             Span::styled("Enter ", key),
             Span::styled("run  ", dim),
         ];
-        if state.home().is_some_and(|home| home.running.is_some()) {
+        if state.actions().is_some_and(|home| home.running.is_some()) {
             spans.push(Span::styled("c ", key));
             spans.push(Span::styled("cancel  ", dim));
         }
@@ -1511,7 +1511,7 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &mut TuiState) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    if state.home_visible() {
+    if state.actions_visible() {
         render_actions_sidebar(frame, area, state);
         return;
     }
@@ -1548,7 +1548,7 @@ fn render_actions_sidebar(frame: &mut Frame<'_>, area: Rect, state: &mut TuiStat
         width: area.width.saturating_sub(1),
         ..area
     };
-    let Some(home) = state.home().cloned() else {
+    let Some(home) = state.actions().cloned() else {
         return;
     };
     let target = home
@@ -1650,9 +1650,12 @@ fn render_actions_sidebar(frame: &mut Frame<'_>, area: Rect, state: &mut TuiStat
         let (glyph, color) = if running_here {
             ("◌", p.yellow)
         } else {
-            match recent.map(|result| result.status.as_str()) {
-                Some("passed") => ("✓", p.green),
-                Some("cancelled" | "interrupted") => ("-", p.overlay0),
+            match recent.map(crate::actions::RecentResult::outcome) {
+                Some(crate::actions::ActionOutcome::Succeeded) => ("✓", p.green),
+                Some(
+                    crate::actions::ActionOutcome::Cancelled
+                    | crate::actions::ActionOutcome::Interrupted,
+                ) => ("-", p.overlay0),
                 Some(_) => ("✗", p.red),
                 None => (" ", p.overlay0),
             }
@@ -1705,12 +1708,12 @@ fn render_actions_sidebar(frame: &mut Frame<'_>, area: Rect, state: &mut TuiStat
         }
     }
     for (y, index) in regions {
-        state.push_click_region(list.x, y, list.width, 1, ClickTarget::HomeAction(index));
+        state.push_click_region(list.x, y, list.width, 1, ClickTarget::ActionItem(index));
     }
 }
 
 fn render_activity_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let Some(home) = state.home() else {
+    let Some(home) = state.actions() else {
         return;
     };
     let p = *state.palette();
@@ -1732,19 +1735,13 @@ fn render_activity_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 .unwrap_or_else(|| "Preparing".into()),
         )
     } else if let Some(result) = &home.last_activity {
-        let passed = result.status == "passed";
+        let outcome = result.outcome();
+        let passed = outcome.succeeded();
         (
             if passed { "✓" } else { "✗" },
             if passed { p.green } else { p.red },
             result.task.as_str(),
-            match result.status.as_str() {
-                "passed" => "succeeded",
-                "cancelled" => "cancelled",
-                "interrupted" => "interrupted",
-                "timed_out" => "timed out",
-                _ => "failed",
-            }
-            .into(),
+            outcome.label().into(),
         )
     } else if home.visible {
         let Some(action) = home.actions.get(home.selected) else {
@@ -2725,21 +2722,21 @@ mod tests {
     fn actions_replace_the_sidebar_without_hiding_the_dashboard() {
         let stack = devme_config::Stack::parse("schema_version=1\n[task.ios]\nkind=\"launch\"\ndescription=\"Run on Simulator\"\ncmd=\"true\"\n[task.verify]\nkind=\"check\"\ncmd=\"true\"\n[task.typescript-check]\nkind=\"check\"\ndescription=\"Format-check TypeScript\"\ncmd=\"true\"\n").unwrap();
         let mut state = TuiState::default();
-        let mut home = crate::home::HomeState::from_stack(
+        let mut home = crate::actions::ActionPanel::from_stack(
             &stack,
-            vec![crate::home::RecentResult {
+            vec![crate::actions::RecentResult {
                 task: "ios".into(),
                 kind: devme_config::TaskKind::Launch,
                 status: "passed".into(),
                 finished_at: 1,
             }],
         );
-        home.set_target(crate::home::ActionTarget {
+        home.set_target(crate::actions::ActionTarget {
             instance_id: "main".into(),
             label: "main".into(),
             cwd: "/tmp/main".into(),
         });
-        state.set_home(home);
+        state.set_actions(home);
         let text = render_to_text(&mut state, 90, 24);
         assert!(text.contains("actions: main"), "{text}");
         assert!(text.contains("ios"), "{text}");
@@ -2752,17 +2749,17 @@ mod tests {
     }
 
     #[test]
-    fn home_renders_typed_step_approval_as_a_modal() {
+    fn actions_render_typed_step_approval_as_a_modal() {
         let stack =
             devme_config::Stack::parse("schema_version=1\n[task.check]\ncmd=\"true\"\n").unwrap();
         let mut state = TuiState::default();
-        let mut home = crate::home::HomeState::from_stack(&stack, vec![]);
-        home.approval = Some(crate::home::ApprovalPrompt {
+        let mut home = crate::actions::ActionPanel::from_stack(&stack, vec![]);
+        home.approval = Some(crate::actions::ApprovalPrompt {
             step: "toolchain".into(),
             command: "mise install".into(),
             description: Some("Install the pinned toolchain".into()),
         });
-        state.set_home(home);
+        state.set_actions(home);
 
         let text = render_to_text(&mut state, 90, 24);
         assert!(text.contains("Step approval"), "{text}");
@@ -2777,8 +2774,8 @@ mod tests {
         )
         .unwrap();
         let mut state = TuiState::default();
-        let mut home = crate::home::HomeState::from_stack(&stack, vec![]);
-        home.set_target(crate::home::ActionTarget {
+        let mut home = crate::actions::ActionPanel::from_stack(&stack, vec![]);
+        home.set_target(crate::actions::ActionTarget {
             instance_id: "feature".into(),
             label: "feature-x".into(),
             cwd: "/tmp/feature-x".into(),
@@ -2786,7 +2783,7 @@ mod tests {
         home.start_activity("verify".into());
         home.logs.push("Waiting for API readiness".into());
         home.visible = false;
-        state.set_home(home);
+        state.set_actions(home);
 
         let text = render_to_text(&mut state, 90, 24);
         assert!(text.contains("feature-x / verify"), "{text}");
@@ -2798,7 +2795,7 @@ mod tests {
     }
 
     #[test]
-    fn home_prioritizes_actions_and_keeps_the_selection_visible() {
+    fn action_panel_keeps_the_selection_visible() {
         let mut config = String::from("schema_version=1\n");
         for index in 0..3 {
             config.push_str(&format!(
@@ -2815,7 +2812,7 @@ mod tests {
         }
         let stack = devme_config::Stack::parse(&config).unwrap();
         let mut state = TuiState::default();
-        state.set_home(crate::home::HomeState::from_stack(&stack, vec![]));
+        state.set_actions(crate::actions::ActionPanel::from_stack(&stack, vec![]));
 
         let text = render_to_text(&mut state, 100, 30);
         assert!(
@@ -2824,7 +2821,7 @@ mod tests {
         );
 
         for _ in 1..19 {
-            state.home_mut().unwrap().move_next();
+            state.actions_mut().unwrap().move_next();
         }
         let text = render_to_text(&mut state, 80, 16);
         assert!(

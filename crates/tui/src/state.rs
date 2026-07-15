@@ -14,7 +14,7 @@ use base64::Engine;
 use devme_config::GlobalConfig;
 use devme_core::{InstanceInfo, ServerMessage, ServiceSnapshot, ServiceState, StepSnapshot};
 
-use crate::home::HomeState;
+use crate::actions::ActionPanel;
 use crate::theme::Palette;
 
 /// Per-service log cap inside the TUI. The daemon's ring is the source of
@@ -477,7 +477,7 @@ fn logs_show_addr_in_use(logs: &VecDeque<String>) -> bool {
 /// so clicks would otherwise be discarded). Coordinates are screen cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClickTarget {
-    HomeAction(usize),
+    ActionItem(usize),
     /// Select the stack (instance) at this index in the sidebar.
     Stack(usize),
     /// Select the "shared" sidebar row.
@@ -621,7 +621,7 @@ struct SidebarDivider {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiState {
-    home: Option<HomeState>,
+    actions: Option<ActionPanel>,
     instances: Vec<InstanceData>,
     selected_instance: Option<usize>,
     /// Shared (repo-scoped) daemon state with its own sidebar row.
@@ -740,7 +740,7 @@ pub struct TuiState {
 impl Default for TuiState {
     fn default() -> Self {
         Self {
-            home: None,
+            actions: None,
             instances: Vec::new(),
             selected_instance: None,
             shared: SharedData::default(),
@@ -786,28 +786,28 @@ impl Default for TuiState {
 }
 
 impl TuiState {
-    pub fn set_home(&mut self, home: HomeState) {
-        self.home = Some(home);
+    pub fn set_actions(&mut self, actions: ActionPanel) {
+        self.actions = Some(actions);
     }
-    pub fn home(&self) -> Option<&HomeState> {
-        self.home.as_ref()
+    pub fn actions(&self) -> Option<&ActionPanel> {
+        self.actions.as_ref()
     }
-    pub fn home_mut(&mut self) -> Option<&mut HomeState> {
-        self.home.as_mut()
+    pub fn actions_mut(&mut self) -> Option<&mut ActionPanel> {
+        self.actions.as_mut()
     }
-    pub fn home_visible(&self) -> bool {
-        self.home.as_ref().is_some_and(|home| home.visible)
+    pub fn actions_visible(&self) -> bool {
+        self.actions.as_ref().is_some_and(|actions| actions.visible)
     }
 
     pub fn open_actions(&mut self) {
-        if let Some(home) = &mut self.home {
-            home.visible = true;
+        if let Some(actions) = &mut self.actions {
+            actions.visible = true;
         }
     }
 
     pub fn close_actions(&mut self) {
-        if let Some(home) = &mut self.home {
-            home.visible = false;
+        if let Some(actions) = &mut self.actions {
+            actions.visible = false;
         }
     }
 }
@@ -1279,12 +1279,12 @@ impl TuiState {
             .unwrap_or("")
     }
 
-    pub fn current_action_target(&self) -> Option<crate::home::ActionTarget> {
+    pub fn current_action_target(&self) -> Option<crate::actions::ActionTarget> {
         if self.shared_selected {
             return None;
         }
         self.current_instance()
-            .map(|instance| crate::home::ActionTarget {
+            .map(|instance| crate::actions::ActionTarget {
                 instance_id: instance.info.id.clone(),
                 label: instance.info.label.clone(),
                 cwd: std::path::PathBuf::from(&instance.info.cwd),
@@ -2821,9 +2821,9 @@ impl TuiState {
             return false;
         };
         match region.target {
-            ClickTarget::HomeAction(i) => {
-                if let Some(home) = self.home.as_mut() {
-                    home.selected = i;
+            ClickTarget::ActionItem(i) => {
+                if let Some(actions) = self.actions.as_mut() {
+                    actions.selected = i;
                 }
             }
             ClickTarget::Stack(i) => {
@@ -4318,14 +4318,14 @@ mod tests {
     }
 
     #[test]
-    fn click_selects_home_action_like_keyboard_navigation() {
+    fn click_selects_action_item_like_keyboard_navigation() {
         let stack = devme_config::Stack::parse("schema_version=1\n[task.ios]\nkind=\"launch\"\ncmd=\"true\"\n[task.verify]\nkind=\"check\"\ncmd=\"true\"\n").unwrap();
         let mut state = TuiState::default();
-        state.set_home(crate::home::HomeState::from_stack(&stack, vec![]));
-        state.push_click_region(2, 4, 30, 1, ClickTarget::HomeAction(1));
+        state.set_actions(crate::actions::ActionPanel::from_stack(&stack, vec![]));
+        state.push_click_region(2, 4, 30, 1, ClickTarget::ActionItem(1));
         assert!(state.click_at(5, 4));
         assert_eq!(
-            state.home().unwrap().selected_task().as_deref(),
+            state.actions().unwrap().selected_task().as_deref(),
             Some("verify")
         );
     }
