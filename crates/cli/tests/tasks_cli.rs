@@ -313,6 +313,7 @@ fn cancellation_returns_130_and_kills_process_tree() {
         .args(["run", "wait", "--output", "json"])
         .current_dir(dir.path())
         .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", dir.path().join(".runtime"))
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
