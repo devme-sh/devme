@@ -252,6 +252,8 @@ async fn execute_inner(
     cancellation: Option<tokio::sync::watch::Receiver<bool>>,
     guardian_hold: GuardianHold,
 ) -> Result<TaskResult> {
+    let run_started_at = now_ms();
+    let run_started = std::time::Instant::now();
     let order = execution_order(stack, name)?;
     let retention = retention_bytes(stack);
     let slot = match SlotClaim::acquire(root) {
@@ -265,18 +267,28 @@ async fn execute_inner(
     let mut final_result = None;
     for current in order {
         let pass = if current == name { args } else { &[] };
-        let result = execute_one(
-            stack,
-            root,
-            current,
-            pass,
-            slot.value,
-            injected_env,
-            updates.clone(),
-            cancellation.clone(),
-            guardian_hold.clone(),
-        )
-        .await?;
+        let result = if current == name && stack.task[current].cmd.is_none() {
+            let result = aggregate_result(
+                name,
+                run_started_at,
+                run_started.elapsed().as_millis() as u64,
+            );
+            persist(root, &result, retention)?;
+            result
+        } else {
+            execute_one(
+                stack,
+                root,
+                current,
+                pass,
+                slot.value,
+                injected_env,
+                updates.clone(),
+                cancellation.clone(),
+                guardian_hold.clone(),
+            )
+            .await?
+        };
         let failed = result.exit_code != 0;
         let failed_dependency = current != name && failed;
         final_result = Some(result);
@@ -1434,6 +1446,14 @@ fn empty_result(name: &str) -> TaskResult {
     }
 }
 
+fn aggregate_result(name: &str, started_at: u64, duration_ms: u64) -> TaskResult {
+    let mut result = empty_result(name);
+    result.started_at = started_at;
+    result.finished_at = now_ms();
+    result.duration_ms = duration_ms;
+    result
+}
+
 pub fn record_interrupted(root: &Path, task: &str, started_at: u64) -> Result<()> {
     let finished_at = now_ms();
     let message = "task owner disconnected unexpectedly";
@@ -1516,6 +1536,31 @@ mod tests {
         assert_eq!(result.exit_code, 124);
         assert!(result.timed_out);
         assert!(!result.cancelled);
+    }
+
+    #[tokio::test]
+    async fn aggregate_result_reports_dependency_wall_time() {
+        let dir = TempDir::new().unwrap();
+        let stack = Stack::parse(
+            "schema_version=1\n[task.leaf]\ncmd=\"sleep 0.12\"\n[task.verify]\ndepends_on=[\"leaf\"]\n",
+        )
+        .unwrap();
+        let result = execute_inner(
+            &stack,
+            dir.path(),
+            "verify",
+            &[],
+            &BTreeMap::new(),
+            None,
+            None,
+            GuardianHold::None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, "passed");
+        assert!(result.duration_ms >= 100, "{result:?}");
+        assert!(result.finished_at >= result.started_at);
     }
 
     #[test]
