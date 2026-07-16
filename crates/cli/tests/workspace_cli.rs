@@ -1,9 +1,11 @@
-use std::process::Command;
+use std::{process::Command, sync::Mutex};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use tempfile::TempDir;
+
+static WORKSPACE_CLI_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_devme")
@@ -12,6 +14,7 @@ fn bin() -> &'static str {
 #[test]
 #[cfg(unix)]
 fn legacy_remote_config_never_changes_default_or_daemon_commands() {
+    let _guard = WORKSPACE_CLI_TEST_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("devme.toml"), "schema_version = 1\n").unwrap();
     let config_dir = dir.path().join(".config/devme");
@@ -80,6 +83,7 @@ fn legacy_remote_config_never_changes_default_or_daemon_commands() {
 
 #[test]
 fn member_directory_lists_and_runs_its_namespaced_task_from_workspace_root() {
+    let _guard = WORKSPACE_CLI_TEST_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join("apps/ios/Sources")).unwrap();
     std::fs::write(
@@ -177,6 +181,7 @@ fn member_directory_lists_and_runs_its_namespaced_task_from_workspace_root() {
 
 #[test]
 fn bare_noninteractive_devme_is_read_only_focused_agent_context() {
+    let _guard = WORKSPACE_CLI_TEST_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join("apps/ios")).unwrap();
     std::fs::write(
@@ -213,6 +218,7 @@ fn bare_noninteractive_devme_is_read_only_focused_agent_context() {
 
 #[test]
 fn task_auto_converges_declared_dependencies_without_starting_a_daemon() {
+    let _guard = WORKSPACE_CLI_TEST_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     std::fs::write(
         dir.path().join("devme.toml"),

@@ -108,6 +108,10 @@ Convex own compilation and runtime semantics. Devme owns ordering, isolation,
 leases, readiness, history, redaction, and diagnostics. There is no second root
 task runner, package graph, remote cache, or native build-graph model.
 
+Tasks may declare path-only `artifacts`. Devme resolves them to absolute
+project paths and reports them with the task result. It does not decide
+retention, upload, rendering, or CI policy.
+
 Splitting the root file is organizational only. It does not create nested
 supervisors or independent resource and history domains. Existing single-file
 configs retain their unqualified names and behavior.

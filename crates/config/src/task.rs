@@ -11,6 +11,9 @@ pub struct Task {
     /// Semantic purpose used by interactive discovery surfaces.
     #[serde(default)]
     pub kind: TaskKind,
+    /// Whether the task belongs on the interactive Home screen.
+    #[serde(default)]
+    pub visibility: TaskVisibility,
     /// Shell command. Optional for aggregate tasks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cmd: Option<String>,
@@ -32,12 +35,26 @@ pub struct Task {
     /// Named scarce resources acquired in declaration order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resources: Vec<String>,
+    /// Root-relative or absolute paths produced by this task. Devme reports
+    /// them but does not upload, retain, or otherwise manage their lifecycle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
     /// Hard execution deadline in seconds. Zero means no deadline.
     #[serde(default)]
     pub timeout: u64,
     /// Overall seconds to wait for required services to become ready.
     #[serde(default = "default_readiness_timeout")]
     pub readiness_timeout: u64,
+}
+
+/// Controls only human Home-screen discovery. Internal tasks remain public to
+/// the CLI, dependency graph, and agent-facing task catalog.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TaskVisibility {
+    #[default]
+    Home,
+    Internal,
 }
 
 /// Small, stable vocabulary for grouping tasks without changing execution.

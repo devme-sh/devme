@@ -73,6 +73,77 @@ depends_on=["echo","fail"]
 }
 
 #[test]
+fn task_listing_keeps_internal_tasks_discoverable() {
+    let dir = fixture(
+        r#"schema_version=1
+[task.simulator]
+kind="launch"
+cmd="true"
+[task.codegen]
+visibility="internal"
+cmd="true"
+"#,
+    );
+
+    let list = run(&dir, &["tasks", "--output", "json"]);
+    assert!(list.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(report["count"], 2);
+    let codegen = report["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["name"] == "codegen")
+        .unwrap();
+    assert_eq!(codegen["visibility"], "internal");
+}
+
+#[test]
+fn task_results_report_interpolated_artifact_paths() {
+    let dir = fixture(
+        r#"schema_version=1
+[task.capture]
+cmd="mkdir -p .devme && touch .devme/result-0.xcresult"
+artifacts=[".devme/result-{slot}.xcresult","screenshots"]
+"#,
+    );
+
+    let output = run(&dir, &["run", "capture", "--output", "json"]);
+    assert!(output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        result["artifacts"],
+        serde_json::json!([
+            dir.path()
+                .canonicalize()
+                .unwrap()
+                .join(".devme/result-0.xcresult"),
+            dir.path().canonicalize().unwrap().join("screenshots"),
+        ])
+    );
+
+    let toon = run(&dir, &["run", "capture", "--output", "toon"]);
+    let text = String::from_utf8_lossy(&toon.stdout);
+    assert!(text.contains("artifacts[2]:"), "{text}");
+    assert!(text.contains("result-0.xcresult"), "{text}");
+}
+
+#[test]
+fn toon_task_results_omit_an_empty_artifact_collection() {
+    let dir = fixture(
+        r#"schema_version=1
+[task.clean]
+cmd="true"
+"#,
+    );
+
+    let output = run(&dir, &["run", "clean", "--output", "toon"]);
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(!text.contains("artifacts[0]"), "{text}");
+}
+
+#[test]
 fn task_logs_and_doctor_are_redacted_without_a_daemon() {
     let dir = fixture(
         r#"schema_version=1

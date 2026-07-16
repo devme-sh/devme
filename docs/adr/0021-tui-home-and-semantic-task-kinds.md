@@ -26,4 +26,7 @@ Bare non-interactive invocation retains the structured agent-context response an
 - Developers get an arrow-and-Enter path to Run and Check actions, recent results, and service health.
 - Keyboard and mouse selection share the same state model and renderer hit map.
 - Profiles and recurring startup pickers are unnecessary.
+- `visibility = "internal"` keeps implementation-detail tasks out of Home
+  without making them private. They remain discoverable and runnable through
+  the CLI and may still participate in task graphs and Sessions.
 - Runtime observation, stop, and status semantics for launched native apps remain deliberately deferred.

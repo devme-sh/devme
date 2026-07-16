@@ -61,6 +61,8 @@ pub struct TaskResult {
     pub stderr: String,
     pub truncated: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub output_events: Vec<TaskOutputEvent>,
 }
 
@@ -419,15 +421,13 @@ async fn execute_one(
     let capture_limit = CAPTURE_LIMIT.min((retention / 4).max(256) as usize);
     let started_at = now_ms();
     let started = std::time::Instant::now();
-    let persistence_patterns = devme_config::persistence_redaction_patterns(stack);
-    let redactor = match devme_config::Redactor::new(&persistence_patterns)
-        .context("invalid logs.redact pattern")
-    {
-        Ok(redactor) => redactor,
+    let ctx = interpolation_context(root, slot);
+    let artifacts = match resolve_artifacts(root, task, &ctx) {
+        Ok(artifacts) => artifacts,
         Err(error) => {
             let result = failed_result(
                 name,
-                &error.to_string(),
+                &format!("invalid task artifact path: {error}"),
                 1,
                 false,
                 started_at,
@@ -437,7 +437,25 @@ async fn execute_one(
             return Ok(result);
         }
     };
-    let ctx = interpolation_context(root, slot);
+    let persistence_patterns = devme_config::persistence_redaction_patterns(stack);
+    let redactor = match devme_config::Redactor::new(&persistence_patterns)
+        .context("invalid logs.redact pattern")
+    {
+        Ok(redactor) => redactor,
+        Err(error) => {
+            let mut result = failed_result(
+                name,
+                &error.to_string(),
+                1,
+                false,
+                started_at,
+                started.elapsed().as_millis() as u64,
+            );
+            result.artifacts = artifacts;
+            persist(root, &result, retention)?;
+            return Ok(result);
+        }
+    };
     let secret_values = redaction_values(stack, task, &ctx, injected_env);
     let guard_files = task
         .cmd
@@ -462,7 +480,7 @@ async fn execute_one(
         guardian_hold,
     )
     .await;
-    let result = match attempt {
+    let mut result = match attempt {
         Ok(result) => result,
         Err(error) => {
             let cancelled = error.downcast_ref::<ResourceWaitCancelled>().is_some();
@@ -477,6 +495,7 @@ async fn execute_one(
             )
         }
     };
+    result.artifacts = artifacts;
     persist(root, &result, retention)?;
     if let Some(guard_files) = &guard_files
         && guard_files.started()
@@ -649,6 +668,7 @@ async fn execute_one_attempt(
         stdout: out.text,
         stderr: err.text,
         truncated: out.truncated || err.truncated,
+        artifacts: Vec::new(),
         output_events: {
             let mut events = out.events;
             events.extend(err.events);
@@ -657,6 +677,25 @@ async fn execute_one_attempt(
         },
     };
     Ok(result)
+}
+
+fn resolve_artifacts(
+    root: &Path,
+    task: &Task,
+    ctx: &devme_config::InterpContext,
+) -> Result<Vec<String>> {
+    task.artifacts
+        .iter()
+        .map(|declared| {
+            let expanded = PathBuf::from(devme_config::interpolate(declared, ctx)?);
+            let resolved = if expanded.is_absolute() {
+                expanded
+            } else {
+                root.join(expanded)
+            };
+            Ok(resolved.display().to_string())
+        })
+        .collect()
 }
 
 fn raw_exit_code(status: std::process::ExitStatus) -> i32 {
@@ -1366,6 +1405,7 @@ fn failed_result(
         stdout: String::new(),
         stderr: message.into(),
         truncated: false,
+        artifacts: Vec::new(),
         output_events: vec![TaskOutputEvent {
             ts: finished_at,
             stream: devme_core::LogStream::Stderr,
@@ -1389,6 +1429,7 @@ fn empty_result(name: &str) -> TaskResult {
         stdout: String::new(),
         stderr: String::new(),
         truncated: false,
+        artifacts: Vec::new(),
         output_events: Vec::new(),
     }
 }
@@ -1409,6 +1450,7 @@ pub fn record_interrupted(root: &Path, task: &str, started_at: u64) -> Result<()
         stdout: String::new(),
         stderr: message.into(),
         truncated: false,
+        artifacts: Vec::new(),
         output_events: vec![TaskOutputEvent {
             ts: finished_at,
             stream: devme_core::LogStream::Stderr,

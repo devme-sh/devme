@@ -289,6 +289,7 @@ impl Composer {
         validate_new_target(&request.target)?;
         let mut base_files = collect_base_files(&loaded.source, &loaded.recipe.base)?;
         validate_payload_paths(&base_files, true)?;
+        validate_base_payload_paths(&base_files)?;
         track_composition_state(&mut base_files);
         let mut planned = base_files.clone();
         let mut external_steps = Vec::new();
@@ -1277,6 +1278,18 @@ fn validate_payload_paths(
                 path.display()
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_base_payload_paths(
+    files: &BTreeMap<PathBuf, PayloadFile>,
+) -> Result<(), ComposerError> {
+    if let Some(path) = files.keys().find(|path| collision_key(path) == MANIFEST) {
+        return Err(ComposerError::InvalidRecipe(format!(
+            "base snapshot contains recipe authority file {}; pin a clean generated-project snapshot instead of the recipe authoring root",
+            path.display()
+        )));
     }
     Ok(())
 }

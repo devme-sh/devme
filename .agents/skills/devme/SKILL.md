@@ -36,7 +36,7 @@ Route on `$action`. Default to diagnostics when none is given.
 
 - `devme tasks --output toon` lists the root command contract from `devme.toml`.
 - `devme tasks show <name> --output toon` shows dependencies, services, resources, and timeout.
-- `devme run <name> --output toon` runs a task. Use `--output json` for existing JSON consumers. Arguments after `--` are passed to the native command.
+- `devme run <name> --output toon` runs a task. Use `--output json` for existing JSON consumers. Arguments after `--` are passed to the native command. Declared task artifacts are returned as absolute paths in the result, so inspect those paths instead of scraping command output.
 - A task with no required services runs without a supervisor. A task with services starts this worktree's supervisor and waits for readiness first.
 - Exit codes are authoritative: wrapped failures retain their code, timeout is 124, and cancellation is 130. A guardian records `interrupted = true` and exit code 130 if the owning foreground CLI disappears. Do not infer success by scraping output.
 - Host/repo/worktree Resource leases wait atomically. The Task guardian releases them only after the Task process group has exited. Task results are bounded and secret-shaped task environment values are redacted before persistence.
@@ -50,7 +50,7 @@ Route on `$action`. Default to diagnostics when none is given.
 - Run `devme create native <path> --dry-run --output toon`, review `changed_files`, then repeat without `--dry-run`. Add repeatable initial features with `--with <name>` only during creation.
 - In an existing composed project, run `devme feature list --output toon`, then `devme feature add|remove|update <name> --dry-run --output toon` before applying.
 - A feature may replace complete files owned by every feature it transitively depends on. Removing it restores the dependency's exact bytes; modified overlays and dependency updates fail closed.
-- Applied feature mutations reconverge steps and reload the detached service graph automatically. A successful `devme feature add auth` or `devme feature add stripe` is ready to use without a second `devme up`.
+- Applied feature mutations reconverge steps and reload the detached service graph automatically. A successful `devme feature add <name>` is ready to use without a second `devme up`.
 - Never use `devme create add`. Creation initializes a project; `devme feature add` evolves one.
 - Exit code 5 means a managed or app-owned file conflicts. Read `error.paths` and `error.help`; do not overwrite the file manually to force progress.
 - If a mutation was interrupted, use `devme feature continue` to retry or `devme feature abort` to restore the source state. Both refuse to erase edits made after interruption.
@@ -122,6 +122,12 @@ steps = ["deps"]
 services = ["postgres"]
 resources = ["device"]
 timeout = 300
+artifacts = ["reports/test-results.xml", "artifacts/screenshots/{slot}"]
+
+[task.codegen]
+kind = "utility"
+visibility = "internal"
+cmd = "bun run codegen"
 
 [service.device-logs]
 cmd = "./scripts/device-logs"
@@ -141,6 +147,8 @@ linger = 30
 
 Rules:
 - Use `kind = "launch"`, `"check"`, or `"utility"` to group tasks in the interactive Actions sidebar. Bare `devme` opens Actions on a cold stack while keeping service tabs and logs visible. `a` switches the left rail between Actions for the selected stack and the stack list; `jk` always navigates that rail and `hl` always navigates services. Existing tasks default to `utility`; kind is discovery metadata and never changes execution.
+- Use `visibility = "internal"` for dependency, CI, code-generation, and diagnostic tasks that should stay out of the human Home surface. Internal tasks remain public through `devme tasks`, `devme run`, dependencies, sessions, and agent tooling.
+- Use `artifacts = ["path"]` to report files or directories produced by a task. Relative paths are rooted at the project root, placeholders such as `{slot}` and `{worktree}` are interpolated, and results expose absolute paths without uploading or interpreting the artifact.
 - `bun` for JS/TS (not npm/node).
 - Docker services: prefix `cmd` with `docker rm -f <name> 2>/dev/null;` and run `--rm --name <project>-<service>` to survive stale containers.
 - **Web services (dev servers, frontends, APIs) need `url = "http://{host}:{port}"`** - it's the only signal that a `host:port` is openable. Without it devme treats the service as copy-only (DB/TCP), so the TUI's `o` and `devme url -o` won't open a browser. DBs/TCP services: omit `url`.

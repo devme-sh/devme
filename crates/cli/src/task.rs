@@ -23,6 +23,9 @@ pub fn emit_result(result: &TaskResult, format: OutputFormat) -> Result<()> {
                 "task {} {} in {}ms",
                 result.task, result.status, result.duration_ms
             ));
+            for artifact in &result.artifacts {
+                devme_ui::info(format!("artifact {artifact}"));
+            }
         }
         OutputFormat::Json => {
             let mut value = serde_json::to_value(result)?;
@@ -45,8 +48,14 @@ pub fn emit_result(result: &TaskResult, format: OutputFormat) -> Result<()> {
                 result.interrupted,
                 result.truncated,
                 toon_string(&result.stdout),
-                toon_string(&result.stderr)
+                toon_string(&result.stderr),
             );
+            if !result.artifacts.is_empty() {
+                print!("\n  artifacts[{}]:", result.artifacts.len());
+                for artifact in &result.artifacts {
+                    print!("\n    {}", toon_string(artifact));
+                }
+            }
         }
     }
     Ok(())
@@ -87,6 +96,7 @@ pub fn show(stack: &Stack, action: Option<TaskAction>, format: OutputFormat) -> 
                             "steps": value.steps,
                             "services": value.services,
                             "resources": value.resources,
+                            "artifacts": value.artifacts,
                             "timeout_seconds": value.timeout,
                             "readiness_timeout_seconds": value.readiness_timeout,
                         }
@@ -104,6 +114,7 @@ pub fn show(stack: &Stack, action: Option<TaskAction>, format: OutputFormat) -> 
                         serde_json::json!({
                             "name": name,
                             "task_kind": task.kind,
+                            "visibility": task.visibility,
                             "description": task.description,
                             "has_command": task.cmd.is_some(),
                         })
@@ -117,7 +128,7 @@ pub fn show(stack: &Stack, action: Option<TaskAction>, format: OutputFormat) -> 
             }
             OutputFormat::Toon => {
                 let mut output = format!(
-                    "count: {}\ntasks[{}]{{name,description,kind,task_kind}}:",
+                    "count: {}\ntasks[{}]{{name,description,kind,task_kind,visibility}}:",
                     stack.task.len(),
                     stack.task.len()
                 );
@@ -128,7 +139,7 @@ pub fn show(stack: &Stack, action: Option<TaskAction>, format: OutputFormat) -> 
                         devme_config::TaskKind::Utility => "utility",
                     };
                     output.push_str(&format!(
-                        "\n  {},{},{},{}",
+                        "\n  {},{},{},{},{}",
                         toon_string(name),
                         toon_string(task.description.as_deref().unwrap_or("")),
                         if task.cmd.is_some() {
@@ -137,6 +148,10 @@ pub fn show(stack: &Stack, action: Option<TaskAction>, format: OutputFormat) -> 
                             "aggregate"
                         },
                         task_kind,
+                        match task.visibility {
+                            devme_config::TaskVisibility::Home => "home",
+                            devme_config::TaskVisibility::Internal => "internal",
+                        },
                     ));
                 }
                 output.push_str(if stack.task.is_empty() {
