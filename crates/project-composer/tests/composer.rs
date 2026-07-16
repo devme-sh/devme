@@ -880,6 +880,27 @@ fn rejects_payloads_that_claim_composer_authority_files() {
 }
 
 #[test]
+fn rejects_a_base_snapshot_that_contains_recipe_authority() {
+    let source = recipe();
+    write(
+        source.path().join("base/devme-template.toml"),
+        "schema_version = 1\nname = \"nested\"\nversion = \"1\"\n",
+    );
+    let workspace = TempDir::new().unwrap();
+    let target = workspace.path().join("groceries");
+
+    let error = Composer::new()
+        .create(create_request(source.path(), target.clone()))
+        .unwrap_err();
+
+    let ComposerError::InvalidRecipe(message) = error else {
+        panic!("expected an invalid recipe");
+    };
+    assert!(message.contains("recipe authority"), "{message}");
+    assert!(!target.exists());
+}
+
+#[test]
 fn rejects_a_case_alias_of_the_base_gitignore() {
     let source = recipe();
     write(source.path().join("base/.GitIgnore"), "build/\n");

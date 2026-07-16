@@ -1,4 +1,5 @@
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -8,6 +9,16 @@ fn write(path: impl AsRef<Path>, contents: &str) {
     let path = path.as_ref();
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, contents).unwrap();
+}
+
+fn runtime(cwd: &Path) -> std::path::PathBuf {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    cwd.hash(&mut hasher);
+    std::path::PathBuf::from(format!(
+        "/tmp/devme-project-composer-{}-{:x}",
+        std::process::id(),
+        hasher.finish()
+    ))
 }
 
 fn recipe() -> TempDir {
@@ -40,6 +51,7 @@ fn run(cwd: &Path, source: &Path, args: &[&str]) -> Output {
         .env("DEVME_TEMPLATE_SOURCE", source)
         .env("HOME", cwd)
         .env("XDG_CONFIG_HOME", cwd.join(".config"))
+        .env("XDG_RUNTIME_DIR", runtime(cwd))
         .env("NO_COLOR", "1")
         .output()
         .unwrap()

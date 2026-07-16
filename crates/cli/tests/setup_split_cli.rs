@@ -1,3 +1,4 @@
+use std::hash::{Hash, Hasher};
 use std::process::{Command, Output};
 
 use tempfile::TempDir;
@@ -6,11 +7,22 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_devme")
 }
 
+fn runtime(dir: &std::path::Path) -> std::path::PathBuf {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    dir.hash(&mut hasher);
+    std::path::PathBuf::from(format!(
+        "/tmp/devme-setup-split-{}-{:x}",
+        std::process::id(),
+        hasher.finish()
+    ))
+}
+
 fn run(dir: &std::path::Path, args: &[&str]) -> Output {
     Command::new(bin())
         .args(args)
         .current_dir(dir)
         .env("HOME", dir)
+        .env("XDG_RUNTIME_DIR", runtime(dir))
         .output()
         .unwrap()
 }

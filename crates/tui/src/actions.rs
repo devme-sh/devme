@@ -105,6 +105,7 @@ impl ActionCatalog {
         let mut actions = stack
             .task
             .iter()
+            .filter(|(_, task)| task.visibility == devme_config::TaskVisibility::Home)
             .map(|(name, task)| ActionItem {
                 task: name.clone(),
                 label: display_label(name, member_focus),
@@ -330,6 +331,24 @@ mod tests {
                 .map(|a| a.task.as_str())
                 .collect::<Vec<_>>(),
             ["ios", "verify", "z"]
+        );
+    }
+
+    #[test]
+    fn internal_tasks_stay_out_of_home_actions() {
+        let stack = Stack::parse(
+            "schema_version = 1\n[task.simulator]\nkind=\"launch\"\ncmd=\"true\"\n[task.codegen]\nvisibility=\"internal\"\ncmd=\"true\"\n",
+        )
+        .unwrap();
+
+        let panel = ActionPanel::from_stack(&stack, vec![]);
+        assert_eq!(
+            panel
+                .actions
+                .iter()
+                .map(|action| action.task.as_str())
+                .collect::<Vec<_>>(),
+            ["simulator"]
         );
     }
 

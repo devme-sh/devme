@@ -1,17 +1,44 @@
-use std::process::Command;
+use std::{
+    hash::{Hash, Hasher},
+    process::Command,
+    sync::Mutex,
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use tempfile::TempDir;
 
+static WORKSPACE_CLI_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_devme")
+}
+
+fn runtime(dir: &std::path::Path) -> std::path::PathBuf {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    dir.hash(&mut hasher);
+    std::path::PathBuf::from(format!(
+        "/tmp/devme-workspace-cli-{}-{:x}",
+        std::process::id(),
+        hasher.finish()
+    ))
+}
+
+fn repo_runtime(dir: &std::path::Path) -> std::path::PathBuf {
+    runtime(dir)
+        .join("devme/repos")
+        .join(devme_config::paths::instance_id(dir))
+}
+
+fn supervisor_socket(dir: &std::path::Path) -> std::path::PathBuf {
+    repo_runtime(dir).join(format!("{}.sock", devme_config::paths::instance_id(dir)))
 }
 
 #[test]
 #[cfg(unix)]
 fn legacy_remote_config_never_changes_default_or_daemon_commands() {
+    let _guard = WORKSPACE_CLI_TEST_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("devme.toml"), "schema_version = 1\n").unwrap();
     let config_dir = dir.path().join(".config/devme");
@@ -43,6 +70,7 @@ fn legacy_remote_config_never_changes_default_or_daemon_commands() {
             .args(args)
             .current_dir(dir.path())
             .env("HOME", dir.path())
+            .env("XDG_RUNTIME_DIR", runtime(dir.path()))
             .env("PATH", &path)
             .output()
             .unwrap()
@@ -80,6 +108,7 @@ fn legacy_remote_config_never_changes_default_or_daemon_commands() {
 
 #[test]
 fn member_directory_lists_and_runs_its_namespaced_task_from_workspace_root() {
+    let _guard = WORKSPACE_CLI_TEST_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join("apps/ios/Sources")).unwrap();
     std::fs::write(
@@ -98,6 +127,7 @@ fn member_directory_lists_and_runs_its_namespaced_task_from_workspace_root() {
         .args(["tasks", "--output", "json"])
         .current_dir(&invocation)
         .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", runtime(dir.path()))
         .output()
         .unwrap();
     assert!(
@@ -112,6 +142,7 @@ fn member_directory_lists_and_runs_its_namespaced_task_from_workspace_root() {
         .args(["--json", "config", "check"])
         .current_dir(&invocation)
         .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", runtime(dir.path()))
         .output()
         .unwrap();
     assert!(
@@ -127,6 +158,7 @@ fn member_directory_lists_and_runs_its_namespaced_task_from_workspace_root() {
         .args(["run", "where", "--output", "json"])
         .current_dir(&invocation)
         .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", runtime(dir.path()))
         .output()
         .unwrap();
     assert!(
@@ -144,12 +176,10 @@ fn member_directory_lists_and_runs_its_namespaced_task_from_workspace_root() {
             .display()
             .to_string()
     );
-    let history = devme_config::paths::repo_socket_dir(dir.path())
-        .unwrap()
-        .join(format!(
-            "{}-tasks/ios__where.jsonl",
-            devme_config::paths::instance_id(dir.path())
-        ));
+    let history = repo_runtime(dir.path()).join(format!(
+        "{}-tasks/ios__where.jsonl",
+        devme_config::paths::instance_id(dir.path())
+    ));
     assert!(
         history.is_file(),
         "missing history at {}",
@@ -161,6 +191,7 @@ fn member_directory_lists_and_runs_its_namespaced_task_from_workspace_root() {
         .args(["run", "root::root-where", "--output", "json"])
         .current_dir(&invocation)
         .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", runtime(dir.path()))
         .output()
         .unwrap();
     assert!(
@@ -177,6 +208,7 @@ fn member_directory_lists_and_runs_its_namespaced_task_from_workspace_root() {
 
 #[test]
 fn bare_noninteractive_devme_is_read_only_focused_agent_context() {
+    let _guard = WORKSPACE_CLI_TEST_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join("apps/ios")).unwrap();
     std::fs::write(
@@ -189,11 +221,12 @@ fn bare_noninteractive_devme_is_read_only_focused_agent_context() {
         "schema_version = 1\n[service.app]\ncmd = \"sleep 30\"\n[task.test]\ncmd = \"true\"\n",
     )
     .unwrap();
-    let socket = devme_config::paths::supervisor_socket(dir.path()).unwrap();
+    let socket = supervisor_socket(dir.path());
 
     let output = Command::new(bin())
         .current_dir(dir.path().join("apps/ios"))
         .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", runtime(dir.path()))
         .output()
         .unwrap();
 
@@ -213,6 +246,7 @@ fn bare_noninteractive_devme_is_read_only_focused_agent_context() {
 
 #[test]
 fn task_auto_converges_declared_dependencies_without_starting_a_daemon() {
+    let _guard = WORKSPACE_CLI_TEST_LOCK.lock().unwrap();
     let dir = TempDir::new().unwrap();
     std::fs::write(
         dir.path().join("devme.toml"),
@@ -227,12 +261,13 @@ steps = ["dependencies"]
 "#,
     )
     .unwrap();
-    let socket = devme_config::paths::supervisor_socket(dir.path()).unwrap();
+    let socket = supervisor_socket(dir.path());
 
     let output = Command::new(bin())
         .args(["run", "check", "--output", "json"])
         .current_dir(dir.path())
         .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", runtime(dir.path()))
         .output()
         .unwrap();
 

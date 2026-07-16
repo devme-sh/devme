@@ -61,6 +61,8 @@ pub struct TaskResult {
     pub stderr: String,
     pub truncated: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub output_events: Vec<TaskOutputEvent>,
 }
 
@@ -250,6 +252,8 @@ async fn execute_inner(
     cancellation: Option<tokio::sync::watch::Receiver<bool>>,
     guardian_hold: GuardianHold,
 ) -> Result<TaskResult> {
+    let run_started_at = now_ms();
+    let run_started = std::time::Instant::now();
     let order = execution_order(stack, name)?;
     let retention = retention_bytes(stack);
     let slot = match SlotClaim::acquire(root) {
@@ -263,18 +267,28 @@ async fn execute_inner(
     let mut final_result = None;
     for current in order {
         let pass = if current == name { args } else { &[] };
-        let result = execute_one(
-            stack,
-            root,
-            current,
-            pass,
-            slot.value,
-            injected_env,
-            updates.clone(),
-            cancellation.clone(),
-            guardian_hold.clone(),
-        )
-        .await?;
+        let result = if current == name && stack.task[current].cmd.is_none() {
+            let result = aggregate_result(
+                name,
+                run_started_at,
+                run_started.elapsed().as_millis() as u64,
+            );
+            persist(root, &result, retention)?;
+            result
+        } else {
+            execute_one(
+                stack,
+                root,
+                current,
+                pass,
+                slot.value,
+                injected_env,
+                updates.clone(),
+                cancellation.clone(),
+                guardian_hold.clone(),
+            )
+            .await?
+        };
         let failed = result.exit_code != 0;
         let failed_dependency = current != name && failed;
         final_result = Some(result);
@@ -419,15 +433,13 @@ async fn execute_one(
     let capture_limit = CAPTURE_LIMIT.min((retention / 4).max(256) as usize);
     let started_at = now_ms();
     let started = std::time::Instant::now();
-    let persistence_patterns = devme_config::persistence_redaction_patterns(stack);
-    let redactor = match devme_config::Redactor::new(&persistence_patterns)
-        .context("invalid logs.redact pattern")
-    {
-        Ok(redactor) => redactor,
+    let ctx = interpolation_context(root, slot);
+    let artifacts = match resolve_artifacts(root, task, &ctx) {
+        Ok(artifacts) => artifacts,
         Err(error) => {
             let result = failed_result(
                 name,
-                &error.to_string(),
+                &format!("invalid task artifact path: {error}"),
                 1,
                 false,
                 started_at,
@@ -437,7 +449,25 @@ async fn execute_one(
             return Ok(result);
         }
     };
-    let ctx = interpolation_context(root, slot);
+    let persistence_patterns = devme_config::persistence_redaction_patterns(stack);
+    let redactor = match devme_config::Redactor::new(&persistence_patterns)
+        .context("invalid logs.redact pattern")
+    {
+        Ok(redactor) => redactor,
+        Err(error) => {
+            let mut result = failed_result(
+                name,
+                &error.to_string(),
+                1,
+                false,
+                started_at,
+                started.elapsed().as_millis() as u64,
+            );
+            result.artifacts = artifacts;
+            persist(root, &result, retention)?;
+            return Ok(result);
+        }
+    };
     let secret_values = redaction_values(stack, task, &ctx, injected_env);
     let guard_files = task
         .cmd
@@ -462,7 +492,7 @@ async fn execute_one(
         guardian_hold,
     )
     .await;
-    let result = match attempt {
+    let mut result = match attempt {
         Ok(result) => result,
         Err(error) => {
             let cancelled = error.downcast_ref::<ResourceWaitCancelled>().is_some();
@@ -477,6 +507,7 @@ async fn execute_one(
             )
         }
     };
+    result.artifacts = artifacts;
     persist(root, &result, retention)?;
     if let Some(guard_files) = &guard_files
         && guard_files.started()
@@ -649,6 +680,7 @@ async fn execute_one_attempt(
         stdout: out.text,
         stderr: err.text,
         truncated: out.truncated || err.truncated,
+        artifacts: Vec::new(),
         output_events: {
             let mut events = out.events;
             events.extend(err.events);
@@ -657,6 +689,25 @@ async fn execute_one_attempt(
         },
     };
     Ok(result)
+}
+
+fn resolve_artifacts(
+    root: &Path,
+    task: &Task,
+    ctx: &devme_config::InterpContext,
+) -> Result<Vec<String>> {
+    task.artifacts
+        .iter()
+        .map(|declared| {
+            let expanded = PathBuf::from(devme_config::interpolate(declared, ctx)?);
+            let resolved = if expanded.is_absolute() {
+                expanded
+            } else {
+                root.join(expanded)
+            };
+            Ok(resolved.display().to_string())
+        })
+        .collect()
 }
 
 fn raw_exit_code(status: std::process::ExitStatus) -> i32 {
@@ -1366,6 +1417,7 @@ fn failed_result(
         stdout: String::new(),
         stderr: message.into(),
         truncated: false,
+        artifacts: Vec::new(),
         output_events: vec![TaskOutputEvent {
             ts: finished_at,
             stream: devme_core::LogStream::Stderr,
@@ -1389,8 +1441,17 @@ fn empty_result(name: &str) -> TaskResult {
         stdout: String::new(),
         stderr: String::new(),
         truncated: false,
+        artifacts: Vec::new(),
         output_events: Vec::new(),
     }
+}
+
+fn aggregate_result(name: &str, started_at: u64, duration_ms: u64) -> TaskResult {
+    let mut result = empty_result(name);
+    result.started_at = started_at;
+    result.finished_at = now_ms();
+    result.duration_ms = duration_ms;
+    result
 }
 
 pub fn record_interrupted(root: &Path, task: &str, started_at: u64) -> Result<()> {
@@ -1409,6 +1470,7 @@ pub fn record_interrupted(root: &Path, task: &str, started_at: u64) -> Result<()
         stdout: String::new(),
         stderr: message.into(),
         truncated: false,
+        artifacts: Vec::new(),
         output_events: vec![TaskOutputEvent {
             ts: finished_at,
             stream: devme_core::LogStream::Stderr,
@@ -1474,6 +1536,31 @@ mod tests {
         assert_eq!(result.exit_code, 124);
         assert!(result.timed_out);
         assert!(!result.cancelled);
+    }
+
+    #[tokio::test]
+    async fn aggregate_result_reports_dependency_wall_time() {
+        let dir = TempDir::new().unwrap();
+        let stack = Stack::parse(
+            "schema_version=1\n[task.leaf]\ncmd=\"sleep 0.12\"\n[task.verify]\ndepends_on=[\"leaf\"]\n",
+        )
+        .unwrap();
+        let result = execute_inner(
+            &stack,
+            dir.path(),
+            "verify",
+            &[],
+            &BTreeMap::new(),
+            None,
+            None,
+            GuardianHold::None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, "passed");
+        assert!(result.duration_ms >= 100, "{result:?}");
+        assert!(result.finished_at >= result.started_at);
     }
 
     #[test]
