@@ -308,7 +308,11 @@ impl Composer {
                 .filter(|path| {
                     feature_owners
                         .get(&collision_key(path))
-                        .is_some_and(|(existing, owner)| owner != "base" || existing != *path)
+                        .is_some_and(|(existing, owner)| {
+                            existing != *path
+                                || (owner != "base"
+                                    && !feature_depends_on(&loaded.recipe, feature, owner))
+                        })
                 })
                 .cloned()
                 .collect::<Vec<_>>();
@@ -815,10 +819,11 @@ impl Composer {
             if current.is_some() && current.as_ref() != expected {
                 conflicts.push(path.clone());
             }
-            if lock
+            if let Some(owner) = lock
                 .features
-                .values()
-                .any(|installed| installed.files.contains_key(path))
+                .iter()
+                .find_map(|(name, installed)| installed.files.contains_key(path).then_some(name))
+                && !feature_depends_on(&loaded.recipe, feature_name, owner)
             {
                 conflicts.push(path.clone());
             }
@@ -1127,6 +1132,26 @@ fn validate_feature_dependencies(
         }
     }
     Ok(())
+}
+
+fn feature_depends_on(recipe: &Recipe, feature: &str, dependency: &str) -> bool {
+    let mut pending = vec![feature];
+    let mut visited = BTreeSet::new();
+    while let Some(name) = pending.pop() {
+        if !visited.insert(name) {
+            continue;
+        }
+        let Some(candidate) = recipe.features.get(name) else {
+            continue;
+        };
+        for parent in &candidate.dependencies {
+            if parent == dependency {
+                return true;
+            }
+            pending.push(parent);
+        }
+    }
+    false
 }
 
 fn validate_new_target(target: &Path) -> Result<(), ComposerError> {

@@ -437,6 +437,231 @@ dependencies = ["auth"]
 }
 
 #[test]
+fn dependent_feature_can_overlay_and_restore_dependency_owned_files() {
+    let source = recipe();
+    write(
+        source.path().join("devme-template.toml"),
+        r#"schema_version = 1
+name = "native"
+version = "2026.7.16"
+
+[base]
+path = "base"
+
+[features.auth]
+version = "1.0.0"
+path = "features/auth"
+
+[features.stripe]
+version = "1.0.0"
+path = "features/stripe"
+dependencies = ["auth"]
+"#,
+    );
+    write(
+        source.path().join("features/stripe/app/settings.txt"),
+        "auth = true\nstripe = true\n",
+    );
+    write(
+        source.path().join("features/stripe/app/stripe.txt"),
+        "stripe\n",
+    );
+    let workspace = TempDir::new().unwrap();
+    let target = workspace.path().join("groceries");
+    let composer = Composer::new();
+    composer
+        .create(create_request(source.path(), target.clone()))
+        .unwrap();
+
+    composer
+        .add_feature(AddFeatureRequest {
+            root: target.clone(),
+            feature: "auth".into(),
+            dry_run: false,
+        })
+        .unwrap();
+    composer
+        .add_feature(AddFeatureRequest {
+            root: target.clone(),
+            feature: "stripe".into(),
+            dry_run: false,
+        })
+        .unwrap();
+
+    assert_eq!(
+        fs::read_to_string(target.join("app/settings.txt")).unwrap(),
+        "auth = true\nstripe = true\n"
+    );
+    composer
+        .remove_feature(RemoveFeatureRequest {
+            root: target.clone(),
+            feature: "stripe".into(),
+            dry_run: false,
+        })
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(target.join("app/settings.txt")).unwrap(),
+        "auth = true\n"
+    );
+    assert!(!target.join("app/stripe.txt").exists());
+
+    composer
+        .remove_feature(RemoveFeatureRequest {
+            root: target.clone(),
+            feature: "auth".into(),
+            dry_run: false,
+        })
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(target.join("app/settings.txt")).unwrap(),
+        "auth = false\n"
+    );
+}
+
+#[test]
+fn modified_dependency_overlay_blocks_feature_removal() {
+    let source = layered_recipe();
+    let workspace = TempDir::new().unwrap();
+    let target = workspace.path().join("groceries");
+    let composer = Composer::new();
+    let mut request = create_request(source.path(), target.clone());
+    request.features = vec!["auth".into(), "stripe".into()];
+    composer.create(request).unwrap();
+    write(
+        target.join("app/settings.txt"),
+        "auth = true\nstripe = customized\n",
+    );
+
+    let error = composer
+        .remove_feature(RemoveFeatureRequest {
+            root: target,
+            feature: "stripe".into(),
+            dry_run: false,
+        })
+        .unwrap_err();
+
+    let ComposerError::Conflict { paths, .. } = error else {
+        panic!("expected a conflict");
+    };
+    assert_eq!(paths, vec![PathBuf::from("app/settings.txt")]);
+}
+
+#[test]
+fn dependency_update_conflicts_while_dependent_overlay_is_installed() {
+    let source = layered_recipe();
+    let workspace = TempDir::new().unwrap();
+    let target = workspace.path().join("groceries");
+    let composer = Composer::new();
+    let mut request = create_request(source.path(), target.clone());
+    request.features = vec!["auth".into(), "stripe".into()];
+    composer.create(request).unwrap();
+    write(
+        source.path().join("devme-template.toml"),
+        r#"schema_version = 1
+name = "native"
+version = "2026.7.17"
+
+[base]
+path = "base"
+
+[features.auth]
+version = "1.1.0"
+path = "features/auth"
+
+[features.stripe]
+version = "1.0.0"
+path = "features/stripe"
+dependencies = ["auth"]
+"#,
+    );
+    write(
+        source.path().join("features/auth/app/settings.txt"),
+        "auth = refreshed\n",
+    );
+
+    let error = composer
+        .update_feature(UpdateFeatureRequest {
+            root: target,
+            feature: "auth".into(),
+            dry_run: false,
+        })
+        .unwrap_err();
+
+    let ComposerError::Conflict { paths, help } = error else {
+        panic!("expected a conflict");
+    };
+    assert_eq!(paths, vec![PathBuf::from("app/settings.txt")]);
+    assert!(help.contains("devme feature update auth --dry-run"));
+}
+
+fn layered_recipe() -> TempDir {
+    let source = recipe();
+    write(
+        source.path().join("devme-template.toml"),
+        r#"schema_version = 1
+name = "native"
+version = "2026.7.16"
+
+[base]
+path = "base"
+
+[features.auth]
+version = "1.0.0"
+path = "features/auth"
+
+[features.stripe]
+version = "1.0.0"
+path = "features/stripe"
+dependencies = ["auth"]
+"#,
+    );
+    write(
+        source.path().join("features/stripe/app/settings.txt"),
+        "auth = true\nstripe = true\n",
+    );
+    source
+}
+
+#[test]
+fn creation_can_compose_dependency_overlays_in_order() {
+    let source = recipe();
+    write(
+        source.path().join("devme-template.toml"),
+        r#"schema_version = 1
+name = "native"
+version = "2026.7.16"
+
+[base]
+path = "base"
+
+[features.auth]
+version = "1.0.0"
+path = "features/auth"
+
+[features.stripe]
+version = "1.0.0"
+path = "features/stripe"
+dependencies = ["auth"]
+"#,
+    );
+    write(
+        source.path().join("features/stripe/app/settings.txt"),
+        "auth = true\nstripe = true\n",
+    );
+    let workspace = TempDir::new().unwrap();
+    let target = workspace.path().join("groceries");
+    let mut request = create_request(source.path(), target.clone());
+    request.features = vec!["auth".into(), "stripe".into()];
+
+    Composer::new().create(request).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(target.join("app/settings.txt")).unwrap(),
+        "auth = true\nstripe = true\n"
+    );
+}
+
+#[test]
 fn refuses_overlapping_feature_payloads_before_creating_the_project() {
     let source = recipe();
     write(
@@ -452,21 +677,20 @@ path = "base"
 version = "1.0.0"
 path = "features/auth"
 
-[features.payments]
+[features.analytics]
 version = "1.0.0"
-path = "features/payments"
-dependencies = ["auth"]
+path = "features/analytics"
 "#,
     );
     write(
-        source.path().join("features/payments/App/Settings.txt"),
-        "payments = true\n",
+        source.path().join("features/analytics/App/Settings.txt"),
+        "analytics = true\n",
     );
     let workspace = TempDir::new().unwrap();
     let target = workspace.path().join("groceries");
     let composer = Composer::new();
     let mut request = create_request(source.path(), target.clone());
-    request.features = vec!["auth".into(), "payments".into()];
+    request.features = vec!["auth".into(), "analytics".into()];
 
     let error = composer.create(request).unwrap_err();
 

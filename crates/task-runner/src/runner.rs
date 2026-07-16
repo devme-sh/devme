@@ -760,7 +760,11 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            result.exit_code, 0,
+            "stdout: {}\nstderr: {}",
+            result.stdout, result.stderr
+        );
     }
 
     #[tokio::test]

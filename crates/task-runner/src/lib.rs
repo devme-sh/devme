@@ -875,6 +875,19 @@ struct SlotClaim {
 }
 
 impl SlotClaim {
+    #[cfg(test)]
+    fn acquire(_root: &Path) -> Result<Self> {
+        Ok(Self {
+            value: 0,
+            allocator: devme_slot_allocator::SlotAllocator::open(
+                devme_config::paths::slot_registry()?,
+            ),
+            instance: String::new(),
+            owned: false,
+        })
+    }
+
+    #[cfg(not(test))]
     fn acquire(root: &Path) -> Result<Self> {
         let allocator =
             devme_slot_allocator::SlotAllocator::open(devme_config::paths::slot_registry()?);

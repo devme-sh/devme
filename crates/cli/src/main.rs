@@ -2002,14 +2002,14 @@ async fn up(services: Vec<String>, detach: bool, wait: bool, timeout: u64) -> an
     {
         devme_ui::warn(format!("shared supervisor not started: {e}"));
     }
-    let fresh_daemon = ensure_daemon(&sock).await?;
+    let mut fresh_daemon = ensure_daemon(&sock).await?;
     let mut client = devme_client::Client::connect(&sock).await?;
     client
         .send(ClientMessage::Subscribe {
             services: selected.clone(),
         })
         .await?;
-    let snapshot: Vec<devme_core::ServiceSnapshot> = match client.next_event().await? {
+    let mut snapshot: Vec<devme_core::ServiceSnapshot> = match client.next_event().await? {
         Some(ServerMessage::Subscribed { services, .. }) => services
             .into_iter()
             .filter(|service| selected.contains(&service.name))
@@ -2019,6 +2019,35 @@ async fn up(services: Vec<String>, detach: bool, wait: bool, timeout: u64) -> an
         }
         None => return Err(anyhow::anyhow!("daemon closed before snapshot")),
     };
+    let missing_services = selected
+        .iter()
+        .filter(|name| !snapshot.iter().any(|service| &service.name == *name))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !fresh_daemon && !missing_services.is_empty() {
+        drop(client);
+        devme_ui::info("configuration changed; restarting the daemon");
+        teardown_daemon(&sock, 30, None).await?;
+        fresh_daemon = ensure_daemon(&sock).await?;
+        client = devme_client::Client::connect(&sock).await?;
+        client
+            .send(ClientMessage::Subscribe {
+                services: selected.clone(),
+            })
+            .await?;
+        snapshot = match client.next_event().await? {
+            Some(ServerMessage::Subscribed { services, .. }) => services
+                .into_iter()
+                .filter(|service| selected.contains(&service.name))
+                .collect(),
+            Some(other) => {
+                return Err(anyhow::anyhow!(
+                    "unexpected initial reply after reload: {other:?}"
+                ));
+            }
+            None => return Err(anyhow::anyhow!("reloaded daemon closed before snapshot")),
+        };
+    }
     if snapshot.is_empty() {
         devme_ui::info("no services declared");
         return Ok(());
