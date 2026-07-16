@@ -120,6 +120,26 @@ A custom interactive script in `.devme/` that handles complex [[Step]] provision
 
 JSON-lines over stdin/stdout. The wizard writes events to stdout (`ask`, `progress`, `log`, `set_var`, `done`) and reads user responses from stdin. Language-agnostic — any executable that can do JSON works. devme ships a thin Bun SDK at `@devme/wizard-sdk` as a convenience wrapper.
 
+### Project composer
+
+The versioned engine behind `devme create` and `devme feature`. It materializes a Project recipe, owns only files recorded in the Composition lock, and plans every mutation before writing.
+
+### Project recipe
+
+An independently versioned manifest that pins a base project by full commit ID and declares optional Feature payloads, dependencies, conflicts, and untrusted manual lifecycle guidance. Recipes provide files but never execute provider or account mutations.
+
+### Composition lock
+
+`.devme/composition.lock`, the project-local record of recipe identity, SHA-256 digest, Feature versions, managed paths, and expected file digests. It is the authority for conflict-safe updates and removals.
+
+### Feature
+
+A versioned optional project capability installed through `devme feature`. A Feature owns complete managed files, declares dependencies and conflicts, and reports external lifecycle steps separately from source changes.
+
+### Operation journal
+
+Recoverable state written before a multi-file Feature mutation. `devme feature continue` restores the recorded pre-operation state and retries, while `devme feature abort` restores it and stops. Recovery refuses to overwrite files edited after the interruption.
+
 ### Service config hash
 
 A hash over a [[Service]]'s effective config (command, env, port). Used to detect when a running `repo`-scoped service is stale relative to what a newly-starting instance expects. Mismatch → the new instance's TUI flags the service as `⚠ stale config` and offers a one-key "restart with new config" action.

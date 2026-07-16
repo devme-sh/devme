@@ -3,7 +3,9 @@
 //! Conventions per ADR-0008 (clig.dev + agent-native):
 //! `--json` everywhere, semantic exit codes, no spinner without a tty.
 
-use clap::{Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
+
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use devme_core::{ServiceSnapshot, StepSnapshot};
 
@@ -65,6 +67,33 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum Command {
+    /// Create a project from a versioned recipe.
+    Create {
+        /// Template name. Omit to inspect the current composition context.
+        template: Option<String>,
+        /// Destination directory. Required when a template is named.
+        path: Option<PathBuf>,
+        /// Compose an optional feature during initial creation. Repeatable.
+        #[arg(long = "with", action = ArgAction::Append)]
+        features: Vec<String>,
+        /// Plan every file change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Structured result format. Non-interactive output defaults to TOON.
+        #[arg(long, value_enum, default_value_t, global = true)]
+        output: OutputFormat,
+        /// Override the independently versioned template recipe source.
+        #[arg(long, env = "DEVME_TEMPLATE_SOURCE", hide = true)]
+        source: Option<PathBuf>,
+    },
+    /// Add, remove, update, or inspect composable project features.
+    Feature {
+        #[command(subcommand)]
+        action: FeatureAction,
+        /// Structured result format. Non-interactive output defaults to TOON.
+        #[arg(long, value_enum, default_value_t, global = true)]
+        output: OutputFormat,
+    },
     /// Open a resource-bound session or stop it idempotently.
     Session {
         /// Session name from `[session.<name>]`.
@@ -254,6 +283,34 @@ pub enum Command {
         #[arg(long)]
         write: bool,
     },
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum FeatureAction {
+    /// Add one feature after a conflict-safe read-only plan.
+    Add {
+        feature: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove one feature while preserving external provider data.
+    Remove {
+        feature: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Update one installed feature.
+    Update {
+        feature: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List installed and available features.
+    List,
+    /// Continue an interrupted composition operation.
+    Continue,
+    /// Restore the pre-operation filesystem after an interrupted operation.
+    Abort,
 }
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]

@@ -5,12 +5,13 @@ use std::io::{BufRead, IsTerminal};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use anyhow::Context;
 use base64::Engine;
 use clap::{CommandFactory, Parser, error::ErrorKind};
 use clap_complete::{Shell, generate};
 use devme_cli::{
-    Cli, Command, ConfigAction, SkillAction, WorktreeAction, format_status_all, format_status_json,
-    format_status_text,
+    Cli, Command, ConfigAction, FeatureAction, SkillAction, WorktreeAction, format_status_all,
+    format_status_json, format_status_text,
 };
 use devme_config::Stack;
 use devme_core::{ClientMessage, ServerMessage, ServiceState};
@@ -289,7 +290,10 @@ async fn run(cli: Cli) -> i32 {
         devme_ui::warn(warning);
     }
     let command_output = match &cli.command {
-        Some(Command::Status { output, .. }) | Some(Command::Doctor { output, .. }) => *output,
+        Some(Command::Status { output, .. })
+        | Some(Command::Doctor { output, .. })
+        | Some(Command::Create { output, .. })
+        | Some(Command::Feature { output, .. }) => *output,
         _ => devme_cli::OutputFormat::Human,
     };
     let error_output = if cli.json {
@@ -310,6 +314,21 @@ async fn run(cli: Cli) -> i32 {
                 devme_cli::OutputFormat::Toon
             })
             .await;
+        }
+        Some(Command::Create {
+            template,
+            path,
+            features,
+            dry_run,
+            output,
+            source,
+        }) => {
+            let output = selected_output(cli.json, output);
+            return create_project(template, path, features, dry_run, output, source);
+        }
+        Some(Command::Feature { action, output }) => {
+            let output = selected_output(cli.json, output);
+            return feature_project(action, output).await;
         }
         Some(Command::Session {
             session,
@@ -488,6 +507,414 @@ async fn run(cli: Cli) -> i32 {
         Ok(()) => 0,
         Err(e) => emit_command_error(error_output, &e),
     }
+}
+
+fn selected_output(json: bool, output: devme_cli::OutputFormat) -> devme_cli::OutputFormat {
+    if json {
+        devme_cli::OutputFormat::Json
+    } else if output == devme_cli::OutputFormat::Human
+        && !output_was_explicit()
+        && (NO_INPUT.load(Ordering::Relaxed) || !std::io::stdout().is_terminal())
+    {
+        devme_cli::OutputFormat::Toon
+    } else {
+        output
+    }
+}
+
+fn output_was_explicit() -> bool {
+    let args = std::env::args().collect::<Vec<_>>();
+    args.iter().any(|arg| arg.starts_with("--output="))
+        || args.windows(2).any(|pair| pair[0] == "--output")
+}
+
+fn create_project(
+    template: Option<String>,
+    path: Option<std::path::PathBuf>,
+    features: Vec<String>,
+    dry_run: bool,
+    output: devme_cli::OutputFormat,
+    source: Option<std::path::PathBuf>,
+) -> i32 {
+    let composer = devme_project_composer::Composer::new();
+    let Some(template) = template else {
+        let cwd = match std::env::current_dir() {
+            Ok(cwd) => cwd,
+            Err(error) => return emit_command_error(output, &error.into()),
+        };
+        if cwd.join(".devme/composition.lock").is_file() {
+            return match composer.list_features(&cwd) {
+                Ok(report) => emit_composer_report(&report, output),
+                Err(error) => emit_composer_error(output, &error),
+            };
+        }
+        let report = serde_json::json!({
+            "schema_version": 1,
+            "context": if cwd.join("devme.toml").is_file() { "unmanaged_project" } else { "outside_project" },
+            "templates": [{
+                "name": "native",
+                "description": "Native SwiftUI and Compose app with a Convex backend"
+            }],
+            "next_commands": ["devme create native <path> --dry-run --output toon"]
+        });
+        return emit_composer_report(&report, output);
+    };
+    if template == "add" {
+        let feature = path
+            .as_deref()
+            .and_then(std::path::Path::to_str)
+            .unwrap_or("<feature>");
+        return emit_composer_error(
+            output,
+            &devme_project_composer::ComposerError::Usage {
+                message: "`devme create` initializes projects; it does not modify them".into(),
+                help: format!("Use `devme feature add {feature}` from the managed project."),
+            },
+        );
+    }
+    let Some(path) = path else {
+        return emit_composer_error(
+            output,
+            &devme_project_composer::ComposerError::Usage {
+                message: "a destination path is required when creating a project".into(),
+                help: format!("Use `devme create {template} <path>`."),
+            },
+        );
+    };
+    let (source, source_locator) = match resolve_template_locator(source) {
+        Ok(source) => source,
+        Err(error) => return emit_command_error(output, &error),
+    };
+    let target = if path.is_absolute() {
+        path
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(error) => return emit_command_error(output, &error.into()),
+        }
+    };
+    match composer.create(devme_project_composer::CreateRequest {
+        template,
+        target,
+        source,
+        source_locator: Some(source_locator),
+        features,
+        dry_run,
+    }) {
+        Ok(report) => emit_composer_report(&report, output),
+        Err(error) => emit_composer_error(output, &error),
+    }
+}
+
+async fn feature_project(action: FeatureAction, output: devme_cli::OutputFormat) -> i32 {
+    let root = match std::env::current_dir() {
+        Ok(root) => root,
+        Err(error) => return emit_command_error(output, &error.into()),
+    };
+    let composer = devme_project_composer::Composer::new();
+    let converge = root.join("devme.toml").is_file()
+        && matches!(
+            &action,
+            FeatureAction::Add { dry_run: false, .. }
+                | FeatureAction::Remove { dry_run: false, .. }
+                | FeatureAction::Update { dry_run: false, .. }
+                | FeatureAction::Continue
+                | FeatureAction::Abort
+        );
+    let result = match action {
+        FeatureAction::Add { feature, dry_run } => {
+            composer.add_feature(devme_project_composer::AddFeatureRequest {
+                root,
+                feature,
+                dry_run,
+            })
+        }
+        FeatureAction::Remove { feature, dry_run } => {
+            composer.remove_feature(devme_project_composer::RemoveFeatureRequest {
+                root,
+                feature,
+                dry_run,
+            })
+        }
+        FeatureAction::List => {
+            return match composer.list_features(&root) {
+                Ok(report) => emit_composer_report(&report, output),
+                Err(error) => emit_composer_error(output, &error),
+            };
+        }
+        FeatureAction::Update { feature, dry_run } => {
+            composer.update_feature(devme_project_composer::UpdateFeatureRequest {
+                root,
+                feature,
+                dry_run,
+            })
+        }
+        FeatureAction::Continue => composer.continue_operation(&root),
+        FeatureAction::Abort => composer.abort_operation(&root),
+    };
+    match result {
+        Ok(report) => {
+            let exit_code = emit_composer_report(&report, output);
+            if exit_code != 0 || !converge {
+                return exit_code;
+            }
+            if let Err(error) = down(30, false).await {
+                return emit_command_error(output, &error);
+            }
+            match up(Vec::new(), true, true, 180).await {
+                Ok(()) => 0,
+                Err(error) => emit_command_error(output, &error),
+            }
+        }
+        Err(error) => emit_composer_error(output, &error),
+    }
+}
+
+fn emit_composer_report<T: serde::Serialize>(report: &T, output: devme_cli::OutputFormat) -> i32 {
+    let value = match serde_json::to_value(report) {
+        Ok(value) => value,
+        Err(error) => return emit_command_error(output, &error.into()),
+    };
+    let result = match output {
+        devme_cli::OutputFormat::Human => {
+            println!("{}", format_composer_human(&value));
+            Ok(())
+        }
+        devme_cli::OutputFormat::Json => {
+            devme_ui::json(&value);
+            Ok(())
+        }
+        devme_cli::OutputFormat::Toon => devme_cli::output::print_toon(&value),
+    };
+    match result {
+        Ok(()) => 0,
+        Err(error) => emit_command_error(output, &error),
+    }
+}
+
+fn format_composer_human(value: &serde_json::Value) -> String {
+    if let Some(templates) = value.get("templates").and_then(serde_json::Value::as_array) {
+        let mut lines = vec!["Templates".to_string()];
+        for template in templates {
+            let name = template
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let description = template
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            lines.push(format!("  {name:<10} {description}"));
+        }
+        append_human_commands(&mut lines, value);
+        return lines.join("\n");
+    }
+
+    let features = value.get("features").and_then(serde_json::Value::as_array);
+    if features.is_some_and(|features| {
+        features
+            .first()
+            .is_none_or(|feature| feature.get("installed").is_some())
+    }) && value.get("template").is_some()
+    {
+        let template = value
+            .get("template")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("project");
+        let mut lines = vec![format!("{} composition", title_case(template))];
+        append_human_recipe(&mut lines, value);
+        lines.push("Features".into());
+        for feature in features.into_iter().flatten() {
+            let name = feature
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let version = feature
+                .get("version")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let status = if feature
+                .get("installed")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                "installed"
+            } else {
+                "available"
+            };
+            lines.push(format!("  {name:<16} {version:<12} {status}"));
+        }
+        append_human_commands(&mut lines, value);
+        return lines.join("\n");
+    }
+
+    if let Some(operation) = value.get("operation").and_then(serde_json::Value::as_str) {
+        let dry_run = value
+            .get("dry_run")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let title = match (operation, dry_run) {
+            ("create", true) => "Project creation plan",
+            ("create", false) => "Project created",
+            ("feature_add", true) => "Feature addition plan",
+            ("feature_add", false) => "Feature added",
+            ("feature_remove", true) => "Feature removal plan",
+            ("feature_remove", false) => "Feature removed",
+            ("feature_update", true) => "Feature update plan",
+            ("feature_update", false) => "Feature updated",
+            ("feature_continue", _) => "Feature operation continued",
+            ("feature_abort", _) => "Feature operation aborted",
+            _ => "Composition complete",
+        };
+        let mut lines = vec![title.to_string()];
+        append_human_recipe(&mut lines, value);
+        if let Some(features) = value.get("features").and_then(serde_json::Value::as_array) {
+            let names = features
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>();
+            lines.push(format!(
+                "Features: {}",
+                if names.is_empty() {
+                    "none".into()
+                } else {
+                    names.join(", ")
+                }
+            ));
+        }
+        if let Some(files) = value
+            .get("changed_files")
+            .and_then(serde_json::Value::as_array)
+        {
+            lines.push(format!("Changed files: {}", files.len()));
+            lines.extend(
+                files
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(|path| format!("  {path}")),
+            );
+        }
+        if let Some(steps) = value
+            .get("external_steps")
+            .and_then(serde_json::Value::as_array)
+            .filter(|steps| !steps.is_empty())
+        {
+            lines.push("Untrusted manual recipe guidance".into());
+            lines.extend(
+                steps
+                    .iter()
+                    .filter_map(|step| {
+                        step.as_str()
+                            .or_else(|| step.get("description").and_then(serde_json::Value::as_str))
+                    })
+                    .map(|step| format!("  {}", sanitize_recipe_text(step))),
+            );
+        }
+        append_human_commands(&mut lines, value);
+        return lines.join("\n");
+    }
+
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn append_human_recipe(lines: &mut Vec<String>, value: &serde_json::Value) {
+    let Some(recipe) = value.get("recipe") else {
+        return;
+    };
+    let name = recipe
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let version = recipe
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    lines.push(format!("Recipe: {name} {version}"));
+}
+
+fn append_human_commands(lines: &mut Vec<String>, value: &serde_json::Value) {
+    let Some(commands) = value
+        .get("next_commands")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    lines.extend(
+        commands
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(|command| format!("Next: {command}")),
+    );
+}
+
+fn title_case(value: &str) -> String {
+    let mut characters = value.chars();
+    characters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().collect::<String>() + characters.as_str()
+    })
+}
+
+fn sanitize_recipe_text(value: &str) -> String {
+    strip_ansi(value)
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
+fn emit_composer_error(
+    output: devme_cli::OutputFormat,
+    error: &devme_project_composer::ComposerError,
+) -> i32 {
+    let report = serde_json::json!({
+        "schema_version": 1,
+        "error": {
+            "code": error.code(),
+            "message": error.to_string(),
+            "paths": error.conflict_paths(),
+            "help": error.help().unwrap_or("Inspect the template recipe and retry."),
+        }
+    });
+    match output {
+        devme_cli::OutputFormat::Human => {
+            devme_ui::error(error.to_string());
+            for path in error.conflict_paths() {
+                eprintln!("  {}", path.display());
+            }
+            if let Some(help) = error.help() {
+                eprintln!("Help: {help}");
+            }
+        }
+        devme_cli::OutputFormat::Json => devme_ui::json(&report),
+        devme_cli::OutputFormat::Toon => devme_cli::output::print_toon(&report)
+            .expect("serializing a composer error report as TOON cannot fail"),
+    }
+    error.exit_code()
+}
+
+fn resolve_template_locator(
+    source: Option<std::path::PathBuf>,
+) -> anyhow::Result<(std::path::PathBuf, String)> {
+    if let Some(source) = source {
+        let source = source
+            .canonicalize()
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("template source does not exist: {}", source.display()));
+        return source.map(|source| {
+            let locator = source.display().to_string();
+            (source, locator)
+        });
+    }
+    const NATIVE_RECIPE: &str = "https://github.com/henrikkvamme/devme-native-template.git";
+    Ok((
+        std::path::PathBuf::from(NATIVE_RECIPE),
+        NATIVE_RECIPE.into(),
+    ))
 }
 
 fn task_approval_handler(
@@ -1596,14 +2023,14 @@ async fn up(services: Vec<String>, detach: bool, wait: bool, timeout: u64) -> an
     {
         devme_ui::warn(format!("shared supervisor not started: {e}"));
     }
-    let fresh_daemon = ensure_daemon(&sock).await?;
+    let mut fresh_daemon = ensure_daemon(&sock).await?;
     let mut client = devme_client::Client::connect(&sock).await?;
     client
         .send(ClientMessage::Subscribe {
             services: selected.clone(),
         })
         .await?;
-    let snapshot: Vec<devme_core::ServiceSnapshot> = match client.next_event().await? {
+    let mut snapshot: Vec<devme_core::ServiceSnapshot> = match client.next_event().await? {
         Some(ServerMessage::Subscribed { services, .. }) => services
             .into_iter()
             .filter(|service| selected.contains(&service.name))
@@ -1613,6 +2040,35 @@ async fn up(services: Vec<String>, detach: bool, wait: bool, timeout: u64) -> an
         }
         None => return Err(anyhow::anyhow!("daemon closed before snapshot")),
     };
+    let missing_services = selected
+        .iter()
+        .filter(|name| !snapshot.iter().any(|service| &service.name == *name))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !fresh_daemon && !missing_services.is_empty() {
+        drop(client);
+        devme_ui::info("configuration changed; restarting the daemon");
+        teardown_daemon(&sock, 30, None).await?;
+        fresh_daemon = ensure_daemon(&sock).await?;
+        client = devme_client::Client::connect(&sock).await?;
+        client
+            .send(ClientMessage::Subscribe {
+                services: selected.clone(),
+            })
+            .await?;
+        snapshot = match client.next_event().await? {
+            Some(ServerMessage::Subscribed { services, .. }) => services
+                .into_iter()
+                .filter(|service| selected.contains(&service.name))
+                .collect(),
+            Some(other) => {
+                return Err(anyhow::anyhow!(
+                    "unexpected initial reply after reload: {other:?}"
+                ));
+            }
+            None => return Err(anyhow::anyhow!("reloaded daemon closed before snapshot")),
+        };
+    }
     if snapshot.is_empty() {
         devme_ui::info("no services declared");
         return Ok(());

@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 devme-core = { workspace = true }
 devme-config = { workspace = true }
+devme-project-composer = { workspace = true }
 devme-resource-lease = { workspace = true }
 devme-task-runner = { workspace = true }
 devme-ui = { workspace = true }
