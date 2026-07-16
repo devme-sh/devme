@@ -18,7 +18,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Check repository skill mirror
         run: scripts/sync-devme-skill.sh --check
@@ -49,7 +49,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -117,7 +117,7 @@ jobs:
 
     steps:
       - name: Checkout (for changelog context)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -156,10 +156,10 @@ jobs:
           fi
 
       - name: Checkout devme (canonical skill)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Checkout skills mirror
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: devme-sh/skills
           token: ${{ secrets.SKILLS_SYNC_TOKEN }}
@@ -199,7 +199,7 @@ jobs:
 
     steps:
       - name: Checkout tap repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: devme-sh/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
