@@ -27,8 +27,8 @@ const DAEMONS: &[DaemonDef] = &[
     DaemonDef {
         id: "orbstack",
         label: "OrbStack",
-        detect: || std::path::Path::new("/Applications/OrbStack.app").exists() || which("orbstack"),
-        start_cmd: &["open", "-a", "OrbStack"],
+        detect: || std::path::Path::new("/Applications/OrbStack.app").exists() || which("orbctl"),
+        start_cmd: &["orbctl", "start"],
     },
     DaemonDef {
         id: "docker-desktop",
@@ -99,20 +99,34 @@ pub fn start_daemon(id: &str) -> Result<(), String> {
         .status()
         .map_err(|e| format!("failed to start {}: {e}", def.label))?;
 
-    if !status.success() {
-        return Err(format!("{} exited with {}", def.label, status));
-    }
+    await_daemon_ready(def.label, status, 60, is_docker_running, || {
+        std::thread::sleep(std::time::Duration::from_millis(500))
+    })
+}
 
-    for _ in 0..60 {
-        if is_docker_running() {
+fn await_daemon_ready(
+    label: &str,
+    start_status: std::process::ExitStatus,
+    attempts: usize,
+    mut is_ready: impl FnMut() -> bool,
+    mut wait: impl FnMut(),
+) -> Result<(), String> {
+    for _ in 0..attempts {
+        if is_ready() {
             return Ok(());
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        wait();
     }
-    Err(format!(
-        "{} started but Docker didn't become ready within 30s",
-        def.label
-    ))
+
+    if start_status.success() {
+        Err(format!(
+            "{label} started but Docker didn't become ready within 30s"
+        ))
+    } else {
+        Err(format!(
+            "{label} exited with {start_status}; Docker didn't become ready within 30s"
+        ))
+    }
 }
 
 /// True if any service in the stack uses docker in its command.
@@ -240,6 +254,33 @@ mod tests {
         assert!(!cmd_needs_docker("npm run dev"));
         assert!(!cmd_needs_docker("cargo run"));
         assert!(!cmd_needs_docker("python manage.py runserver"));
+    }
+
+    #[test]
+    fn orbstack_start_command_starts_the_engine() {
+        assert_eq!(
+            start_command_for("orbstack").as_deref(),
+            Some("orbctl start")
+        );
+    }
+
+    #[test]
+    fn transient_launcher_failure_is_tolerated_when_docker_becomes_ready() {
+        let failed_status = std::process::Command::new("false").status().unwrap();
+        let mut attempts = 0;
+
+        let result = await_daemon_ready(
+            "test daemon",
+            failed_status,
+            3,
+            || {
+                attempts += 1;
+                attempts == 2
+            },
+            || {},
+        );
+
+        assert_eq!(result, Ok(()));
     }
 
     #[test]
