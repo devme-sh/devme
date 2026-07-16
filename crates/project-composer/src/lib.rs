@@ -310,8 +310,11 @@ impl Composer {
                         .get(&collision_key(path))
                         .is_some_and(|(existing, owner)| {
                             existing != *path
-                                || (owner != "base"
-                                    && !feature_depends_on(&loaded.recipe, feature, owner))
+                                || !feature_can_overlay_owned_path(
+                                    &loaded.recipe,
+                                    feature,
+                                    std::iter::once(owner.as_str()),
+                                )
                         })
                 })
                 .cloned()
@@ -819,12 +822,15 @@ impl Composer {
             if current.is_some() && current.as_ref() != expected {
                 conflicts.push(path.clone());
             }
-            if let Some(owner) = lock
+            let owners = lock
                 .features
                 .iter()
-                .find_map(|(name, installed)| installed.files.contains_key(path).then_some(name))
-                && !feature_depends_on(&loaded.recipe, feature_name, owner)
-            {
+                .filter_map(|(name, installed)| installed.files.contains_key(path).then_some(name));
+            if !feature_can_overlay_owned_path(
+                &loaded.recipe,
+                feature_name,
+                owners.map(String::as_str),
+            ) {
                 conflicts.push(path.clone());
             }
             if has_case_collision(lock, path) {
@@ -1152,6 +1158,16 @@ fn feature_depends_on(recipe: &Recipe, feature: &str, dependency: &str) -> bool 
         }
     }
     false
+}
+
+fn feature_can_overlay_owned_path<'a>(
+    recipe: &Recipe,
+    feature: &str,
+    owners: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    owners
+        .into_iter()
+        .all(|owner| owner == "base" || feature_depends_on(recipe, feature, owner))
 }
 
 fn validate_new_target(target: &Path) -> Result<(), ComposerError> {

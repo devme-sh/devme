@@ -519,6 +519,74 @@ dependencies = ["auth"]
 }
 
 #[test]
+fn sibling_cannot_bypass_the_effective_dependency_overlay() {
+    let source = recipe();
+    write(
+        source.path().join("devme-template.toml"),
+        r#"schema_version = 1
+name = "native"
+version = "2026.7.16"
+
+[base]
+path = "base"
+
+[features.auth]
+version = "1.0.0"
+path = "features/auth"
+
+[features.stripe]
+version = "1.0.0"
+path = "features/stripe"
+dependencies = ["auth"]
+
+[features.analytics]
+version = "1.0.0"
+path = "features/analytics"
+dependencies = ["auth"]
+"#,
+    );
+    write(
+        source.path().join("features/stripe/app/settings.txt"),
+        "auth = true\nstripe = true\n",
+    );
+    write(
+        source.path().join("features/analytics/app/settings.txt"),
+        "auth = true\nanalytics = true\n",
+    );
+    let workspace = TempDir::new().unwrap();
+    let incremental_target = workspace.path().join("incremental");
+    let composer = Composer::new();
+    composer
+        .create(create_request(source.path(), incremental_target.clone()))
+        .unwrap();
+    for feature in ["auth", "stripe"] {
+        composer
+            .add_feature(AddFeatureRequest {
+                root: incremental_target.clone(),
+                feature: feature.into(),
+                dry_run: false,
+            })
+            .unwrap();
+    }
+
+    let incremental_error = composer
+        .add_feature(AddFeatureRequest {
+            root: incremental_target,
+            feature: "analytics".into(),
+            dry_run: false,
+        })
+        .unwrap_err();
+    assert!(matches!(incremental_error, ComposerError::Conflict { .. }));
+
+    let composed_target = workspace.path().join("composed");
+    let mut request = create_request(source.path(), composed_target.clone());
+    request.features = vec!["auth".into(), "stripe".into(), "analytics".into()];
+    let composed_error = composer.create(request).unwrap_err();
+    assert!(matches!(composed_error, ComposerError::Conflict { .. }));
+    assert!(!composed_target.exists());
+}
+
+#[test]
 fn modified_dependency_overlay_blocks_feature_removal() {
     let source = layered_recipe();
     let workspace = TempDir::new().unwrap();

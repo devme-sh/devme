@@ -153,6 +153,54 @@ path = "features/auth"
 }
 
 #[test]
+fn feature_add_converges_new_runtime_dependencies_without_a_second_command() {
+    let source = recipe();
+    write(
+        source.path().join("base/devme.toml"),
+        "schema_version = 1\n",
+    );
+    write(
+        source.path().join("features/auth/devme.toml"),
+        r#"schema_version = 1
+
+[step.auth-dependencies]
+check = "test -f .auth-ready"
+provision = "touch .auth-ready"
+trust = "auto"
+
+[service.auth-runtime]
+cmd = "sleep 60"
+depends_on = ["auth-dependencies"]
+"#,
+    );
+    let workspace = TempDir::new().unwrap();
+    let target = workspace.path().join("groceries");
+    toon(&run(
+        workspace.path(),
+        source.path(),
+        &[
+            "create",
+            "native",
+            "groceries",
+            "--no-input",
+            "--output",
+            "toon",
+        ],
+    ));
+
+    let added = run(
+        &target,
+        source.path(),
+        &["feature", "add", "auth", "--no-input", "--output", "toon"],
+    );
+
+    let added = toon(&added);
+    assert_eq!(added["operation"], "feature_add");
+    assert!(target.join(".auth-ready").is_file());
+    assert!(run(&target, source.path(), &["down"]).status.success());
+}
+
+#[test]
 fn feature_conflicts_use_exit_five_and_structured_recovery() {
     let source = recipe();
     let workspace = TempDir::new().unwrap();

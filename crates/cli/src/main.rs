@@ -328,7 +328,7 @@ async fn run(cli: Cli) -> i32 {
         }
         Some(Command::Feature { action, output }) => {
             let output = selected_output(cli.json, output);
-            return feature_project(action, output);
+            return feature_project(action, output).await;
         }
         Some(Command::Session {
             session,
@@ -606,12 +606,21 @@ fn create_project(
     }
 }
 
-fn feature_project(action: FeatureAction, output: devme_cli::OutputFormat) -> i32 {
+async fn feature_project(action: FeatureAction, output: devme_cli::OutputFormat) -> i32 {
     let root = match std::env::current_dir() {
         Ok(root) => root,
         Err(error) => return emit_command_error(output, &error.into()),
     };
     let composer = devme_project_composer::Composer::new();
+    let converge = root.join("devme.toml").is_file()
+        && matches!(
+            &action,
+            FeatureAction::Add { dry_run: false, .. }
+                | FeatureAction::Remove { dry_run: false, .. }
+                | FeatureAction::Update { dry_run: false, .. }
+                | FeatureAction::Continue
+                | FeatureAction::Abort
+        );
     let result = match action {
         FeatureAction::Add { feature, dry_run } => {
             composer.add_feature(devme_project_composer::AddFeatureRequest {
@@ -644,7 +653,19 @@ fn feature_project(action: FeatureAction, output: devme_cli::OutputFormat) -> i3
         FeatureAction::Abort => composer.abort_operation(&root),
     };
     match result {
-        Ok(report) => emit_composer_report(&report, output),
+        Ok(report) => {
+            let exit_code = emit_composer_report(&report, output);
+            if exit_code != 0 || !converge {
+                return exit_code;
+            }
+            if let Err(error) = down(30, false).await {
+                return emit_command_error(output, &error);
+            }
+            match up(Vec::new(), true, true, 180).await {
+                Ok(()) => 0,
+                Err(error) => emit_command_error(output, &error),
+            }
+        }
         Err(error) => emit_composer_error(output, &error),
     }
 }
