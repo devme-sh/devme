@@ -4,6 +4,7 @@ members = [
     "crates/ui",
     "crates/core",
     "crates/config",
+    "crates/project-composer",
     "crates/resource-lease",
     "crates/task-runner",
     "crates/slot-allocator",
@@ -28,6 +29,7 @@ repository = "https://github.com/devme-sh/devme"
 devme-ui = { path = "crates/ui" }
 devme-core = { path = "crates/core" }
 devme-config = { path = "crates/config" }
+devme-project-composer = { path = "crates/project-composer" }
 devme-resource-lease = { path = "crates/resource-lease" }
 devme-task-runner = { path = "crates/task-runner" }
 devme-slot-allocator = { path = "crates/slot-allocator" }
@@ -61,6 +63,7 @@ process_alive = "0.1"
 fs2 = "0.4"
 tempfile = "3"
 notify = "8"
+sha2 = "0.10"
 
 # HTTP client (health probes)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }

@@ -303,7 +303,8 @@ mod tests {
     #[test]
     fn embedded_skill_has_expected_frontmatter() {
         assert!(SKILL_MD.starts_with("---\nname: devme\n"));
-        assert!(SKILL_MD.contains("description: Manage dev environments with devme. Use when"));
+        assert!(SKILL_MD.contains("description: Manage dev environments and composed projects"));
+        assert!(SKILL_MD.contains("devme feature add|remove|update"));
         assert!(SKILL_MD.contains("### CLI reference"));
         assert!(!SKILL_MD.contains("`devme remote"));
         assert!(SKILL_MD.contains("Legacy remote config is ignored"));
