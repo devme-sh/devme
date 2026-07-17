@@ -1401,7 +1401,7 @@ fn collect_files(root: &Path) -> Result<BTreeMap<PathBuf, PayloadFile>, Composer
         for entry in entries {
             let file_type = entry.file_type()?;
             let path = entry.path();
-            if file_type.is_dir() && entry.file_name() == ".git" {
+            if file_type.is_dir() && matches!(entry.file_name().to_str(), Some(".git" | ".devme")) {
                 continue;
             }
             if file_type.is_symlink() {

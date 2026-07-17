@@ -3534,7 +3534,7 @@ async fn launch_tui(session_owns_home: bool) -> anyhow::Result<i32> {
             let interactive = interactive_input();
             let mut stdin = std::io::BufReader::new(std::io::stdin());
             let mut stderr = std::io::stderr();
-            let _ = devme_supervisor::env_resolve::resolve_env_vars(
+            devme_supervisor::env_resolve::resolve_env_vars(
                 &env_pairs,
                 &env_file,
                 &cwd,
@@ -3542,7 +3542,8 @@ async fn launch_tui(session_owns_home: bool) -> anyhow::Result<i32> {
                 &mut stderr,
                 interactive,
                 devme_ui::err_style(),
-            );
+            )
+            .map_err(|error| anyhow::anyhow!("environment setup is incomplete: {error}"))?;
         }
         // Only show preflight output when something needs provisioning.
         if !devme_supervisor::preflight::all_checks_pass(&focused, &cwd) {
@@ -3771,7 +3772,7 @@ async fn ensure_daemon_with_preflight_targets(
             let interactive = interactive_input();
             let mut stdin = std::io::BufReader::new(std::io::stdin());
             let mut stderr = std::io::stderr();
-            if let Err(e) = devme_supervisor::env_resolve::resolve_env_vars(
+            devme_supervisor::env_resolve::resolve_env_vars(
                 &env_pairs,
                 &env_file,
                 &cwd,
@@ -3779,9 +3780,8 @@ async fn ensure_daemon_with_preflight_targets(
                 &mut stderr,
                 interactive,
                 devme_ui::err_style(),
-            ) {
-                devme_ui::warn(format!("env resolution failed: {e}"));
-            }
+            )
+            .map_err(|error| anyhow::anyhow!("environment setup is incomplete: {error}"))?;
         }
         // Preflight: check dependencies that don't need services. Under `-q`
         // the tree renders into a buffer dumped only when something failed.

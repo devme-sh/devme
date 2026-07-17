@@ -3,7 +3,7 @@ name: devme
 description: Manage dev environments and composed projects with devme. Use when creating a native starter, adding or removing a managed feature, services fail, logs need inspection, or the user mentions devme.
 license: MIT
 metadata:
-  version: "0.2.3"
+  version: "0.2.4"
 allowed-tools: Bash(devme *) Bash(docker *) Bash(lsof *) Bash(ps *) Bash(find *) Bash(cat *) Bash(ls *) Read Write
 ---
 
@@ -67,6 +67,13 @@ graphs. It ignores generated `.devme` state and keeps modules owned by one
 Gradle settings root in a single member. Bun and project dependency checks are
 emitted as ordinary provision steps. Review every generated command before
 running it.
+
+Completion gate:
+
+1. Run `devme config check` and inventory every declared task with `devme tasks --output toon`.
+2. Make prerequisites executable: values needed by any task use `[env.*] required = true`; tools and generated state use idempotent steps; runtimes use services and resources. A task must not depend on README-only setup.
+3. Run every non-consequential declared task through `devme run`, including launch and utility tasks. An aggregate `verify` does not prove tasks outside its dependency graph. Exercise native launch tasks on their real simulator, emulator, or connected device.
+4. Run `devme doctor`. Handoff requires passing task results and healthy required services. If a task needs unavailable credentials, hardware, approval, or another external prerequisite, report the setup as blocked instead of complete. For consequential publish or deploy tasks, prove a non-mutating preflight and request approval before execution.
 
 Detect the stack from `package.json` (scripts.dev, drizzle/prisma), `Cargo.toml`, `pyproject.toml`/`requirements.txt`, `go.mod`, `docker-compose.yml`, `Dockerfile`, `.env`/`.env.example`, and DB references. Then write a `devme.toml`:
 
@@ -146,6 +153,7 @@ linger = 30
 ```
 
 Rules:
+- Every value without which a declared task fails is required in `[env.*]`; reserve skippable values for capabilities no advertised task assumes.
 - Use `kind = "launch"`, `"check"`, or `"utility"` to group tasks in the interactive Actions sidebar. Bare `devme` opens Actions on a cold stack while keeping service tabs and logs visible. `a` switches the left rail between Actions for the selected stack and the stack list; `jk` always navigates that rail and `hl` always navigates services. Existing tasks default to `utility`; kind is discovery metadata and never changes execution.
 - Use `visibility = "internal"` for dependency, CI, code-generation, and diagnostic tasks that should stay out of the human Home surface. Internal tasks remain public through `devme tasks`, `devme run`, dependencies, sessions, and agent tooling.
 - Use `artifacts = ["path"]` to report files or directories produced by a task. Relative paths are rooted at the project root, placeholders such as `{slot}` and `{worktree}` are interpolated, and results expose absolute paths without uploading or interpreting the artifact.

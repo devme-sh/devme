@@ -129,6 +129,15 @@ fn read_line_safe<R: BufRead>(input: &mut R) -> Result<Option<String>, std::io::
     }
 }
 
+fn required_env_error(name: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "required environment variable {name} is missing; run devme interactively to configure it"
+        ),
+    )
+}
+
 /// Resolve missing env vars with Clack-style interactive prompts.
 pub fn resolve_env_vars<R: BufRead, W: Write>(
     declared: &[(String, EnvVar)],
@@ -147,8 +156,9 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
 
     let missing: Vec<(&String, &EnvVar)> = declared
         .iter()
-        .filter(|(name, _)| {
-            !existing.contains_key(name.as_str()) && !previously_skipped.contains(name.as_str())
+        .filter(|(name, var)| {
+            !existing.contains_key(name.as_str())
+                && (var.required || !previously_skipped.contains(name.as_str()))
         })
         .map(|(name, var)| (name, var))
         .collect();
@@ -187,6 +197,9 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
 
                 match read_line_safe(input)? {
                     None => {
+                        if var.required {
+                            return Err(required_env_error(name));
+                        }
                         sec.newline()?;
                         break;
                     }
@@ -199,6 +212,14 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
                                     resolved.push(((*name).clone(), value));
                                 }
                                 Err(e) => {
+                                    if var.required {
+                                        return Err(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidInput,
+                                            format!(
+                                                "could not generate required environment variable {name}: {e}"
+                                            ),
+                                        ));
+                                    }
                                     sec.sub(Item::Warn, &format!("Generate failed: {e}"))?;
                                     skipped.push((*name).clone());
                                 }
@@ -217,6 +238,12 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
                         sec.item(Item::Ok, name, Some("Generated"))?;
                         resolved.push(((*name).clone(), value));
                     }
+                    Err(e) if var.required => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("could not generate required environment variable {name}: {e}"),
+                        ));
+                    }
                     Err(_) => {
                         skipped.push((*name).clone());
                     }
@@ -230,6 +257,8 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
             if let Some(d) = &var.default {
                 sec.item(Item::Ok, name, Some(d))?;
                 resolved.push(((*name).clone(), d.clone()));
+            } else if var.required {
+                return Err(required_env_error(name));
             } else {
                 sec.item(Item::Skip, name, Some("skipped"))?;
                 skipped.push((*name).clone());
@@ -264,8 +293,12 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
                         resolved.push(((*name).clone(), value));
                     }
                     None => {
-                        sec.sub(Item::Skip, "Skipped")?;
-                        skipped.push((*name).clone());
+                        if var.required {
+                            return Err(required_env_error(name));
+                        } else {
+                            sec.sub(Item::Skip, "Skipped")?;
+                            skipped.push((*name).clone());
+                        }
                     }
                 }
             } else {
@@ -289,47 +322,34 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
         };
         sec.prompt(&prompt_hint)?;
 
-        match read_line_safe(input)? {
-            None => {
+        loop {
+            let Some(line) = read_line_safe(input)? else {
+                if var.required {
+                    return Err(required_env_error(name));
+                }
                 sec.newline()?;
                 break;
-            }
-            Some(line) => {
-                let trimmed = line.trim();
-                let value = if trimmed.is_empty() {
-                    var.default.clone().unwrap_or_default()
-                } else {
-                    trimmed.to_string()
-                };
+            };
+            let trimmed = line.trim();
+            let value = if trimmed.is_empty() {
+                var.default.clone().unwrap_or_default()
+            } else {
+                trimmed.to_string()
+            };
 
-                if value.is_empty() {
-                    if var.required {
-                        sec.sub(Item::Fail, "This variable is required.")?;
-                        sec.prompt("›")?;
-                        match read_line_safe(input)? {
-                            None => {
-                                sec.newline()?;
-                                break;
-                            }
-                            Some(retry) => {
-                                let retry_val = retry.trim();
-                                if retry_val.is_empty() {
-                                    skipped.push((*name).clone());
-                                } else {
-                                    sec.sub(Item::Ok, "Set")?;
-                                    resolved.push(((*name).clone(), retry_val.to_string()));
-                                }
-                            }
-                        }
-                    } else {
-                        sec.sub(Item::Skip, "Skipped")?;
-                        skipped.push((*name).clone());
-                    }
-                } else {
-                    sec.sub(Item::Ok, &value)?;
-                    resolved.push(((*name).clone(), value));
-                }
+            if !value.is_empty() {
+                sec.sub(Item::Ok, &value)?;
+                resolved.push(((*name).clone(), value));
+                break;
             }
+            if !var.required {
+                sec.sub(Item::Skip, "Skipped")?;
+                skipped.push((*name).clone());
+                break;
+            }
+
+            sec.sub(Item::Fail, "This variable is required.")?;
+            sec.prompt("›")?;
         }
     }
 
@@ -639,6 +659,90 @@ mod tests {
 
         assert!(result.resolved.is_empty());
         assert_eq!(result.skipped, vec!["OPTIONAL_KEY"]);
+    }
+
+    #[test]
+    fn required_var_reprompts_until_it_has_a_value() {
+        let dir = TempDir::new().unwrap();
+        let env_path = dir.path().join(".env.local");
+        std::fs::write(&env_path, "").unwrap();
+        let declared = vec![(
+            "REQUIRED_KEY".into(),
+            make_env_var(true, None, None, None, vec![]),
+        )];
+        let mut input = Cursor::new(b"\n\nconfigured\n");
+        let mut output = Vec::new();
+
+        let result = resolve_env_vars(
+            &declared,
+            &env_path,
+            dir.path(),
+            &mut input,
+            &mut output,
+            true,
+            Style::PLAIN,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result.resolved,
+            vec![("REQUIRED_KEY".to_string(), "configured".to_string())]
+        );
+        assert!(result.skipped.is_empty());
+    }
+
+    #[test]
+    fn required_var_blocks_noninteractive_startup_when_missing() {
+        let dir = TempDir::new().unwrap();
+        let env_path = dir.path().join(".env.local");
+        let declared = vec![(
+            "REQUIRED_KEY".into(),
+            make_env_var(true, None, None, None, vec![]),
+        )];
+        let mut input = Cursor::new(b"");
+        let mut output = Vec::new();
+
+        let error = resolve_env_vars(
+            &declared,
+            &env_path,
+            dir.path(),
+            &mut input,
+            &mut output,
+            false,
+            Style::PLAIN,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("REQUIRED_KEY"));
+        assert!(!env_path.exists());
+    }
+
+    #[test]
+    fn required_var_is_reopened_after_it_was_previously_skipped() {
+        let dir = TempDir::new().unwrap();
+        let env_path = dir.path().join(".env.local");
+        std::fs::write(&env_path, "# REQUIRED_KEY=\n").unwrap();
+        let declared = vec![(
+            "REQUIRED_KEY".into(),
+            make_env_var(true, None, None, None, vec![]),
+        )];
+        let mut input = Cursor::new(b"configured\n");
+        let mut output = Vec::new();
+
+        let result = resolve_env_vars(
+            &declared,
+            &env_path,
+            dir.path(),
+            &mut input,
+            &mut output,
+            true,
+            Style::PLAIN,
+        )
+        .unwrap();
+
+        assert_eq!(result.resolved[0].0, "REQUIRED_KEY");
+        assert_eq!(result.resolved[0].1, "configured");
     }
 
     #[test]
