@@ -66,6 +66,8 @@ pub struct CompositionReport {
     pub recipe: RecipeIdentity,
     pub features: Vec<String>,
     pub changed_files: Vec<PathBuf>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub regenerated_files: Vec<PathBuf>,
     pub external_steps: Vec<ExternalStep>,
     pub next_commands: Vec<String>,
 }
@@ -191,6 +193,8 @@ struct FeatureRecipe {
     #[serde(default)]
     conflicts: Vec<String>,
     #[serde(default)]
+    generated_files: Vec<PathBuf>,
+    #[serde(default)]
     external_steps: Vec<String>,
     #[serde(default)]
     remove_external_steps: Vec<String>,
@@ -231,6 +235,8 @@ struct LockedFeatureFile {
     installed_digest: String,
     previous_digest: Option<String>,
     previous_existed: bool,
+    #[serde(default)]
+    generated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -304,6 +310,7 @@ impl Composer {
             validate_feature_dependencies(&feature_order, &loaded.recipe, feature, recipe)?;
             let files = collect_files(&payload_root(&loaded.source, &recipe.path)?)?;
             validate_payload_paths(&files, false)?;
+            validate_generated_files(recipe, &files)?;
             let overlaps = files
                 .keys()
                 .filter(|path| {
@@ -437,12 +444,17 @@ impl Composer {
             });
         }
         let mut conflicts = Vec::new();
+        let mut regenerated_files = Vec::new();
         for (path, file) in &feature.files {
             ensure_target_path_safe(&request.root, path)?;
             if file_digest_optional(&request.root.join(path))?.as_deref()
                 != Some(file.installed_digest.as_str())
             {
-                conflicts.push(path.clone());
+                if file.generated {
+                    regenerated_files.push(path.clone());
+                } else {
+                    conflicts.push(path.clone());
+                }
             }
         }
         if !conflicts.is_empty() {
@@ -511,17 +523,20 @@ impl Composer {
             "Source removal does not delete provider data, cancel subscriptions, revoke credentials, or remove store resources."
                 .into(),
         ]));
-        Ok(report(
-            "feature_remove",
-            request.dry_run,
-            identity,
-            lock.features
-                .keys()
-                .filter(|name| *name != &request.feature)
-                .cloned()
-                .collect(),
-            changed_files,
-            external_steps,
+        Ok(with_regenerated_files(
+            report(
+                "feature_remove",
+                request.dry_run,
+                identity,
+                lock.features
+                    .keys()
+                    .filter(|name| *name != &request.feature)
+                    .cloned()
+                    .collect(),
+                changed_files,
+                external_steps,
+            ),
+            regenerated_files,
         ))
     }
 
@@ -591,6 +606,7 @@ impl Composer {
         }
         let selected = vec![feature];
         let mut changed_files = BTreeSet::new();
+        let mut regenerated_files = BTreeSet::new();
         let mut external_steps = Vec::new();
 
         for feature_name in &selected {
@@ -609,6 +625,7 @@ impl Composer {
             )?;
             let next_files = collect_files(&payload_root(&loaded.source, &recipe.path)?)?;
             validate_payload_paths(&next_files, false)?;
+            let next_generated = validate_generated_files(recipe, &next_files)?;
             let paths = old
                 .files
                 .keys()
@@ -621,14 +638,24 @@ impl Composer {
                 let current = file_digest_optional(&request.root.join(path))?;
                 if let Some(old_file) = old.files.get(path) {
                     if current.as_deref() != Some(old_file.installed_digest.as_str()) {
+                        if old_file.generated || next_generated.contains(path) {
+                            regenerated_files.insert(path.clone());
+                        } else {
+                            conflicts.push(path.clone());
+                        }
+                    }
+                } else if current.as_ref() != lock.managed_files.get(path) {
+                    if next_generated.contains(path) && lock.managed_files.contains_key(path) {
+                        regenerated_files.insert(path.clone());
+                    } else {
                         conflicts.push(path.clone());
                     }
-                } else if current.is_some() && current.as_ref() != lock.managed_files.get(path) {
-                    conflicts.push(path.clone());
                 }
-                if lock.features.iter().any(|(other_name, other)| {
-                    other_name != feature_name && other.files.contains_key(path)
-                }) {
+                let owners = lock.features.iter().filter_map(|(other_name, other)| {
+                    (other_name != feature_name && other.files.contains_key(path))
+                        .then_some(other_name.as_str())
+                });
+                if !feature_can_overlay_owned_path(&loaded.recipe, feature_name, owners) {
                     conflicts.push(path.clone());
                 }
                 if has_case_collision(&lock, path) {
@@ -688,6 +715,7 @@ impl Composer {
                 lock.managed_files.insert(path.clone(), file_digest(next));
                 let mut updated = old_file.clone();
                 updated.installed_digest = file_digest(next);
+                updated.generated = next_generated.contains(path);
                 updated_files.insert(path.clone(), updated);
             }
             for (path, next) in &next_files {
@@ -713,6 +741,7 @@ impl Composer {
                         installed_digest,
                         previous_digest,
                         previous_existed,
+                        generated: next_generated.contains(path),
                     },
                 );
             }
@@ -734,13 +763,16 @@ impl Composer {
             write_lock(&request.root, &lock)?;
             clear_journal(&request.root)?;
         }
-        Ok(report(
-            "feature_update",
-            request.dry_run,
-            loaded.identity,
-            lock.features.keys().cloned().collect(),
-            changed_files.into_iter().collect(),
-            external_steps,
+        Ok(with_regenerated_files(
+            report(
+                "feature_update",
+                request.dry_run,
+                loaded.identity,
+                lock.features.keys().cloned().collect(),
+                changed_files.into_iter().collect(),
+                external_steps,
+            ),
+            regenerated_files.into_iter().collect(),
         ))
     }
 
@@ -815,13 +847,19 @@ impl Composer {
         )?;
         let files = collect_files(&payload_root(&loaded.source, &feature.path)?)?;
         validate_payload_paths(&files, false)?;
+        let generated_files = validate_generated_files(feature, &files)?;
         let mut conflicts = Vec::new();
+        let mut regenerated_files = Vec::new();
         for path in files.keys() {
             ensure_target_path_safe(root, path)?;
             let current = file_digest_optional(&root.join(path))?;
             let expected = lock.managed_files.get(path);
-            if current.is_some() && current.as_ref() != expected {
-                conflicts.push(path.clone());
+            if current.as_ref() != expected {
+                if generated_files.contains(path) && expected.is_some() {
+                    regenerated_files.push(path.clone());
+                } else {
+                    conflicts.push(path.clone());
+                }
             }
             let owners = lock
                 .features
@@ -883,6 +921,7 @@ impl Composer {
                         installed_digest,
                         previous_digest,
                         previous_existed,
+                        generated: generated_files.contains(path),
                     },
                 );
             }
@@ -907,13 +946,16 @@ impl Composer {
             installed.push(feature_name.to_string());
             installed.sort();
         }
-        Ok(report(
-            "feature_add",
-            dry_run,
-            loaded.identity.clone(),
-            installed,
-            changed_files,
-            manual_steps(&feature.external_steps),
+        Ok(with_regenerated_files(
+            report(
+                "feature_add",
+                dry_run,
+                loaded.identity.clone(),
+                installed,
+                changed_files,
+                manual_steps(&feature.external_steps),
+            ),
+            regenerated_files,
         ))
     }
 }
@@ -1280,6 +1322,30 @@ fn validate_payload_paths(
         }
     }
     Ok(())
+}
+
+fn validate_generated_files(
+    feature: &FeatureRecipe,
+    files: &BTreeMap<PathBuf, PayloadFile>,
+) -> Result<BTreeSet<PathBuf>, ComposerError> {
+    let mut generated = BTreeSet::new();
+    let mut normalized = BTreeSet::new();
+    for path in &feature.generated_files {
+        validate_relative(path)?;
+        if !files.contains_key(path) {
+            return Err(ComposerError::InvalidRecipe(format!(
+                "generated file is not present in the feature payload: {}",
+                path.display()
+            )));
+        }
+        if !generated.insert(path.clone()) || !normalized.insert(collision_key(path)) {
+            return Err(ComposerError::InvalidRecipe(format!(
+                "generated file is declared more than once: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(generated)
 }
 
 fn validate_base_payload_paths(
@@ -1798,9 +1864,18 @@ fn report(
         recipe,
         features,
         changed_files,
+        regenerated_files: Vec::new(),
         external_steps,
         next_commands,
     }
+}
+
+fn with_regenerated_files(
+    mut report: CompositionReport,
+    regenerated_files: Vec<PathBuf>,
+) -> CompositionReport {
+    report.regenerated_files = regenerated_files;
+    report
 }
 
 fn manual_steps(steps: &[String]) -> Vec<ExternalStep> {
