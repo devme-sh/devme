@@ -27,10 +27,7 @@ pub struct ParsedEnvFile {
 }
 
 pub fn parse_env_file(path: &Path) -> ParsedEnvFile {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => String::new(),
-    };
+    let content = std::fs::read_to_string(path).unwrap_or_default();
     parse_env_contents(&content)
 }
 
@@ -187,6 +184,11 @@ pub fn set_env_value(
         options.mode(0o600);
     }
     let mut file = options.open(env_file)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        env_file,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )?;
     file.lock()?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;
@@ -566,10 +568,20 @@ pub fn append_to_env_file(
         return Ok(());
     }
 
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    file.lock()?;
 
     if let Ok(existing) = std::fs::read_to_string(path)
         && !existing.is_empty()
@@ -586,6 +598,7 @@ pub fn append_to_env_file(
         writeln!(file, "# {key}=")?;
     }
 
+    file.sync_data()?;
     Ok(())
 }
 
@@ -652,9 +665,9 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
     let missing: Vec<(&String, &EnvVar)> = declared
         .iter()
         .filter(|(name, var)| {
-            !existing
+            existing
                 .get(name.as_str())
-                .is_some_and(|value| !value.trim().is_empty())
+                .is_none_or(|value| value.trim().is_empty())
                 && (var.required || !previously_skipped.contains(name.as_str()))
         })
         .map(|(name, var)| (name, var))
@@ -1360,6 +1373,25 @@ mod tests {
     }
 
     #[test]
+    fn setup_snapshot_never_serializes_secret_choices() {
+        let temp = TempDir::new().unwrap();
+        let declared = vec![(
+            "API_SECRET".to_string(),
+            EnvVar {
+                secret: true,
+                choices: vec!["first-secret".into(), "second-secret".into()],
+                ..EnvVar::default()
+            },
+        )];
+
+        let snapshot = setup_snapshot(&declared, &temp.path().join(".env.local"));
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains("first-secret"));
+        assert!(!json.contains("second-secret"));
+        assert!(snapshot.variables[0].choices.is_empty());
+    }
+
+    #[test]
     fn set_env_value_writes_once_and_refuses_overwrite() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(".env.auth.local");
@@ -1371,6 +1403,14 @@ mod tests {
         let snapshot =
             set_env_value(&declared, &path, "GOOGLE_CLIENT_SECRET", "secret-value").unwrap();
         assert_eq!(snapshot.status, SetupStatus::Complete);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         assert_eq!(
             parse_env_file(&path)
                 .vars
