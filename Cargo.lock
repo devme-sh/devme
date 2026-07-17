@@ -583,6 +583,7 @@ dependencies = [
  "devme-slot-allocator",
  "devme-supervisor",
  "devme-task-runner",
+ "devme-ui",
  "notify",
  "ratatui",
  "serde",
@@ -596,6 +597,7 @@ dependencies = [
 name = "devme-ui"
 version = "0.5.0"
 dependencies = [
+ "base64",
  "serde_json",
 ]
 

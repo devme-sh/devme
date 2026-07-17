@@ -315,6 +315,16 @@ pub enum FeatureAction {
 
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum SetupAction {
+    /// Report configured and missing environment setup without exposing values.
+    Status,
+    /// Set one declared environment value. Existing values are never overwritten.
+    Set {
+        /// Name from `[env.<NAME>]`.
+        name: String,
+        /// Value for a non-secret variable. Secret variables must use stdin.
+        #[arg(long)]
+        value: Option<String>,
+    },
     /// Generate an explicit one-level workspace with local child configs.
     Split {
         /// Preview every generated file without changing the worktree.

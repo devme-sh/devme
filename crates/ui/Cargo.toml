@@ -8,3 +8,4 @@ repository.workspace = true
 
 [dependencies]
 serde_json = { workspace = true }
+base64 = { workspace = true }

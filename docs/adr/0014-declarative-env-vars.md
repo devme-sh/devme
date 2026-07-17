@@ -25,6 +25,7 @@ help = "Auth signing key. Auto-generated on first run."
 
 [env.VITE_POSTHOG_KEY]
 help = "Find it at: app.posthog.com → your project → Settings → Project API Key"
+setup_url = "https://app.posthog.com"
 
 [env.VITE_POSTHOG_HOST]
 choices = ["https://us.i.posthog.com", "https://eu.i.posthog.com"]
@@ -41,6 +42,8 @@ help = "PostHog ingestion endpoint."
 | `help` | string | none | Shown below the prompt. Explains where to find the value. |
 | `generate` | string | none | Shell command whose stdout becomes the value. Runs automatically if the var is missing and the user doesn't provide input. |
 | `choices` | string[] | none | Renders a selector instead of free-text input. |
+| `setup_url` | string | none | Browser destination offered as open/copy controls and exposed in redacted setup status. |
+| `secret` | bool | `false` | Masks human input and requires agent CLI submission through stdin. |
 
 ### Resolution flow
 
@@ -54,8 +57,13 @@ Runs before step checks, after config parsing:
    - If `choices` is set: show a selector with the options
    - Otherwise: show a text prompt with `default` pre-filled and `help` below
    - If not `required`: allow skipping (Enter with no input)
-5. Append new values to `.env.local`
+5. Append each accepted value immediately to `.env.local`; a live interactive
+   wizard observes values written by another process and advances automatically
 6. Load the full `.env.local` into the process environment for all subsequent steps and services
+
+Agents inspect the same derived state through `devme setup status --json` and
+write one declared value with `devme setup set`. Secret values are accepted only
+on stdin and no setup status surface serializes values. See ADR-0023.
 
 ### Interaction with services
 

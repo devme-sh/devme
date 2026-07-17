@@ -17,6 +17,12 @@ use serde::{Deserialize, Serialize};
 /// [env.BETTER_AUTH_SECRET]
 /// generate = "npx -y @better-auth/cli secret"
 /// help = "Auth signing key. Auto-generated on first run."
+/// secret = true
+///
+/// [env.GOOGLE_CLIENT_ID]
+/// required = true
+/// setup_url = "https://console.cloud.google.com/apis/credentials"
+/// help = "Create a web OAuth client and copy its client ID."
 ///
 /// [env.VITE_POSTHOG_HOST]
 /// choices = ["https://us.i.posthog.com", "https://eu.i.posthog.com"]
@@ -50,6 +56,18 @@ pub struct EnvVar {
     /// If `default` is set, it's pre-selected.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub choices: Vec<String>,
+
+    /// Browser destination where a human or agent can obtain this value.
+    /// Human setup surfaces offer open and copy controls; structured setup
+    /// status exposes the same URL to agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_url: Option<String>,
+
+    /// Whether the value must be masked and omitted from structured output.
+    /// Secret values supplied through the CLI must arrive on stdin so they
+    /// do not appear in process arguments or shell history.
+    #[serde(default)]
+    pub secret: bool,
 }
 
 #[cfg(test)]
@@ -79,6 +97,8 @@ mod tests {
         assert!(v.help.is_none());
         assert!(v.generate.is_none());
         assert!(v.choices.is_empty());
+        assert!(v.setup_url.is_none());
+        assert!(!v.secret);
     }
 
     #[test]
@@ -91,6 +111,8 @@ default = "postgres://localhost/dev"
 help = "Connection string for the dev database"
 generate = "echo postgres://localhost/dev"
 choices = ["postgres://localhost/dev", "postgres://localhost/test"]
+setup_url = "https://console.example.test/database"
+secret = true
 "#,
         );
         let v = &vars["DATABASE_URL"];
@@ -105,6 +127,11 @@ choices = ["postgres://localhost/dev", "postgres://localhost/test"]
             v.choices,
             vec!["postgres://localhost/dev", "postgres://localhost/test"]
         );
+        assert_eq!(
+            v.setup_url.as_deref(),
+            Some("https://console.example.test/database")
+        );
+        assert!(v.secret);
     }
 
     #[test]
@@ -173,6 +200,8 @@ bogus_field = "oops"
             help: None,
             generate: None,
             choices: Vec::new(),
+            setup_url: None,
+            secret: false,
         };
         let s = toml::to_string(&v).unwrap();
         assert!(!s.contains("choices"), "got: {s}");

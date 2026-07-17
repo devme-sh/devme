@@ -1,6 +1,5 @@
 use std::io::Stdout;
 
-use base64::Engine;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -1361,74 +1360,7 @@ fn copy_to_clipboard(lines: &[&str]) {
     if lines.is_empty() {
         return;
     }
-    let text = lines.join("\n");
-    if !prefer_osc52() && copy_native(&text) {
-        return;
-    }
-    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    let _ = std::io::Write::write_all(
-        &mut std::io::stdout(),
-        format!("\x1b]52;c;{encoded}\x07").as_bytes(),
-    );
-}
-
-/// Whether to skip the native clipboard and go straight to OSC 52 — true in
-/// SSH and WSL sessions, where the native clipboard isn't the user's.
-fn prefer_osc52() -> bool {
-    std::env::var_os("SSH_CONNECTION").is_some()
-        || std::env::var_os("SSH_TTY").is_some()
-        || is_wsl()
-}
-
-fn is_wsl() -> bool {
-    std::env::var_os("WSL_DISTRO_NAME").is_some()
-        || std::env::var_os("WSL_INTEROP").is_some()
-        || std::fs::read_to_string("/proc/sys/kernel/osrelease")
-            .map(|s| {
-                let l = s.to_ascii_lowercase();
-                l.contains("microsoft") || l.contains("wsl")
-            })
-            .unwrap_or(false)
-}
-
-/// Pipe `text` into the platform clipboard tool, returning true on success.
-/// Tries each candidate in order until one is installed and exits cleanly.
-fn copy_native(text: &str) -> bool {
-    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
-        &[("pbcopy", &[])]
-    } else {
-        // Wayland first, then the X11 helpers — whichever the box has.
-        &[
-            ("wl-copy", &[]),
-            ("xclip", &["-selection", "clipboard"]),
-            ("xsel", &["--clipboard", "--input"]),
-        ]
-    };
-    candidates
-        .iter()
-        .any(|(cmd, args)| pipe_to(cmd, args, text))
-}
-
-fn pipe_to(cmd: &str, args: &[&str], text: &str) -> bool {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let Ok(mut child) = Command::new(cmd)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return false;
-    };
-    if let Some(mut stdin) = child.stdin.take()
-        && stdin.write_all(text.as_bytes()).is_err()
-    {
-        return false;
-        // Otherwise the borrow ends here, closing the pipe → EOF, so the
-        // clipboard tool flushes and exits.
-    }
-    matches!(child.wait(), Ok(status) if status.success())
+    devme_ui::copy_to_clipboard(&lines.join("\n"));
 }
 
 fn build_debug_prompt(state: &TuiState) -> String {

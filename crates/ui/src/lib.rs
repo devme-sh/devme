@@ -22,6 +22,8 @@
 use std::io::{IsTerminal, Write};
 use std::sync::OnceLock;
 
+use base64::Engine;
+
 /// ANSI escape codes. Always pair with [`Style::paint`] (or a `Style`
 /// convenience wrapper) so color stays gated in one place.
 pub mod ansi {
@@ -187,6 +189,70 @@ pub fn out_style() -> Style {
 /// Style for stderr (one-liners, sections rendered to stderr).
 pub fn err_style() -> Style {
     ui().err
+}
+
+/// Copy text to the user's clipboard. Native clipboard tools are preferred
+/// locally; SSH and WSL use OSC 52 so the value reaches the client terminal.
+pub fn copy_to_clipboard(text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if !prefer_osc52() && copy_native(text) {
+        return;
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let _ = std::io::stdout().write_all(format!("\x1b]52;c;{encoded}\x07").as_bytes());
+}
+
+fn prefer_osc52() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_TTY").is_some()
+        || is_wsl()
+}
+
+fn is_wsl() -> bool {
+    std::env::var_os("WSL_DISTRO_NAME").is_some()
+        || std::env::var_os("WSL_INTEROP").is_some()
+        || std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .map(|value| {
+                let lower = value.to_ascii_lowercase();
+                lower.contains("microsoft") || lower.contains("wsl")
+            })
+            .unwrap_or(false)
+}
+
+fn copy_native(text: &str) -> bool {
+    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else {
+        &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ]
+    };
+    candidates
+        .iter()
+        .any(|(command, args)| pipe_to(command, args, text))
+}
+
+fn pipe_to(command: &str, args: &[&str], text: &str) -> bool {
+    use std::process::{Command, Stdio};
+    let Ok(mut child) = Command::new(command)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take()
+        && stdin.write_all(text.as_bytes()).is_err()
+    {
+        return false;
+    }
+    matches!(child.wait(), Ok(status) if status.success())
 }
 
 // --- one-liners (stderr) -----------------------------------------------------

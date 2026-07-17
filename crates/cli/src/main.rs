@@ -501,7 +501,7 @@ async fn run(cli: Cli) -> i32 {
                 Err(e) => emit_command_error(output, &e),
             };
         }
-        Some(Command::Setup { action, write }) => setup_cmd(action, write),
+        Some(Command::Setup { action, write }) => setup_cmd(action, write, cli.json),
     };
     match result {
         Ok(()) => 0,
@@ -1211,7 +1211,11 @@ fn parse_error_help(args: &[String]) -> String {
     )
 }
 
-fn setup_cmd(action: Option<devme_cli::SetupAction>, write: bool) -> anyhow::Result<()> {
+fn setup_cmd(
+    action: Option<devme_cli::SetupAction>,
+    write: bool,
+    json: bool,
+) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     match action {
         None => {
@@ -1251,6 +1255,97 @@ fn setup_cmd(action: Option<devme_cli::SetupAction>, write: bool) -> anyhow::Res
                     }
                 }
             }
+        }
+        Some(devme_cli::SetupAction::Status) => {
+            if write {
+                anyhow::bail!("--write cannot be combined with setup status");
+            }
+            let snapshot = setup_snapshot_for(&cwd)?;
+            emit_setup_snapshot(&snapshot, json)?;
+        }
+        Some(devme_cli::SetupAction::Set { name, value }) => {
+            if write {
+                anyhow::bail!("--write cannot be combined with setup set");
+            }
+            let resolved = devme_config::ResolvedWorkspace::resolve(&cwd)?;
+            let stack = resolved.stack();
+            let Some(variable) = stack.env.get(&name) else {
+                anyhow::bail!("environment variable {name} is not declared in devme.toml");
+            };
+            let value = match value {
+                Some(_) if variable.secret => {
+                    anyhow::bail!(
+                        "secret environment variable {name} must be supplied on stdin, not as a process argument"
+                    )
+                }
+                Some(value) => value,
+                None => {
+                    if std::io::stdin().is_terminal() {
+                        anyhow::bail!(
+                            "pipe the value on stdin{}",
+                            if variable.secret {
+                                " so the secret is not exposed in shell history"
+                            } else {
+                                " or pass --value"
+                            }
+                        );
+                    }
+                    let mut value = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut value)?;
+                    value.trim_end_matches(['\r', '\n']).to_string()
+                }
+            };
+            let env_file = devme_supervisor::env_resolve::env_file_path(stack, resolved.root());
+            let declared = stack.env.clone().into_iter().collect::<Vec<_>>();
+            let snapshot =
+                devme_supervisor::env_resolve::set_env_value(&declared, &env_file, &name, &value)?;
+            emit_setup_snapshot(&snapshot, json)?;
+        }
+    }
+    Ok(())
+}
+
+fn setup_snapshot_for(
+    cwd: &std::path::Path,
+) -> anyhow::Result<devme_supervisor::env_resolve::SetupSnapshot> {
+    let resolved = devme_config::ResolvedWorkspace::resolve(cwd)?;
+    let stack = resolved.stack();
+    let env_file = devme_supervisor::env_resolve::env_file_path(stack, resolved.root());
+    let declared = stack.env.clone().into_iter().collect::<Vec<_>>();
+    Ok(devme_supervisor::env_resolve::setup_snapshot(
+        &declared, &env_file,
+    ))
+}
+
+fn emit_setup_snapshot(
+    snapshot: &devme_supervisor::env_resolve::SetupSnapshot,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        devme_ui::json(&serde_json::to_value(snapshot)?);
+        return Ok(());
+    }
+    println!(
+        "Environment setup: {} required value{} missing",
+        snapshot.missing_required,
+        if snapshot.missing_required == 1 {
+            ""
+        } else {
+            "s"
+        }
+    );
+    println!("File: {}", snapshot.env_file.display());
+    for variable in &snapshot.variables {
+        let marker = match variable.state {
+            devme_supervisor::env_resolve::SetupValueState::Configured => "✔",
+            devme_supervisor::env_resolve::SetupValueState::Missing => "○",
+            devme_supervisor::env_resolve::SetupValueState::Skipped => "-",
+        };
+        println!("{marker} {}", variable.name);
+        if let Some(url) = &variable.setup_url
+            && variable.state == devme_supervisor::env_resolve::SetupValueState::Missing
+        {
+            println!("  {url}");
         }
     }
     Ok(())
@@ -3524,27 +3619,7 @@ async fn launch_tui(session_owns_home: bool) -> anyhow::Result<i32> {
     if let Some(resolved) = &resolved {
         let stack = resolved.stack().clone();
         let focused = focused_runtime_stack(resolved);
-        // Env resolution only prompts when vars are missing — silent otherwise.
-        if !stack.env.is_empty() {
-            // Honour `[stack] env_file` (ADR-0014) — compute the target
-            // path before moving `stack.env` out below.
-            let env_file = devme_supervisor::env_resolve::env_file_path(&stack, &cwd);
-            let env_pairs: Vec<(String, devme_config::EnvVar)> =
-                stack.env.clone().into_iter().collect();
-            let interactive = interactive_input();
-            let mut stdin = std::io::BufReader::new(std::io::stdin());
-            let mut stderr = std::io::stderr();
-            devme_supervisor::env_resolve::resolve_env_vars(
-                &env_pairs,
-                &env_file,
-                &cwd,
-                &mut stdin,
-                &mut stderr,
-                interactive,
-                devme_ui::err_style(),
-            )
-            .map_err(|error| anyhow::anyhow!("environment setup is incomplete: {error}"))?;
-        }
+        resolve_declared_environment(&stack, resolved.root())?;
         // Only show preflight output when something needs provisioning.
         if !devme_supervisor::preflight::all_checks_pass(&focused, &cwd) {
             let interactive = interactive_input();
@@ -3759,30 +3834,12 @@ async fn ensure_daemon_with_preflight_targets(
         .or_else(|| devme_config::ResolvedWorkspace::resolve(&cwd).ok());
     if let Some(resolved) = resolved {
         let stack = resolved.stack().clone();
+        let root = resolved.root().to_path_buf();
         let focused = targets.map_or_else(
             || focused_runtime_stack(&resolved),
             |targets| runtime_stack_for_targets(resolved.stack(), targets),
         );
-        if !stack.env.is_empty() {
-            // Honour `[stack] env_file` (ADR-0014) — compute the target
-            // path before moving `stack.env` out below.
-            let env_file = devme_supervisor::env_resolve::env_file_path(&stack, &cwd);
-            let env_pairs: Vec<(String, devme_config::EnvVar)> =
-                stack.env.clone().into_iter().collect();
-            let interactive = interactive_input();
-            let mut stdin = std::io::BufReader::new(std::io::stdin());
-            let mut stderr = std::io::stderr();
-            devme_supervisor::env_resolve::resolve_env_vars(
-                &env_pairs,
-                &env_file,
-                &cwd,
-                &mut stdin,
-                &mut stderr,
-                interactive,
-                devme_ui::err_style(),
-            )
-            .map_err(|error| anyhow::anyhow!("environment setup is incomplete: {error}"))?;
-        }
+        resolve_declared_environment(&stack, &root)?;
         // Preflight: check dependencies that don't need services. Under `-q`
         // the tree renders into a buffer dumped only when something failed.
         let interactive = interactive_input();
@@ -3806,6 +3863,37 @@ async fn ensure_daemon_with_preflight_targets(
     }
 
     ensure_daemon_inner(sock, &cwd).await
+}
+
+fn resolve_declared_environment(stack: &Stack, root: &std::path::Path) -> anyhow::Result<()> {
+    if stack.env.is_empty() {
+        return Ok(());
+    }
+    let env_file = devme_supervisor::env_resolve::env_file_path(stack, root);
+    let declared = stack.env.clone().into_iter().collect::<Vec<_>>();
+    if interactive_input() {
+        devme_supervisor::env_resolve::resolve_env_vars_live(
+            &declared,
+            &env_file,
+            root,
+            devme_ui::err_style(),
+        )
+        .map_err(|error| anyhow::anyhow!("environment setup is incomplete: {error}"))?;
+    } else {
+        let mut stdin = std::io::BufReader::new(std::io::stdin());
+        let mut stderr = std::io::stderr();
+        devme_supervisor::env_resolve::resolve_env_vars(
+            &declared,
+            &env_file,
+            root,
+            &mut stdin,
+            &mut stderr,
+            false,
+            devme_ui::err_style(),
+        )
+        .map_err(|error| anyhow::anyhow!("environment setup is incomplete: {error}"))?;
+    }
+    Ok(())
 }
 
 /// Run the dependency preflight with `-q` semantics: normally the tree
