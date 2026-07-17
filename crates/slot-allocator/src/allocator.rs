@@ -18,8 +18,9 @@ use crate::liveness::{Liveness, SystemLiveness};
 use crate::record::{ClaimRecord, Registry};
 
 /// How many slots a freshly-constructed allocator hands out by default.
-/// Slots range from 0 (inclusive) to `max_slots` (exclusive).
-pub const DEFAULT_MAX_SLOTS: u8 = 10;
+/// Use every slot supported by [`Slot`] so concurrent agent work does not hit
+/// a lower allocator-only ceiling.
+pub const DEFAULT_MAX_SLOTS: u8 = Slot::MAX + 1;
 
 /// Coordinate slot ownership across worktrees on the same machine.
 pub struct SlotAllocator {
@@ -360,6 +361,23 @@ mod tests {
             .with_pid(1010);
         let err = third.claim("c").unwrap_err();
         assert!(matches!(err, AllocError::Exhausted { max: 2 }));
+    }
+
+    #[test]
+    fn default_allocator_uses_every_supported_slot() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("slots.toml");
+        let mock = Arc::new(MockLiveness::default());
+
+        for slot in 0..=Slot::MAX {
+            let allocator = SlotAllocator::open(&path)
+                .with_liveness(mock.clone())
+                .with_pid(10_000 + u32::from(slot));
+            assert_eq!(
+                allocator.claim(&format!("worktree-{slot}")).unwrap(),
+                Slot::new(slot).unwrap()
+            );
+        }
     }
 
     #[test]
