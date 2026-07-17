@@ -3,7 +3,7 @@ name: devme
 description: Manage dev environments and composed projects with devme. Use when creating a native starter, adding or removing a managed feature, services fail, logs need inspection, or the user mentions devme.
 license: MIT
 metadata:
-  version: "0.2.4"
+  version: "0.2.5"
 allowed-tools: Bash(devme *) Bash(docker *) Bash(lsof *) Bash(ps *) Bash(find *) Bash(cat *) Bash(ls *) Read Write
 ---
 
@@ -50,6 +50,7 @@ Route on `$action`. Default to diagnostics when none is given.
 - Run `devme create native <path> --dry-run --output toon`, review `changed_files`, then repeat without `--dry-run`. Add repeatable initial features with `--with <name>` only during creation.
 - In an existing composed project, run `devme feature list --output toon`, then `devme feature add|remove|update <name> --dry-run --output toon` before applying.
 - A feature may replace complete files owned by every feature it transitively depends on. Removing it restores the dependency's exact bytes; modified overlays and dependency updates fail closed.
+- Recipe authors may declare payload-owned `generated_files`. Devme may replace drift only when that path is new or already owned by the recipe, reports every replacement as `regenerated_files`, and never lets this declaration adopt an app-owned file. Do not mark hand-edited source as generated.
 - Applied feature mutations reconverge steps and reload the detached service graph automatically. A successful `devme feature add <name>` is ready to use without a second `devme up`.
 - Never use `devme create add`. Creation initializes a project; `devme feature add` evolves one.
 - Exit code 5 means a managed or app-owned file conflicts. Read `error.paths` and `error.help`; do not overwrite the file manually to force progress.
