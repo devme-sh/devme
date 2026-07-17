@@ -93,9 +93,10 @@ fn guardian_rejects_a_dead_owner_without_opening_the_gate() {
     let dir = TempDir::new().unwrap();
     let gate = dir.path().join("gate");
     let completion = dir.path().join("complete");
-    let mut owner = Command::new("true").spawn().unwrap();
+    let mut owner = Command::new("sleep").arg("30").spawn().unwrap();
     let owner_pid = owner.id();
     let owner_identity = devme_resource_lease::process_identity(owner_pid).unwrap();
+    owner.kill().unwrap();
     owner.wait().unwrap();
     let mut task = grouped_command("sleep", &["30"]);
     let mut task = task.spawn().unwrap();
