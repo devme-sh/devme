@@ -99,6 +99,28 @@ cmd="true"
 }
 
 #[test]
+fn missing_required_environment_blocks_daemon_startup() {
+    let dir = fixture(
+        r#"schema_version=1
+[env.REQUIRED_KEY]
+required=true
+[service.worker]
+cmd="sleep 30"
+"#,
+    );
+
+    let output = run(&dir, &["up", "-d"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(rendered.contains("REQUIRED_KEY"), "{rendered}");
+}
+
+#[test]
 fn task_results_report_interpolated_artifact_paths() {
     let dir = fixture(
         r#"schema_version=1
