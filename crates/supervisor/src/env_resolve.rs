@@ -125,7 +125,11 @@ pub fn setup_snapshot(declared: &[(String, EnvVar)], env_file: &Path) -> SetupSn
                 setup_url: var.setup_url.clone(),
                 has_default: var.default.is_some(),
                 can_generate: var.generate.is_some(),
-                choices: var.choices.clone(),
+                choices: if var.secret {
+                    Vec::new()
+                } else {
+                    var.choices.clone()
+                },
             }
         })
         .collect::<Vec<_>>();
@@ -219,6 +223,41 @@ enum LiveSetupInput {
     Cancel,
 }
 
+#[derive(Clone, Copy)]
+enum SetupFieldKind<'a> {
+    Choice {
+        values: &'a [String],
+        initial: usize,
+    },
+    Generate {
+        command: &'a str,
+    },
+    Text,
+}
+
+impl<'a> SetupFieldKind<'a> {
+    fn from_variable(variable: &'a EnvVar) -> Self {
+        // A validated config cannot combine secrets and choices. Keeping this
+        // defensive guard here ensures an unvalidated caller cannot render a
+        // secret choice value either.
+        if !variable.secret && !variable.choices.is_empty() {
+            let initial = variable
+                .default
+                .as_ref()
+                .and_then(|default| variable.choices.iter().position(|item| item == default))
+                .unwrap_or(0);
+            Self::Choice {
+                values: &variable.choices,
+                initial,
+            }
+        } else if let Some(command) = variable.generate.as_deref() {
+            Self::Generate { command }
+        } else {
+            Self::Text
+        }
+    }
+}
+
 struct RawModeGuard;
 
 struct CrLfWriter<W>(W);
@@ -289,17 +328,18 @@ pub fn resolve_env_vars_live(
     writeln!(output, "  {}", style.dim(devme_ui::glyph::BAR))?;
 
     for (name, variable) in declared {
-        if setup_snapshot(declared, env_file).variables[declared
+        let current = setup_snapshot(declared, env_file);
+        let is_missing = current
+            .variables
             .iter()
-            .position(|(candidate, _)| candidate == name)
-            .unwrap()]
-        .state
-            != SetupValueState::Missing
-        {
+            .find(|candidate| candidate.name == *name)
+            .is_some_and(|candidate| candidate.state == SetupValueState::Missing);
+        if !is_missing {
             continue;
         }
-        render_live_setup_field(&mut output, name, variable, style)?;
-        match read_live_setup_input(name, variable, env_file, cwd, &mut output, style)? {
+        let field = SetupFieldKind::from_variable(variable);
+        render_live_setup_field(&mut output, name, variable, field, style)?;
+        match read_live_setup_input(name, variable, field, env_file, cwd, &mut output, style)? {
             LiveSetupInput::Value(value) => match set_env_value(declared, env_file, name, &value) {
                 Ok(_) => writeln!(
                     output,
@@ -364,6 +404,7 @@ fn render_live_setup_field(
     output: &mut impl Write,
     name: &str,
     variable: &EnvVar,
+    field: SetupFieldKind<'_>,
     style: Style,
 ) -> std::io::Result<()> {
     writeln!(
@@ -384,36 +425,44 @@ fn render_live_setup_field(
             style.accent("[c Copy URL]")
         )?;
     }
-    if !variable.choices.is_empty() {
+    if let SetupFieldKind::Choice { values, initial } = field {
+        writeln!(
+            output,
+            "  {}  Selected: {}",
+            style.dim(devme_ui::glyph::BAR),
+            values[initial]
+        )?;
         writeln!(
             output,
             "  {}  [↑/↓ Choose]  [Enter Set]",
             style.dim(devme_ui::glyph::BAR)
         )?;
-    } else {
-        let mut controls = vec!["[Enter Add value]".to_string()];
-        if variable.default.is_some() {
-            controls.push("[d Use default]".into());
-        }
-        if variable.generate.is_some() {
-            controls.push("[g Generate]".into());
-        }
-        if !variable.required {
-            controls.push("[s Skip]".into());
-        }
-        writeln!(
-            output,
-            "  {}  {}",
-            style.dim(devme_ui::glyph::BAR),
-            controls.join("  ")
-        )?;
+        return output.flush();
     }
+
+    let mut controls = vec!["[Enter Add value]".to_string()];
+    if variable.default.is_some() {
+        controls.push("[d Use default]".into());
+    }
+    if matches!(field, SetupFieldKind::Generate { .. }) {
+        controls.push("[g Generate]".into());
+    }
+    if !variable.required {
+        controls.push("[s Skip]".into());
+    }
+    writeln!(
+        output,
+        "  {}  {}",
+        style.dim(devme_ui::glyph::BAR),
+        controls.join("  ")
+    )?;
     output.flush()
 }
 
 fn read_live_setup_input(
     name: &str,
     variable: &EnvVar,
+    field: SetupFieldKind<'_>,
     env_file: &Path,
     cwd: &Path,
     output: &mut impl Write,
@@ -423,11 +472,10 @@ fn read_live_setup_input(
 
     let mut editing = false;
     let mut value = String::new();
-    let mut choice = variable
-        .default
-        .as_ref()
-        .and_then(|default| variable.choices.iter().position(|item| item == default))
-        .unwrap_or(0);
+    let mut choice = match field {
+        SetupFieldKind::Choice { initial, .. } => initial,
+        _ => 0,
+    };
     loop {
         if parse_env_file(env_file)
             .vars
@@ -449,6 +497,13 @@ fn read_live_setup_input(
                 render_live_value(output, &value, variable.secret, style)?;
             }
             Event::Key(key) if key.kind == KeyEventKind::Press && editing => match key.code {
+                KeyCode::Char('c')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    return Ok(LiveSetupInput::Cancel);
+                }
                 KeyCode::Enter if !value.trim().is_empty() => {
                     writeln!(output)?;
                     return Ok(LiveSetupInput::Value(value));
@@ -461,7 +516,7 @@ fn read_live_setup_input(
                     editing = false;
                     value.clear();
                     writeln!(output)?;
-                    render_live_setup_field(output, name, variable, style)?;
+                    render_live_setup_field(output, name, variable, field, style)?;
                 }
                 KeyCode::Char(character)
                     if !key
@@ -475,6 +530,13 @@ fn read_live_setup_input(
             },
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                 KeyCode::Esc => return Ok(LiveSetupInput::Cancel),
+                KeyCode::Char('c')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    return Ok(LiveSetupInput::Cancel);
+                }
                 KeyCode::Char('o') if variable.setup_url.is_some() => {
                     let url = variable.setup_url.as_deref().unwrap();
                     devme_config::browser::open_url(url)?;
@@ -484,7 +546,12 @@ fn read_live_setup_input(
                         style.dim(devme_ui::glyph::BAR)
                     )?;
                 }
-                KeyCode::Char('c') if variable.setup_url.is_some() => {
+                KeyCode::Char('c')
+                    if variable.setup_url.is_some()
+                        && !key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
                     let url = variable.setup_url.as_deref().unwrap();
                     devme_ui::copy_to_clipboard(url);
                     writeln!(output, "  {}  Copied URL", style.dim(devme_ui::glyph::BAR))?;
@@ -494,22 +561,34 @@ fn read_live_setup_input(
                         variable.default.as_ref().unwrap().clone(),
                     ));
                 }
-                KeyCode::Char('g') if variable.generate.is_some() => {
-                    return run_generate(variable.generate.as_deref().unwrap(), cwd)
+                KeyCode::Char('g') if matches!(field, SetupFieldKind::Generate { .. }) => {
+                    let SetupFieldKind::Generate { command } = field else {
+                        unreachable!()
+                    };
+                    return run_generate(command, cwd)
                         .map(LiveSetupInput::Value)
                         .map_err(|error| std::io::Error::other(format!("{name}: {error}")));
                 }
                 KeyCode::Char('s') if !variable.required => return Ok(LiveSetupInput::Skip),
-                KeyCode::Up if !variable.choices.is_empty() => {
+                KeyCode::Up if matches!(field, SetupFieldKind::Choice { .. }) => {
+                    let SetupFieldKind::Choice { values, .. } = field else {
+                        unreachable!()
+                    };
                     choice = choice.saturating_sub(1);
-                    render_live_choice(output, &variable.choices[choice], style)?;
+                    render_live_choice(output, &values[choice], style)?;
                 }
-                KeyCode::Down if !variable.choices.is_empty() => {
-                    choice = (choice + 1).min(variable.choices.len() - 1);
-                    render_live_choice(output, &variable.choices[choice], style)?;
+                KeyCode::Down if matches!(field, SetupFieldKind::Choice { .. }) => {
+                    let SetupFieldKind::Choice { values, .. } = field else {
+                        unreachable!()
+                    };
+                    choice = (choice + 1).min(values.len() - 1);
+                    render_live_choice(output, &values[choice], style)?;
                 }
-                KeyCode::Enter if !variable.choices.is_empty() => {
-                    return Ok(LiveSetupInput::Value(variable.choices[choice].clone()));
+                KeyCode::Enter if matches!(field, SetupFieldKind::Choice { .. }) => {
+                    let SetupFieldKind::Choice { values, .. } = field else {
+                        unreachable!()
+                    };
+                    return Ok(LiveSetupInput::Value(values[choice].clone()));
                 }
                 KeyCode::Enter => {
                     editing = true;
@@ -696,11 +775,10 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
             sec.gutter()?;
         }
         first = false;
+        let field = SetupFieldKind::from_variable(var);
 
         // --- Generate vars: prompt with Enter-to-generate ---
-        if let Some(gen_cmd) = &var.generate
-            && var.choices.is_empty()
-        {
+        if let SetupFieldKind::Generate { command } = field {
             if interactive {
                 sec.field(name, var.help.as_deref())?;
                 sec.prompt("Enter to auto-generate, or type a value ›")?;
@@ -716,7 +794,7 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
                     Some(line) => {
                         let trimmed = line.trim();
                         if trimmed.is_empty() {
-                            match run_generate(gen_cmd, cwd) {
+                            match run_generate(command, cwd) {
                                 Ok(value) => {
                                     sec.sub(Item::Ok, "Generated")?;
                                     resolved.push(((*name).clone(), value));
@@ -743,7 +821,7 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
                 continue;
             } else {
                 // Non-interactive: auto-generate silently
-                match run_generate(gen_cmd, cwd) {
+                match run_generate(command, cwd) {
                     Ok(value) => {
                         sec.item(Item::Ok, name, Some("Generated"))?;
                         resolved.push(((*name).clone(), value));
@@ -765,7 +843,11 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
         // --- Non-interactive fallback ---
         if !interactive {
             if let Some(d) = &var.default {
-                sec.item(Item::Ok, name, Some(d))?;
+                sec.item(
+                    Item::Ok,
+                    name,
+                    Some(if var.secret { "Configured" } else { d }),
+                )?;
                 resolved.push(((*name).clone(), d.clone()));
             } else if var.required {
                 return Err(required_env_error(name));
@@ -777,45 +859,31 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
         }
 
         // --- Choice selector ---
-        if !var.choices.is_empty() {
+        if let SetupFieldKind::Choice {
+            values,
+            initial: default_idx,
+        } = field
+        {
             sec.field(name, var.help.as_deref())?;
 
-            let default_idx = var
-                .default
-                .as_ref()
-                .and_then(|d| var.choices.iter().position(|c| c == d))
-                .unwrap_or(0);
-
-            if interactive {
-                // Shared single-select prompt: arrow-key picker on a TTY,
-                // numbered fallback when stdin is piped (CI, tests).
-                let picked = crate::prompt::select_one(
-                    input,
-                    sec.writer(),
-                    &var.choices,
-                    default_idx,
-                    style,
-                )?;
-                match picked {
-                    Some(idx) => {
-                        let value = var.choices[idx].clone();
-                        sec.sub(Item::Ok, &value)?;
-                        resolved.push(((*name).clone(), value));
-                    }
-                    None => {
-                        if var.required {
-                            return Err(required_env_error(name));
-                        } else {
-                            sec.sub(Item::Skip, "Skipped")?;
-                            skipped.push((*name).clone());
-                        }
+            // Shared single-select prompt: arrow-key picker on a TTY,
+            // numbered fallback when stdin is piped (CI, tests).
+            let picked =
+                crate::prompt::select_one(input, sec.writer(), values, default_idx, style)?;
+            match picked {
+                Some(idx) => {
+                    let value = values[idx].clone();
+                    sec.sub(Item::Ok, &value)?;
+                    resolved.push(((*name).clone(), value));
+                }
+                None => {
+                    if var.required {
+                        return Err(required_env_error(name));
+                    } else {
+                        sec.sub(Item::Skip, "Skipped")?;
+                        skipped.push((*name).clone());
                     }
                 }
-            } else {
-                // Non-interactive: use default
-                let value = var.choices[default_idx].clone();
-                sec.sub(Item::Ok, &value)?;
-                resolved.push(((*name).clone(), value));
             }
             continue;
         }
@@ -823,7 +891,9 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
         // --- Free-text prompt ---
         sec.field(name, var.help.as_deref())?;
 
-        let prompt_hint = if let Some(d) = &var.default {
+        let prompt_hint = if var.secret && var.default.is_some() {
+            "Enter to use default, or type a value ›".to_string()
+        } else if let Some(d) = &var.default {
             format!("Enter for {d}, or type a value ›")
         } else if var.required {
             "required ›".to_string()
@@ -848,7 +918,7 @@ pub fn resolve_env_vars<R: BufRead, W: Write>(
             };
 
             if !value.is_empty() {
-                sec.sub(Item::Ok, &value)?;
+                sec.sub(Item::Ok, if var.secret { "Set" } else { &value })?;
                 resolved.push(((*name).clone(), value));
                 break;
             }
@@ -1047,6 +1117,39 @@ mod tests {
 
         let content = std::fs::read_to_string(&env_path).unwrap();
         assert!(content.contains("DB_URL=postgres://localhost/dev"));
+    }
+
+    #[test]
+    fn buffered_resolver_never_renders_secret_values() {
+        let dir = TempDir::new().unwrap();
+        let env_path = dir.path().join(".env.local");
+        let mut variable = make_env_var(
+            true,
+            Some("default-secret"),
+            Some("Provider secret"),
+            None,
+            vec![],
+        );
+        variable.secret = true;
+        let declared = vec![("API_SECRET".into(), variable)];
+        let mut input = Cursor::new(b"typed-secret\n");
+        let mut output = Vec::new();
+
+        resolve_env_vars(
+            &declared,
+            &env_path,
+            dir.path(),
+            &mut input,
+            &mut output,
+            true,
+            Style::PLAIN,
+        )
+        .unwrap();
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(!rendered.contains("default-secret"), "{rendered}");
+        assert!(!rendered.contains("typed-secret"), "{rendered}");
+        assert!(rendered.contains("Set"), "{rendered}");
     }
 
     #[test]
@@ -1375,14 +1478,15 @@ mod tests {
     #[test]
     fn setup_snapshot_never_serializes_secret_choices() {
         let temp = TempDir::new().unwrap();
-        let declared = vec![(
-            "API_SECRET".to_string(),
-            EnvVar {
-                secret: true,
-                choices: vec!["first-secret".into(), "second-secret".into()],
-                ..EnvVar::default()
-            },
-        )];
+        let mut secret = make_env_var(
+            true,
+            None,
+            None,
+            None,
+            vec!["first-secret", "second-secret"],
+        );
+        secret.secret = true;
+        let declared = vec![("API_SECRET".to_string(), secret)];
 
         let snapshot = setup_snapshot(&declared, &temp.path().join(".env.local"));
         let json = serde_json::to_string(&snapshot).unwrap();

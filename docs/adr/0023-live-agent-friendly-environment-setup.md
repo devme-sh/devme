@@ -21,6 +21,8 @@ from, report whether it is present, and accept it without exposing secrets.
 - `setup_url` is a browser destination where the value can be obtained.
 - `secret = true` masks interactive input, omits the value from structured
   output, and requires CLI submission through stdin.
+- A secret cannot declare `choices`, because choices are intentionally exposed
+  as setup metadata and rendered by selectors.
 
 The configured env file remains the source of truth. Interactive Devme watches
 it while presenting missing values and advances automatically when another

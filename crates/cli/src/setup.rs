@@ -5,6 +5,31 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use devme_core::ErrorCode;
+
+/// A setup command failure with the stable CLI semantics from ADR-0008.
+#[derive(Debug)]
+pub struct SetupCommandError {
+    pub code: ErrorCode,
+    pub message: String,
+}
+
+impl SetupCommandError {
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for SetupCommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SetupCommandError {}
 
 /// A file produced by split setup.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -25,6 +25,7 @@ pub fn validate(stack: &Stack) -> Result<(), Vec<ConfigError>> {
     check_external_services_have_health(stack, &mut errors);
     check_readiness(stack, &mut errors);
     check_redaction_patterns(stack, &mut errors);
+    check_env_setup(stack, &mut errors);
     check_tasks(stack, &mut errors);
     check_sessions(stack, &mut errors);
 
@@ -32,6 +33,14 @@ pub fn validate(stack: &Stack) -> Result<(), Vec<ConfigError>> {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+fn check_env_setup(stack: &Stack, errors: &mut Vec<ConfigError>) {
+    for (name, variable) in &stack.env {
+        if variable.secret && !variable.choices.is_empty() {
+            errors.push(ConfigError::SecretEnvChoices { name: name.clone() });
+        }
     }
 }
 
@@ -603,6 +612,25 @@ mod tests {
     fn empty_config_is_valid() {
         let s = parse("schema_version = 1");
         assert!(validate(&s).is_ok());
+    }
+
+    #[test]
+    fn secret_environment_variables_cannot_expose_choices() {
+        let stack = parse(
+            r#"
+schema_version = 1
+
+[env.API_SECRET]
+secret = true
+choices = ["first-secret", "second-secret"]
+"#,
+        );
+
+        let errors = validate(&stack).unwrap_err();
+        assert!(matches!(
+            errors.as_slice(),
+            [ConfigError::SecretEnvChoices { name }] if name == "API_SECRET"
+        ));
     }
 
     #[test]

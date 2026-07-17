@@ -11,7 +11,7 @@
 //! - **Sections** are the clack-style tree (`◆ │ ◇ └`) — the only
 //!   multi-line progress style. Items are `◇` done / `⚠` attention /
 //!   `✗` failed, with `↳` hint continuations.
-//! - **Tables and standalone summaries** use `✔ ⚠ ✗` plus the service-state
+//! - **Tables and standalone summaries** use `✔ ⚠ ✗ -` plus the service-state
 //!   dots (`● ◐ ◌ ○ ↻`).
 //! - **Color** is resolved once per stream (flag → `NO_COLOR` →
 //!   `FORCE_COLOR`/`CLICOLOR_FORCE` → is-a-tty) and carried as a [`Style`];
@@ -57,6 +57,8 @@ pub mod glyph {
     pub const HINT: &str = "↳";
     /// List bullet.
     pub const BULLET: &str = "•";
+    /// Optional setup value intentionally skipped.
+    pub const SKIP: &str = "-";
 
     /// Section header (active step).
     pub const SECTION: &str = "◆";
@@ -201,7 +203,7 @@ pub fn copy_to_clipboard(text: &str) {
         return;
     }
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    let _ = std::io::stdout().write_all(format!("\x1b]52;c;{encoded}\x07").as_bytes());
+    let _ = std::io::stderr().write_all(format!("\x1b]52;c;{encoded}\x07").as_bytes());
 }
 
 fn prefer_osc52() -> bool {

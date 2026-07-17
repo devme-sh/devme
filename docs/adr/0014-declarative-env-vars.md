@@ -43,7 +43,7 @@ help = "PostHog ingestion endpoint."
 | `generate` | string | none | Shell command whose stdout becomes the value. Runs automatically if the var is missing and the user doesn't provide input. |
 | `choices` | string[] | none | Renders a selector instead of free-text input. |
 | `setup_url` | string | none | Browser destination offered as open/copy controls and exposed in redacted setup status. |
-| `secret` | bool | `false` | Masks human input and requires agent CLI submission through stdin. |
+| `secret` | bool | `false` | Masks human input and requires agent CLI submission through stdin. Cannot be combined with `choices`, whose values are public setup metadata. |
 
 ### Resolution flow
 

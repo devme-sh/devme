@@ -109,6 +109,8 @@ setup_url = "https://provider.example/credentials" # human open/copy; agent stat
 choices = ["us-east-1", "eu-west-1"]              # known option set
 default = "eu-west-1"
 
+# `secret = true` cannot be combined with `choices`, whose values are public.
+
 # Steps: prerequisites checked before services start. check returns 0 on success;
 # provision runs to fix a failing check. trust gates consent for provision:
 #   prompt (default) - ask first   auto - run unattended   manual - show, never run

@@ -1121,36 +1121,48 @@ fn emit_command_error(format: devme_cli::OutputFormat, error: &anyhow::Error) ->
         format
     };
     let message = error.to_string();
-    let (code, exit_code, help) =
-        if let Some(session) = error.downcast_ref::<devme_cli::session::SessionCommandError>() {
-            let code = match session.code {
-                devme_core::ErrorCode::Usage => "invalid_arguments",
-                devme_core::ErrorCode::NotFound => "not_found",
-                devme_core::ErrorCode::Permission => "permission_denied",
-                devme_core::ErrorCode::Conflict => "conflict",
-                devme_core::ErrorCode::Internal => "operation_failed",
-            };
+    let (code, exit_code, help) = if let Some(command) = error
+        .downcast_ref::<devme_cli::session::SessionCommandError>()
+        .map(|error| {
             (
-                code,
-                session.code.cli_exit_code(),
+                error.code,
                 "Run `devme sessions` to inspect configured and live session state.",
             )
-        } else if error
-            .downcast_ref::<devme_cli::task::UnknownTask>()
-            .is_some()
-        {
-            (
-                "not_found",
-                3,
-                "Run `devme tasks` to list tasks in the current directory scope.",
-            )
-        } else {
-            (
-                "operation_failed",
-                1,
-                "Inspect `devme doctor` or correct the named task/configuration.",
-            )
+        })
+        .or_else(|| {
+            error
+                .downcast_ref::<devme_cli::setup::SetupCommandError>()
+                .map(|error| {
+                    (
+                        error.code,
+                        "Run `devme setup status` to inspect declared environment setup.",
+                    )
+                })
+        }) {
+        let code = match command.0 {
+            devme_core::ErrorCode::Usage => "invalid_arguments",
+            devme_core::ErrorCode::NotFound => "not_found",
+            devme_core::ErrorCode::Permission => "permission_denied",
+            devme_core::ErrorCode::Conflict => "conflict",
+            devme_core::ErrorCode::Internal => "operation_failed",
         };
+        (code, command.0.cli_exit_code(), command.1)
+    } else if error
+        .downcast_ref::<devme_cli::task::UnknownTask>()
+        .is_some()
+    {
+        (
+            "not_found",
+            3,
+            "Run `devme tasks` to list tasks in the current directory scope.",
+        )
+    } else {
+        (
+            "operation_failed",
+            1,
+            "Inspect `devme doctor` or correct the named task/configuration.",
+        )
+    };
     let report = serde_json::json!({
         "schema_version": 1,
         "error": {
@@ -1258,37 +1270,57 @@ fn setup_cmd(
         }
         Some(devme_cli::SetupAction::Status) => {
             if write {
-                anyhow::bail!("--write cannot be combined with setup status");
+                return Err(devme_cli::setup::SetupCommandError::new(
+                    devme_core::ErrorCode::Usage,
+                    "--write cannot be combined with setup status",
+                )
+                .into());
             }
             let snapshot = setup_snapshot_for(&cwd)?;
             emit_setup_snapshot(&snapshot, json)?;
         }
         Some(devme_cli::SetupAction::Set { name, value }) => {
             if write {
-                anyhow::bail!("--write cannot be combined with setup set");
+                return Err(devme_cli::setup::SetupCommandError::new(
+                    devme_core::ErrorCode::Usage,
+                    "--write cannot be combined with setup set",
+                )
+                .into());
             }
             let resolved = devme_config::ResolvedWorkspace::resolve(&cwd)?;
             let stack = resolved.stack();
             let Some(variable) = stack.env.get(&name) else {
-                anyhow::bail!("environment variable {name} is not declared in devme.toml");
+                return Err(devme_cli::setup::SetupCommandError::new(
+                    devme_core::ErrorCode::NotFound,
+                    format!("environment variable {name} is not declared in devme.toml"),
+                )
+                .into());
             };
             let value = match value {
                 Some(_) if variable.secret => {
-                    anyhow::bail!(
-                        "secret environment variable {name} must be supplied on stdin, not as a process argument"
+                    return Err(devme_cli::setup::SetupCommandError::new(
+                        devme_core::ErrorCode::Usage,
+                        format!(
+                            "secret environment variable {name} must be supplied on stdin, not as a process argument"
+                        ),
                     )
+                    .into());
                 }
                 Some(value) => value,
                 None => {
                     if std::io::stdin().is_terminal() {
-                        anyhow::bail!(
-                            "pipe the value on stdin{}",
-                            if variable.secret {
-                                " so the secret is not exposed in shell history"
-                            } else {
-                                " or pass --value"
-                            }
-                        );
+                        return Err(devme_cli::setup::SetupCommandError::new(
+                            devme_core::ErrorCode::Usage,
+                            format!(
+                                "pipe the value on stdin{}",
+                                if variable.secret {
+                                    " so the secret is not exposed in shell history"
+                                } else {
+                                    " or pass --value"
+                                }
+                            ),
+                        )
+                        .into());
                     }
                     let mut value = String::new();
                     std::io::Read::read_to_string(&mut std::io::stdin(), &mut value)?;
@@ -1298,7 +1330,17 @@ fn setup_cmd(
             let env_file = devme_supervisor::env_resolve::env_file_path(stack, resolved.root());
             let declared = stack.env.clone().into_iter().collect::<Vec<_>>();
             let snapshot =
-                devme_supervisor::env_resolve::set_env_value(&declared, &env_file, &name, &value)?;
+                devme_supervisor::env_resolve::set_env_value(&declared, &env_file, &name, &value)
+                    .map_err(|error| {
+                    let code = match error.kind() {
+                        std::io::ErrorKind::InvalidInput => devme_core::ErrorCode::Usage,
+                        std::io::ErrorKind::NotFound => devme_core::ErrorCode::NotFound,
+                        std::io::ErrorKind::PermissionDenied => devme_core::ErrorCode::Permission,
+                        std::io::ErrorKind::AlreadyExists => devme_core::ErrorCode::Conflict,
+                        _ => devme_core::ErrorCode::Internal,
+                    };
+                    devme_cli::setup::SetupCommandError::new(code, error.to_string())
+                })?;
             emit_setup_snapshot(&snapshot, json)?;
         }
     }
@@ -1337,9 +1379,9 @@ fn emit_setup_snapshot(
     println!("File: {}", snapshot.env_file.display());
     for variable in &snapshot.variables {
         let marker = match variable.state {
-            devme_supervisor::env_resolve::SetupValueState::Configured => "✔",
-            devme_supervisor::env_resolve::SetupValueState::Missing => "○",
-            devme_supervisor::env_resolve::SetupValueState::Skipped => "-",
+            devme_supervisor::env_resolve::SetupValueState::Configured => devme_ui::glyph::OK,
+            devme_supervisor::env_resolve::SetupValueState::Missing => devme_ui::glyph::STOPPED,
+            devme_supervisor::env_resolve::SetupValueState::Skipped => devme_ui::glyph::SKIP,
         };
         println!("{marker} {}", variable.name);
         if let Some(url) = &variable.setup_url

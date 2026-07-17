@@ -160,3 +160,77 @@ fn setup_set_accepts_secrets_only_on_stdin_and_updates_status() {
     assert!(env.contains("GOOGLE_CLIENT_SECRET=local-secret"));
     assert!(!env.contains("leaked-argument"));
 }
+
+#[test]
+fn setup_set_uses_semantic_exit_codes() {
+    let dir = fixture();
+
+    let unknown = run(
+        &dir,
+        &["setup", "set", "UNKNOWN", "--value", "value", "--json"],
+    );
+    assert_eq!(unknown.status.code(), Some(3));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&unknown.stdout).unwrap()["error"]["code"],
+        "not_found"
+    );
+
+    let secret_argument = run(
+        &dir,
+        &[
+            "setup",
+            "set",
+            "GOOGLE_CLIENT_SECRET",
+            "--value",
+            "secret",
+            "--json",
+        ],
+    );
+    assert_eq!(secret_argument.status.code(), Some(2));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&secret_argument.stdout).unwrap()["error"]["code"],
+        "invalid_arguments"
+    );
+
+    let empty = run(
+        &dir,
+        &[
+            "setup",
+            "set",
+            "GOOGLE_WEB_CLIENT_ID",
+            "--value",
+            "",
+            "--json",
+        ],
+    );
+    assert_eq!(empty.status.code(), Some(2));
+
+    let first = run(
+        &dir,
+        &[
+            "setup",
+            "set",
+            "GOOGLE_WEB_CLIENT_ID",
+            "--value",
+            "first",
+            "--json",
+        ],
+    );
+    assert!(first.status.success());
+    let conflict = run(
+        &dir,
+        &[
+            "setup",
+            "set",
+            "GOOGLE_WEB_CLIENT_ID",
+            "--value",
+            "second",
+            "--json",
+        ],
+    );
+    assert_eq!(conflict.status.code(), Some(5));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&conflict.stdout).unwrap()["error"]["code"],
+        "conflict"
+    );
+}

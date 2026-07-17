@@ -42,6 +42,11 @@ pub enum ConfigError {
     #[error("invalid logs.redact pattern {pattern:?}: {message}")]
     InvalidRedactionPattern { pattern: String, message: String },
 
+    #[error(
+        "secret environment variable '{name}' cannot declare `choices`; choices are exposed as setup metadata"
+    )]
+    SecretEnvChoices { name: String },
+
     #[error("session '{session}' references unknown {kind} '{name}'")]
     UnknownSessionReference {
         session: String,
