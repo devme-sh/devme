@@ -1221,7 +1221,7 @@ fn spawn_task_guardian(
     }
     leases.pass_to_child(&mut command);
     let mut guardian = command.spawn()?;
-    for _ in 0..40 {
+    for _ in 0..600 {
         if gate.exists() {
             std::thread::spawn(move || {
                 let _ = guardian.wait();
@@ -1234,7 +1234,7 @@ fn spawn_task_guardian(
         std::thread::sleep(Duration::from_millis(25));
     }
     let _ = guardian.kill();
-    bail!("Task guardian did not release the gate within 1 second")
+    bail!("Task guardian did not release the gate within 15 seconds")
 }
 
 #[cfg(test)]

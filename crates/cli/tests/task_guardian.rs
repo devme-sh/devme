@@ -50,9 +50,13 @@ fn guardian_interrupts_task_group_after_owner_disappears() {
         .spawn()
         .unwrap();
 
-    for _ in 0..50 {
+    let gate_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while std::time::Instant::now() < gate_deadline {
         if gate.exists() {
             break;
+        }
+        if let Some(status) = guardian.try_wait().unwrap() {
+            panic!("guardian exited before releasing the Task gate: {status}");
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -182,7 +186,7 @@ fn guardian_waits_for_the_full_task_group_before_releasing_ownership() {
         &completion,
     );
 
-    for _ in 0..100 {
+    for _ in 0..750 {
         if child_pid_file.exists() {
             break;
         }
