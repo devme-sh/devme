@@ -730,6 +730,175 @@ dependencies = ["auth"]
 }
 
 #[test]
+fn generated_dependency_overlays_replace_drift_and_restore_the_lower_layer() {
+    let source = layered_recipe();
+    write(
+        source.path().join("devme-template.toml"),
+        r#"schema_version = 1
+name = "native"
+version = "2026.7.17"
+
+[base]
+path = "base"
+
+[features.auth]
+version = "1.0.0"
+path = "features/auth"
+generated_files = ["app/settings.txt"]
+
+[features.stripe]
+version = "1.0.0"
+path = "features/stripe"
+dependencies = ["auth"]
+generated_files = ["app/settings.txt"]
+"#,
+    );
+    let workspace = TempDir::new().unwrap();
+    let target = workspace.path().join("groceries");
+    let composer = Composer::new();
+    composer
+        .create(create_request(source.path(), target.clone()))
+        .unwrap();
+    composer
+        .add_feature(AddFeatureRequest {
+            root: target.clone(),
+            feature: "auth".into(),
+            dry_run: false,
+        })
+        .unwrap();
+    write(target.join("app/settings.txt"), "auth = generated\n");
+
+    let added = composer
+        .add_feature(AddFeatureRequest {
+            root: target.clone(),
+            feature: "stripe".into(),
+            dry_run: false,
+        })
+        .unwrap();
+
+    assert_eq!(
+        added.regenerated_files,
+        vec![PathBuf::from("app/settings.txt")]
+    );
+    assert_eq!(
+        fs::read_to_string(target.join("app/settings.txt")).unwrap(),
+        "auth = true\nstripe = true\n"
+    );
+    write(
+        target.join("app/settings.txt"),
+        "auth = true\nstripe = generated\n",
+    );
+
+    let removed = composer
+        .remove_feature(RemoveFeatureRequest {
+            root: target.clone(),
+            feature: "stripe".into(),
+            dry_run: false,
+        })
+        .unwrap();
+
+    assert_eq!(
+        removed.regenerated_files,
+        vec![PathBuf::from("app/settings.txt")]
+    );
+    assert_eq!(
+        fs::read_to_string(target.join("app/settings.txt")).unwrap(),
+        "auth = generated\n"
+    );
+    write(target.join("app/settings.txt"), "auth = regenerated\n");
+    composer
+        .remove_feature(RemoveFeatureRequest {
+            root: target.clone(),
+            feature: "auth".into(),
+            dry_run: false,
+        })
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(target.join("app/settings.txt")).unwrap(),
+        "auth = false\n"
+    );
+}
+
+#[test]
+fn generated_declaration_does_not_adopt_an_unmanaged_file() {
+    let source = recipe();
+    write(
+        source.path().join("devme-template.toml"),
+        r#"schema_version = 1
+name = "native"
+version = "2026.7.17"
+
+[base]
+path = "base"
+
+[features.auth]
+version = "1.0.0"
+path = "features/auth"
+generated_files = ["app/auth.txt"]
+"#,
+    );
+    let workspace = TempDir::new().unwrap();
+    let target = workspace.path().join("groceries");
+    let composer = Composer::new();
+    composer
+        .create(create_request(source.path(), target.clone()))
+        .unwrap();
+    write(target.join("app/auth.txt"), "app owned\n");
+
+    let error = composer
+        .add_feature(AddFeatureRequest {
+            root: target,
+            feature: "auth".into(),
+            dry_run: false,
+        })
+        .unwrap_err();
+
+    let ComposerError::Conflict { paths, .. } = error else {
+        panic!("expected a conflict");
+    };
+    assert_eq!(paths, vec![PathBuf::from("app/auth.txt")]);
+}
+
+#[test]
+fn generated_declaration_must_reference_a_payload_file() {
+    let source = recipe();
+    write(
+        source.path().join("devme-template.toml"),
+        r#"schema_version = 1
+name = "native"
+version = "2026.7.17"
+
+[base]
+path = "base"
+
+[features.auth]
+version = "1.0.0"
+path = "features/auth"
+generated_files = ["app/missing.txt"]
+"#,
+    );
+    let workspace = TempDir::new().unwrap();
+    let target = workspace.path().join("groceries");
+    let composer = Composer::new();
+    composer
+        .create(create_request(source.path(), target.clone()))
+        .unwrap();
+
+    let error = composer
+        .add_feature(AddFeatureRequest {
+            root: target,
+            feature: "auth".into(),
+            dry_run: false,
+        })
+        .unwrap_err();
+
+    let ComposerError::InvalidRecipe(message) = error else {
+        panic!("expected an invalid recipe");
+    };
+    assert!(message.contains("not present in the feature payload"));
+}
+
+#[test]
 fn refuses_overlapping_feature_payloads_before_creating_the_project() {
     let source = recipe();
     write(
