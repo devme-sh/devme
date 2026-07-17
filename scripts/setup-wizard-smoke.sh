@@ -105,6 +105,25 @@ capture_pipe_until() {
   return 1
 }
 
+wait_for_file_content() {
+  local pattern="$1"
+  local file="$2"
+  local label="$3"
+  for _ in {1..100}; do
+    if grep -qF "$pattern" "$file" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "ASSERT FAIL: $label never contained '$pattern'" >&2
+  if [[ -f "$file" ]]; then
+    cat "$file" >&2
+  else
+    echo "(file was not created)" >&2
+  fi
+  return 1
+}
+
 tmux new-session -d -s "$SESSION" -x 140 -y 28 \
   "cd '$FIXTURE' && PATH='$BIN_DIR:$PATH' DEVME_BROWSER_OPEN_LOG='$OPEN_LOG' DEVME_CLIPBOARD_LOG='$CLIPBOARD_LOG' HOME='$HOME_DIR' XDG_CONFIG_HOME='$HOME_DIR/.config' XDG_RUNTIME_DIR='$RUNTIME_DIR' '$DEVME'"
 
@@ -121,6 +140,7 @@ if grep -qF "Type value" "$FIXTURE/initial.txt"; then
 fi
 tmux send-keys -t "$SESSION" Tab
 capture_until "Copied agent prompt" "$FIXTURE/agent-prompt.txt"
+wait_for_file_content 'authentication or approval' "$CLIPBOARD_LOG" "clipboard helper output"
 grep -qF "Help me complete the Devme setup wizard in $FIXTURE_REAL." "$CLIPBOARD_LOG" || {
   echo "ASSERT FAIL: copied agent prompt used the wrong project path" >&2
   cat "$CLIPBOARD_LOG" >&2
@@ -138,13 +158,7 @@ grep -qF "Shift+Tab Open browser" "$FIXTURE/url.txt"
 grep -qF "›" "$FIXTURE/url.txt"
 tmux send-keys -t "$SESSION" BTab
 capture_until "Opened https://console.example.test/credentials" "$FIXTURE/opened.txt"
-for _ in {1..100}; do
-  if grep -qF "https://console.example.test/credentials" "$OPEN_LOG" 2>/dev/null; then
-    break
-  fi
-  sleep 0.1
-done
-grep -qF "https://console.example.test/credentials" "$OPEN_LOG"
+wait_for_file_content "https://console.example.test/credentials" "$OPEN_LOG" "browser helper output"
 
 (cd "$FIXTURE" && HOME="$HOME_DIR" XDG_CONFIG_HOME="$HOME_DIR/.config" \
   XDG_RUNTIME_DIR="$RUNTIME_DIR" "$DEVME" setup set GOOGLE_WEB_CLIENT_ID \
