@@ -425,8 +425,8 @@ fn render_live_setup_field(
             output,
             "  {}  {}  {}",
             style.dim(devme_ui::glyph::BAR),
-            style.accent("[o Open browser]"),
-            style.accent("[c Copy URL]")
+            style.accent("[Ctrl+O Open browser]"),
+            style.accent("[Ctrl+Y Copy URL]")
         )?;
     }
     if let SetupFieldKind::Choice { values, initial } = field {
@@ -444,15 +444,15 @@ fn render_live_setup_field(
         return output.flush();
     }
 
-    let mut controls = vec!["[Enter Add value]".to_string()];
+    let mut controls = vec!["[Type value]".to_string(), "[Enter Set]".to_string()];
     if variable.default.is_some() {
-        controls.push("[d Use default]".into());
+        controls.push("[Ctrl+D Use default]".into());
     }
     if matches!(field, SetupFieldKind::Generate { .. }) {
-        controls.push("[g Generate]".into());
+        controls.push("[Ctrl+G Generate]".into());
     }
     if !variable.required {
-        controls.push("[s Skip]".into());
+        controls.push("[Ctrl+S Skip]".into());
     }
     writeln!(
         output,
@@ -496,7 +496,8 @@ fn read_live_setup_input(
         }
         let event = event::read()?;
         match event {
-            Event::Paste(pasted) if editing => {
+            Event::Paste(pasted) if !matches!(field, SetupFieldKind::Choice { .. }) => {
+                editing = true;
                 value.push_str(pasted.trim_end_matches(['\r', '\n']));
                 render_live_value(output, &value, variable.secret, style)?;
             }
@@ -523,9 +524,10 @@ fn read_live_setup_input(
                     render_live_setup_field(output, name, variable, field, style)?;
                 }
                 KeyCode::Char(character)
-                    if !key
-                        .modifiers
-                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                    if !matches!(field, SetupFieldKind::Choice { .. })
+                        && !key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
                 {
                     value.push(character);
                     render_live_value(output, &value, variable.secret, style)?;
@@ -541,7 +543,12 @@ fn read_live_setup_input(
                 {
                     return Ok(LiveSetupInput::Cancel);
                 }
-                KeyCode::Char('o') if variable.setup_url.is_some() => {
+                KeyCode::Char('o')
+                    if variable.setup_url.is_some()
+                        && key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
                     let url = variable.setup_url.as_deref().unwrap();
                     devme_config::browser::open_url(url)?;
                     writeln!(
@@ -550,9 +557,9 @@ fn read_live_setup_input(
                         style.dim(devme_ui::glyph::BAR)
                     )?;
                 }
-                KeyCode::Char('c')
+                KeyCode::Char('y')
                     if variable.setup_url.is_some()
-                        && !key
+                        && key
                             .modifiers
                             .contains(crossterm::event::KeyModifiers::CONTROL) =>
                 {
@@ -560,12 +567,22 @@ fn read_live_setup_input(
                     devme_ui::copy_to_clipboard(url);
                     writeln!(output, "  {}  Copied URL", style.dim(devme_ui::glyph::BAR))?;
                 }
-                KeyCode::Char('d') if variable.default.is_some() => {
+                KeyCode::Char('d')
+                    if variable.default.is_some()
+                        && key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
                     return Ok(LiveSetupInput::Value(
                         variable.default.as_ref().unwrap().clone(),
                     ));
                 }
-                KeyCode::Char('g') if matches!(field, SetupFieldKind::Generate { .. }) => {
+                KeyCode::Char('g')
+                    if matches!(field, SetupFieldKind::Generate { .. })
+                        && key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
                     let SetupFieldKind::Generate { command } = field else {
                         unreachable!()
                     };
@@ -573,7 +590,14 @@ fn read_live_setup_input(
                         .map(LiveSetupInput::Value)
                         .map_err(|error| std::io::Error::other(format!("{name}: {error}")));
                 }
-                KeyCode::Char('s') if !variable.required => return Ok(LiveSetupInput::Skip),
+                KeyCode::Char('s')
+                    if !variable.required
+                        && key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    return Ok(LiveSetupInput::Skip);
+                }
                 KeyCode::Up if matches!(field, SetupFieldKind::Choice { .. }) => {
                     let SetupFieldKind::Choice { values, .. } = field else {
                         unreachable!()
@@ -596,6 +620,15 @@ fn read_live_setup_input(
                 }
                 KeyCode::Enter => {
                     editing = true;
+                    render_live_value(output, &value, variable.secret, style)?;
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    editing = true;
+                    value.push(character);
                     render_live_value(output, &value, variable.secret, style)?;
                 }
                 _ => {}

@@ -84,8 +84,11 @@ tmux new-session -d -s "$SESSION" -x 140 -y 28 \
   "cd '$FIXTURE' && HOME='$HOME_DIR' XDG_CONFIG_HOME='$HOME_DIR/.config' XDG_RUNTIME_DIR='$RUNTIME_DIR' '$DEVME'"
 
 capture_until "GOOGLE_WEB_CLIENT_ID" "$FIXTURE/initial.txt"
-grep -qF "Open browser" "$FIXTURE/initial.txt"
-grep -qF "Copy URL" "$FIXTURE/initial.txt"
+grep -qF "Ctrl+O Open browser" "$FIXTURE/initial.txt"
+grep -qF "Ctrl+Y Copy URL" "$FIXTURE/initial.txt"
+grep -qF "Type value" "$FIXTURE/initial.txt"
+tmux send-keys -t "$SESSION" C-y
+capture_until "Copied URL" "$FIXTURE/copied.txt"
 
 (cd "$FIXTURE" && HOME="$HOME_DIR" XDG_CONFIG_HOME="$HOME_DIR/.config" \
   XDG_RUNTIME_DIR="$RUNTIME_DIR" "$DEVME" setup set GOOGLE_WEB_CLIENT_ID \
@@ -98,10 +101,9 @@ grep -qF "set by another process" "$FIXTURE/secret.txt" || {
   exit 1
 }
 
-tmux send-keys -t "$SESSION" Enter
-tmux send-keys -t "$SESSION" "local-secret"
+tmux send-keys -t "$SESSION" "oauth-client-secret"
 capture_until "••••" "$FIXTURE/masked.txt"
-if grep -qF "local-secret" "$FIXTURE/masked.txt"; then
+if grep -qF "oauth-client-secret" "$FIXTURE/masked.txt"; then
   echo "ASSERT FAIL: secret input was rendered in plaintext" >&2
   cat "$FIXTURE/masked.txt" >&2
   exit 1
@@ -109,6 +111,7 @@ fi
 tmux send-keys -t "$SESSION" Enter
 
 capture_until "actions:" "$FIXTURE/complete.txt"
+grep -qF "GOOGLE_CLIENT_SECRET=oauth-client-secret" "$FIXTURE/.env.auth.local"
 (cd "$FIXTURE" && HOME="$HOME_DIR" XDG_CONFIG_HOME="$HOME_DIR/.config" \
   XDG_RUNTIME_DIR="$RUNTIME_DIR" "$DEVME" setup status --json) > "$FIXTURE/status.json"
 grep -qF '"status": "complete"' "$FIXTURE/status.json"
@@ -142,6 +145,7 @@ tmux kill-session -t "$PIPE_SESSION"
 tmux send-keys -t "$SESSION" q
 echo "ok [controls] setup URL can be opened or copied"
 echo "ok [live] agent-supplied values advanced the human wizard without recheck"
+echo "ok [typing] values accept direct input without an activation key"
 echo "ok [secret] human secret input stayed masked"
 echo "ok [status] configured env file is the live source of truth"
 echo "ok [piped secret] non-interactive stdin selects redacted TOON on terminal stdout"

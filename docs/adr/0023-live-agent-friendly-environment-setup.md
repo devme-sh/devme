@@ -34,6 +34,10 @@ For variables with `setup_url`, the human wizard offers `Open browser` and
 through `devme setup status --output toon`, uses its available browser adapter,
 and submits results with `devme setup set`.
 
+Printable text and paste begin value entry immediately. Auxiliary actions use
+explicit Ctrl shortcuts so a valid first character can never be consumed as a
+wizard command.
+
 `setup status` and `setup set` support human, TOON, and JSON output. A
 non-interactive invocation defaults to TOON; `--json` remains the stable JSON
 compatibility alias.
