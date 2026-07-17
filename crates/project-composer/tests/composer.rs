@@ -880,6 +880,26 @@ fn rejects_payloads_that_claim_composer_authority_files() {
 }
 
 #[test]
+fn ignores_local_devme_artifacts_inside_a_feature_payload() {
+    let source = recipe();
+    write(
+        source
+            .path()
+            .join("features/auth/.devme/DerivedData/Starter.app/Info.plist"),
+        "local build artifact\n",
+    );
+    let workspace = TempDir::new().unwrap();
+    let target = workspace.path().join("groceries");
+    let mut request = create_request(source.path(), target.clone());
+    request.features.push("auth".into());
+
+    Composer::new().create(request).unwrap();
+
+    assert!(target.join("app/auth.txt").is_file());
+    assert!(!target.join(".devme/DerivedData").exists());
+}
+
+#[test]
 fn rejects_a_base_snapshot_that_contains_recipe_authority() {
     let source = recipe();
     write(
