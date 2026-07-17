@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "devme"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -401,7 +401,7 @@ dependencies = [
 
 [[package]]
 name = "devme-client"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "devme-core",
  "devme-ipc",
@@ -417,7 +417,7 @@ dependencies = [
 
 [[package]]
 name = "devme-config"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "devme-core",
  "indexmap",
@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "devme-core"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -440,7 +440,7 @@ dependencies = [
 
 [[package]]
 name = "devme-executor"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "devme-config",
  "devme-core",
@@ -449,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "devme-ipc"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "devme-core",
  "futures",
@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "devme-project-composer"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "devme-resource-lease"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "devme-config",
@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "devme-shared-supervisor"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -510,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "devme-slot-allocator"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "devme-core",
  "process_alive",
@@ -522,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "devme-supervisor"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "devme-task-runner"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "devme-client",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "devme-tui"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
@@ -594,7 +594,7 @@ dependencies = [
 
 [[package]]
 name = "devme-ui"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "serde_json",
 ]
