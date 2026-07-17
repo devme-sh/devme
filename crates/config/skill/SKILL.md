@@ -59,14 +59,15 @@ Route on `$action`. Default to diagnostics when none is given.
 
 ### action "setup" - configure environment or generate devme.toml
 
-When `devme.toml` already exists, run `devme setup status --json` before
+When `devme.toml` already exists, run `devme setup status --output toon` before
 starting services. It reports every declared environment value as configured,
 missing, or skipped, including a machine-readable `setup_url`, but never emits
 values. If a value has a setup URL, use the available browser tooling to obtain
 it. Submit non-secret values with `devme setup set <NAME> --value <value>`.
 Submit secret values on stdin with `devme setup set <NAME>` so they do not enter
-process arguments or shell history. The command refuses to overwrite an
-existing non-empty value. Do not manually mark setup complete: the configured
+process arguments or shell history. Repeating the same value is a safe no-op;
+a different existing value is never overwritten. Use `--json` only for
+existing JSON consumers. Do not manually mark setup complete: the configured
 env file is the source of truth and a running human wizard advances live when
 the value appears.
 
@@ -209,8 +210,8 @@ Rules:
 | `devme session <name> [--stop] [--output human\|toon\|json]` | Open/join or idempotently stop a resource-bound service/task composition |
 | `devme setup [--write]` | Detect supported project markers and preview or write one root config |
 | `devme setup split --dry-run\|--write` | Preview or explicitly create a one-level root/member workspace layout |
-| `devme setup status [--json]` | Redacted configured/missing environment setup derived from the configured env file, including setup URLs |
-| `devme setup set <NAME> [--value <value>] [--json]` | Write one missing declared value without overwriting; secrets must be supplied on stdin |
+| `devme setup status [--output human\|toon\|json]` | Redacted configured/missing environment setup derived from the configured env file, including setup URLs. Non-interactive output defaults to TOON; `--json` is compatible |
+| `devme setup set <NAME> [--value <value>] [--output human\|toon\|json]` | Idempotently write one declared value without overwriting a different value; secrets must be supplied on stdin |
 | `devme agent setup\|status\|remove [--target claude\|codex\|opencode\|all]` | Explicitly manage project-scoped session integrations; never installed silently |
 | `devme agent context [--json]` | Compact directory-scoped live state, session/resource waits, and contextual next commands. TOON is default; JSON is compatible |
 
@@ -227,7 +228,7 @@ Rules:
 ## Live agent guidance
 
 - Run bare `devme` or `devme agent context` for compact directory-focused state without starting a daemon in non-interactive use.
-- Run `devme setup status --json` for missing local configuration. Use its `setup_url` with browser tooling, then submit values through `devme setup set`.
+- Run `devme setup status --output toon` for missing local configuration. Use its `setup_url` with browser tooling, then submit values through `devme setup set`.
 - Run `devme tasks --output toon` to discover one-shot commands.
 - Run `devme run <task> --output toon -- <args>` to execute with readiness and leases.
 - Run `devme sessions --output toon` and `devme session <name> --output toon` for resource-bound native app/device lifetimes.

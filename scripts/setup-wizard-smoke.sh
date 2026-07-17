@@ -9,6 +9,7 @@ if [[ "$DEVME" != /* ]]; then
   DEVME="$(cd "$(dirname "$DEVME")" && pwd)/$(basename "$DEVME")"
 fi
 SESSION="devme-setup-wizard-$$"
+PIPE_SESSION="devme-setup-piped-secret-$$"
 FIXTURE="$(mktemp -d /tmp/devme-setup-wizard.XXXXXX)"
 HOME_DIR="$FIXTURE/home"
 RUNTIME_DIR="$FIXTURE/runtime"
@@ -16,6 +17,7 @@ RUNTIME_DIR="$FIXTURE/runtime"
 cleanup() {
   local status=$?
   tmux kill-session -t "$SESSION" 2>/dev/null || true
+  tmux kill-session -t "$PIPE_SESSION" 2>/dev/null || true
   (cd "$FIXTURE" && HOME="$HOME_DIR" XDG_CONFIG_HOME="$HOME_DIR/.config" \
     XDG_RUNTIME_DIR="$RUNTIME_DIR" "$DEVME" down >/dev/null 2>&1) || true
   rm -rf "$FIXTURE"
@@ -63,6 +65,21 @@ capture_until() {
   return 1
 }
 
+capture_pipe_until() {
+  local pattern="$1"
+  local output="$2"
+  for _ in {1..100}; do
+    tmux capture-pane -t "$PIPE_SESSION" -p > "$output"
+    if grep -qF "$pattern" "$output"; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "ASSERT FAIL: piped-secret command never showed '$pattern'" >&2
+  cat "$output" >&2
+  return 1
+}
+
 tmux new-session -d -s "$SESSION" -x 140 -y 28 \
   "cd '$FIXTURE' && HOME='$HOME_DIR' XDG_CONFIG_HOME='$HOME_DIR/.config' XDG_RUNTIME_DIR='$RUNTIME_DIR' '$DEVME'"
 
@@ -96,8 +113,35 @@ capture_until "actions:" "$FIXTURE/complete.txt"
   XDG_RUNTIME_DIR="$RUNTIME_DIR" "$DEVME" setup status --json) > "$FIXTURE/status.json"
 grep -qF '"status": "complete"' "$FIXTURE/status.json"
 
+PIPE_FIXTURE="$FIXTURE/piped-secret"
+mkdir -p "$PIPE_FIXTURE"
+cat > "$PIPE_FIXTURE/devme.toml" <<'TOML'
+schema_version = 1
+
+[env.API_SECRET]
+required = true
+secret = true
+TOML
+printf 'piped-secret-value\n' > "$PIPE_FIXTURE/value"
+tmux new-session -d -s "$PIPE_SESSION" -x 100 -y 20 \
+  "cd '$PIPE_FIXTURE' && export HOME='$HOME_DIR' XDG_CONFIG_HOME='$HOME_DIR/.config' XDG_RUNTIME_DIR='$RUNTIME_DIR'; cat value | '$DEVME' setup set API_SECRET; printf '\n__SETUP_DONE__\n'; sleep 30"
+capture_pipe_until "__SETUP_DONE__" "$PIPE_FIXTURE/output.txt"
+grep -qF "status: complete" "$PIPE_FIXTURE/output.txt"
+if grep -qF "Environment setup:" "$PIPE_FIXTURE/output.txt"; then
+  echo "ASSERT FAIL: piped secret with terminal stdout used human output" >&2
+  cat "$PIPE_FIXTURE/output.txt" >&2
+  exit 1
+fi
+if grep -qF "piped-secret-value" "$PIPE_FIXTURE/output.txt"; then
+  echo "ASSERT FAIL: piped secret appeared in terminal output" >&2
+  cat "$PIPE_FIXTURE/output.txt" >&2
+  exit 1
+fi
+tmux kill-session -t "$PIPE_SESSION"
+
 tmux send-keys -t "$SESSION" q
 echo "ok [controls] setup URL can be opened or copied"
 echo "ok [live] agent-supplied values advanced the human wizard without recheck"
 echo "ok [secret] human secret input stayed masked"
 echo "ok [status] configured env file is the live source of truth"
+echo "ok [piped secret] non-interactive stdin selects redacted TOON on terminal stdout"

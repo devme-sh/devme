@@ -316,14 +316,21 @@ pub enum FeatureAction {
 #[derive(Debug, Subcommand, PartialEq, Eq)]
 pub enum SetupAction {
     /// Report configured and missing environment setup without exposing values.
-    Status,
-    /// Set one declared environment value. Existing values are never overwritten.
+    Status {
+        /// Structured result format. Defaults to human on a terminal and TOON otherwise.
+        #[arg(long, value_enum, default_value_t, hide_default_value = true)]
+        output: OutputFormat,
+    },
+    /// Set one declared value. Same-value retries are no-ops; different values conflict.
     Set {
         /// Name from `[env.<NAME>]`.
         name: String,
         /// Value for a non-secret variable. Secret variables must use stdin.
         #[arg(long)]
         value: Option<String>,
+        /// Structured result format. Defaults to human on a terminal and TOON otherwise.
+        #[arg(long, value_enum, default_value_t, hide_default_value = true)]
+        output: OutputFormat,
     },
     /// Generate an explicit one-level workspace with local child configs.
     Split {

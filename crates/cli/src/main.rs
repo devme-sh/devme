@@ -37,6 +37,12 @@ fn interactive_input() -> bool {
     !NO_INPUT.load(Ordering::Relaxed) && std::io::stdin().is_terminal()
 }
 
+fn non_interactive_output() -> bool {
+    NO_INPUT.load(Ordering::Relaxed)
+        || !std::io::stdin().is_terminal()
+        || !std::io::stdout().is_terminal()
+}
+
 fn main() {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__task-guardian")) {
         std::process::exit(task_guardian_main());
@@ -73,6 +79,7 @@ fn main() {
                 && (args.windows(2).any(|pair| pair == ["--output", "toon"])
                     || args.iter().any(|arg| arg == "--output=toon")
                     || args.iter().any(|arg| arg == "--no-input")
+                    || !std::io::stdin().is_terminal()
                     || !std::io::stdout().is_terminal());
             let message = error.to_string();
             let report = serde_json::json!({
@@ -289,22 +296,8 @@ async fn run(cli: Cli) -> i32 {
     if !interactive_default && let (_, Some(warning)) = devme_config::GlobalConfig::load_checked() {
         devme_ui::warn(warning);
     }
-    let command_output = match &cli.command {
-        Some(Command::Status { output, .. })
-        | Some(Command::Doctor { output, .. })
-        | Some(Command::Create { output, .. })
-        | Some(Command::Feature { output, .. }) => *output,
-        _ => devme_cli::OutputFormat::Human,
-    };
-    let error_output = if cli.json {
-        devme_cli::OutputFormat::Json
-    } else if command_output != devme_cli::OutputFormat::Human {
-        command_output
-    } else if cli.no_input || !std::io::stdout().is_terminal() {
-        devme_cli::OutputFormat::Toon
-    } else {
-        devme_cli::OutputFormat::Human
-    };
+    let command_output = requested_output(&cli.command);
+    let error_output = selected_output(cli.json, command_output);
 
     let result = match cli.command {
         None => {
@@ -509,12 +502,30 @@ async fn run(cli: Cli) -> i32 {
     }
 }
 
+fn requested_output(command: &Option<Command>) -> devme_cli::OutputFormat {
+    match command {
+        Some(Command::Status { output, .. })
+        | Some(Command::Doctor { output, .. })
+        | Some(Command::Create { output, .. })
+        | Some(Command::Feature { output, .. })
+        | Some(Command::Setup {
+            action: Some(devme_cli::SetupAction::Status { output }),
+            ..
+        })
+        | Some(Command::Setup {
+            action: Some(devme_cli::SetupAction::Set { output, .. }),
+            ..
+        }) => *output,
+        _ => devme_cli::OutputFormat::Human,
+    }
+}
+
 fn selected_output(json: bool, output: devme_cli::OutputFormat) -> devme_cli::OutputFormat {
     if json {
         devme_cli::OutputFormat::Json
     } else if output == devme_cli::OutputFormat::Human
         && !output_was_explicit()
-        && (NO_INPUT.load(Ordering::Relaxed) || !std::io::stdout().is_terminal())
+        && non_interactive_output()
     {
         devme_cli::OutputFormat::Toon
     } else {
@@ -1113,13 +1124,7 @@ fn focused_session_view(stack: &Stack) -> Stack {
 }
 
 fn emit_command_error(format: devme_cli::OutputFormat, error: &anyhow::Error) -> i32 {
-    let format = if format == devme_cli::OutputFormat::Human
-        && (NO_INPUT.load(Ordering::Relaxed) || !std::io::stdout().is_terminal())
-    {
-        devme_cli::OutputFormat::Toon
-    } else {
-        format
-    };
+    let format = selected_output(false, format);
     let message = error.to_string();
     let (code, exit_code, help) = if let Some(command) = error
         .downcast_ref::<devme_cli::session::SessionCommandError>()
@@ -1268,7 +1273,7 @@ fn setup_cmd(
                 }
             }
         }
-        Some(devme_cli::SetupAction::Status) => {
+        Some(devme_cli::SetupAction::Status { output }) => {
             if write {
                 return Err(devme_cli::setup::SetupCommandError::new(
                     devme_core::ErrorCode::Usage,
@@ -1277,9 +1282,13 @@ fn setup_cmd(
                 .into());
             }
             let snapshot = setup_snapshot_for(&cwd)?;
-            emit_setup_snapshot(&snapshot, json)?;
+            emit_setup_snapshot(&snapshot, selected_output(json, output))?;
         }
-        Some(devme_cli::SetupAction::Set { name, value }) => {
+        Some(devme_cli::SetupAction::Set {
+            name,
+            value,
+            output,
+        }) => {
             if write {
                 return Err(devme_cli::setup::SetupCommandError::new(
                     devme_core::ErrorCode::Usage,
@@ -1341,7 +1350,7 @@ fn setup_cmd(
                     };
                     devme_cli::setup::SetupCommandError::new(code, error.to_string())
                 })?;
-            emit_setup_snapshot(&snapshot, json)?;
+            emit_setup_snapshot(&snapshot, selected_output(json, output))?;
         }
     }
     Ok(())
@@ -1361,11 +1370,18 @@ fn setup_snapshot_for(
 
 fn emit_setup_snapshot(
     snapshot: &devme_supervisor::env_resolve::SetupSnapshot,
-    json: bool,
+    output: devme_cli::OutputFormat,
 ) -> anyhow::Result<()> {
-    if json {
-        devme_ui::json(&serde_json::to_value(snapshot)?);
-        return Ok(());
+    match output {
+        devme_cli::OutputFormat::Json => {
+            devme_ui::json(&serde_json::to_value(snapshot)?);
+            return Ok(());
+        }
+        devme_cli::OutputFormat::Toon => {
+            devme_cli::output::print_toon(snapshot)?;
+            return Ok(());
+        }
+        devme_cli::OutputFormat::Human => {}
     }
     println!(
         "Environment setup: {} required value{} missing",

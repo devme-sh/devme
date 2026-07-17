@@ -61,9 +61,10 @@ Runs before step checks, after config parsing:
    wizard observes values written by another process and advances automatically
 6. Load the full `.env.local` into the process environment for all subsequent steps and services
 
-Agents inspect the same derived state through `devme setup status --json` and
+Agents inspect the same derived state through `devme setup status --output toon` and
 write one declared value with `devme setup set`. Secret values are accepted only
-on stdin and no setup status surface serializes values. See ADR-0023.
+on stdin, and no setup status surface serializes values. JSON remains available
+through `--json` for compatible consumers. See ADR-0023.
 
 ### Interaction with services
 

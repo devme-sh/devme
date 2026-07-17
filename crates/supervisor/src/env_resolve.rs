@@ -196,14 +196,18 @@ pub fn set_env_value(
     file.lock()?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;
-    if parse_env_contents(&contents)
+    if let Some(current) = parse_env_contents(&contents)
         .vars
         .get(name)
-        .is_some_and(|current| !current.trim().is_empty())
+        .filter(|current| !current.trim().is_empty())
     {
+        if current == value {
+            drop(file);
+            return Ok(setup_snapshot(declared, env_file));
+        }
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
-            format!("environment variable {name} is already configured"),
+            format!("environment variable {name} is already configured with a different value"),
         ));
     }
     file.seek(SeekFrom::End(0))?;
@@ -631,7 +635,19 @@ fn render_live_choice(output: &mut impl Write, value: &str, style: Style) -> std
 }
 
 fn unquote(s: &str) -> String {
-    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        let mut value = String::new();
+        let mut chars = s[1..s.len() - 1].chars().peekable();
+        while let Some(character) = chars.next() {
+            if character == '\\' && chars.peek() == Some(&'"') {
+                chars.next();
+                value.push('"');
+            } else {
+                value.push(character);
+            }
+        }
+        value
+    } else if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
         s[1..s.len() - 1].to_string()
     } else {
         s.to_string()
@@ -682,7 +698,7 @@ pub fn append_to_env_file(
 }
 
 fn write_env_var(output: &mut impl Write, key: &str, value: &str) -> std::io::Result<()> {
-    if value.contains(' ') || value.contains('"') || value.contains('#') {
+    if value.chars().any(char::is_whitespace) || value.contains('"') || value.contains('#') {
         writeln!(output, "{key}=\"{}\"", value.replace('"', "\\\""))
     } else {
         writeln!(output, "{key}={value}")
@@ -1496,7 +1512,7 @@ mod tests {
     }
 
     #[test]
-    fn set_env_value_writes_once_and_refuses_overwrite() {
+    fn set_env_value_is_idempotent_and_refuses_a_different_overwrite() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(".env.auth.local");
         let declared = vec![(
@@ -1523,6 +1539,12 @@ mod tests {
             Some("secret-value")
         );
 
+        let retry =
+            set_env_value(&declared, &path, "GOOGLE_CLIENT_SECRET", "secret-value").unwrap();
+        assert_eq!(retry.status, SetupStatus::Complete);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.matches("GOOGLE_CLIENT_SECRET=").count(), 1);
+
         let error =
             set_env_value(&declared, &path, "GOOGLE_CLIENT_SECRET", "replacement").unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
@@ -1533,6 +1555,40 @@ mod tests {
                 .map(String::as_str),
             Some("secret-value")
         );
+    }
+
+    #[test]
+    fn set_env_value_retry_handles_values_that_require_env_quoting() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".env.local");
+        let declared = vec![(
+            "DISPLAY_NAME".into(),
+            make_env_var(true, None, None, None, vec![]),
+        )];
+        let value = "Sambu #1 \"Home\"";
+
+        set_env_value(&declared, &path, "DISPLAY_NAME", value).unwrap();
+        set_env_value(&declared, &path, "DISPLAY_NAME", value).unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.matches("DISPLAY_NAME=").count(), 1);
+        assert_eq!(parse_env_file(&path).vars["DISPLAY_NAME"], value);
+    }
+
+    #[test]
+    fn set_env_value_retry_preserves_leading_and_trailing_tabs() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".env.local");
+        let declared = vec![(
+            "TAB_VALUE".into(),
+            make_env_var(true, None, None, None, vec![]),
+        )];
+        let value = "\tvalue\t";
+
+        set_env_value(&declared, &path, "TAB_VALUE", value).unwrap();
+        set_env_value(&declared, &path, "TAB_VALUE", value).unwrap();
+
+        assert_eq!(parse_env_file(&path).vars["TAB_VALUE"], value);
     }
 
     #[test]

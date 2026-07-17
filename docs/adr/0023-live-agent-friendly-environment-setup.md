@@ -31,13 +31,21 @@ persisted immediately instead of waiting for the whole form to finish.
 
 For variables with `setup_url`, the human wizard offers `Open browser` and
 `Copy URL`. Browser automation stays outside Devme. An agent reads the same URL
-through `devme setup status --json`, uses its available browser adapter, and
-submits results with `devme setup set`.
+through `devme setup status --output toon`, uses its available browser adapter,
+and submits results with `devme setup set`.
+
+`setup status` and `setup set` support human, TOON, and JSON output. A
+non-interactive invocation defaults to TOON; `--json` remains the stable JSON
+compatibility alias.
 
 `devme setup set <name> --value <value>` accepts non-secret values.
 `devme setup set <name>` reads stdin and is required for secrets. It locks the
 configured env file, refuses to overwrite an existing non-empty value, and
 returns the refreshed redacted setup snapshot.
+
+Submitting the same value again is a successful no-op so interrupted agents
+can retry safely. Submitting a different value remains a conflict and never
+overwrites the configured value.
 
 There is no normal recheck action. The wizard and `setup status` derive their
 state from the env file on every observation. Explicit retry is reserved for a

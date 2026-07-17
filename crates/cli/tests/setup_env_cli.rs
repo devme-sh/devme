@@ -100,6 +100,51 @@ fn setup_status_is_agent_readable_and_never_exposes_values() {
 }
 
 #[test]
+fn setup_status_supports_toon_output() {
+    let dir = fixture();
+
+    let output = run(&dir, &["setup", "status", "--output", "toon"]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        toon_format::decode_strict(std::str::from_utf8(&output.stdout).unwrap()).unwrap();
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["status"], "incomplete");
+    assert_eq!(report["missing_required"], 2);
+    assert_eq!(report["variables"][0]["name"], "GOOGLE_WEB_CLIENT_ID");
+}
+
+#[test]
+fn setup_status_defaults_to_toon_when_stdout_is_not_a_terminal() {
+    let dir = fixture();
+
+    let output = run(&dir, &["setup", "status"]);
+
+    assert!(output.status.success());
+    let report: serde_json::Value =
+        toon_format::decode_strict(std::str::from_utf8(&output.stdout).unwrap()).unwrap();
+    assert_eq!(report["status"], "incomplete");
+    assert_eq!(report["missing_required"], 2);
+}
+
+#[test]
+fn setup_help_describes_the_terminal_sensitive_output_default() {
+    let dir = fixture();
+
+    let output = run(&dir, &["setup", "status", "--help"]);
+
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("Defaults to human on a terminal and TOON otherwise"));
+    assert!(!help.contains("[default: human]"));
+}
+
+#[test]
 fn setup_set_accepts_secrets_only_on_stdin_and_updates_status() {
     let dir = fixture();
     let client = run(
@@ -162,6 +207,36 @@ fn setup_set_accepts_secrets_only_on_stdin_and_updates_status() {
 }
 
 #[test]
+fn setup_set_supports_toon_output() {
+    let dir = fixture();
+
+    let output = run(
+        &dir,
+        &[
+            "setup",
+            "set",
+            "GOOGLE_WEB_CLIENT_ID",
+            "--value",
+            "web-client",
+            "--output",
+            "toon",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        toon_format::decode_strict(std::str::from_utf8(&output.stdout).unwrap()).unwrap();
+    assert_eq!(report["status"], "incomplete");
+    assert_eq!(report["missing_required"], 1);
+    assert_eq!(report["variables"][0]["state"], "configured");
+}
+
+#[test]
 fn setup_set_uses_semantic_exit_codes() {
     let dir = fixture();
 
@@ -217,6 +292,21 @@ fn setup_set_uses_semantic_exit_codes() {
         ],
     );
     assert!(first.status.success());
+    let retry = run(
+        &dir,
+        &[
+            "setup",
+            "set",
+            "GOOGLE_WEB_CLIENT_ID",
+            "--value",
+            "first",
+            "--json",
+        ],
+    );
+    assert_eq!(retry.status.code(), Some(0));
+    let env = std::fs::read_to_string(dir.path().join(".env.auth.local")).unwrap();
+    assert_eq!(env.matches("GOOGLE_WEB_CLIENT_ID=").count(), 1);
+
     let conflict = run(
         &dir,
         &[
@@ -225,12 +315,28 @@ fn setup_set_uses_semantic_exit_codes() {
             "GOOGLE_WEB_CLIENT_ID",
             "--value",
             "second",
-            "--json",
+            "--output",
+            "toon",
         ],
     );
     assert_eq!(conflict.status.code(), Some(5));
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&conflict.stdout).unwrap()["error"]["code"],
-        "conflict"
+    let conflict_report: serde_json::Value =
+        toon_format::decode_strict(std::str::from_utf8(&conflict.stdout).unwrap()).unwrap();
+    assert_eq!(conflict_report["error"]["code"], "conflict");
+}
+
+#[test]
+fn explicit_human_output_applies_to_setup_errors() {
+    let dir = fixture();
+
+    let output = run(
+        &dir,
+        &[
+            "setup", "set", "UNKNOWN", "--value", "value", "--output", "human",
+        ],
     );
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not declared"));
 }
