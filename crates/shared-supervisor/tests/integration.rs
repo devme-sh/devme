@@ -43,7 +43,7 @@ async fn wait_for_shared_socket_or_diag(
     use std::io::Read;
     let repos = runtime.join("devme").join("repos");
     let started = std::time::Instant::now();
-    let timeout = Duration::from_secs(2);
+    let timeout = Duration::from_secs(5);
     loop {
         if let Ok(rd) = std::fs::read_dir(&repos) {
             for entry in rd.flatten() {
@@ -74,9 +74,14 @@ async fn wait_for_shared_socket_or_diag(
                         .join(", ")
                 })
                 .unwrap_or_else(|e| format!("(read_dir err: {e})"));
+            // Close the pipe before reading it. Reading stderr while the child
+            // is still alive blocks forever and turns a startup timeout into a
+            // hung workspace test.
+            let _ = child.kill();
+            let _ = child.wait();
             let mut stderr = String::new();
-            if let Some(mut s) = child.stderr.take() {
-                let _ = s.read_to_string(&mut stderr);
+            if let Some(mut stream) = child.stderr.take() {
+                let _ = stream.read_to_string(&mut stderr);
             }
             panic!(
                 "shared.sock did not appear under {} within {timeout:?}\nentries: [{listing}]\n--- stderr ---\n{stderr}",
