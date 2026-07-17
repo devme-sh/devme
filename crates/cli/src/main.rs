@@ -1712,6 +1712,14 @@ async fn down_all(timeout_secs: u64) -> anyhow::Result<()> {
         }
     }
 
+    // A freshly composed project is intentionally usable before `git init`.
+    // Worktree discovery has nothing to enumerate in that state, so always
+    // try the current instance socket as a fallback. If discovery already
+    // stopped it, reconnecting simply returns false.
+    if teardown_daemon(&socket_path(), timeout_secs, None).await? {
+        any = true;
+    }
+
     // Every instance daemon is down now, so the shared services are free to
     // stop unconditionally (no sibling can still be relying on them).
     if let Ok(shared_sock) = devme_config::paths::shared_socket(&cwd)
