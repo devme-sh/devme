@@ -98,6 +98,8 @@ tmux new-session -d -s "$SESSION" -x 140 -y 28 \
   "cd '$FIXTURE' && PATH='$BIN_DIR:$PATH' DEVME_BROWSER_OPEN_LOG='$OPEN_LOG' HOME='$HOME_DIR' XDG_CONFIG_HOME='$HOME_DIR/.config' XDG_RUNTIME_DIR='$RUNTIME_DIR' '$DEVME'"
 
 capture_until "DISPLAY_NAME" "$FIXTURE/initial.txt"
+grep -qF "Agent help: ask your coding agent to finish this setup." "$FIXTURE/initial.txt"
+grep -qF "It can read this wizard's live context with devme setup status." "$FIXTURE/initial.txt"
 grep -qF "Enter Use default" "$FIXTURE/initial.txt"
 grep -qF "›" "$FIXTURE/initial.txt"
 if grep -qF "Type value" "$FIXTURE/initial.txt"; then

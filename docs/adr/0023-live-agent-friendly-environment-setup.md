@@ -29,6 +29,9 @@ it while presenting missing values and advances automatically when another
 process supplies the current value. Values accepted in the human wizard are
 persisted immediately instead of waiting for the whole form to finish.
 
+The wizard tells the human that a coding agent can help and names
+`devme setup status` as the live context surface the agent can read.
+
 For variables with `setup_url`, the human wizard offers `Open browser` and
 `Copy URL`. Browser automation stays outside Devme. An agent reads the same URL
 through `devme setup status --output toon`, uses its available browser adapter,

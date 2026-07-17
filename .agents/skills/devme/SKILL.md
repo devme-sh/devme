@@ -69,7 +69,8 @@ process arguments or shell history. Repeating the same value is a safe no-op;
 a different existing value is never overwritten. Use `--json` only for
 existing JSON consumers. Do not manually mark setup complete: the configured
 env file is the source of truth and a running human wizard advances live when
-the value appears.
+the value appears. The human wizard explicitly offers agent help and names
+`devme setup status` as the live context surface shared with the agent.
 
 When `devme.toml` does not exist, use the detection workflow below.
 

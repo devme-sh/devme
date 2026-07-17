@@ -330,6 +330,19 @@ pub fn resolve_env_vars_live(
         ))
     )?;
     writeln!(output, "  {}", style.dim(devme_ui::glyph::BAR))?;
+    writeln!(
+        output,
+        "  {}  {} ask your coding agent to finish this setup.",
+        style.dim(devme_ui::glyph::BAR),
+        style.accent("Agent help:")
+    )?;
+    writeln!(
+        output,
+        "  {}  It can read this wizard's live context with {}.",
+        style.dim(devme_ui::glyph::BAR),
+        style.accent("devme setup status")
+    )?;
+    writeln!(output, "  {}", style.dim(devme_ui::glyph::BAR))?;
 
     for (name, variable) in declared {
         let current = setup_snapshot(declared, env_file);
