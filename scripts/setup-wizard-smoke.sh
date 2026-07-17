@@ -13,6 +13,8 @@ PIPE_SESSION="devme-setup-piped-secret-$$"
 FIXTURE="$(mktemp -d /tmp/devme-setup-wizard.XXXXXX)"
 HOME_DIR="$FIXTURE/home"
 RUNTIME_DIR="$FIXTURE/runtime"
+BIN_DIR="$FIXTURE/bin"
+OPEN_LOG="$FIXTURE/opened-url.txt"
 
 cleanup() {
   local status=$?
@@ -25,14 +27,26 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$HOME_DIR/.config/devme" "$RUNTIME_DIR"
+mkdir -p "$HOME_DIR/.config/devme" "$RUNTIME_DIR" "$BIN_DIR"
 git -C "$FIXTURE" init -q
 printf '[hints]\nskills = "false"\n' > "$HOME_DIR/.config/devme/config.toml"
+cat > "$BIN_DIR/browser-open" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$1" > "$DEVME_BROWSER_OPEN_LOG"
+SH
+chmod +x "$BIN_DIR/browser-open"
+ln -s browser-open "$BIN_DIR/open"
+ln -s browser-open "$BIN_DIR/xdg-open"
 cat > "$FIXTURE/devme.toml" <<'TOML'
 schema_version = 1
 
 [stack]
 env_file = ".env.auth.local"
+
+[env.DISPLAY_NAME]
+required = true
+default = "Devme"
+help = "Display name"
 
 [env.GOOGLE_WEB_CLIENT_ID]
 required = true
@@ -81,14 +95,33 @@ capture_pipe_until() {
 }
 
 tmux new-session -d -s "$SESSION" -x 140 -y 28 \
-  "cd '$FIXTURE' && HOME='$HOME_DIR' XDG_CONFIG_HOME='$HOME_DIR/.config' XDG_RUNTIME_DIR='$RUNTIME_DIR' '$DEVME'"
+  "cd '$FIXTURE' && PATH='$BIN_DIR:$PATH' DEVME_BROWSER_OPEN_LOG='$OPEN_LOG' HOME='$HOME_DIR' XDG_CONFIG_HOME='$HOME_DIR/.config' XDG_RUNTIME_DIR='$RUNTIME_DIR' '$DEVME'"
 
-capture_until "GOOGLE_WEB_CLIENT_ID" "$FIXTURE/initial.txt"
-grep -qF "Ctrl+O Open browser" "$FIXTURE/initial.txt"
-grep -qF "Ctrl+Y Copy URL" "$FIXTURE/initial.txt"
-grep -qF "Type value" "$FIXTURE/initial.txt"
-tmux send-keys -t "$SESSION" C-y
+capture_until "DISPLAY_NAME" "$FIXTURE/initial.txt"
+grep -qF "Enter Use default" "$FIXTURE/initial.txt"
+grep -qF "›" "$FIXTURE/initial.txt"
+if grep -qF "Type value" "$FIXTURE/initial.txt"; then
+  echo "ASSERT FAIL: setup wizard showed redundant typing instructions" >&2
+  cat "$FIXTURE/initial.txt" >&2
+  exit 1
+fi
+tmux send-keys -t "$SESSION" Enter
+capture_until "GOOGLE_WEB_CLIENT_ID" "$FIXTURE/url.txt"
+grep -qF "DISPLAY_NAME=Devme" "$FIXTURE/.env.auth.local"
+grep -qF "Tab Copy URL" "$FIXTURE/url.txt"
+grep -qF "Shift+Tab Open browser" "$FIXTURE/url.txt"
+grep -qF "›" "$FIXTURE/url.txt"
+tmux send-keys -t "$SESSION" Tab
 capture_until "Copied URL" "$FIXTURE/copied.txt"
+tmux send-keys -t "$SESSION" BTab
+capture_until "Opened https://console.example.test/credentials" "$FIXTURE/opened.txt"
+for _ in {1..100}; do
+  if grep -qF "https://console.example.test/credentials" "$OPEN_LOG" 2>/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+grep -qF "https://console.example.test/credentials" "$OPEN_LOG"
 
 (cd "$FIXTURE" && HOME="$HOME_DIR" XDG_CONFIG_HOME="$HOME_DIR/.config" \
   XDG_RUNTIME_DIR="$RUNTIME_DIR" "$DEVME" setup set GOOGLE_WEB_CLIENT_ID \
