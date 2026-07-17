@@ -29,17 +29,21 @@ it while presenting missing values and advances automatically when another
 process supplies the current value. Values accepted in the human wizard are
 persisted immediately instead of waiting for the whole form to finish.
 
-The wizard tells the human that a coding agent can help and names
-`devme setup status` as the live context surface the agent can read.
+The wizard tells the human that a coding agent can help and offers a shortcut
+to copy a ready-to-paste agent prompt. The prompt identifies the project,
+names `devme setup status --output toon` as the live redacted context surface,
+explains safe `setup set` usage, and reserves authentication and approval for
+the human.
 
-For variables with `setup_url`, the human wizard offers `Open browser` and
-`Copy URL`. Browser automation stays outside Devme. An agent reads the same URL
-through `devme setup status --output toon`, uses its available browser adapter,
-and submits results with `devme setup set`.
+For variables with `setup_url`, the human wizard offers `Open browser`.
+Browser automation stays outside Devme. An agent reads the same URL through
+`devme setup status --output toon`, uses its available browser adapter, and
+submits results with `devme setup set`.
 
 The text prompt is visible and active as soon as a field appears. Printable
-text and paste begin value entry immediately. URL actions use Tab and Shift+Tab
-so a valid first character can never be consumed as a wizard command.
+text and paste begin value entry immediately. Tab copies the agent prompt and
+Shift+Tab opens a setup URL, so valid input characters are never consumed as
+wizard commands.
 
 `setup status` and `setup set` support human, TOON, and JSON output. A
 non-interactive invocation defaults to TOON; `--json` remains the stable JSON

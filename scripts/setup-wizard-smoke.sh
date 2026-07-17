@@ -11,10 +11,12 @@ fi
 SESSION="devme-setup-wizard-$$"
 PIPE_SESSION="devme-setup-piped-secret-$$"
 FIXTURE="$(mktemp -d /tmp/devme-setup-wizard.XXXXXX)"
+FIXTURE_REAL="$(cd "$FIXTURE" && pwd -P)"
 HOME_DIR="$FIXTURE/home"
 RUNTIME_DIR="$FIXTURE/runtime"
 BIN_DIR="$FIXTURE/bin"
 OPEN_LOG="$FIXTURE/opened-url.txt"
+CLIPBOARD_LOG="$FIXTURE/clipboard.txt"
 
 cleanup() {
   local status=$?
@@ -37,6 +39,15 @@ SH
 chmod +x "$BIN_DIR/browser-open"
 ln -s browser-open "$BIN_DIR/open"
 ln -s browser-open "$BIN_DIR/xdg-open"
+cat > "$BIN_DIR/clipboard-copy" <<'SH'
+#!/usr/bin/env bash
+cat > "$DEVME_CLIPBOARD_LOG"
+SH
+chmod +x "$BIN_DIR/clipboard-copy"
+ln -s clipboard-copy "$BIN_DIR/pbcopy"
+ln -s clipboard-copy "$BIN_DIR/wl-copy"
+ln -s clipboard-copy "$BIN_DIR/xclip"
+ln -s clipboard-copy "$BIN_DIR/xsel"
 cat > "$FIXTURE/devme.toml" <<'TOML'
 schema_version = 1
 
@@ -95,11 +106,12 @@ capture_pipe_until() {
 }
 
 tmux new-session -d -s "$SESSION" -x 140 -y 28 \
-  "cd '$FIXTURE' && PATH='$BIN_DIR:$PATH' DEVME_BROWSER_OPEN_LOG='$OPEN_LOG' HOME='$HOME_DIR' XDG_CONFIG_HOME='$HOME_DIR/.config' XDG_RUNTIME_DIR='$RUNTIME_DIR' '$DEVME'"
+  "cd '$FIXTURE' && PATH='$BIN_DIR:$PATH' DEVME_BROWSER_OPEN_LOG='$OPEN_LOG' DEVME_CLIPBOARD_LOG='$CLIPBOARD_LOG' HOME='$HOME_DIR' XDG_CONFIG_HOME='$HOME_DIR/.config' XDG_RUNTIME_DIR='$RUNTIME_DIR' '$DEVME'"
 
 capture_until "DISPLAY_NAME" "$FIXTURE/initial.txt"
 grep -qF "Agent help: ask your coding agent to finish this setup." "$FIXTURE/initial.txt"
 grep -qF "It can read this wizard's live context with devme setup status." "$FIXTURE/initial.txt"
+grep -qF "Tab Copy agent prompt" "$FIXTURE/initial.txt"
 grep -qF "Enter Use default" "$FIXTURE/initial.txt"
 grep -qF "›" "$FIXTURE/initial.txt"
 if grep -qF "Type value" "$FIXTURE/initial.txt"; then
@@ -107,14 +119,23 @@ if grep -qF "Type value" "$FIXTURE/initial.txt"; then
   cat "$FIXTURE/initial.txt" >&2
   exit 1
 fi
+tmux send-keys -t "$SESSION" Tab
+capture_until "Copied agent prompt" "$FIXTURE/agent-prompt.txt"
+grep -qF "Help me complete the Devme setup wizard in $FIXTURE_REAL." "$CLIPBOARD_LOG" || {
+  echo "ASSERT FAIL: copied agent prompt used the wrong project path" >&2
+  cat "$CLIPBOARD_LOG" >&2
+  exit 1
+}
+grep -qF 'devme setup status --output toon' "$CLIPBOARD_LOG"
+grep -qF 'devme setup set <NAME> --value <value>' "$CLIPBOARD_LOG"
+grep -qF 'secret values on stdin' "$CLIPBOARD_LOG"
+grep -qF 'authentication or approval' "$CLIPBOARD_LOG"
 tmux send-keys -t "$SESSION" Enter
 capture_until "GOOGLE_WEB_CLIENT_ID" "$FIXTURE/url.txt"
 grep -qF "DISPLAY_NAME=Devme" "$FIXTURE/.env.auth.local"
-grep -qF "Tab Copy URL" "$FIXTURE/url.txt"
+grep -qF "Tab Copy agent prompt" "$FIXTURE/url.txt"
 grep -qF "Shift+Tab Open browser" "$FIXTURE/url.txt"
 grep -qF "›" "$FIXTURE/url.txt"
-tmux send-keys -t "$SESSION" Tab
-capture_until "Copied URL" "$FIXTURE/copied.txt"
 tmux send-keys -t "$SESSION" BTab
 capture_until "Opened https://console.example.test/credentials" "$FIXTURE/opened.txt"
 for _ in {1..100}; do
@@ -178,7 +199,7 @@ fi
 tmux kill-session -t "$PIPE_SESSION"
 
 tmux send-keys -t "$SESSION" q
-echo "ok [controls] setup URL can be opened or copied"
+echo "ok [controls] agent prompt can be copied and setup URL can be opened"
 echo "ok [live] agent-supplied values advanced the human wizard without recheck"
 echo "ok [typing] values accept direct input without an activation key"
 echo "ok [secret] human secret input stayed masked"

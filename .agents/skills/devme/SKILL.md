@@ -70,7 +70,9 @@ a different existing value is never overwritten. Use `--json` only for
 existing JSON consumers. Do not manually mark setup complete: the configured
 env file is the source of truth and a running human wizard advances live when
 the value appears. The human wizard explicitly offers agent help and names
-`devme setup status` as the live context surface shared with the agent.
+`devme setup status` as the live context surface shared with the agent. Its Tab
+shortcut copies a safe prompt that tells the agent to inspect redacted status,
+use `setup set`, and hand authentication or approval back to the human.
 
 When `devme.toml` does not exist, use the detection workflow below.
 
@@ -106,7 +108,7 @@ generate = "openssl rand -hex 32"                 # auto-create secrets
 [env.PROVIDER_CLIENT_SECRET]
 required = true
 secret = true                                      # masks input; CLI requires stdin
-setup_url = "https://provider.example/credentials" # human open/copy; agent status
+setup_url = "https://provider.example/credentials" # human open; agent status
 [env.REGION]
 choices = ["us-east-1", "eu-west-1"]              # known option set
 default = "eu-west-1"

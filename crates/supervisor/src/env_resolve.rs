@@ -433,15 +433,17 @@ fn render_live_setup_field(
     if let Some(help) = &variable.help {
         writeln!(output, "  {}  {}", style.dim(devme_ui::glyph::BAR), help)?;
     }
+    let mut actions = Vec::new();
     if variable.setup_url.is_some() {
-        writeln!(
-            output,
-            "  {}  {}  {}",
-            style.dim(devme_ui::glyph::BAR),
-            style.accent("[Shift+Tab Open browser]"),
-            style.accent("[Tab Copy URL]")
-        )?;
+        actions.push(style.accent("[Shift+Tab Open browser]"));
     }
+    actions.push(style.accent("[Tab Copy agent prompt]"));
+    writeln!(
+        output,
+        "  {}  {}",
+        style.dim(devme_ui::glyph::BAR),
+        actions.join("  ")
+    )?;
     if let SetupFieldKind::Choice { values, initial } = field {
         writeln!(
             output,
@@ -470,6 +472,17 @@ fn render_live_setup_field(
         writeln!(output, "  {}  {}", style.dim(devme_ui::glyph::BAR), control)?;
     }
     output.flush()
+}
+
+fn setup_agent_prompt(cwd: &Path) -> String {
+    format!(
+        "Help me complete the Devme setup wizard in {}.\n\
+Run `devme setup status --output toon` from that directory to read the live redacted setup state, then complete as many missing variables as possible.\n\
+Use `devme setup set <NAME> --value <value>` for non-secret values. Submit secret values on stdin to `devme setup set <NAME>` so they do not enter shell history. Never print secret values.\n\
+Use each `setup_url` with browser tooling when available, and keep checking status until setup is complete.\n\
+Ask me only when authentication or approval is required, or when a value cannot be obtained safely.",
+        cwd.display()
+    )
 }
 
 fn read_live_setup_input(
@@ -522,13 +535,16 @@ fn read_live_setup_input(
                     return Ok(LiveSetupInput::Cancel);
                 }
                 KeyCode::Esc => return Ok(LiveSetupInput::Cancel),
-                KeyCode::Tab if variable.setup_url.is_some() => {
+                KeyCode::Tab => {
                     if text_field {
                         writeln!(output)?;
                     }
-                    let url = variable.setup_url.as_deref().unwrap();
-                    devme_ui::copy_to_clipboard(url);
-                    writeln!(output, "  {}  Copied URL", style.dim(devme_ui::glyph::BAR))?;
+                    devme_ui::copy_to_clipboard(&setup_agent_prompt(cwd));
+                    writeln!(
+                        output,
+                        "  {}  Copied agent prompt",
+                        style.dim(devme_ui::glyph::BAR)
+                    )?;
                     if text_field {
                         render_live_value(output, &value, variable.secret, style)?;
                     }
