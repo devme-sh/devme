@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
 const CAPTURE_LIMIT: usize = 64 * 1024;
+const DEPENDENCY_DIAGNOSTIC_LIMIT: usize = 4 * 1024;
 
 #[derive(Debug)]
 pub struct UnknownTask {
@@ -84,6 +85,12 @@ enum GuardianHold {
         socket: PathBuf,
         session: String,
     },
+}
+
+#[derive(Clone, Copy)]
+enum ResourceContext {
+    AcquirePlan,
+    Borrowed,
 }
 
 struct TaskGuardFiles {
@@ -213,6 +220,7 @@ async fn execute_streaming(
         Some(updates),
         cancellation,
         guardian_hold,
+        ResourceContext::AcquirePlan,
     )
     .await
 }
@@ -237,6 +245,7 @@ async fn execute_streaming_with_env(
         Some(updates),
         cancellation,
         guardian_hold,
+        ResourceContext::Borrowed,
     )
     .await
 }
@@ -251,11 +260,42 @@ async fn execute_inner(
     updates: Option<tokio::sync::mpsc::UnboundedSender<TaskOutputEvent>>,
     cancellation: Option<tokio::sync::watch::Receiver<bool>>,
     guardian_hold: GuardianHold,
+    resource_context: ResourceContext,
 ) -> Result<TaskResult> {
     let run_started_at = now_ms();
     let run_started = std::time::Instant::now();
     let order = execution_order(stack, name)?;
     let retention = retention_bytes(stack);
+    let resource_names = if matches!(resource_context, ResourceContext::AcquirePlan) {
+        let mut names = order
+            .iter()
+            .flat_map(|task| stack.task[*task].resources.iter().cloned())
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        names
+    } else {
+        Vec::new()
+    };
+    let leases =
+        match acquire_resources(stack, root, name, &resource_names, cancellation.clone()).await {
+            Ok(leases) => leases,
+            Err(error) => {
+                let cancelled = error.downcast_ref::<ResourceWaitCancelled>().is_some();
+                let result = failed_result(
+                    name,
+                    &error.to_string(),
+                    if cancelled { 130 } else { 1 },
+                    cancelled,
+                    run_started_at,
+                    run_started.elapsed().as_millis() as u64,
+                );
+                persist(root, &result, retention)?;
+                return Ok(result);
+            }
+        };
+    let mut plan_env = injected_env.clone();
+    plan_env.extend(leases.env().clone());
     let slot = match SlotClaim::acquire(root) {
         Ok(slot) => slot,
         Err(error) => {
@@ -282,7 +322,8 @@ async fn execute_inner(
                 current,
                 pass,
                 slot.value,
-                injected_env,
+                &plan_env,
+                &leases,
                 updates.clone(),
                 cancellation.clone(),
                 guardian_hold.clone(),
@@ -294,18 +335,7 @@ async fn execute_inner(
         final_result = Some(result);
         if failed_dependency {
             let dependency = final_result.as_ref().expect("result was just assigned");
-            let message = format!(
-                "dependency {current:?} failed with exit code {}",
-                dependency.exit_code
-            );
-            let root_result = failed_result(
-                name,
-                &message,
-                dependency.exit_code,
-                dependency.cancelled,
-                dependency.started_at,
-                dependency.duration_ms,
-            );
+            let root_result = dependency_failure_result(name, current, dependency);
             persist(root, &root_result, retention)?;
             final_result = Some(root_result);
             break;
@@ -424,6 +454,7 @@ async fn execute_one(
     args: &[String],
     slot: u8,
     injected_env: &BTreeMap<String, String>,
+    leases: &ResourceLeases,
     updates: Option<tokio::sync::mpsc::UnboundedSender<TaskOutputEvent>>,
     cancellation: Option<tokio::sync::watch::Receiver<bool>>,
     guardian_hold: GuardianHold,
@@ -486,6 +517,7 @@ async fn execute_one(
         started_at,
         &started,
         injected_env,
+        leases,
         updates,
         cancellation,
         guard_files.as_ref(),
@@ -530,6 +562,7 @@ async fn execute_one_attempt(
     started_at: u64,
     started: &std::time::Instant,
     injected_env: &BTreeMap<String, String>,
+    leases: &ResourceLeases,
     updates: Option<tokio::sync::mpsc::UnboundedSender<TaskOutputEvent>>,
     cancellation: Option<tokio::sync::watch::Receiver<bool>>,
     guard_files: Option<&TaskGuardFiles>,
@@ -555,8 +588,6 @@ async fn execute_one_attempt(
         return Ok(empty_result(name));
     }
 
-    let leases =
-        acquire_resources(stack, root, name, &task.resources, cancellation.clone()).await?;
     let cwd = match &task.cwd {
         Some(value) => root.join(devme_config::interpolate(value, ctx)?),
         None => root.to_path_buf(),
@@ -606,7 +637,7 @@ async fn execute_one_attempt(
         .id()
         .ok_or_else(|| anyhow!("task process has no pid"))? as i32;
     if let Err(error) = spawn_task_guardian(
-        &leases,
+        leases,
         pid as u32,
         gate,
         &guard_files.completion,
@@ -1426,6 +1457,84 @@ fn failed_result(
     }
 }
 
+fn dependency_failure_result(
+    name: &str,
+    dependency_name: &str,
+    dependency: &TaskResult,
+) -> TaskResult {
+    let diagnostic = dependency_diagnostic(dependency, DEPENDENCY_DIAGNOSTIC_LIMIT);
+    let message = if diagnostic.trim().is_empty() {
+        format!(
+            "dependency {dependency_name:?} failed with exit code {}",
+            dependency.exit_code
+        )
+    } else {
+        format!(
+            "dependency {dependency_name:?} failed with exit code {}:\n{diagnostic}",
+            dependency.exit_code
+        )
+    };
+    let mut result = failed_result(
+        name,
+        &message,
+        dependency.exit_code,
+        dependency.cancelled,
+        dependency.started_at,
+        dependency.duration_ms,
+    );
+    result.timed_out = dependency.timed_out;
+    result.truncated = dependency.truncated
+        || dependency.stdout.len() + dependency.stderr.len() > DEPENDENCY_DIAGNOSTIC_LIMIT;
+    result
+}
+
+fn dependency_diagnostic(result: &TaskResult, limit: usize) -> String {
+    let streams = [
+        ("stdout", result.stdout.as_str()),
+        ("stderr", result.stderr.as_str()),
+    ]
+    .into_iter()
+    .filter(|(_, output)| !output.trim().is_empty())
+    .collect::<Vec<_>>();
+    if streams.is_empty() {
+        return String::new();
+    }
+    let label_bytes = streams
+        .iter()
+        .map(|(label, _)| label.len() + 2)
+        .sum::<usize>();
+    let content_budget = limit.saturating_sub(label_bytes);
+    let per_stream = content_budget / streams.len();
+    let mut remaining = content_budget % streams.len();
+    streams
+        .into_iter()
+        .map(|(label, output)| {
+            let budget = per_stream + usize::from(std::mem::take(&mut remaining) > 0);
+            format!("{label}:\n{}", bounded_tail(output, budget))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn bounded_tail(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_string();
+    }
+    const MARKER: &str = "... (truncated)\n";
+    if limit <= MARKER.len() {
+        let mut start = value.len().saturating_sub(limit);
+        while !value.is_char_boundary(start) {
+            start += 1;
+        }
+        return value[start..].to_string();
+    }
+    let mut start = value.len() - (limit - MARKER.len());
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{MARKER}{}", &value[start..])
+}
+
 fn empty_result(name: &str) -> TaskResult {
     let now = now_ms();
     TaskResult {
@@ -1530,6 +1639,7 @@ mod tests {
             None,
             None,
             GuardianHold::None,
+            ResourceContext::AcquirePlan,
         )
         .await
         .unwrap();
@@ -1554,6 +1664,7 @@ mod tests {
             None,
             None,
             GuardianHold::None,
+            ResourceContext::AcquirePlan,
         )
         .await
         .unwrap();
@@ -1571,6 +1682,15 @@ mod tests {
             &devme_config::Redactor::default(),
         );
         assert_eq!(text, "token=[REDACTED]");
+    }
+
+    #[test]
+    fn bounded_tail_respects_its_byte_budget_for_multibyte_text() {
+        let text = "å".repeat(3_000);
+        let bounded = bounded_tail(&text, 4_096);
+        assert!(bounded.len() <= 4_096, "{}", bounded.len());
+        assert!(bounded.starts_with("... (truncated)\n"));
+        assert!(bounded.ends_with('å'));
     }
 
     #[tokio::test]

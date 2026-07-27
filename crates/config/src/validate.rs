@@ -248,13 +248,13 @@ fn check_tasks(stack: &Stack, errors: &mut Vec<ConfigError>) {
         }
     }
     for (name, task) in &stack.task {
+        let closure = task_dependency_closure(stack, name);
         if task.cmd.is_none() {
             for (field, present) in [
                 ("cwd", task.cwd.is_some()),
                 ("env", !task.env.is_empty()),
                 ("steps", !task.steps.is_empty()),
                 ("services", !task.services.is_empty()),
-                ("resources", !task.resources.is_empty()),
                 ("timeout", task.timeout != 0),
                 ("readiness_timeout", task.readiness_timeout != 60),
             ] {
@@ -298,6 +298,49 @@ fn check_tasks(stack: &Stack, errors: &mut Vec<ConfigError>) {
                 }
             }
         }
+        if task.cmd.is_none() && !task.resources.is_empty() {
+            for dependency_name in &closure {
+                let Some(dependency) = stack.task.get(dependency_name.as_str()) else {
+                    continue;
+                };
+                if dependency.cmd.is_some() {
+                    for resource in &task.resources {
+                        if !dependency.resources.contains(resource) {
+                            errors.push(ConfigError::AggregateResourceMissingFromDependency {
+                                task: name.clone(),
+                                resource: resource.clone(),
+                                dependency: dependency_name.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let mut exported = HashMap::<String, String>::new();
+        for task_name in std::iter::once(name.as_str()).chain(closure.iter().map(String::as_str)) {
+            let Some(plan_task) = stack.task.get(task_name) else {
+                continue;
+            };
+            for resource_name in &plan_task.resources {
+                let Some(env) = stack
+                    .resource
+                    .get(resource_name)
+                    .and_then(|resource| resource.env.as_ref())
+                else {
+                    continue;
+                };
+                if let Some(first) = exported.insert(env.clone(), resource_name.clone())
+                    && first != *resource_name
+                {
+                    errors.push(ConfigError::DuplicateTaskPlanResourceEnv {
+                        task: name.clone(),
+                        first,
+                        second: resource_name.clone(),
+                        env: env.clone(),
+                    });
+                }
+            }
+        }
     }
     fn visit<'a>(
         name: &'a str,
@@ -331,6 +374,24 @@ fn check_tasks(stack: &Stack, errors: &mut Vec<ConfigError>) {
     for name in stack.task.keys() {
         visit(name, stack, &mut Vec::new(), &mut black, errors);
     }
+}
+
+fn task_dependency_closure(stack: &Stack, name: &str) -> Vec<String> {
+    let mut pending = stack
+        .task
+        .get(name)
+        .map(|task| task.depends_on.clone())
+        .unwrap_or_default();
+    let mut seen = HashSet::new();
+    while let Some(name) = pending.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        if let Some(task) = stack.task.get(&name) {
+            pending.extend(task.depends_on.iter().cloned());
+        }
+    }
+    seen.into_iter().collect()
 }
 
 /// A non-fatal advisory: the config parses and [`validate`]s, but something
@@ -876,7 +937,7 @@ readiness = { interval_ms = 0, timeout_ms = 0, retries = 0 }
     }
 
     #[test]
-    fn aggregate_tasks_may_only_declare_metadata_and_dependencies() {
+    fn aggregate_tasks_reject_execution_fields() {
         let stack = parse(
             r#"
 schema_version = 1
@@ -895,6 +956,80 @@ services = ["backend"]
             error,
             ConfigError::InvalidAggregateTaskField { task, field }
                 if task == "all" && *field == "services"
+        )));
+    }
+
+    #[test]
+    fn aggregate_tasks_may_declare_resources_for_the_whole_dag() {
+        let stack = parse(
+            r#"
+schema_version = 1
+
+[resource.backend]
+scope = "repo"
+
+[task.leaf]
+cmd = "true"
+resources = ["backend"]
+
+[task.all]
+depends_on = ["leaf"]
+resources = ["backend"]
+"#,
+        );
+        assert!(validate(&stack).is_ok());
+    }
+
+    #[test]
+    fn aggregate_resources_require_matching_executable_dependencies() {
+        let stack = parse(
+            r#"
+schema_version = 1
+
+[resource.backend]
+scope = "repo"
+
+[task.leaf]
+cmd = "true"
+
+[task.all]
+depends_on = ["leaf"]
+resources = ["backend"]
+"#,
+        );
+        assert!(validate(&stack).unwrap_err().iter().any(|error| matches!(
+            error,
+            ConfigError::AggregateResourceMissingFromDependency {
+                task,
+                resource,
+                dependency,
+            } if task == "all" && resource == "backend" && dependency == "leaf"
+        )));
+    }
+
+    #[test]
+    fn task_plan_resources_cannot_export_the_same_environment_name() {
+        let stack = parse(
+            r#"
+schema_version = 1
+[resource.first]
+env = "BACKEND_SLOT"
+[resource.second]
+env = "BACKEND_SLOT"
+[task.a]
+cmd = "true"
+resources = ["first"]
+[task.b]
+cmd = "true"
+resources = ["second"]
+[task.all]
+depends_on = ["a", "b"]
+"#,
+        );
+        assert!(validate(&stack).unwrap_err().iter().any(|error| matches!(
+            error,
+            ConfigError::DuplicateTaskPlanResourceEnv { task, env, .. }
+                if task == "all" && env == "BACKEND_SLOT"
         )));
     }
 

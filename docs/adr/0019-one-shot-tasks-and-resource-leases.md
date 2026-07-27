@@ -18,7 +18,9 @@ such as simulators, emulator identities, and signing access.
 bounded pools. `devme run <task>` executes task dependencies in declaration
 order, checks required setup steps, starts and waits for required services, and
 then delegates the command to its native build tool. Aggregate tasks omit
-`cmd` and contain dependencies only.
+`cmd`. They may declare Resources shared by the full DAG. Every executable
+dependency must repeat an aggregate Resource so invoking that dependency
+directly cannot bypass the same lease; static validation enforces this.
 
 Tasks without services do not start a supervisor. Every task process is a
 process-group leader. Timeout and cancellation terminate the whole group and
@@ -28,7 +30,11 @@ command failures preserve the wrapped command's exit code.
 Resource leases are file-locked slots with host, repository, or worktree
 scope. The OS releases locks after crashes, owner metadata remains inspectable,
 and a configured environment variable exposes the allocated zero-based slot.
-Names are acquired in sorted order to prevent multi-resource deadlock.
+Names are acquired in sorted order to prevent multi-resource deadlock. A Task
+DAG acquires the union of Resources declared by its root and dependencies once,
+then exposes their environment values and holds the leases until the whole DAG
+finishes. This makes repeated aggregate and leaf declarations safe without
+nested self-acquisition.
 Task and Session acquisition use one shared Resource lease module and metadata
 format. A foreground Task hands its lease descriptors to an exact-binary Task
 guardian before it starts running. The Task remains behind a gate until the
@@ -62,15 +68,17 @@ cannot widen that context by requesting another Service or Resource.
 
 Every active Task, Session, or explicit runtime owner contributes a reference-
 counted Service hold for its required Service closure. A Task DAG contributes
-one hold for the aggregate plan, while each executable Task acquires its own
-Resource leases. Releasing one hold stops only hold-managed Services that no
-remaining owner requires. Pre-existing or explicitly managed Services are not
-claimed for teardown merely because a Task used them.
+one hold and one atomic Resource lease set for the aggregate plan. Releasing
+one hold stops only hold-managed Services that no remaining owner requires.
+Pre-existing or explicitly managed Services are not claimed for teardown merely
+because a Task used them.
 
 Task and service history share one retention and redaction policy. Redaction
 patterns are compiled as regular expressions and applied before disk writes.
 `devme logs` correlates service and `task:<name>` records by timestamp, while
 `devme doctor` includes the latest task results and readiness failure details.
+When a dependency fails, the requested aggregate result includes a compact,
+redacted tail from the dependency's stderr, or stdout when stderr is empty.
 
 Required service startup is a targeted supervisor operation. It advances only
 the required dependency closure and reports each readiness attempt, the last

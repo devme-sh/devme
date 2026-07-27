@@ -39,7 +39,7 @@ Route on `$action`. Default to diagnostics when none is given.
 - `devme run <name> --output toon` runs a task. Use `--output json` for existing JSON consumers. Arguments after `--` are passed to the native command. Declared task artifacts are returned as absolute paths in the result, so inspect those paths instead of scraping command output.
 - A task with no required services runs without a supervisor. A task with services starts this worktree's supervisor and waits for readiness first.
 - Exit codes are authoritative: wrapped failures retain their code, timeout is 124, and cancellation is 130. A guardian records `interrupted = true` and exit code 130 if the owning foreground CLI disappears. Do not infer success by scraping output.
-- Host/repo/worktree Resource leases wait atomically. The Task guardian releases them only after the Task process group has exited. Task results are bounded and secret-shaped task environment values are redacted before persistence.
+- Host/repo/worktree Resource leases wait atomically. A Task DAG acquires the union of its declared Resources once and holds them through every dependency, so repeated leaf declarations do not self-deadlock. An aggregate may declare shared Resources, and `devme config check` requires every executable dependency to repeat them so direct leaf runs cannot bypass the lease. The Task guardian releases leases only after the Task process group has exited. Aggregate failures include a compact redacted tail from the failed dependency. Task results remain bounded and secret-shaped task environment values are redacted before persistence.
 - Required Services use overlapping reference-counted holds. Finishing one Task or Session never stops a Service that another active owner still requires, and a Task does not claim a pre-existing explicitly managed Service for teardown.
 - `devme sessions --output toon` lists resource-bound native/runtime sessions without starting a daemon. `devme session <name> --output toon` acquires its Resources, holds only its required Service closure, waits for readiness, and runs its optional launch Task inside that existing context. The launch Task cannot widen the Session's Services or Resources. `devme session <name> --stop` is idempotent for a declared Session.
 - From a workspace member, unqualified task/session/service names are local aliases. Use `member::name` for another member and `root::name` for a root task or resource.
@@ -154,6 +154,10 @@ services = ["postgres"]
 resources = ["device"]
 timeout = 300
 artifacts = ["reports/test-results.xml", "artifacts/screenshots/{slot}"]
+
+[task.verify]
+depends_on = ["test"]
+resources = ["device"] # held for the DAG; executable dependencies repeat it
 
 [task.codegen]
 kind = "utility"

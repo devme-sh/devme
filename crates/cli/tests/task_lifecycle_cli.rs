@@ -55,7 +55,8 @@ fn aggregate_dependency_failure_is_recorded_for_child_and_requested_root() {
     let dir = fixture(
         r#"schema_version=1
 [task.child]
-cmd="printf child-error >&2; exit 9"
+cmd="printf 'child-error swordfish' >&2; exit 9"
+env={API_TOKEN="swordfish"}
 [task.root]
 depends_on=["child"]
 "#,
@@ -67,7 +68,17 @@ depends_on=["child"]
     assert_eq!(result["task"], "root");
     assert_eq!(result["exit_code"], 9);
     assert_eq!(result["status"], "failed");
-    assert!(result["stderr"].as_str().unwrap().contains("child"));
+    let stderr = result["stderr"].as_str().unwrap();
+    assert!(stderr.contains("dependency \"child\" failed with exit code 9"));
+    assert!(stderr.contains("child-error"), "{stderr}");
+    assert!(stderr.contains("[REDACTED]"), "{stderr}");
+    assert!(!stderr.contains("swordfish"), "{stderr}");
+
+    let toon = run(&dir, &["run", "root", "--output", "toon"]);
+    assert_eq!(toon.status.code(), Some(9));
+    let toon = String::from_utf8_lossy(&toon.stdout);
+    assert!(toon.contains("child-error [REDACTED]"), "{toon}");
+    assert!(!toon.contains("swordfish"), "{toon}");
 
     let logs = run(&dir, &["logs", "--tail", "0", "--json"]);
     let records = String::from_utf8_lossy(&logs.stdout)
@@ -83,6 +94,82 @@ depends_on=["child"]
         records
             .iter()
             .any(|record| record["service"] == "task:root")
+    );
+}
+
+#[test]
+fn aggregate_dependency_diagnostic_is_compact_and_marks_truncation() {
+    let dir = fixture(
+        r#"schema_version=1
+[task.child]
+cmd="printf '%05000d' 0 >&2; exit 4"
+[task.root]
+depends_on=["child"]
+"#,
+    );
+
+    let output = run(&dir, &["run", "root", "--output", "json"]);
+    assert_eq!(output.status.code(), Some(4));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let stderr = result["stderr"].as_str().unwrap();
+    assert!(result["truncated"].as_bool().unwrap());
+    assert!(stderr.contains("(truncated)"), "{stderr}");
+    assert!(stderr.len() < 4_300, "{}", stderr.len());
+}
+
+#[test]
+fn aggregate_dependency_diagnostic_includes_both_streams() {
+    let dir = fixture(
+        r#"schema_version=1
+[task.child]
+cmd="printf actionable-cause; printf incidental-warning >&2; exit 6"
+[task.root]
+depends_on=["child"]
+"#,
+    );
+    let output = run(&dir, &["run", "root", "--output", "toon"]);
+    assert_eq!(output.status.code(), Some(6));
+    let output = String::from_utf8_lossy(&output.stdout);
+    assert!(output.contains("actionable-cause"), "{output}");
+    assert!(output.contains("incidental-warning"), "{output}");
+}
+
+#[test]
+fn aggregate_resources_cover_the_whole_dag_and_serialize_independent_runs() {
+    let dir = fixture(
+        r#"schema_version=1
+[resource.backend]
+scope="worktree"
+capacity=1
+env="BACKEND_SLOT"
+[task.mutate]
+cmd="test \"$BACKEND_SLOT\" = 0; test ! -e active; touch active; sleep 0.3; rm active"
+resources=["backend"]
+[task.verify]
+depends_on=["mutate"]
+resources=["backend"]
+"#,
+    );
+
+    let first = Command::new(bin())
+        .args(["run", "verify", "--output", "json"])
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", runtime(&dir))
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for(&dir.path().join("active"));
+
+    let started = Instant::now();
+    let second = run(&dir, &["run", "mutate", "--output", "json"]);
+    let first = first.wait_with_output().unwrap();
+
+    assert!(first.status.success(), "{first:?}");
+    assert!(second.status.success(), "{second:?}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(200),
+        "the independent leaf run did not wait for the aggregate lease"
     );
 }
 

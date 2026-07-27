@@ -36,6 +36,25 @@ pub enum ConfigError {
     )]
     InvalidAggregateTaskField { task: String, field: &'static str },
 
+    #[error(
+        "aggregate task '{task}' resource '{resource}' must also be declared by executable dependency '{dependency}' so direct runs use the same lease"
+    )]
+    AggregateResourceMissingFromDependency {
+        task: String,
+        resource: String,
+        dependency: String,
+    },
+
+    #[error(
+        "task plan '{task}' resources '{first}' and '{second}' both expose environment variable '{env}'"
+    )]
+    DuplicateTaskPlanResourceEnv {
+        task: String,
+        first: String,
+        second: String,
+        env: String,
+    },
+
     #[error("service '{name}' readiness.{field} must be at least 1")]
     InvalidReadinessValue { name: String, field: &'static str },
 
